@@ -319,7 +319,7 @@ pub const CLAMP_OPERATION_NAME: &str = "clamp";
 /// upper-bound tangent where `upper < x`, and zero everywhere else. With ordered bounds, equality to either bound
 /// gives zero. With crossed bounds, equality to the lower bound still passes the upper-bound tangent. Complex
 /// differentiation extends these rules using the lexicographic ordering of the extrema.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClampOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> ClampOperation<T> {

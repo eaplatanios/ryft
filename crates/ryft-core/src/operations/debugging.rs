@@ -92,7 +92,7 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// [`Operation`] contract.
 ///
 /// Refer to the documentation of [`Print`] for more information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrintOperation<T: Type> {
     /// Refer to the documentation of [`label`](Self::label) for more information.
     label: String,

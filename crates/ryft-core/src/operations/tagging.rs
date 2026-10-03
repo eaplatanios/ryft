@@ -67,7 +67,7 @@ pub const TAG_OPERATION_NAME: &str = "tag";
 /// batched value, so that a batched program still carries the key. Differentiation passes the tangent through unchanged
 /// while re-tagging the primal value so that the tag is visible to instructions that define linearization residuals,
 /// which is exactly what consumers such as key-based rematerialization strategies need.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TagOperation<T: Type> {
     /// Refer to the documentation of [`key`](Self::key) for more information.
     key: String,

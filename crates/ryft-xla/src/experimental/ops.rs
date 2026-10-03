@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -28,9 +29,9 @@ use ryft_core::{
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation,
-    LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation,
-    NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationBoundaryPruning,
+    GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation, LiteralIdentity,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationBoundaryPruning,
     OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
     ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
     PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
@@ -197,6 +198,20 @@ impl Display for XlaConstant {
             Self::Dimension(value) => Display::fmt(value, formatter),
             Self::Boolean(value) => Display::fmt(value, formatter),
         }
+    }
+}
+
+// XLA program constants carry only immediate scalars and typed capture slots, so their ordinary equality is already
+// exact and serves as their literal identity.
+impl LiteralIdentity for XlaConstant {
+    #[inline]
+    fn literal_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    #[inline]
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        self.hash(state);
     }
 }
 
@@ -391,7 +406,7 @@ impl AssertionValue for XlaConstant {
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(crate = "ryft_core", type = ArrayIrType, constant = Constant)]
 #[ryft(members(ArrayType, structural(DimensionType)))]
-#[ryft(dispatch(discharge, batching, differentiation, transposition))]
+#[ryft(identity, dispatch(discharge, batching, differentiation, transposition))]
 pub enum XlaOperation<Constant = XlaConstant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -503,7 +518,7 @@ where
     While(WhileOperation<ArrayIrType>),
 
     /// Backend-owned scan whose attached body region can contain XLA operations.
-    Scan(ScanOperation<Constant>),
+    Scan(ScanOperation<ArrayIrType>),
 
     /// Backend-owned custom function call whose primal region can contain XLA operations, with either attached rule
     /// regions that can contain XLA operations or retained rules registered in this family, which are traced lazily.
@@ -684,33 +699,7 @@ where
             ArrayIrOperation::RaggedAllToAll(operation) => Self::RaggedAllToAll(operation),
             ArrayIrOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayIrOperation::While(operation) => Self::While(operation),
-            ArrayIrOperation::Scan(operation) => {
-                let captures = operation
-                    .captures()
-                    .iter()
-                    .cloned()
-                    .map(|capture| match capture {
-                        ryft_core::arrays::ArrayIrValue::Array(capture) => Constant::from_projected(capture),
-                        ryft_core::arrays::ArrayIrValue::Dimension(_)
-                        | ryft_core::arrays::ArrayIrValue::Reference(_) => {
-                            // Scan captures are validated as stacked arrays during `infer_output_types`
-                            // (`validate_scan_capture`); this conversion is infallible, so a dimension or reference
-                            // capture reaching it means a scan was converted before that validation ran.
-                            unreachable!(
-                                "scan captures must be validated as stacked arrays before converting the scan; \
-                                dimension and reference captures are rejected by scan capture validation"
-                            )
-                        }
-                    })
-                    .collect();
-                Self::Scan(
-                    ScanOperation::<Constant>::new(operation.carry_count(), operation.length())
-                        .with_reverse(operation.reverse())
-                        .with_unroll(operation.unroll())
-                        .unwrap()
-                        .with_captures(captures),
-                )
-            }
+            ArrayIrOperation::Scan(operation) => Self::Scan(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
             // Custom function calls and carriers with attached rules follow their regions into the native variants.
@@ -1000,7 +989,7 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract each.
 /// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in
 /// operation equality and callee-deduplication identity and scopes reference-capture resolution during analysis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JitCallOperation<T: Type> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
     capture_count: usize,
@@ -3885,19 +3874,11 @@ mod tests {
             )
             .unwrap();
 
-        let capture = XlaConstant::Captured(CaptureReference::new(
-            1,
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)])).into(),
-        ));
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
         builder.add_input(reference_type.into());
         let carry = builder.add_input(vector_type().into());
-        let operation = ScanOperation::<XlaConstant>::new(1, 3)
-            .with_reverse(true)
-            .with_unroll(3)
-            .unwrap()
-            .with_captures(vec![capture.clone()]);
+        let operation = ScanOperation::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
         let outputs = builder
             .add_instruction(XlaOperation::Scan(operation), vec![body], vec![carry], None)
             .unwrap()
@@ -3921,7 +3902,7 @@ mod tests {
         assert_eq!(scan.carry_count(), 2);
 
         // Selecting the captured allocation through the partial entry point agrees exactly with full capture-aware
-        // discharge. Threading its state widens the carry list while leaving the scan's capture metadata intact.
+        // discharge. Threading its state widens the carry list while preserving the scan's direction and unroll factor.
         let selected = ReferenceDischargeResult::try_from(
             program
                 .clone()
@@ -3941,7 +3922,7 @@ mod tests {
         };
         assert_eq!(scan.carry_count(), 2);
         assert_eq!(scan.unroll(), 3);
-        assert_eq!(scan.captures(), &[capture]);
+        assert!(scan.reverse());
     }
 
     #[test]

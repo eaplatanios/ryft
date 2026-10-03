@@ -411,7 +411,7 @@ fn execute_aot_case<'c>(
         vec![Device::from_pjrt(&device).unwrap()],
     )
     .unwrap();
-    let producer = Arc::new(XlaSession::new(client));
+    let producer = XlaSession::new(client);
     let bundle = KernelAotBundle::compile(
         &definition,
         &producer.domain(),
@@ -426,7 +426,7 @@ fn execute_aot_case<'c>(
     drop(bundle);
     drop(producer);
     let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
-    let runtime = Arc::new(XlaSession::new(client));
+    let runtime = XlaSession::new(client);
     let loaded = restored.load(&runtime.domain(), &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
@@ -576,7 +576,6 @@ fn execute_aot_case<'c>(
 #[cfg(feature = "mosaic-gpu")]
 mod gpu {
     use std::env;
-    use std::sync::Arc;
     use std::time::Instant;
 
     use pretty_assertions::assert_eq;
@@ -681,7 +680,7 @@ mod gpu {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let session = Arc::new(XlaSession::new(client));
+        let session = XlaSession::new(client);
         let domain = session.domain();
         let compiled: CompiledXlaFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile_with_options(
             |inputs: Vec<XlaCompileTracer<'_>>| {
@@ -1365,7 +1364,7 @@ mod cutile {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Arc::new(XlaSession::new(client));
+        let producer = XlaSession::new(client);
         let domain = producer.domain();
         let staged = domain
             .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
@@ -1384,7 +1383,7 @@ mod cutile {
             CompiledKernel::from_manifest(&verified, output.manifest(), output.artifact().bytes().to_vec()).unwrap();
         assert_eq!(restored_output.artifact().bytes(), output.artifact().bytes());
         assert_eq!(restored_output.arguments(), output.arguments());
-        let runtime_session = Arc::new(XlaSession::new(client));
+        let runtime_session = XlaSession::new(client);
         let runtime = runtime_session.domain();
         let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
         let executable = compiled
@@ -1566,7 +1565,7 @@ mod cutile {
                     Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
                 let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
                 let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
-                let session = Arc::new(XlaSession::new(&client));
+                let session = XlaSession::new(&client);
                 let domain = session.domain();
                 let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_options(
                     |input: XlaCompileTracer<'_>| {
@@ -1697,6 +1696,7 @@ mod cutile {
 mod tuning {
     use std::env;
     use std::num::NonZeroUsize;
+    #[cfg(feature = "cutile")]
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -1866,7 +1866,7 @@ mod tuning {
                 (schedule, binding)
             })
             .collect();
-        let session = Arc::new(XlaSession::new(client));
+        let session = XlaSession::new(client);
         let inputs = case
             .input_types
             .iter()
@@ -2300,7 +2300,7 @@ mod triton {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let producer = Arc::new(XlaSession::new(client));
+        let producer = XlaSession::new(client);
         let domain = producer.domain();
         let staged = domain
             .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
@@ -2315,7 +2315,7 @@ mod triton {
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         cancellation.store(true, Ordering::Release);
-        let session = Arc::new(XlaSession::new(client));
+        let session = XlaSession::new(client);
         let runtime = session.domain();
         let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
         let executable = compiled

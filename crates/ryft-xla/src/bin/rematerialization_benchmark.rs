@@ -29,7 +29,7 @@ use ryft_core::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
-use ryft_xla::{Array, FromPjrt, XlaDomain, XlaOptions};
+use ryft_xla::{Array, FromPjrt, XlaDomain, XlaOptions, XlaSession};
 
 type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
@@ -194,10 +194,10 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 }
 
 /// Returns an array of the provided shape that is replicated over `mesh` with deterministic small values.
-fn array<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, shape: &[usize]) -> Array<'c> {
+fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize]) -> Array<'c> {
     let size = shape.iter().product::<usize>();
     let bytes = (0..size).flat_map(|index| ((index % 97) as f32 / 970.0).to_ne_bytes()).collect::<Vec<_>>();
-    Array::from_host_buffer(client, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
+    Array::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
 }
 
 /// Returns the values of `array`.
@@ -401,16 +401,16 @@ fn main() {
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
     let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
-    let domain = XlaDomain::new(client);
+    let domain = XlaSession::new(client).domain();
     println!("platform: {}", client.platform_name().unwrap());
 
     // Runtime of a model that scans over its layers.
     let model = Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 };
     let inputs = || {
         (
-            array(client, &mesh, &[model.batch_size, model.width]),
-            array(client, &mesh, &[model.layer_count, model.width, model.expanded_width]),
-            array(client, &mesh, &[model.layer_count, model.expanded_width, model.width]),
+            array(&domain, &mesh, &[model.batch_size, model.width]),
+            array(&domain, &mesh, &[model.layer_count, model.width, model.expanded_width]),
+            array(&domain, &mesh, &[model.layer_count, model.expanded_width, model.width]),
         )
     };
     print_header(&format!("Scan over layers ({model:?})"));
@@ -431,9 +431,9 @@ fn main() {
     let down_shape = [model.expanded_width, model.width];
     let inputs = || {
         (
-            array(client, &mesh, &[model.batch_size, model.width]),
-            array(client, &mesh, &up_shape),
-            array(client, &mesh, &down_shape),
+            array(&domain, &mesh, &[model.batch_size, model.width]),
+            array(&domain, &mesh, &up_shape),
+            array(&domain, &mesh, &down_shape),
         )
     };
     print_header(&format!("Repeated calls ({model:?})"));

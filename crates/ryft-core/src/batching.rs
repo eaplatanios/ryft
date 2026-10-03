@@ -1880,10 +1880,8 @@ impl<C: Context, P: BatchingPolicy<C, Batch: PartialEq>> PartialEq for BatchingT
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         // A batch-carrying value compares by its packed value (through that value's own `PartialEq`, which is
-        // identity-shaped for tracer-valued parents) and its batch axis, ignoring the stamped context. Consumers such
-        // as the scan/while loop-invariance fixed points of partial evaluation compare flowing values across replay
-        // rounds to detect passthrough, and a batched value passes through exactly when its packed value does on the
-        // same axis.
+        // identity-shaped for tracer-valued parents) and its batch axis, ignoring the stamped context, so two
+        // batched values are equal exactly when their packed values are equal on the same axis.
         self.batch == other.batch
     }
 }

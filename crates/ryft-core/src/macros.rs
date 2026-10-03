@@ -965,7 +965,7 @@ macro_rules! define_elementwise_operation {
     // rendered as a bracketed field because program renderings also key compilation caches.
     (@unary_marker [accuracy] [$($documentation:tt)*] $operation:ident, $name:ident) => {
         $($documentation)*
-        #[derive(Clone)]
+        #[derive(Clone, PartialEq, Eq, Hash)]
         pub struct $operation<__T: $crate::Type> {
             /// [`Accuracy`](crate::Accuracy) requested from the backend implementation of this operation.
             accuracy: $crate::Accuracy,
@@ -1057,7 +1057,7 @@ macro_rules! define_elementwise_operation {
     // This internal branch defines the zero-sized, type-indexed marker shared by both public operation arities.
     (@marker [$($documentation:tt)*] $operation:ident, $name:ident) => {
         $($documentation)*
-        #[derive(Clone)]
+        #[derive(Clone, PartialEq, Eq, Hash)]
         pub struct $operation<__T: $crate::Type>(::std::marker::PhantomData<fn() -> __T>);
 
         impl<__T: $crate::Type> $operation<__T> {

@@ -136,7 +136,7 @@ where
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<DynamicBroadcastOperation>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -180,7 +180,7 @@ where
             vec![Placeholder],
         )?;
 
-        let scan = ScanOperation::<C::Constant>::new(0, length.clone());
+        let scan = ScanOperation::<C::Type>::new(0, length.clone());
         let mut packed_inputs = vec![input.into_value()];
         if length.variable().is_some() {
             packed_inputs.push(scan_extent);

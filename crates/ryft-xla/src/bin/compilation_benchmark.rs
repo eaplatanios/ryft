@@ -11,7 +11,7 @@ use ryft_core::{
     ValueProjection, stage_function,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};
+use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, jitted};
 use serde_json::{Value, json};
 
 type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
@@ -155,7 +155,7 @@ fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::
 }
 
 fn input_array<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     mesh: &DeviceMesh,
     r#type: ArrayType,
     size: usize,
@@ -164,7 +164,7 @@ fn input_array<'c>(
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
     }
-    Ok(Array::from_host_buffer(client, r#type, mesh.clone(), bytes.as_slice())?)
+    Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
 }
 
 fn stage_workload<'c>(
@@ -201,18 +201,20 @@ fn persistent_restore(
     r#type: &ArrayType,
     directory: &Path,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let producer = XlaDomain::with_configured_disk_cache(
+    let producer = XlaSession::with_configured_disk_cache(
         client,
         DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
-    );
+    )
+    .domain();
     let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
     let producer_lowered = producer.lower(producer_staged)?;
     producer.compile(producer_lowered)?;
 
-    let restored = XlaDomain::with_configured_disk_cache(
+    let restored = XlaSession::with_configured_disk_cache(
         client,
         DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
-    );
+    )
+    .domain();
     let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
     let restored_lowered = restored.lower(restored_staged)?;
     let start = Instant::now();
@@ -237,9 +239,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
-    let input = input_array(&client, &mesh, r#type.clone(), arguments.size)?;
+    let domain = XlaSession::new(&client).domain();
+    let input = input_array(&domain, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
-    let domain = XlaDomain::new(&client);
     let start = Instant::now();
     let staged = stage_workload(&domain, &mesh, r#type.clone())?;
     let cold_trace_ns = duration_nanoseconds(start);

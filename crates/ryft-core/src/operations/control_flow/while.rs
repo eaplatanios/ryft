@@ -110,7 +110,7 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
 /// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
 /// shared implementation supports homogeneous array and composite array IR loops.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WhileOperation<T: Type> {
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
     /// truncating even while the condition still produces true.
@@ -1097,8 +1097,8 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
 }
 
 /// Type-family partial-evaluation semantics for [`WhileOperation`]s. The known-side context parameter rides as a
-/// trait input (with the type family as the implementing type, mirroring [`ScanPayload`](super::scan::ScanPayload)) so
-/// that each family implementation can carry exactly the capability bounds its rule needs.
+/// trait input (with the type family as the implementing type) so that each family implementation can carry exactly
+/// the capability bounds its rule needs.
 pub(crate) trait WhilePartialEvaluation<C: Context>: WhileTypeSemantics {
     /// Partially evaluates the provided [`WhileOperation`]; refer to the documentation of
     /// [`PartiallyEvaluatableOperation::partially_evaluate`] for the contract.
@@ -1114,18 +1114,16 @@ pub(crate) trait WhilePartialEvaluation<C: Context>: WhileTypeSemantics {
 //
 // A while's inputs are the initial loop state and its outputs are the final loop state (the same arity). Partial
 // evaluation folds the known value of every *loop-invariant-known* state element into both nested programs: a state
-// element is loop-invariant-known iff its init input is [`Known`](PartialValue::Known) and, with the
-// loop-invariant-known state bound to its init values and everything else [`Unknown`](PartialValue::Unknown), its body
-// next-state output is itself a known value equal to that init. Such an element holds its init value on every
+// element is loop-invariant-known iff the body passes it through unchanged (its next-state output is its own state
+// input) and its init input is [`Known`](PartialValue::Known). Such an element holds its init value on every
 // iteration, so binding it to that constant inside the condition and body is sound and collapses every subcomputation
-// that depended only on it.
+// that depended only on it. Invariance is structural rather than decided by comparing the body's next-state values
+// with the init values, because value equality cannot distinguish values that the body changes without changing their
+// equality class (e.g., a body that negates a state element of `0.0` returns `-0.0`, which compares equal to `0.0`).
 //
-// The invariant set is found by the same monotonic fixed point as the [`scan`](super::scan::ScanOperation) rule (a
-// state element can only be demoted from invariant to non-invariant as more are admitted, so it converges), recursing
-// through the partial-evaluation driver's split requests on the *body* (the condition produces no state and so
-// cannot affect whether a state element reproduces its init). After the fixed point, both the body and the condition
-// are partially evaluated with the invariant-known state knowledge — the condition reads the state too, so folding
-// an invariant element can shrink it as well.
+// Both the body and the condition are then partially evaluated with the invariant-known state knowledge through the
+// partial-evaluation driver's split requests. The condition reads the state too, so folding an invariant element can
+// shrink it as well.
 //
 // The residual while keeps the *same* state set and therefore the same output arity as the original operation. A
 // loop-invariant-known element is not dropped; instead its body next-state output is rebuilt as the constant init
@@ -1146,7 +1144,6 @@ impl<V, O, C> WhilePartialEvaluation<C> for ArrayType
 where
     V: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    C::Value: PartialEq,
     O: Operation<Type = ArrayType> + From<WhileOperation<ArrayType>>,
 {
     fn partially_evaluate_while<D: PartialEvaluationDriver<C>>(
@@ -1173,10 +1170,10 @@ where
         let state_types = body.input_types();
         let state_count = state_types.len();
 
-        // The invariance fixed point below probes by folding the condition and body through the *live* known-side
-        // context, and the closed-knownness split's known loop re-runs the known part of every iteration. For an
-        // effectful loop the probes would execute (eager) or stage (staging) the loop's effects once more and the
-        // split would run them twice, so effectful loops skip both and residualize unchanged (see the effect
+        // The invariance probes below fold the condition and body through the *live* known-side context, and the
+        // closed-knownness split's known loop re-runs the known part of every iteration. For an effectful loop the
+        // probes would execute (eager) or stage (staging) the loop's effects once more and the split would run them
+        // twice, so effectful loops skip both and residualize unchanged (see the effect
         // placement contract on `PartialEvaluationContext::fold_or_residualize`). Every reference operation is
         // `OrderedState`, so a loop touching references is never pure and no probe below can execute a reference
         // operation, fold a reference carry across the loop boundary, or change the active context's effect-ordering
@@ -1208,23 +1205,27 @@ where
             ),
         };
 
-        // A state element can only fold if its init input is known *and* resolves to a constant in the known-side
-        // context: the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic knowns
-        // also keeps the fixed point's probe rounds from folding symbolic known work into a live staging context.
+        // A state element can only fold if the body passes it through unchanged and its init input is known *and*
+        // resolves to a constant in the known-side context: the folded value must be embeddable as a rebuilt-program
+        // constant, and skipping symbolic knowns also keeps the probes from folding symbolic known work into a live
+        // staging context.
         let state_inits = (0..state_count)
             .map(|index| {
-                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_constant()).cloned()
+                inputs[index]
+                    .as_known()
+                    .filter(|value| {
+                        body.output_ids()[index] == body.input_ids()[index]
+                            && context.parent().resolve(value).is_constant()
+                    })
+                    .cloned()
             })
             .collect::<Vec<Option<C::Value>>>();
 
-        // Monotonically narrow the set of loop-invariant-known state elements to a fixed point. A round binds each
-        // invariant element to its init, leaves everything else unknown, and keeps an element only if the body
-        // reproduces its init as the next-state value. With no invariance candidates at all there is nothing the
-        // rebuild below could embed, so skip the live-context probe entirely — in particular, under a staging
-        // known-side context every symbolic known init lands here, which is where the closed-knownness split serves
-        // `Program::linearize`.
-        let mut invariant = state_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
-        if invariant.iter().all(|candidate| !candidate) {
+        // With no invariant elements there is nothing the rebuild below could embed, so skip the live-context probes
+        // entirely. In particular, under a staging known-side context every symbolic known init lands here, which is
+        // where the closed-knownness split serves `Program::linearize`.
+        let invariant = state_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
+        if invariant.iter().all(|folded| !folded) {
             return split_or_residualize(context);
         }
         let state_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
@@ -1243,29 +1244,9 @@ where
         // probe folds are safe to discard, and the split stays error-consistent: its partitions stage through fresh
         // contexts without executing known work, and its known loop replays the loop's exact runtime semantics
         // (running nothing when the condition is false on entry).
-        let Ok(mut body_evaluation) = driver.partially_evaluate_program(context, body, &state_knowledge(&invariant))
-        else {
+        let Ok(body_evaluation) = driver.partially_evaluate_program(context, body, &state_knowledge(&invariant)) else {
             return split_or_residualize(context);
         };
-        loop {
-            let refined = (0..state_count)
-                .map(|index| {
-                    invariant[index]
-                        && matches!(
-                            &body_evaluation.outputs[index],
-                            PartialEvaluationOutput::Known(value) if Some(value) == state_inits[index].as_ref()
-                        )
-                })
-                .collect::<Vec<bool>>();
-            if refined == invariant {
-                break;
-            }
-            invariant = refined;
-            body_evaluation = match driver.partially_evaluate_program(context, body, &state_knowledge(&invariant)) {
-                Ok(evaluation) => evaluation,
-                Err(_) => return split_or_residualize(context),
-            };
-        }
 
         // The condition reads the loop state too, so folding the invariant-known state can shrink it as well.
         let condition_evaluation =
@@ -1274,17 +1255,10 @@ where
                 Err(_) => return split_or_residualize(context),
             };
 
-        // Nothing folded: defer to the split-or-residualize fallback. A loop-invariant-known element always shrinks
-        // the body (its uses fold to constants), so the only way nothing folds is an empty invariant set whose
-        // residual condition and body did not shrink either — a time-varying known chain lands here and is what the
-        // closed-knownness split recovers. The rebuild below embeds the probes' known values as inline program
-        // constants, which is only possible when they all resolve to constants — under a staging known-side context a
-        // probe can fold a constant-only chain into a live-trace tracer — so a non-constant probe takes the same
-        // fallback.
-        if (invariant.iter().all(|folded| !folded)
-            && body_evaluation.program.instructions().len() >= body.instructions().len()
-            && condition_evaluation.program.instructions().len() >= condition.instructions().len())
-            || !context.all_knowns_are_constants(&body_evaluation)
+        // The rebuild below embeds the probes' known values as inline program constants, which is only possible when
+        // they all resolve to constants. Under a staging known-side context a probe can fold a constant-only chain into
+        // a live-trace tracer, so a non-constant probe defers to the split-or-residualize fallback.
+        if !context.all_knowns_are_constants(&body_evaluation)
             || !context.all_knowns_are_constants(&condition_evaluation)
         {
             return split_or_residualize(context);
@@ -1851,11 +1825,11 @@ where
 ///      storage after early exit is never interpreted as a dimension value.
 ///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
 ///
-/// Reverse mode is total with no while-specific transpose code: the staged tangent scan re-keys through the existing
-/// scan re-key path into a captured-stack linear scan whose body re-keys the per-iteration `select` over its mask-item
-/// capture, and the single outer transpose flips the scan direction and transposes the body — the masked pushforward
-/// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
-/// cotangents pass through inactive batch items unchanged.
+/// Reverse mode is total with no while-specific transpose code: the staged tangent scan reads its residual and validity
+/// stacks as known stacked inputs and its invariant residuals as known carries that its body passes through unchanged,
+/// so the ordinary scan transposition flips the scan direction and transposes the body. The per-iteration `select`
+/// routes a zero cotangent to the masked pushforward on inactive batch items and the full cotangent to the carried
+/// side, so cotangents pass through inactive batch items unchanged.
 fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A, P: DifferentiationPolicy<C>>(
     operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -1870,7 +1844,7 @@ where
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + WhileResidualStackOperation<C::Type, A>,
 {
     let state_count = body.input_count();
@@ -1920,7 +1894,7 @@ where
     C::Operation: ResidualZeroProvider<ArrayType, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayType>>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + WhileResidualStackOperation<ArrayType, C::Constant>,
 {
     fn jvp_while<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -1949,7 +1923,7 @@ where
         + WhileResidualStackOperation<C::Type, A>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
-        + From<ScanOperation<C::Constant>>,
+        + From<ScanOperation<C::Type>>,
 {
     let state_types = driver.region(1)?.input_types();
     let state_count = state_types.len();
@@ -2148,11 +2122,17 @@ where
                 let mut conditional_inputs = Vec::with_capacity(inputs.len());
                 conditional_inputs.push(mask[0].clone());
                 conditional_inputs.extend_from_slice(iteration_inputs);
-                trace_context.bind(
+                let conditional_outputs = trace_context.bind(
                     C::Operation::from(ConditionOperation::new()),
                     vec![active_body, passive_body],
                     conditional_inputs.as_slice(),
-                )
+                )?;
+                // Both branches forward the invariant residuals, so the scan body returns its own inputs for them.
+                // Keeping them structurally passed through is what lets scan transposition treat them as invariant
+                // known carries.
+                let mut outputs = iteration_inputs[..invariant_residual_count].to_vec();
+                outputs.extend(conditional_outputs.into_iter().skip(invariant_residual_count));
+                Ok::<_, ProgramError>(outputs)
             },
             scan_body_input_types,
         )?
@@ -2214,7 +2194,7 @@ where
             .collect::<Result<Vec<_>, _>>()?,
     );
     tangent_scan_inputs.push(context.primal_to_tangent(mask_stack)?);
-    let tangent_scan = ScanOperation::<C::Constant>::new(invariant_residual_count + tangent_state_count, bound);
+    let tangent_scan = ScanOperation::<C::Type>::new(invariant_residual_count + tangent_state_count, bound);
     let tangent_outputs =
         context
             .tangent()
@@ -2242,7 +2222,7 @@ where
     C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayIrType>>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + WhileResidualStackOperation<ArrayIrType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
 {
     fn jvp_while<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -2820,7 +2800,9 @@ mod tests {
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
-    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
+    use crate::operations::arithmetic::{
+        AddOperation, DivOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, SubOperation,
+    };
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
@@ -5608,6 +5590,82 @@ mod tests {
         assert_eq!(reassembled[0].to_f64s(), vec![0.0]);
         assert_eq!(reassembled[1].to_f64s(), vec![37.0]);
         assert_eq!(reassembled[2].to_f64s(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_while_partial_evaluation_preserves_signed_zero_state() {
+        // Body `[counter, value] -> [counter - 1, -value]` over an unknown counter and a known value of `0.0`. Negating
+        // `0.0` yields `-0.0`, which compares equal to `0.0`, so a value-based invariance check would wrongly fold the
+        // value to its initial `0.0`. After an odd number of iterations, the final value must be `-0.0`.
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let counter = builder.add_input(scalar());
+            let _value = builder.add_input(scalar());
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
+                    Vec::new(),
+                    vec![counter, zero],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let counter = builder.add_input(scalar());
+            let value = builder.add_input(scalar());
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
+            let next_counter =
+                builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
+            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![next_counter, negated],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let counter = builder.add_input(scalar());
+        let value = builder.add_input(scalar());
+        let outputs = builder
+            .add_instruction(
+                ArrayOperation::While(WhileOperation::new()),
+                vec![condition, body],
+                vec![counter, value],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(scalar()), PartialValue::Known(Array::scalar(0.0f64).unwrap())])
+            .unwrap();
+        let residual_inputs = evaluation
+            .inputs
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Known(value) => value.clone(),
+                PartialEvaluationInput::Unknown(_) => Array::scalar(3.0f64).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let residual_outputs = evaluation.program.interpret(residual_inputs).unwrap();
+        let final_value = match &evaluation.outputs[1] {
+            PartialEvaluationOutput::Known(value) => value.clone(),
+            PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].clone(),
+        };
+        assert!(final_value.to_f64s()[0].is_sign_negative());
     }
 
     #[test]

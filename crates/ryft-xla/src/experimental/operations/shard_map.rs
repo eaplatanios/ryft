@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -300,6 +301,28 @@ fn render_axis_name(name: &str) -> String {
 impl<V> Display for ShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render_operation(formatter, 0)
+    }
+}
+
+// The leaf type `V` is only a marker (the body is an attached region), so these implementations compare and hash the
+// boundary metadata without requiring `V` to be comparable or hashable.
+impl<V> PartialEq for ShardMapOperation<V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.shard_map == other.shard_map
+            && self.input_types == other.input_types
+            && self.output_types == other.output_types
+            && self.output_forwarding == other.output_forwarding
+    }
+}
+
+impl<V> Eq for ShardMapOperation<V> {}
+
+impl<V> Hash for ShardMapOperation<V> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.shard_map.hash(state);
+        self.input_types.hash(state);
+        self.output_types.hash(state);
+        self.output_forwarding.hash(state);
     }
 }
 

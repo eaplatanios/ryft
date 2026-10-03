@@ -23,9 +23,6 @@ pub enum Error {
     #[error("missing required sharding metadata")]
     MissingSharding,
 
-    #[error("domain was constructed without a PJRT client")]
-    MissingClient,
-
     #[error("domain was constructed without a device mesh")]
     MissingMesh,
 

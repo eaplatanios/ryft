@@ -15,14 +15,14 @@ use crate::{Array, ArrayShard};
 ///
 /// This is the JAX-style op-by-op dispatch shape behind every eager value capability of [`Array`]. The blanket
 /// capability implementations in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...)
-/// already follow it through [`Value::dispatch_domain`] — which for a concrete [`Array`] recovers the rich,
-/// PJRT-backed [`XlaDomain`](crate::XlaDomain) that compiles a cached single-operation program and executes it —
-/// so this module only implements the capabilities those blankets cannot cover: the foreign `std::ops` operator
-/// sugar (per-type implementations required by the orphan rule) and host-readback capabilities such as
-/// [`Concretizable`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step; callers must pass
-/// at least one input,
-/// and the first input determines the domain (and thereby the client and compile cache) the operation executes
-/// against.
+/// already follow it through [`Value::dispatch_domain`], which for a concrete [`Array`] recovers the PJRT-backed
+/// [`XlaDomain`](crate::XlaDomain) that the array belongs to. That domain executes the operation through a
+/// single-operation program that its session caches per operation application, so a repeated eager operation skips
+/// tracing and lowering. This module therefore only implements the capabilities those blankets cannot cover: the
+/// foreign `std::ops` operator sugar (per-type implementations required by the orphan rule) and host-readback
+/// capabilities such as [`Concretizable`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step.
+/// Callers must pass at least one input, and the first input determines the domain (and thereby the session, its
+/// caches, and the effect scope) that the operation executes in.
 fn bind_single_output<'o, P: Into<ArrayOperation<XlaArrayConstant>>>(
     operation: P,
     inputs: &[Array<'o>],
@@ -311,6 +311,8 @@ impl std::ops::Not for Array<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
@@ -330,7 +332,7 @@ mod tests {
         ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, execution_client, values_from_bytes,
         values_to_bytes,
     };
-    use crate::{Array, FromPjrt};
+    use crate::{Array, FromPjrt, XlaDomain, XlaSession};
 
     use super::*;
 
@@ -356,13 +358,13 @@ mod tests {
             .unwrap()
     }
 
-    fn f32_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+    fn f32_vector<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
         let r#type = replicated_type(mesh, DataType::F32, &[values.len()]);
-        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
     fn f32_matrix<'c>(
-        client: &'c Client<'c>,
+        domain: &XlaDomain<'c>,
         mesh: &DeviceMesh,
         rows: usize,
         columns: usize,
@@ -370,18 +372,18 @@ mod tests {
     ) -> Array<'c> {
         assert_eq!(values.len(), rows * columns);
         let r#type = replicated_type(mesh, DataType::F32, &[rows, columns]);
-        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
-    fn f32_scalar<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+    fn f32_scalar<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
         let r#type = replicated_type(mesh, DataType::F32, &[]);
-        Array::from_host_buffer(client, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
-    fn boolean_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+    fn boolean_vector<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
         let r#type = replicated_type(mesh, DataType::Boolean, &[values.len()]);
         let bytes = values.iter().map(|value| u8::from(*value)).collect::<Vec<_>>();
-        Array::from_host_buffer(client, r#type, mesh.clone(), bytes.as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice()).unwrap()
     }
 
     fn read_f32s(array: &Array<'_>) -> Vec<f32> {
@@ -446,9 +448,9 @@ mod tests {
         bytes.iter().map(|byte| *byte != 0).collect()
     }
 
-    fn c64_scalar<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, value: num_complex::Complex<f32>) -> Array<'c> {
+    fn c64_scalar<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, value: num_complex::Complex<f32>) -> Array<'c> {
         let r#type = replicated_type(mesh, DataType::C64, &[]);
-        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes(&[value]).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(&[value]).as_slice()).unwrap()
     }
 
     fn read_c64s(array: &Array<'_>) -> Vec<num_complex::Complex<f32>> {
@@ -470,9 +472,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let a = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
-        let b = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let a = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let b = f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
 
         assert_eq!(read_f32s(&a.add(&b).unwrap()), vec![11.0, 22.0, 33.0, 44.0]);
         assert_eq!(read_f32s(&b.sub(&a).unwrap()), vec![9.0, 18.0, 27.0, 36.0]);
@@ -488,7 +491,7 @@ mod tests {
 
         // Complex sine and cosine preserve their mathematically exact zero component even when the hyperbolic factor
         // overflows. A naive `0 * inf` decomposition would produce a NaN here.
-        let extreme = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 1000.0));
+        let extreme = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 1000.0));
         let sine = read_c64s(&extreme.sin().unwrap())[0];
         assert_eq!(sine.re, 0.0);
         assert!(sine.im.is_infinite() && sine.im.is_sign_positive());
@@ -500,14 +503,15 @@ mod tests {
     #[test]
     fn test_eager_arithmetic_one_bit_integers() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // One-bit arithmetic wraps modulo two; StableHLO predicate addition instead performs Boolean OR.
         for data_type in [DataType::I1, DataType::U1] {
             let left =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
                     .unwrap();
             let right =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
                     .unwrap();
             assert_eq!(
                 shard_host_bytes(left.add(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
@@ -526,7 +530,7 @@ mod tests {
                 vec![0, 0, 1, 1],
             );
             let divisor =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[1]).unwrap();
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[1]).unwrap();
             assert_eq!(
                 shard_host_bytes(left.div(&divisor).unwrap().addressable_shards().next().unwrap()).unwrap(),
                 vec![0, 0, 1, 1],
@@ -537,7 +541,7 @@ mod tests {
             );
             // The CPU backend's division-by-zero sentinel also narrows to the single set bit.
             let zero =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[0]).unwrap();
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[0]).unwrap();
             assert_eq!(
                 shard_host_bytes(left.div(&zero).unwrap().addressable_shards().next().unwrap()).unwrap(),
                 vec![1, 1, 1, 1],
@@ -548,12 +552,12 @@ mod tests {
             );
         }
         let signed =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
                 .unwrap();
         assert_eq!(shard_host_bytes(signed.sign().unwrap().addressable_shards().next().unwrap()).unwrap(), vec![1, 0]);
         // Implicit promotion must interpret a signed set bit as minus one before doing wider arithmetic.
         let two =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I8, &[]), mesh.clone(), &[2]).unwrap();
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I8, &[]), mesh.clone(), &[2]).unwrap();
         assert_eq!(
             shard_host_bytes(signed.add(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
             vec![1, 2],
@@ -579,9 +583,10 @@ mod tests {
     #[test]
     fn test_eager_floor() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
-        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        let input = f32_vector(&domain, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
         assert_eq!(
             read_f32s(&input.floor().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
             [-0.0f32, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0, 2.0].map(f32::to_bits),
@@ -589,7 +594,7 @@ mod tests {
 
         // Exponent-only floats cannot represent zero; rounding to zero must produce NaN instead of failing.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
             mesh.clone(),
             &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
@@ -608,9 +613,10 @@ mod tests {
     #[test]
     fn test_eager_ceil() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
-        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        let input = f32_vector(&domain, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
         assert_eq!(
             read_f32s(&input.ceil().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
             [-0.0f32, 0.0, -0.0, 1.0, -0.0, 1.0, 2.0, 3.0].map(f32::to_bits),
@@ -618,7 +624,7 @@ mod tests {
 
         // Upward rounding stays representable in the exponent-only format, while NaN remains NaN.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
             mesh.clone(),
             &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
@@ -637,9 +643,10 @@ mod tests {
     #[test]
     fn test_eager_round() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
-        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        let input = f32_vector(&domain, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
         assert_eq!(
             read_f32s(&input.round().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
             [-0.0f32, 0.0, -0.0, 0.0, -0.0, 0.0, 2.0, 2.0].map(f32::to_bits),
@@ -647,7 +654,7 @@ mod tests {
 
         // Exponent-only floats cannot represent zero; rounding to zero must produce NaN instead of failing.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
             mesh.clone(),
             &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
@@ -666,11 +673,12 @@ mod tests {
     #[test]
     fn test_eager_sin_complex_large_imaginary() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Hyperbolic factors need not overflow with their exponential intermediates. A small real factor can
         // also keep one component finite beyond the range of the hyperbolic factor itself.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[3]),
             mesh.clone(),
             values_to_bytes::<f64>(&[0.0, 710.0, 0.0, -710.0, 1e-300, 1400.0]),
@@ -685,7 +693,7 @@ mod tests {
         assert!((values[4] / 5.143333304259947e307 - 1.0).abs() < 2e-15);
         assert_eq!(values[5], f64::INFINITY);
 
-        let input = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 89.0));
+        let input = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 89.0));
         let output = input.sin().unwrap();
         let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
         assert_eq!(values[0], 0.0);
@@ -695,9 +703,10 @@ mod tests {
     #[test]
     fn test_eager_cos_complex_large_imaginary() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[3]),
             mesh.clone(),
             values_to_bytes::<f64>(&[0.0, 710.0, 0.0, -710.0, 1e-300, 1400.0]),
@@ -712,7 +721,7 @@ mod tests {
         assert_eq!(values[4], f64::INFINITY);
         assert!((values[5] / -5.143333304259947e307 - 1.0).abs() < 2e-15);
 
-        let input = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 89.0));
+        let input = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 89.0));
         let output = input.cos().unwrap();
         let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
         assert!((values[0] / 2.2448064e38 - 1.0).abs() < 2e-7);
@@ -722,9 +731,10 @@ mod tests {
     #[test]
     fn test_eager_atan2_jvp_extreme_magnitudes() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F64, &[2]),
             mesh.clone(),
             values_to_bytes::<f64>(&[1e200, 1e-200]),
@@ -748,10 +758,11 @@ mod tests {
     fn test_eager_result_accuracies() {
         // Requested accuracies reach the XLA compiler, which selects its implementations while preserving the results.
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let values = [0.5f32, -1.0, 2.0];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[values.len()]),
             mesh.clone(),
             values_to_bytes(&values),
@@ -782,9 +793,10 @@ mod tests {
     #[test]
     fn test_eager_tanh_complex_large_real() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[3]),
             mesh.clone(),
             values_to_bytes::<f64>(&[400.0, 1.0, f64::INFINITY, 1.0, -400.0, 1.0]),
@@ -798,13 +810,14 @@ mod tests {
     #[test]
     fn test_eager_erf() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Cover the complete exponent-only encoding domain, including the subnormal input and NaN.
         let bytes = (0..=255u8).collect::<Vec<_>>();
         let input_type = replicated_type(&mesh, DataType::F8E8M0FNU, &[256]);
         let reference = CpuArray::new(input_type.clone(), bytes.clone()).unwrap().erf().unwrap();
         assert_eq!(&reference.logical_bytes()[..3], &[1, 1, 2]);
-        let input = Array::from_host_buffer(&client, input_type, mesh, bytes).unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, mesh, bytes).unwrap();
         let output = input.erf().unwrap();
         assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), reference.logical_bytes(),);
     }
@@ -812,10 +825,11 @@ mod tests {
     #[test]
     fn test_eager_log() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // An exponent-only logarithm of one is an unrepresentable zero and converts to NaN.
         let input =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
                 .unwrap();
         let output = input.log().unwrap();
         assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [255]);
@@ -824,10 +838,11 @@ mod tests {
     #[test]
     fn test_eager_ln_1p_complex() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // The near-zero input retains both tiny components; the negative-real branch preserves its side.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[5]),
             mesh.clone(),
             &values_to_bytes::<f64>(&[1e-20, 1e-20, -2.0, 0.0, -2.0, -0.0, -1.0, 1e-300, f64::NAN, 0.0]),
@@ -847,10 +862,11 @@ mod tests {
     #[test]
     fn test_eager_cumulative_log_sum_exp_finite_identity() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Every rounded pair returns the finite minimum, even beyond the removed scan-length limit.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F8E4M3FNUZ, &[3001]),
             mesh.clone(),
             vec![0xff; 3001],
@@ -863,6 +879,7 @@ mod tests {
     #[test]
     fn test_eager_cumulative_log_sum_exp_complex() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
         // infinity leaves the other one unchanged, so pairs of such operands (including pairs of initial values) never
@@ -870,7 +887,7 @@ mod tests {
         let first = num_complex::Complex::new(1.0f32, 2.0);
         let doubled = num_complex::Complex::new(1.0 + std::f32::consts::LN_2, 2.0);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[4]),
             mesh.clone(),
             values_to_bytes(&[
@@ -900,10 +917,11 @@ mod tests {
     #[test]
     fn test_eager_complex_edge_cases_match_reference_backend() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let vector = |values: &[num_complex::Complex<f64>]| {
             Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, DataType::C128, &[values.len()]),
                 mesh.clone(),
                 values_to_bytes(values).as_slice(),
@@ -994,6 +1012,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Forward real sums lower to `chlo.scan` on GPU targets, while reverse sums keep the full-prefix
         // `reduce_window` form. Small integral values keep every `f32` prefix sum exact, so both forms must agree with
@@ -1002,7 +1021,7 @@ mod tests {
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[rows, columns]),
             mesh.clone(),
             values_to_bytes(values.as_slice()).as_slice(),
@@ -1026,7 +1045,7 @@ mod tests {
 
         // Integer sums take the same `chlo.scan` path, here along the leading axis.
         let integers = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[4, 2]),
             mesh.clone(),
             values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]).as_slice(),
@@ -1042,6 +1061,7 @@ mod tests {
     #[test]
     fn test_eager_reduce_log_sum_exp_complex() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` (the padding of ragged
         // complex reductions) contributes a zero exponential.
@@ -1049,7 +1069,7 @@ mod tests {
         let second = num_complex::Complex::new(3.0f32, -2.0);
         let shift = num_complex::Complex::new(3.0f32, 0.0);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[3]),
             mesh.clone(),
             values_to_bytes(&[first, second, num_complex::Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
@@ -1061,7 +1081,7 @@ mod tests {
         // Even without reduced axes, the principal logarithm wraps phases outside its branch.
         let values = [num_complex::Complex::new(1f32, 4.0), num_complex::Complex::new(2f32, -4.0)];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[2]),
             mesh.clone(),
             values_to_bytes(&values).as_slice(),
@@ -1083,25 +1103,26 @@ mod tests {
     #[test]
     fn test_eager_log_add_exp() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Keep unsigned exponent-only intermediates and half-precision intermediates in the working type.
         let left =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
                 .unwrap();
         let right =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[126])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[126])
                 .unwrap();
         let output = left.log_add_exp(&right).unwrap();
         assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [127]);
         let left = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F16, &[2]),
             mesh.clone(),
             &values_to_bytes::<f16>(&[f16::from_f32(0.5), f16::from_f32(-5.0)]),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F16, &[2]),
             mesh.clone(),
             &values_to_bytes::<f16>(&[f16::ONE, f16::from_f32(-5.0)]),
@@ -1115,7 +1136,7 @@ mod tests {
 
         // Complex outputs wrap the phase onto the principal logarithm branch.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[1]),
             mesh.clone(),
             &values_to_bytes::<f64>(&[0.0, 4.0]),
@@ -1127,7 +1148,7 @@ mod tests {
         assert!((values[1] - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
         // Already-principal tiny phases must not disappear through an unnecessary add/subtract of pi.
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[1]),
             mesh.clone(),
             &values_to_bytes::<f32>(&[0.0, 1e-20]),
@@ -1149,12 +1170,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let left_values = [0.5f32, 1.25, 2.0, 3.75];
         let right_values = [4.0f32, 0.25, -1.5, 2.5];
-        let left = f32_vector(&client, &mesh, &left_values);
-        let right = f32_vector(&client, &mesh, &right_values);
+        let left = f32_vector(&domain, &mesh, &left_values);
+        let right = f32_vector(&domain, &mesh, &right_values);
         let reference_left = CpuArray::vector(left_values.to_vec()).unwrap();
         let reference_right = CpuArray::vector(right_values.to_vec()).unwrap();
 
@@ -1213,8 +1235,8 @@ mod tests {
         // difference-based tolerance, so both backends are pinned to the exact same four results directly.
         let infinite_values = [f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NAN];
         let guarded_values = [f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, 1.25];
-        let infinite = f32_vector(&client, &mesh, &infinite_values);
-        let guarded = f32_vector(&client, &mesh, &guarded_values);
+        let infinite = f32_vector(&domain, &mesh, &infinite_values);
+        let guarded = f32_vector(&domain, &mesh, &guarded_values);
         let device_values = read_f32s(&infinite.log_add_exp(&guarded).unwrap());
         assert_eq!(device_values[0], f32::INFINITY);
         assert_eq!(device_values[1], f32::NEG_INFINITY);
@@ -1257,7 +1279,7 @@ mod tests {
 
         // Selection agrees.
         let condition_values = [true, false, true, false];
-        let condition = boolean_vector(&client, &mesh, &condition_values);
+        let condition = boolean_vector(&domain, &mesh, &condition_values);
         let reference_condition = CpuArray::vector(condition_values.to_vec()).unwrap();
         assert_parity(
             &Select::select(&condition, &left, &right).unwrap(),
@@ -1285,7 +1307,7 @@ mod tests {
         // Integer reductions agree exactly, including the truncating integer division of `Mean`.
         let integer_values = [5i32, -2, 7, 0];
         let integer = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[integer_values.len()]),
             mesh.clone(),
             values_to_bytes::<i32>(&integer_values).as_slice(),
@@ -1305,8 +1327,8 @@ mod tests {
         // Complex multiplication agrees.
         let complex_left_value = num_complex::Complex::new(1.5f32, -2.0);
         let complex_right_value = num_complex::Complex::new(0.5f32, 3.0);
-        let complex_left = c64_scalar(&client, &mesh, complex_left_value);
-        let complex_right = c64_scalar(&client, &mesh, complex_right_value);
+        let complex_left = c64_scalar(&domain, &mesh, complex_left_value);
+        let complex_right = c64_scalar(&domain, &mesh, complex_right_value);
         let device_product = read_c64s(&complex_left.mul(&complex_right).unwrap())[0];
         let reference_product = CpuArray::scalar(complex_left_value)
             .unwrap()
@@ -1319,12 +1341,13 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_integer_rounding() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Integer precision above a BF16 rounding midpoint must survive the conversion.
         let midpoint = (1u64 << 60) + (1u64 << 52);
         let values = [midpoint - 1, midpoint, midpoint + 1, u64::MAX];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[values.len()]),
             mesh.clone(),
             values_to_bytes(&values).as_slice(),
@@ -1344,7 +1367,7 @@ mod tests {
         let midpoint = midpoint as i64;
         let values = [-midpoint - 1, -midpoint, -midpoint + 1, i64::MIN, i64::MAX];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I64, &[values.len()]),
             mesh.clone(),
             values_to_bytes(&values).as_slice(),
@@ -1359,7 +1382,7 @@ mod tests {
         let midpoint = 3_u64 << 60;
         let values = [midpoint - 1, midpoint, midpoint + 1];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[3]),
             mesh.clone(),
             values_to_bytes(&values).as_slice(),
@@ -1372,9 +1395,10 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_finite_float_extremes() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let values = [0.0_f32, -0.0, 1.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0];
-        let input = f32_vector(&client, &mesh, &values);
+        let input = f32_vector(&domain, &mesh, &values);
         let reference = CpuArray::from_elements(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())])),
             &values,
@@ -1395,7 +1419,7 @@ mod tests {
         let values =
             [minimum.next_down(), minimum, minimum.next_up(), midpoint.next_down(), midpoint, midpoint.next_up()];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F64, &[values.len()]),
             mesh.clone(),
             values_to_bytes(&values).as_slice(),
@@ -1411,6 +1435,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_fp6_decoding() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let encodings = (0_u8..64).collect::<Vec<_>>();
         // Every FP6 encoding is finite. Exact F32 bytes distinguish both zeros and cover the subnormal/normal boundary
@@ -1432,7 +1457,7 @@ mod tests {
             ),
         ] {
             let input_type = replicated_type(&mesh, data_type, &[64]);
-            let input = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &encodings).unwrap();
+            let input = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &encodings).unwrap();
             let output = input.convert_element_type(DataType::F32).unwrap();
             let expected = magnitudes.into_iter().chain(magnitudes.map(|value| -value)).collect::<Vec<_>>();
             assert_eq!(output.shape().dimensions(), &[64]);
@@ -1452,6 +1477,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_f64_rounding() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         for (data_type, midpoint, expected) in [
             (DataType::BF16, 1.00390625_f64, [0x3f80_u16, 0x3f80, 0x3f81]),
@@ -1484,7 +1510,7 @@ mod tests {
                 0x8000,
             ];
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, DataType::F64, &[values.len()]),
                 mesh.clone(),
                 values_to_bytes(&values).as_slice(),
@@ -1502,11 +1528,12 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_complex_boolean() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Purely imaginary values and NaNs in either component are nonzero; signed zeros are false.
         let components = [0.0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[6]),
             mesh.clone(),
             values_to_bytes(&components).as_slice(),
@@ -1519,18 +1546,19 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_one_bit_integers() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // The same physical bits represent -1 for I1 and +1 for U1 and Boolean.
         for (data_type, expected) in
             [(DataType::I1, vec![0.0, -1.0]), (DataType::U1, vec![0.0, 1.0]), (DataType::Boolean, vec![0.0, 1.0])]
         {
             let input =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &[0, 1])
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &[0, 1])
                     .unwrap();
             assert_eq!(read_f32s(&input.convert_element_type(DataType::F32).unwrap()), expected);
         }
         // Real inputs truncate and saturate to the logical range, unlike Boolean truthiness.
-        let input = f32_vector(&client, &mesh, &[0.0, 1.9, 2.0, 3.0, -1.9, -2.0, 128.0, -129.0]);
+        let input = f32_vector(&domain, &mesh, &[0.0, 1.9, 2.0, 3.0, -1.9, -2.0, 128.0, -129.0]);
         for (data_type, expected) in [
             (DataType::I1, vec![0, 0, 0, 0, 1, 1, 0, 1]),
             (DataType::U1, vec![0, 1, 1, 1, 0, 0, 1, 0]),
@@ -1541,7 +1569,7 @@ mod tests {
         }
         let integers = [-129i32, -2, -1, 0, 1, 2, 128, 129];
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[integers.len()]),
             mesh.clone(),
             values_to_bytes(&integers).as_slice(),
@@ -1559,6 +1587,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_subbyte_carrier_boundaries() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let values = [
             -129.0f32,
@@ -1583,7 +1612,7 @@ mod tests {
             f32::INFINITY,
             f32::NAN,
         ];
-        let input = f32_vector(&client, &mesh, &values);
+        let input = f32_vector(&domain, &mesh, &values);
         let reference = CpuArray::vector(values.to_vec()).unwrap();
         // Real conversion saturates at the logical limits, including infinities; NaNs convert to zero.
         for data_type in [DataType::I2, DataType::I4, DataType::U2, DataType::U4] {
@@ -1599,8 +1628,9 @@ mod tests {
     #[test]
     fn test_array_bitcast_element_type() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[1.0, -0.0]);
+        let input = f32_vector(&domain, &mesh, &[1.0, -0.0]);
         let integers = input.bitcast_element_type(DataType::I32).unwrap();
         assert_eq!(read_i32s(&integers), vec![0x3f800000, i32::MIN]);
 
@@ -1618,9 +1648,10 @@ mod tests {
     #[test]
     fn test_array_bitcast_element_type_one_bit() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let input =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::U8, &[]), mesh.clone(), &[0xab]).unwrap();
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::U8, &[]), mesh.clone(), &[0xab]).unwrap();
         for data_type in [DataType::I1, DataType::U1] {
             let bits = input.bitcast_element_type(data_type).unwrap();
             assert_eq!(bits.shape().dimensions(), &[8]);
@@ -1632,7 +1663,7 @@ mod tests {
             assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![0xab]);
         }
         let pair =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::U2, &[]), mesh.clone(), &[3]).unwrap();
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::U2, &[]), mesh.clone(), &[3]).unwrap();
         let bits = pair.bitcast_element_type(DataType::U1).unwrap();
         assert_eq!(shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(), vec![1, 1]);
         let restored = bits.bitcast_element_type(DataType::U2).unwrap();
@@ -1642,13 +1673,14 @@ mod tests {
     #[test]
     fn test_array_bitcast_element_type_fp6() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let encodings = (0_u8..64).collect::<Vec<_>>();
         for (data_type, other_data_type) in
             [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]
         {
             let input_type = replicated_type(&mesh, data_type, &[64]);
-            let input = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &encodings).unwrap();
+            let input = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &encodings).unwrap();
             // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
             let output = input.bitcast_element_type(other_data_type).unwrap();
             assert_eq!(output.shape().dimensions(), &[64]);
@@ -1701,6 +1733,7 @@ mod tests {
     #[test]
     fn test_array_reduce_precision_parity_with_reference_backend() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // Each case lists element encodings covering ties, rounding carries into the exponent, overflow, underflow,
@@ -1768,7 +1801,7 @@ mod tests {
         for (data_type, bytes, formats) in cases {
             let count = bytes.len() / (data_type.bit_width() / 8);
             let device_input = Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, data_type, &[count]),
                 mesh.clone(),
                 bytes.as_slice(),
@@ -1803,6 +1836,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // Compare complete operands lexicographically, selecting the right operand on ties and unordered comparisons.
@@ -1822,14 +1856,14 @@ mod tests {
             num_complex::Complex::new(1.0, 4.0),
         ];
         let left = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[left_values.len()]),
             mesh.clone(),
             values_to_bytes(&left_values).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[right_values.len()]),
             mesh.clone(),
             values_to_bytes(&right_values).as_slice(),
@@ -1851,14 +1885,14 @@ mod tests {
         // A real scalar broadcasts into a complex vector after promotion to complex double precision.
         let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
         let complex = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[2]),
             mesh.clone(),
             values_to_bytes(&complex_values).as_slice(),
         )
         .unwrap();
         let real = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F64, &[]),
             mesh.clone(),
             values_to_bytes(&[2.0f64]).as_slice(),
@@ -1883,6 +1917,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // Compare complete operands lexicographically, selecting the right operand on ties and unordered comparisons.
@@ -1902,14 +1937,14 @@ mod tests {
             num_complex::Complex::new(1.0, 4.0),
         ];
         let left = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[left_values.len()]),
             mesh.clone(),
             values_to_bytes(&left_values).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[right_values.len()]),
             mesh.clone(),
             values_to_bytes(&right_values).as_slice(),
@@ -1931,14 +1966,14 @@ mod tests {
         // A real scalar broadcasts into a complex vector after promotion to complex double precision.
         let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
         let complex = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C128, &[2]),
             mesh.clone(),
             values_to_bytes(&complex_values).as_slice(),
         )
         .unwrap();
         let real = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F64, &[]),
             mesh.clone(),
             values_to_bytes(&[2.0f64]).as_slice(),
@@ -1963,9 +1998,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let array = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
-            Array::from_host_buffer(&client, replicated_type(&mesh, data_type, dimensions), mesh.clone(), bytes)
+            Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, dimensions), mesh.clone(), bytes)
                 .unwrap()
         };
 
@@ -2055,11 +2091,12 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // Boolean extrema use false/true identities, including when the reduced axis is empty.
         let empty_booleans =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::Boolean, &[0]), mesh.clone(), &[])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::Boolean, &[0]), mesh.clone(), &[])
                 .unwrap();
         assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Max).unwrap()), vec![false]);
         assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Min).unwrap()), vec![true]);
@@ -2067,7 +2104,7 @@ mod tests {
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
         let nan_values = [1.0f32, f32::NAN];
         let nan = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[nan_values.len()]),
             mesh.clone(),
             values_to_bytes(&nan_values).as_slice(),
@@ -2076,7 +2113,7 @@ mod tests {
         assert!(read_f32s(&nan.reduce(&[0], ReductionKind::Max).unwrap())[0].is_nan());
         let zero_values = [-0.0f32, 0.0];
         let zeros = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[zero_values.len()]),
             mesh.clone(),
             values_to_bytes(&zero_values).as_slice(),
@@ -2092,7 +2129,7 @@ mod tests {
             num_complex::Complex::new(2.0, 4.0),
         ];
         let complex = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[complex_values.len()]),
             mesh.clone(),
             values_to_bytes(&complex_values).as_slice(),
@@ -2107,21 +2144,21 @@ mod tests {
             vec![num_complex::Complex::new(1.0, 5.0)]
         );
         let empty_complex =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::C64, &[0]), mesh.clone(), &[]).unwrap();
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::C64, &[0]), mesh.clone(), &[]).unwrap();
         assert_eq!(
             read_c64s(&empty_complex.reduce(&[0], ReductionKind::Max).unwrap()),
             vec![num_complex::Complex::new(f32::NEG_INFINITY, f32::NEG_INFINITY)],
         );
 
         let indices = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[1, 1]),
             mesh.clone(),
             values_to_bytes(&[0i32]).as_slice(),
         )
         .unwrap();
         let updates = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::C64, &[1]),
             mesh.clone(),
             values_to_bytes(&[num_complex::Complex::new(1.0f32, 9.0)]).as_slice(),
@@ -2158,13 +2195,14 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let values = [
             -6.5f32, -4.0, -3.0, -2.0, -1.5, -1.0, -0.9, -0.5, -0.1, -1e-3, -1e-10, 0.0, 1e-10, 1e-3, 0.1, 0.5, 0.9,
             1.0, 1.2, 1.25, 2.0, 2.9, 3.0, 4.0, 6.5,
         ];
-        let device_values = read_f32s(&f32_vector(&client, &mesh, &values).erf().unwrap());
+        let device_values = read_f32s(&f32_vector(&domain, &mesh, &values).erf().unwrap());
         let reference_values = CpuArray::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
         assert_eq!(device_values.len(), reference_values.len());
         for ((input, device_value), reference_value) in
@@ -2201,6 +2239,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // The handler receives both matrix buffers in non-default column-major order. Its elementwise computation is
@@ -2208,7 +2247,7 @@ mod tests {
         let matrix_type = replicated_type(&mesh, DataType::F32, &[2, 2])
             .with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
         let matrix_input = Array::from_host_buffer(
-            &client,
+            &domain,
             matrix_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.5, 2.5, 3.5, 4.5]),
@@ -2226,7 +2265,7 @@ mod tests {
 
         // An aliased side-effecting call executes with the same public array-only FFI contract while its lowering
         // uses the alias metadata and a hidden ordered-I/O token.
-        let vector_input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let vector_input = f32_vector(&domain, &mesh, &[1.5, 2.5]);
         let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![vector_input.r#type().into_owned()])
             .with_input_output_alias(0, 0)
             .unwrap()
@@ -2251,11 +2290,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let row_type = replicated_type(&mesh, DataType::F32, &[2]);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[3, 2]),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
@@ -2311,10 +2351,11 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let row_type = replicated_type(&mesh, DataType::F32, &[4]);
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::F32, &[3, 4]),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 99.0, 99.0, 3.0, 4.0, 5.0, 99.0, 7.0, 99.0, 99.0, 99.0]),
@@ -2322,14 +2363,14 @@ mod tests {
         .unwrap();
         let invalid_input = input.clone();
         let extents = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[3]),
             mesh.clone(),
             values_to_bytes::<i32>(&[2, 3, 1]),
         )
         .unwrap();
         let invalid_extents = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[3]),
             mesh,
             values_to_bytes::<i32>(&[2, 5, 1]),
@@ -2379,15 +2420,14 @@ mod tests {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
         use ryft_core::{DomainTracer, custom_function};
 
-        use crate::XlaDomain;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let input = f32_vector(&domain, &mesh, &[1.5, 2.5]);
         let output_type = replicated_type(&mesh, DataType::F32, &[2]);
         let domain = input.execution_domain();
 
@@ -2422,15 +2462,14 @@ mod tests {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
         use ryft_core::{CustomFunction, DomainTracer};
 
-        use crate::XlaDomain;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let input = f32_vector(&domain, &mesh, &[1.5, 2.5]);
         let output_type = replicated_type(&mesh, DataType::F32, &[2]);
         let domain = input.execution_domain();
 
@@ -2459,16 +2498,15 @@ mod tests {
     fn test_eager_custom_function_with_batching_rule() {
         use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
 
-        use crate::XlaDomain;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = [0.5f32, 1.0, 1.5];
-        let input = f32_vector(&client, &mesh, &x);
-        let tangent = f32_vector(&client, &mesh, &[1.0, 1.0, 1.0]);
+        let input = f32_vector(&domain, &mesh, &x);
+        let tangent = f32_vector(&domain, &mesh, &[1.0, 1.0, 1.0]);
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
         let function = custom_function(|x: Tracer<'_>| Ok(x.sin()?)).with_batching(
@@ -2506,12 +2544,11 @@ mod tests {
     fn test_eager_custom_function_with_axis_dependent_batching_rule() {
         use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
 
-        use crate::XlaDomain;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
@@ -2532,8 +2569,8 @@ mod tests {
                 Ok(differentiate_at((x, y)).jvp((x_tangent, y_tangent), |inputs| function.call(inputs))?)
             },
             (
-                (f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]), f32_scalar(&client, &mesh, 4.0)),
-                (f32_vector(&client, &mesh, &[1.0, 0.5, 0.25]), f32_vector(&client, &mesh, &[2.0, 3.0, 4.0])),
+                (f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]), f32_scalar(&domain, &mesh, 4.0)),
+                (f32_vector(&domain, &mesh, &[1.0, 0.5, 0.25]), f32_vector(&domain, &mesh, &[2.0, 3.0, 4.0])),
             ),
             ((BatchAxis::new(0), BatchAxis::replicated()), (BatchAxis::new(0), BatchAxis::new(0))),
             (BatchAxis::new(0), BatchAxis::new(0)),
@@ -2555,14 +2592,15 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         // The canonical ordering ties signed zeros and all NaNs, while the total ordering separates them, so both
         // the sorted keys (compared bit for bit) and the payloads expose any disagreement in tie handling.
         let key_values = [3.0f32, f32::NAN, 1.0, 3.0, -f32::NAN, -0.0, 0.0, 2.0];
         let payload_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
-        let keys = f32_vector(&client, &mesh, &key_values);
-        let payloads = f32_vector(&client, &mesh, &payload_values);
+        let keys = f32_vector(&domain, &mesh, &key_values);
+        let payloads = f32_vector(&domain, &mesh, &payload_values);
         let reference_keys = CpuArray::vector(key_values.to_vec()).unwrap();
         let reference_payloads = CpuArray::vector(payload_values.to_vec()).unwrap();
         for ordering in [SortOrdering::Canonical, SortOrdering::Total] {
@@ -2599,11 +2637,11 @@ mod tests {
         ];
         let complex_type = replicated_type(&mesh, DataType::C64, &[complex_values.len()]);
         let complex_keys =
-            Array::from_host_buffer(&client, complex_type, mesh.clone(), values_to_bytes(&complex_values).as_slice())
+            Array::from_host_buffer(&domain, complex_type, mesh.clone(), values_to_bytes(&complex_values).as_slice())
                 .unwrap();
         let positions = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let sorted =
-            Sort::sort(&[complex_keys, f32_vector(&client, &mesh, &positions)], 0, SortDirection::Ascending).unwrap();
+            Sort::sort(&[complex_keys, f32_vector(&domain, &mesh, &positions)], 0, SortDirection::Ascending).unwrap();
         let reference_sorted = Sort::sort(
             &[CpuArray::vector(complex_values.to_vec()).unwrap(), CpuArray::vector(positions.to_vec()).unwrap()],
             0,
@@ -2615,7 +2653,7 @@ mod tests {
 
         // Ties select the lowest index: both threes appear before the two, and index 0 precedes index 2.
         let top_k_values = [3.0f32, 1.0, 3.0, -0.0, 0.0, 2.0];
-        let (device_values, device_indices) = f32_vector(&client, &mesh, &top_k_values).top_k(3, 0).unwrap();
+        let (device_values, device_indices) = f32_vector(&domain, &mesh, &top_k_values).top_k(3, 0).unwrap();
         let (reference_values, reference_indices) =
             CpuArray::vector(top_k_values.to_vec()).unwrap().top_k(3, 0).unwrap();
         assert_eq!(read_f32s(&device_values), reference_values.elements::<f32>().unwrap());
@@ -2630,14 +2668,14 @@ mod tests {
             ([-0.0f32, 0.0, 5.0], 2, 0),
             ([0.0f32, -0.0, -5.0], 0, 2),
         ] {
-            let device = f32_vector(&client, &mesh, &values);
+            let device = f32_vector(&domain, &mesh, &values);
             let reference = CpuArray::vector(values.to_vec()).unwrap();
             assert_eq!(read_i32s(&device.argmax(0).unwrap()), vec![expected_argmax]);
             assert_eq!(reference.argmax(0).unwrap().elements::<i32>().unwrap(), vec![expected_argmax]);
             assert_eq!(read_i32s(&device.argmin(0).unwrap()), vec![expected_argmin]);
             assert_eq!(reference.argmin(0).unwrap().elements::<i32>().unwrap(), vec![expected_argmin]);
         }
-        let device = f32_vector(&client, &mesh, &[-0.0, 0.0]);
+        let device = f32_vector(&domain, &mesh, &[-0.0, 0.0]);
         assert_eq!(read_i32s(&device.argmax(0).unwrap()), vec![0]);
         assert_eq!(read_i32s(&device.argmin(0).unwrap()), vec![0]);
     }
@@ -2651,6 +2689,7 @@ mod tests {
         use ryft_core::{ArgMax, ArgMin};
 
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let nan = bf16::NAN;
         let cases = [
@@ -2677,7 +2716,7 @@ mod tests {
         ];
         for (data_type, bytes, axis, index_data_type, expected_argmax, expected_argmin) in cases {
             let device =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2, 3]), mesh.clone(), &bytes)
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[2, 3]), mesh.clone(), &bytes)
                     .unwrap();
             let reference = CpuArray::new(ArrayType::new_static(data_type, [2, 3]), bytes).unwrap();
             for (device_output, reference_output, expected) in [
@@ -2718,6 +2757,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let primary_values = [2i32, 1, 2, 1, 2, 1];
@@ -2725,14 +2765,14 @@ mod tests {
         let passenger_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
         let primary_type = replicated_type(&mesh, DataType::I32, &[primary_values.len()]);
         let primary = Array::from_host_buffer(
-            &client,
+            &domain,
             primary_type,
             mesh.clone(),
             values_to_bytes::<i32>(&primary_values).as_slice(),
         )
         .unwrap();
-        let secondary = f32_vector(&client, &mesh, &secondary_values);
-        let passenger = f32_vector(&client, &mesh, &passenger_values);
+        let secondary = f32_vector(&domain, &mesh, &secondary_values);
+        let passenger = f32_vector(&domain, &mesh, &passenger_values);
         let reference_primary = CpuArray::from_elements(
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(primary_values.len())])),
             &primary_values,
@@ -2795,12 +2835,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let state_values = [42u64, 7u64];
         let state_type = replicated_type(&mesh, DataType::U64, &[2]);
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             state_type,
             mesh.clone(),
             values_to_bytes::<u64>(&state_values).as_slice(),
@@ -2856,10 +2897,11 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let state_values = [(1u64 << 32) | 42, u64::from(u32::MAX)];
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[2]),
             mesh.clone(),
             values_to_bytes::<u64>(&state_values).as_slice(),
@@ -2900,12 +2942,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let state_values = [42u64, 7u64, 9u64];
         let state_type = replicated_type(&mesh, DataType::U64, &[3]);
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             state_type,
             mesh.clone(),
             values_to_bytes::<u64>(&state_values).as_slice(),
@@ -2957,6 +3000,7 @@ mod tests {
         use ryft_core::{RandomAlgorithm, RngBitGenerator};
 
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         for (algorithm, state_values) in [
             (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
@@ -2964,7 +3008,7 @@ mod tests {
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, u64::MAX]),
         ] {
             let state = Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, DataType::U64, &[state_values.len()]),
                 mesh.clone(),
                 values_to_bytes::<u64>(&state_values).as_slice(),
@@ -3017,11 +3061,12 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let state_values = [11u64, 3u64];
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[2]),
             mesh.clone(),
             values_to_bytes::<u64>(&state_values).as_slice(),
@@ -3055,7 +3100,7 @@ mod tests {
         }
 
         let logit_values = [0.0f32, 10.0, -3.0, 2.0];
-        let device_logits = f32_vector(&client, &mesh, &logit_values);
+        let device_logits = f32_vector(&domain, &mesh, &logit_values);
         let reference_logits = CpuArray::vector(logit_values.iter().map(|value| f64::from(*value)).collect())
             .unwrap()
             .convert_element_type(DataType::F32)
@@ -3082,10 +3127,11 @@ mod tests {
         use ryft_core::{Random, RandomAlgorithm};
 
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let state_values = [11u64, 3];
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[2]),
             mesh.clone(),
             values_to_bytes(&state_values).as_slice(),
@@ -3116,10 +3162,11 @@ mod tests {
         use ryft_core::{Random, RandomAlgorithm};
 
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let state_values = [11u64, 3];
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[2]),
             mesh.clone(),
             values_to_bytes(&state_values).as_slice(),
@@ -3165,6 +3212,7 @@ mod tests {
         use ryft_core::{CategoricalSamplingMode, Random, RandomAlgorithm};
 
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         for algorithm in [RandomAlgorithm::ThreeFry, RandomAlgorithm::Philox] {
             let state_values = match algorithm {
@@ -3172,7 +3220,7 @@ mod tests {
                 RandomAlgorithm::Philox => vec![11u64, 3, 0],
             };
             let state = Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, DataType::U64, &[state_values.len()]),
                 mesh.clone(),
                 values_to_bytes(&state_values).as_slice(),
@@ -3186,7 +3234,7 @@ mod tests {
                         .convert_element_type(data_type)
                         .unwrap();
                 let logits = Array::from_host_buffer(
-                    &client,
+                    &domain,
                     replicated_type(&mesh, data_type, &[2, 3]),
                     mesh.clone(),
                     &reference_logits.logical_bytes(),
@@ -3211,13 +3259,13 @@ mod tests {
         // A zero first uniform exercises the rare tail where ordinary log(1 - x) loses the distinction from zero.
         let state_values = [0u64, 0x1badd8a64e5859ae];
         let state = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[2]),
             mesh.clone(),
             values_to_bytes(&state_values).as_slice(),
         )
         .unwrap();
-        let logits = f32_vector(&client, &mesh, &[-16.0, 0.0]);
+        let logits = f32_vector(&domain, &mesh, &[-16.0, 0.0]);
         for (mode, expected) in
             [(CategoricalSamplingMode::LowPrecision, 1), (CategoricalSamplingMode::HighPrecision, 0)]
         {
@@ -3236,6 +3284,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let operand_type =
@@ -3255,8 +3304,8 @@ mod tests {
         let lhs_bytes = reference_lhs.logical_bytes();
         let rhs_bytes = reference_rhs.logical_bytes();
         let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
-        let lhs = Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
-        let rhs = Array::from_host_buffer(&client, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
+        let lhs = Array::from_host_buffer(&domain, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
+        let rhs = Array::from_host_buffer(&domain, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
 
         let device_product =
             lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32).unwrap();
@@ -3281,6 +3330,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
         let element_type =
@@ -3314,23 +3364,23 @@ mod tests {
         let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
         let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
         let lhs = Array::from_host_buffer(
-            &client,
+            &domain,
             device_element_type.clone(),
             mesh.clone(),
             bits(&reference_lhs).as_slice(),
         )
         .unwrap();
-        let rhs = Array::from_host_buffer(&client, device_element_type, mesh.clone(), bits(&reference_rhs).as_slice())
+        let rhs = Array::from_host_buffer(&domain, device_element_type, mesh.clone(), bits(&reference_rhs).as_slice())
             .unwrap();
         let lhs_scales = Array::from_host_buffer(
-            &client,
+            &domain,
             device_scale_type.clone(),
             mesh.clone(),
             bits(&reference_lhs_scales).as_slice(),
         )
         .unwrap();
         let rhs_scales =
-            Array::from_host_buffer(&client, device_scale_type, mesh.clone(), bits(&reference_rhs_scales).as_slice())
+            Array::from_host_buffer(&domain, device_scale_type, mesh.clone(), bits(&reference_rhs_scales).as_slice())
                 .unwrap();
 
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
@@ -3359,6 +3409,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let dimensions = [1usize, 3, 2, 2];
         let host_type =
@@ -3368,7 +3419,7 @@ mod tests {
         let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
         let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
         let device = |values: &[f32]| {
-            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&domain, device_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let reference = |values: &[f32]| CpuArray::from_elements::<f32>(host_type.clone(), &values).unwrap();
@@ -3408,7 +3459,7 @@ mod tests {
         let reference_key_value_lengths = CpuArray::from_elements(lengths_type, &[3_i32]).unwrap();
         let device_value = |value: &CpuArray, dimensions: &[usize]| {
             Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type(&mesh, value.r#type().data_type(), dimensions),
                 mesh.clone(),
                 value.logical_bytes().as_slice(),
@@ -3455,18 +3506,17 @@ mod tests {
         };
         use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
 
-        use crate::XlaDomain;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let dimensions = [1usize, 2, 1, 2];
         let values = [0.25_f32, -0.5, 0.75, 1.0];
         let device_type = replicated_type(&mesh, DataType::F32, &dimensions);
         let device = || {
-            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+            Array::from_host_buffer(&domain, device_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
                 .unwrap()
         };
         let host_type =
@@ -3512,9 +3562,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let a = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let b = f32_vector(&client, &mesh, &[3.0, 5.0]);
+        let a = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let b = f32_vector(&domain, &mesh, &[3.0, 5.0]);
 
         assert_eq!(read_f32s(&(a.clone() + b.clone())), vec![4.0, 7.0]);
         assert_eq!(read_f32s(&(b.clone() - a.clone())), vec![2.0, 3.0]);
@@ -3522,8 +3573,8 @@ mod tests {
         assert_eq!(read_f32s(&(b.clone() / a.clone())), vec![3.0, 2.5]);
         assert_eq!(read_f32s(&(-a)), vec![-1.0, -2.0]);
 
-        let truths = boolean_vector(&client, &mesh, &[true, true, false, false]);
-        let mixed = boolean_vector(&client, &mesh, &[true, false, true, false]);
+        let truths = boolean_vector(&domain, &mesh, &[true, true, false, false]);
+        let mixed = boolean_vector(&domain, &mesh, &[true, false, true, false]);
         assert_eq!(read_booleans(&(truths.clone() & mixed.clone())), vec![true, false, false, false]);
         assert_eq!(read_booleans(&(truths.clone() | mixed.clone())), vec![true, true, true, false]);
         assert_eq!(read_booleans(&(truths.clone() ^ mixed.clone())), vec![false, true, true, false]);
@@ -3533,8 +3584,9 @@ mod tests {
     #[test]
     fn test_eager_transpose_and_reshape_round_trip() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let matrix = f32_matrix(&client, &mesh, 2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = f32_matrix(&domain, &mesh, 2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         let transposed = matrix.transpose([1, 0]).unwrap();
         assert_eq!(transposed.shape(), StaticShape::new(vec![3, 2]));
@@ -3557,9 +3609,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let a = f32_vector(&client, &mesh, &[1.0, 5.0, 3.0, 8.0]);
-        let b = f32_vector(&client, &mesh, &[4.0, 2.0, 3.0, 9.0]);
+        let a = f32_vector(&domain, &mesh, &[1.0, 5.0, 3.0, 8.0]);
+        let b = f32_vector(&domain, &mesh, &[4.0, 2.0, 3.0, 9.0]);
 
         let less_than = a.compare(&b, ComparisonDirection::LessThan).unwrap();
         assert_eq!(less_than.data_type(), DataType::Boolean);
@@ -3572,11 +3625,12 @@ mod tests {
     #[test]
     fn test_eager_cumulative_one_bit_integers() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let bits = [1, 1, 0, 1];
         for data_type in [DataType::I1, DataType::U1] {
             let input =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &bits).unwrap();
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &bits).unwrap();
             let reference = CpuArray::from_logical_bytes(ArrayType::new_static(data_type, [4]), &bits).unwrap();
             // Sum must wrap modulo two rather than behave like Boolean OR. Signed extrema reverse the
             // predicate carrier's order, while unsigned extrema and multiplication use its ordinary order.
@@ -3596,13 +3650,14 @@ mod tests {
     #[test]
     fn test_eager_select_signed_one_bit_promotion() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let condition = boolean_vector(&client, &mesh, &[true, false, true, false]);
+        let condition = boolean_vector(&domain, &mesh, &[true, false, true, false]);
         let signed =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[4]), mesh.clone(), &[1, 1, 0, 0])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I1, &[4]), mesh.clone(), &[1, 1, 0, 0])
                 .unwrap();
         let wide = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[4]),
             mesh.clone(),
             &values_to_bytes(&[2i32, 3, 4, 5]),
@@ -3638,15 +3693,16 @@ mod tests {
     #[test]
     fn test_eager_compare_one_bit_integers() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         // Every pair of bits is compared in every direction. I1 interprets the set bit as -1; U1 and Boolean
         // interpret it as +1. These checks exercise compilation and device execution, not just MLIR verification.
         for data_type in [DataType::Boolean, DataType::I1, DataType::U1] {
             let left =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
                     .unwrap();
             let right =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
+                Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
                     .unwrap();
             let signed = data_type == DataType::I1;
             for (direction, expected) in [
@@ -3663,7 +3719,7 @@ mod tests {
 
         // Implicit promotion must preserve the signed set bit before comparing against wider numeric inputs.
         let signed =
-            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
+            Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
                 .unwrap();
         for (data_type, bytes) in [
             (DataType::Boolean, vec![0, 0]),
@@ -3672,7 +3728,7 @@ mod tests {
             (DataType::I32, values_to_bytes(&[0i32, 0])),
             (DataType::F32, values_to_bytes(&[0f32, 0.0])),
         ] {
-            let zero = Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &bytes)
+            let zero = Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &bytes)
                 .unwrap();
             for (direction, expected) in [
                 (ComparisonDirection::Equal, vec![false, true]),
@@ -3690,8 +3746,9 @@ mod tests {
     #[test]
     fn test_eager_manipulation_capabilities() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let vector = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let vector = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
 
         // Slice and update-slice round trip.
         let sliced = vector.slice(&[1], &[3], &[1]).unwrap();
@@ -3710,7 +3767,7 @@ mod tests {
         assert_eq!(read_f32s(&broadcast), vec![1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 2.0, 3.0],);
 
         // Padding writes the padding value around and between the payload elements.
-        let padding_value = f32_scalar(&client, &mesh, 0.5);
+        let padding_value = f32_scalar(&domain, &mesh, 0.5);
         let padded = vector.pad(&padding_value, &[1], &[0], &[0]).unwrap();
         assert_eq!(read_f32s(&padded), vec![0.5, 1.0, 2.0, 3.0, 4.0]);
         let trimmed = vector.pad(&padding_value, &[-1], &[-1], &[0]).unwrap();
@@ -3732,16 +3789,17 @@ mod tests {
     #[test]
     fn test_eager_scatter_differentiation() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[2.0, 5.0]);
+        let input = f32_vector(&domain, &mesh, &[2.0, 5.0]);
         let indices = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[2, 1]),
             mesh.clone(),
             &values_to_bytes(&[0_i32, 0]),
         )
         .unwrap();
-        let updates = f32_vector(&client, &mesh, &[2.0, 2.0]);
+        let updates = f32_vector(&domain, &mesh, &[2.0, 2.0]);
 
         // Both extrema divide the derivative equally between the retained input and its two tied updates.
         for kind in [ScatterReductionKind::Min, ScatterReductionKind::Max] {
@@ -3769,7 +3827,7 @@ mod tests {
 
         // Duplicate overwrite may select either update. Its primal and pullback must select the same winner,
         // and untouched elements must retain their identity derivative regardless of device scheduling.
-        let updates = f32_vector(&client, &mesh, &[7.0, 8.0]);
+        let updates = f32_vector(&domain, &mesh, &[7.0, 8.0]);
         let (value, (input_gradient, updates_gradient)) = differentiate_at((input.clone(), updates))
             .with_captures(indices)
             .in_context(&input.execution_domain())
@@ -3796,10 +3854,11 @@ mod tests {
     #[test]
     fn test_eager_gather_differentiation() {
         let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0]);
+        let input = f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0]);
         let indices = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I32, &[4, 1]),
             mesh.clone(),
             &values_to_bytes(&[-1_i32, 1, 1, 3]),
@@ -3831,9 +3890,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let small = f32_scalar(&client, &mesh, 2.0);
-        let large = f32_scalar(&client, &mesh, 5.0);
+        let small = f32_scalar(&domain, &mesh, 2.0);
+        let large = f32_scalar(&domain, &mesh, 5.0);
 
         // Python-style control flow: branch on a device-computed comparison result.
         let predicate = small.compare(&large, ComparisonDirection::LessThan).unwrap();
@@ -3845,13 +3905,13 @@ mod tests {
         assert!(!reverse_predicate);
 
         // Elementwise truthiness is an explicit comparison against zero: zero maps to false and nonzero maps to true.
-        let input = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]);
+        let input = f32_vector(&domain, &mesh, &[0.0, 2.0, 0.0]);
         let boolean = input.compare(&input.zero_like().unwrap(), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.data_type(), DataType::Boolean);
         assert_eq!(read_booleans(&boolean), vec![false, true, false]);
 
         // Rank-one predicates cannot collapse to a single Boolean.
-        let vector_predicate = boolean_vector(&client, &mesh, &[true, false]);
+        let vector_predicate = boolean_vector(&domain, &mesh, &[true, false]);
         assert!(matches!(
             Concretizable::<bool>::concretize(&vector_predicate),
             Err(ProgramError::Concretization { .. })
@@ -3864,16 +3924,17 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let signed = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::I64, &[]),
             mesh.clone(),
             i64::MIN.to_ne_bytes(),
         )
         .unwrap();
         let unsigned = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type(&mesh, DataType::U64, &[]),
             mesh.clone(),
             u64::MAX.to_ne_bytes(),
@@ -3891,9 +3952,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
 
-        let matrix = f32_matrix(&client, &mesh, 2, 3, &[0.0; 6]);
+        let matrix = f32_matrix(&domain, &mesh, 2, 3, &[0.0; 6]);
         assert_eq!(matrix.dimension_size(0), Ok(2));
         assert_eq!(matrix.dimension_size(-1), Ok(3));
         assert!(matches!(
@@ -3907,15 +3969,15 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
         let sharded =
-            Array::from_host_buffer(&client, sharded_type, mesh.clone(), values_to_bytes::<f32>(&[0.0; 5])).unwrap();
+            Array::from_host_buffer(&domain, sharded_type, mesh.clone(), values_to_bytes::<f32>(&[0.0; 5])).unwrap();
         assert_eq!(sharded.dimension_size(0), Ok(5));
 
         let scalar_type = replicated_type(&mesh, DataType::I32, &[]);
-        let scalar = Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), 5_i32.to_ne_bytes()).unwrap();
+        let scalar = Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), 5_i32.to_ne_bytes()).unwrap();
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         assert_eq!(scalar.to_dimension(variable.clone()).unwrap().extent(), 5);
 
-        let negative = Array::from_host_buffer(&client, scalar_type, mesh, (-1_i32).to_ne_bytes()).unwrap();
+        let negative = Array::from_host_buffer(&domain, scalar_type, mesh, (-1_i32).to_ne_bytes()).unwrap();
         assert!(matches!(
             negative.to_dimension(variable),
             Err(ProgramError::InvalidArgument { message })
@@ -3930,41 +3992,45 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
-        let mixed = boolean_vector(&client, &mesh, &[false, true]);
-        let none = boolean_vector(&client, &mesh, &[false, false]);
+        let mixed = boolean_vector(&domain, &mesh, &[false, true]);
+        let none = boolean_vector(&domain, &mesh, &[false, false]);
         assert!(mixed.any_true().unwrap());
         assert!(!none.any_true().unwrap());
-        assert!(matches!(f32_vector(&client, &mesh, &[1.0]).any_true(), Err(ProgramError::Concretization { .. }),));
+        assert!(matches!(f32_vector(&domain, &mesh, &[1.0]).any_true(), Err(ProgramError::Concretization { .. }),));
 
         // The prefix-shaped predicate broadcasts along its leading axes: item 0 keeps `on_false`'s first row and
         // item 1 takes `on_true`'s second row.
-        let on_true = f32_matrix(&client, &mesh, 2, 2, &[1.0, 2.0, 3.0, 4.0]);
-        let on_false = f32_matrix(&client, &mesh, 2, 2, &[5.0, 6.0, 7.0, 8.0]);
+        let on_true = f32_matrix(&domain, &mesh, 2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let on_false = f32_matrix(&domain, &mesh, 2, 2, &[5.0, 6.0, 7.0, 8.0]);
         let masked = mixed.mask_select(&on_true, &on_false).unwrap();
         assert_eq!(read_f32s(&masked), vec![5.0, 6.0, 3.0, 4.0]);
     }
 
     #[test]
-    fn test_eager_chained_operations_propagate_client_and_cache() {
+    fn test_eager_chained_operations_propagate_domain_and_cache() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let a = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let b = f32_vector(&client, &mesh, &[3.0, 4.0]);
+        let a = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let b = f32_vector(&domain, &mesh, &[3.0, 4.0]);
 
-        // The result of an eager operation carries the executing client, so it feeds directly into further eager
-        // operations, and it shares the producing domain's compile cache.
+        // The result of an eager operation belongs to the executing domain, so it feeds directly into further eager
+        // operations, and it shares that domain's session and compile cache.
         let sum = a.add(&b).unwrap();
-        assert!(std::ptr::eq(sum.client().unwrap(), &client));
+        assert!(std::ptr::eq(sum.client(), &client));
+        assert!(Arc::ptr_eq(sum.domain().session(), domain.session()));
         assert_eq!(sum.execution_domain().parent().cache_size(), 1);
 
         let product = sum.mul(&b).unwrap();
         assert_eq!(read_f32s(&product), vec![12.0, 24.0]);
-        assert!(std::ptr::eq(product.client().unwrap(), &client));
+        assert!(std::ptr::eq(product.client(), &client));
+        assert!(Arc::ptr_eq(product.domain().session(), domain.session()));
 
         // All values derived from `a` share one dispatch cache: `add` and `mul` each compiled once, and repeating
         // `add` at the same input signature is a cache hit.
@@ -3973,6 +4039,7 @@ mod tests {
         let repeated = a.add(&b).unwrap();
         assert_eq!(read_f32s(&repeated), vec![4.0, 6.0]);
         assert_eq!(a.execution_domain().parent().cache_size(), 2);
+        assert_eq!(domain.cache_size(), 2);
     }
 
     #[test]
@@ -3981,23 +4048,24 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
 
-        // Arrays with an attached client recover a client-backed domain.
-        let array = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let domain = array.execution_domain();
-        assert!(std::ptr::eq(domain.parent().client().unwrap(), &client));
+        // Arrays recover the domain they were constructed in, together with its session and client.
+        let array = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let recovered = array.execution_domain();
+        assert!(std::ptr::eq(recovered.parent().client(), &client));
+        assert!(Arc::ptr_eq(recovered.parent().session(), domain.session()));
 
-        // Arrays constructed without a client recover a clientless domain whose eager binds error clearly, which
-        // also surfaces through the fallible value capabilities.
-        let r#type = replicated_type(&mesh, DataType::F32, &[2]);
-        let clientless = Array::from_addressable_buffers(None, r#type, mesh, Vec::new()).unwrap();
-        assert!(clientless.client().is_none());
-        assert!(matches!(
-            clientless.neg(),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "xla domain cannot eagerly execute operation `neg` without a PJRT client",
-        ));
+        // Associating an array with a domain of another session on the same client redirects the recovered domain,
+        // so subsequent receiver-based eager operations compile and execute in that session instead.
+        let other_domain = XlaSession::new(&client).domain();
+        let associated = array.associate(&other_domain).unwrap();
+        let recovered = associated.execution_domain();
+        assert!(Arc::ptr_eq(recovered.parent().session(), other_domain.session()));
+        assert_eq!(read_f32s(&associated.neg().unwrap()), vec![-1.0, -2.0]);
+        assert_eq!(other_domain.cache_size(), 1);
+        assert_eq!(domain.cache_size(), 0);
     }
 
     /// Top-level forward mode over concrete arrays: `jvp` of `f(x) = x * x` at `x = [1, 2, 3]` with unit tangents
@@ -4008,9 +4076,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let tangents = f32_vector(&client, &mesh, &[1.0, 1.0, 1.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let tangents = f32_vector(&domain, &mesh, &[1.0, 1.0, 1.0]);
         let domain = x.execution_domain();
         let (value, tangent): (Array<'_>, Array<'_>) =
             domain.jvp(|x, ()| Mul::mul(&x, &x), x.clone(), tangents, ()).unwrap();
@@ -4026,17 +4095,18 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let primal = f32_scalar(&client, &mesh, 0.0);
-        let tangent = f32_scalar(&client, &mesh, 3.0);
+        let primal = f32_scalar(&domain, &mesh, 0.0);
+        let tangent = f32_scalar(&domain, &mesh, 3.0);
 
         let (value, tangent) =
             primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![3.0]);
 
-        let primal = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 0.0));
-        let tangent = c64_scalar(&client, &mesh, num_complex::Complex::new(1.0, 2.0));
+        let primal = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 0.0));
+        let tangent = c64_scalar(&domain, &mesh, num_complex::Complex::new(1.0, 2.0));
         let (value, tangent) =
             primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
@@ -4051,6 +4121,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]))
@@ -4063,7 +4134,7 @@ mod tests {
             num_complex::Complex::new(7.0f32, 24.0),
         ];
         let input =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap();
 
         let output: Array<'_> = batch(|input| input.abs(), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         let expected_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -4083,8 +4154,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let (value, gradient) = domain
             .differentiate_at(x.clone())
@@ -4105,8 +4177,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let gradient = domain
             .differentiate_at(x.clone())
@@ -4127,19 +4200,20 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
-        let (value, pullback) = domain.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let context = x.execution_domain();
+        let (value, pullback) = context.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
         // The direct-transpose pullback consumes `[output_cotangents ++ residuals]` and produces the flat input
         // cotangents.
-        let cotangent = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let cotangent = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let mut pullback_inputs = vec![cotangent];
         pullback_inputs.extend(residuals);
-        let input_cotangents = pullback.interpret_in_context(&domain, pullback_inputs).unwrap();
+        let input_cotangents = pullback.interpret_in_context(&context, pullback_inputs).unwrap();
         assert_eq!(input_cotangents.len(), 1);
         assert_eq!(read_f32s(&input_cotangents[0]), vec![2.0, 8.0, 18.0]);
     }
@@ -4154,15 +4228,16 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let z = num_complex::Complex::new(0.7f32, -0.3f32);
-        let x = c64_scalar(&client, &mesh, z);
-        let domain = x.execution_domain();
+        let x = c64_scalar(&domain, &mesh, z);
+        let context = x.execution_domain();
 
         // Holomorphic gradient of z² through the XLA eager domain: the `one` cotangent seed lowers through the
         // composed complex constant, and the pullback recovers ∂(z²)/∂z = 2z on device.
         let (value, gradient) =
-            domain.differentiate_at(x.clone()).holomorphic().value_and_gradient(|x| x.clone() * x).unwrap();
+            context.differentiate_at(x.clone()).holomorphic().value_and_gradient(|x| x.clone() * x).unwrap();
         assert_c64_close(read_c64s(&value)[0], z * z);
         assert_c64_close(read_c64s(&gradient)[0], z + z);
 
@@ -4170,9 +4245,9 @@ mod tests {
         // singularities and branch cuts.
         let y = num_complex::Complex::new(0.7f32, -0.2f32);
         let x_value = num_complex::Complex::new(-0.3f32, 0.4f32);
-        let y_array = c64_scalar(&client, &mesh, y);
-        let x_array = c64_scalar(&client, &mesh, x_value);
-        let (value, (y_gradient, x_gradient)) = domain
+        let y_array = c64_scalar(&domain, &mesh, y);
+        let x_array = c64_scalar(&domain, &mesh, x_value);
+        let (value, (y_gradient, x_gradient)) = context
             .differentiate_at((y_array, x_array))
             .holomorphic()
             .value_and_gradient(|(y, x)| y.atan2(&x))
@@ -4188,7 +4263,7 @@ mod tests {
 
         // ℂ → ℝ gradient of |z|² = Re(z · z̄) through the plain entry point, exercising the `conjugate` (lowered as
         // `complex(real, -imag)`), `real`, and `complex` StableHLO lowerings in the pullback: the gradient is 2·z̄.
-        let gradient = domain
+        let gradient = context
             .differentiate_at(x.clone())
             .gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap())
             .unwrap();
@@ -4201,8 +4276,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let ((value, aux), gradient): ((Array<'_>, Array<'_>), Array<'_>) = domain
             .differentiate_at(x.clone())
@@ -4225,20 +4301,21 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let primal = Array::from_host_buffer(
-            &client,
+            &domain,
             r#type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let capture = Array::from_host_buffer(
-            &client,
+            &domain,
             r#type,
             mesh.clone(),
             values_to_bytes::<f32>(&[4.0, 5.0, 6.0, 7.0]).as_slice(),
@@ -4255,7 +4332,7 @@ mod tests {
         assert_eq!(read_f32s(&value), vec![60.0]);
         assert_eq!(read_f64_coordinates(&gradient), vec![4.0, 5.0, 6.0, 7.0]);
         assert_eq!(gradient.sharding(), &sharding);
-        assert!(gradient.client().is_some());
+        assert!(Arc::ptr_eq(gradient.domain().session(), domain.session()));
 
         let (_, pushforward) = differentiate_at(primal.clone())
             .with_captures(capture)
@@ -4268,7 +4345,7 @@ mod tests {
             .find(|residual| read_f64_coordinates(residual) == vec![4.0, 5.0, 6.0, 7.0])
             .expect("capture should survive as a pushforward residual");
         assert_eq!(capture_residual.sharding(), &sharding);
-        assert!(capture_residual.client().is_some());
+        assert!(Arc::ptr_eq(capture_residual.domain().session(), domain.session()));
     }
 
     /// Nested transform composition over concrete arrays: `grad` of a function that internally maps its per-item
@@ -4280,8 +4357,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let gradient = domain
             .differentiate_at(x.clone())
@@ -4303,15 +4381,19 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
-        assert!(block.value().client().is_some(), "the derivative block must remain attached to its device client");
+        assert!(
+            Arc::ptr_eq(block.value().domain().session(), domain.parent().session()),
+            "the derivative block must remain in the session of its input",
+        );
         assert_eq!(block.value().shape(), StaticShape::new(vec![3, 3]));
         assert_eq!(read_f64_coordinates(block.value()).as_slice(), &[2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 6.0]);
     }
@@ -4324,6 +4406,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         for data_type in [DataType::F16, DataType::BF16] {
             let r#type = replicated_type(&mesh, data_type, &[3]);
@@ -4333,7 +4416,7 @@ mod tests {
                 }
                 _ => [1.0, 2.0, 3.0].iter().flat_map(|value| bf16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>(),
             };
-            let array = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+            let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
             assert_eq!(read_f64_coordinates(&array), vec![1.0, 2.0, 3.0]);
 
             let r#type = array.r#type().into_owned();
@@ -4354,7 +4437,7 @@ mod tests {
         // A rank-two leaf exercises the rectangular basis construction and final reshape with a nonzero packed offset.
         let matrix_type = replicated_type(&mesh, DataType::F32, &[2, 3]);
         let matrix = Array::from_host_buffer(
-            &client,
+            &domain,
             matrix_type,
             mesh.clone(),
             values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -4379,7 +4462,7 @@ mod tests {
         let complex_type = replicated_type(&mesh, DataType::C64, &[2]);
         let complex_values = [num_complex::Complex::new(2.0f32, 1.0), num_complex::Complex::new(-1.0, 3.0)];
         let complex =
-            Array::from_host_buffer(&client, complex_type, mesh.clone(), values_to_bytes(&complex_values)).unwrap();
+            Array::from_host_buffer(&domain, complex_type, mesh.clone(), values_to_bytes(&complex_values)).unwrap();
         let complex_type = complex.r#type().into_owned();
         let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
             &complex.execution_domain(),
@@ -4410,10 +4493,11 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let r#type = replicated_type(&mesh, DataType::F16, &[3]);
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
-        let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+        let x = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
@@ -4429,9 +4513,10 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let value = num_complex::Complex::new(1.0f32, 2.0);
-        let input = c64_scalar(&client, &mesh, value);
+        let input = c64_scalar(&domain, &mesh, value);
         let context = input.execution_domain();
 
         let forward = context
@@ -4464,13 +4549,14 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
-        let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+        let x = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
@@ -4492,13 +4578,14 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
-        let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
+        let x = Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
@@ -4519,8 +4606,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
@@ -4538,8 +4626,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let hessian = domain
             .differentiate_at(x)
@@ -4565,13 +4654,14 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
-        let (value, pullback) = domain.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x, ()).unwrap();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let context = x.execution_domain();
+        let (value, pullback) = context.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x, ()).unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
-        let cotangent = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let cotangent = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let input_cotangent = pullback.apply(vec![cotangent]).unwrap();
         assert_eq!(read_f32s(&input_cotangent), vec![2.0, 8.0, 18.0]);
     }
@@ -4582,8 +4672,9 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
-        let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
 
         // The free `batch` recovers the eager XLA domain from the concrete input array and squares each item of the
         // length-3 batch through eager per-operation dispatch.

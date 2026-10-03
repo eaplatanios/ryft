@@ -104,7 +104,7 @@ pub enum KernelError {
 }
 
 /// Full logical array, declared access, and window mapping for one body reference input.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelParameter {
     /// Full array type at the functional outer boundary.
     r#type: ArrayType,
@@ -246,7 +246,7 @@ pub const KERNEL_SCHEMA_VERSION: u32 = 2;
 /// omit read-only parameters. A read-write parameter therefore contributes one ordinary input and one ordinary
 /// result. This functional alias relationship does not expose a reference-state slot or permit an input mutation
 /// visible outside the call. The body returns no values: its stores produce the declared array results.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelCallOperation {
     /// Logical execution grid, independent of native launch dimensions.
     grid: Grid,

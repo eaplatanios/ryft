@@ -261,7 +261,7 @@ impl Device {
 /// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`Device`]s into a [`LogicalMesh`].
 /// Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g., for a two-dimensional mesh
 /// with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has linear index `i * 2 + j`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
     logical_mesh: LogicalMesh,

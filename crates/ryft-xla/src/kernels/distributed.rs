@@ -291,7 +291,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             .with_maximum_rounds(options.maximum_rounds)?;
         kernel.validate_distributed_effects()?;
         let (domain, inputs, mesh, identity, execution) = kernel.distributed_parts();
-        let client = domain.client().map_err(XlaDomainError::from)?;
+        let client = domain.client();
         validate_kernel_participants(client, mesh)?;
         if mesh.devices().len() != 1 || inputs.is_empty() || inputs.len() > 64 {
             return Err(DistributedKernelError::invalid(
@@ -301,7 +301,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         if identity.len() > 64 * 1024 || execution.len() > 64 * 1024 {
             return Err(DistributedKernelError::invalid("kernel identity exceeds the coordination metadata budget"));
         }
-        let actual = crate::kernels::XlaKernelExecutionFacts::from_client(client, mesh)?.configuration_key()?;
+        let actual = crate::kernels::XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
         if actual != execution {
             return Err(DistributedKernelError::invalid("loaded kernel live execution identity changed"));
         }
@@ -508,7 +508,6 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
                 &KernelTransfer { size: bytes.len(), checksum: Sha256::digest(&bytes).into() },
             )?;
         }
-        let client = domain.client().map_err(XlaDomainError::from)?;
         let mut arguments = Vec::with_capacity(types.len());
         for (index, (&process, r#type)) in sources.iter().zip(types).enumerate() {
             let manifest: KernelTransfer = serde_json::from_slice(&self.coordination.wait(
@@ -535,7 +534,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
             let value =
-                Array::from_host_buffer(client, r#type.clone(), mesh.clone(), bytes).map_err(XlaDomainError::from)?;
+                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes).map_err(XlaDomainError::from)?;
             value.block_until_ready().map_err(XlaDomainError::from)?;
             arguments.push(value);
         }
@@ -730,13 +729,12 @@ mod tests {
 
     /// Produces a real CPU-loaded scalar identity through the existing AOT persistence fixture.
     fn loaded<'c>(
-        client: &'c ryft_pjrt::Client<'c>,
         domain: &crate::XlaDomain<'c>,
         mesh: &DeviceMesh,
         compiler_options: u32,
     ) -> LoadedKernel<'c> {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
-        crate::kernels::aot::tests::executable_bundle(client, domain, mesh, ryft_core::DataType::I32, false, &compiler)
+        crate::kernels::aot::tests::executable_bundle(domain, mesh, ryft_core::DataType::I32, false, &compiler)
             .load(domain, &compiler, mesh)
             .unwrap()
     }
@@ -877,14 +875,14 @@ mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = crate::XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = crate::XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
-        let kernel = loaded(&client, &domain, &mesh, compiler_options);
+        let kernel = loaded(&domain, &mesh, compiler_options);
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
         let mut coordinator = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
             mesh.clone(),
             (10 + process as i32).to_ne_bytes(),

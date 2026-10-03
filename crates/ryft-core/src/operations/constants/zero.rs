@@ -37,7 +37,7 @@ pub const ZERO_OPERATION_NAME: &str = "zero";
 /// This constructs zeros whose geometry is fully described by their type. Differentiation's separate
 /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol handles zeros that require runtime geometry from
 /// residual values, such as disconnected cotangents with dynamic axes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ZeroOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     r#type: T,

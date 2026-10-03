@@ -39,7 +39,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _donate: bool,
         _may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let client = engine.client()?;
+        let client = engine.client();
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,
@@ -51,7 +51,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         };
         let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)?;
-        Array::from_host_buffer(client, r#type, mesh, bytes.as_slice())
+        Array::from_host_buffer(engine, r#type, mesh, bytes.as_slice())
     }
 }
 

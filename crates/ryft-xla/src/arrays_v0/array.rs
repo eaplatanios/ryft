@@ -90,14 +90,14 @@ impl<'o> Array<'o> {
         target_sharding: Sharding,
         donate: bool,
     ) -> Result<Self, ArrayError> {
-        let client = engine.client()?;
+        let client = engine.client();
         check_sharding!(&target_mesh, &target_sharding);
 
         let global_shape = self.shape();
         let global_dimensions = global_shape.as_slice();
         if self.data_type().is_zero() {
             let r#type = self.r#type().into_owned().with_sharding(target_sharding)?;
-            return Ok(Self::from_zero_space(client, r#type, target_mesh)?);
+            return Ok(Self::from_zero_space(engine, r#type, target_mesh)?);
         }
 
         // Tier 1: exact-shard fast path. Doesn't materialize anything new on host.
@@ -110,7 +110,7 @@ impl<'o> Array<'o> {
         )? {
             let shape = Shape::new(global_dimensions.iter().copied().map(Dimension::Static).collect());
             let array_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding)?;
-            return Ok(Self::from_addressable_buffers(client, array_type, target_mesh, addressable_buffers)?);
+            return Ok(Self::from_addressable_buffers(engine, array_type, target_mesh, addressable_buffers)?);
         }
 
         // Tier 2: compiled-XLA SPMD path. Captures whatever error the path produces so we can
@@ -137,7 +137,7 @@ impl<'o> Array<'o> {
         };
         let shape = Shape::new(global_dimensions.iter().copied().map(Dimension::Static).collect());
         let host_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding.clone())?;
-        match Self::from_host_buffer(client, host_type, target_mesh, host_bytes.as_slice()) {
+        match Self::from_host_buffer(engine, host_type, target_mesh, host_bytes.as_slice()) {
             Ok(array) => Ok(array),
             Err(_) => Err(compiled_error),
         }

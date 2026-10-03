@@ -5,6 +5,8 @@
 //! excludes control flow and array-to-dimension conversion. Prefetched scalar arrays require a separate, explicit
 //! binding contract before they can enter this subset.
 
+use std::hash::{Hash, Hasher};
+
 use thiserror::Error;
 
 use crate::arrays::{
@@ -288,6 +290,28 @@ impl BlockMapping {
     }
 }
 
+// Two mappings are identical when their programs have the same region-content identity (which every content-changing
+// construction re-mints and every content-preserving copy keeps, so it is a conservative but exact identity of the
+// mapping program) and their block shapes and boundary policies agree. Separately constructed mappings with equal
+// programs therefore compare unequal, which only affects caching, never correctness.
+impl PartialEq for BlockMapping {
+    fn eq(&self, other: &Self) -> bool {
+        self.program.entry_region().transform_cache().ptr_eq(other.program.entry_region().transform_cache())
+            && self.block_shape == other.block_shape
+            && self.boundary_policy == other.boundary_policy
+    }
+}
+
+impl Eq for BlockMapping {}
+
+impl Hash for BlockMapping {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.program.entry_region().transform_cache().hash_identity(state);
+        self.block_shape.hash(state);
+        self.boundary_policy.hash(state);
+    }
+}
+
 /// Evaluated block starts and their valid full array intersection. No storage or reference handle is owned here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockWindow {
@@ -341,6 +365,9 @@ impl BlockWindow {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::hash::DefaultHasher;
+
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{ArrayType, DataType, DimensionBounds, DimensionError, DimensionType};
@@ -349,6 +376,13 @@ mod tests {
     use crate::programs::{ProgramBuilder, ReferenceType};
 
     use super::*;
+
+    /// Returns the hash of `value` under the standard library's default hasher.
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
 
     /// Builds a dimension-only identity mapping with independently bounded coordinate inputs.
     fn identity_program(rank: usize) -> FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>> {
@@ -682,6 +716,36 @@ mod tests {
         assert_eq!(
             empty.evaluate(&inputs(&empty, &[0]), &[0]).unwrap().valid_transform(),
             &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] },
+        );
+    }
+
+    #[test]
+    fn test_block_mapping_identity() {
+        // Clones share the program's region-content identity, so they are equal and hash identically.
+        let program = identity_program(1);
+        let mapping = BlockMapping::new(program.clone(), vec![4], BoundaryPolicy::InBounds).unwrap();
+        assert_eq!(mapping, mapping.clone());
+        assert_eq!(hash_of(&mapping), hash_of(&mapping.clone()));
+        let same_mapping = BlockMapping::new(program.clone(), vec![4], BoundaryPolicy::InBounds).unwrap();
+        assert_eq!(mapping, same_mapping);
+        assert_eq!(hash_of(&mapping), hash_of(&same_mapping));
+        let mappings = HashMap::from([(mapping.clone(), "mapping")]);
+        assert_eq!(mappings.get(&same_mapping), Some(&"mapping"));
+
+        // The block shape and boundary policy participate in the identity.
+        let wider_mapping = BlockMapping::new(program.clone(), vec![8], BoundaryPolicy::InBounds).unwrap();
+        assert_ne!(mapping, wider_mapping);
+        assert_eq!(mappings.get(&wider_mapping), None);
+        assert_ne!(mapping, BlockMapping::new(program, vec![4], BoundaryPolicy::Masked).unwrap());
+
+        // Separately constructed programs carry distinct region-content identities, so mappings built from them are
+        // conservatively unequal even when the programs render identically.
+        let first_program = identity_program(0);
+        let second_program = identity_program(0);
+        assert_eq!(first_program.to_string(), second_program.to_string());
+        assert_ne!(
+            BlockMapping::new(first_program, vec![], BoundaryPolicy::InBounds).unwrap(),
+            BlockMapping::new(second_program, vec![], BoundaryPolicy::InBounds).unwrap(),
         );
     }
 

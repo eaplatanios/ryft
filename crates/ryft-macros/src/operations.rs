@@ -13,6 +13,7 @@ use crate::helpers::symbols::Symbol;
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
+const IDENTITY_ATTRIBUTE: Symbol = Symbol::new("identity");
 const TYPE_ATTRIBUTE: Symbol = Symbol::new("type");
 const CONSTANT_ATTRIBUTE: Symbol = Symbol::new("constant");
 const MEMBERS_ATTRIBUTE: Symbol = Symbol::new("members");
@@ -24,8 +25,8 @@ const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
 const STRUCTURAL_ATTRIBUTE: Symbol = Symbol::new("structural");
 const MIXED_ATTRIBUTE: Symbol = Symbol::new("mixed");
 const SKIP_FROM_ATTRIBUTE: Symbol = Symbol::new("skip_from");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 5] =
-    [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE, TYPE_ATTRIBUTE, CONSTANT_ATTRIBUTE, MEMBERS_ATTRIBUTE];
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 6] =
+    [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE, IDENTITY_ATTRIBUTE, TYPE_ATTRIBUTE, CONSTANT_ATTRIBUTE, MEMBERS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 /// Mutable parser and diagnostic accumulator for `#[derive(Operation)]`.
@@ -45,6 +46,9 @@ struct OperationParser {
 
     /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
     dispatchers: Option<Dispatchers>,
+
+    /// Whether `#[ryft(identity)]` requested the payload-delegating `PartialEq`, `Eq`, and `Hash` implementations.
+    identity: bool,
 
     /// Errors accumulated in this [`OperationParser`]. The way error handling works in this parser is that we
     /// collect errors as we encounter them, and keep going as far as we can with the information that is available,
@@ -95,6 +99,9 @@ struct OperationEnum {
 
     /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
     dispatchers: Dispatchers,
+
+    /// Whether to generate the payload-delegating `PartialEq`, `Eq`, and `Hash` implementations.
+    identity: bool,
 
     /// Enum identifier.
     ident: syn::Ident,
@@ -157,6 +164,7 @@ impl OperationParser {
             program_constant_type: None,
             members: Vec::new(),
             dispatchers: None,
+            identity: false,
             errors: Vec::new(),
         }
     }
@@ -204,6 +212,13 @@ impl OperationParser {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
                 path if path == &DISPATCH_ATTRIBUTE => self.extract_dispatch_attribute(&meta),
+                path if path == &IDENTITY_ATTRIBUTE && self.identity => {
+                    Err(meta.error("duplicate ryft attribute 'identity'"))
+                }
+                path if path == &IDENTITY_ATTRIBUTE => {
+                    self.identity = true;
+                    Ok(())
+                }
                 path if path == &MEMBERS_ATTRIBUTE => self.extract_members_attribute(&meta),
                 path if path == &TYPE_ATTRIBUTE => operation_type.set(&meta),
                 path if path == &CONSTANT_ATTRIBUTE => program_constant_type.set(&meta),
@@ -457,6 +472,7 @@ impl OperationParser {
             operation_type,
             members,
             dispatchers: self.dispatchers.unwrap_or_default(),
+            identity: self.identity,
             ident,
             generics,
             conversion_generics,
@@ -704,7 +720,72 @@ impl OperationEnum {
         let batching = self.dispatchers.batching.then(|| self.generate_batchable_operation());
         let differentiation = self.dispatchers.differentiation.then(|| self.generate_differentiable_operation());
         let transposition = self.dispatchers.transposition.then(|| self.generate_transposable_operation());
-        quote!(#operation #discharge #batching #differentiation #transposition)
+        let identity = self.identity.then(|| self.generate_identity());
+        quote!(#operation #discharge #batching #differentiation #transposition #identity)
+    }
+
+    /// Generates the `#[ryft(identity)]` output: [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to
+    /// the payload of each variant. Unlike the standard derives, which bound every generic parameter by the derived
+    /// trait, these implementations are bounded by the payload types themselves, so that a family is comparable
+    /// exactly when its payloads are (e.g., a payload that stores a literal may require a bound other than
+    /// [`PartialEq`] on the family's value parameter). Two values are equal when they are the same variant with equal
+    /// payloads, and the hash covers the variant discriminant and the payload.
+    fn generate_identity(&self) -> TokenStream {
+        let enum_type = &self.self_type;
+        let mut payload_types = Vec::<&syn::Type>::new();
+        for variant in &self.variants {
+            let payload_name = variant.payload_type.to_token_stream().to_string();
+            if !payload_types.iter().any(|payload_type| payload_type.to_token_stream().to_string() == payload_name) {
+                payload_types.push(&variant.payload_type);
+            }
+        }
+        let bounded_generics = |bound: TokenStream| {
+            let mut generics = self.conversion_generics.clone();
+            let where_clause = generics.make_where_clause();
+            for payload_type in &payload_types {
+                where_clause.predicates.push(syn::parse_quote!(#payload_type: #bound));
+            }
+            generics
+        };
+        let partial_eq_generics = bounded_generics(quote!(::std::cmp::PartialEq));
+        let eq_generics = bounded_generics(quote!(::std::cmp::Eq));
+        let hash_generics = bounded_generics(quote!(::std::hash::Hash));
+        let (partial_eq_impl_generics, _, partial_eq_where_clause) = partial_eq_generics.split_for_impl();
+        let (eq_impl_generics, _, eq_where_clause) = eq_generics.split_for_impl();
+        let (hash_impl_generics, _, hash_where_clause) = hash_generics.split_for_impl();
+        let variant_idents = self.variants.iter().map(|variant| &variant.ident).collect::<Vec<_>>();
+        let mismatched_variants = (self.variants.len() > 1).then(|| quote!(_ => false,));
+        quote! {
+            #[automatically_derived]
+            impl #partial_eq_impl_generics ::std::cmp::PartialEq for #enum_type
+            #partial_eq_where_clause
+            {
+                fn eq(&self, other: &Self) -> bool {
+                    match (self, other) {
+                        #((Self::#variant_idents(left), Self::#variant_idents(right)) => left == right,)*
+                        #mismatched_variants
+                    }
+                }
+            }
+
+            #[automatically_derived]
+            impl #eq_impl_generics ::std::cmp::Eq for #enum_type
+            #eq_where_clause
+            {
+            }
+
+            #[automatically_derived]
+            impl #hash_impl_generics ::std::hash::Hash for #enum_type
+            #hash_where_clause
+            {
+                fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                    ::std::hash::Hash::hash(&::std::mem::discriminant(self), state);
+                    match self {
+                        #(Self::#variant_idents(operation) => ::std::hash::Hash::hash(operation, state),)*
+                    }
+                }
+            }
+        }
     }
 
     /// Generates the `Operation` derive output: the [`Operation`] dispatcher, the [`InterpretableOperation`]
@@ -2650,7 +2731,7 @@ mod tests {
     fn test_operation_parser_extract_attributes() {
         let generator = extract_attributes(quote! {
             #[ryft(crate = "wrapped::ryft")]
-            #[ryft(dispatch(discharge, batching, differentiation, transposition))]
+            #[ryft(identity, dispatch(discharge, batching, differentiation, transposition))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
@@ -2658,6 +2739,7 @@ mod tests {
         assert!(generator.errors.is_empty());
         assert_eq!(generator.ryft_crate.to_token_stream().to_string(), "wrapped :: ryft");
         assert_eq!(generator.operation_type.as_ref().unwrap().to_token_stream().to_string(), "DataType");
+        assert!(generator.identity);
         let dispatchers = generator.dispatchers.unwrap_or_default();
         assert!(dispatchers.batching);
         assert!(dispatchers.discharge);
@@ -2692,6 +2774,7 @@ mod tests {
             }
         });
         assert!(generator.errors.is_empty());
+        assert!(!generator.identity);
         let dispatchers = generator.dispatchers.unwrap_or_default();
         assert!(!dispatchers.batching);
         assert!(!dispatchers.discharge);
@@ -2733,6 +2816,9 @@ mod tests {
                  'differentiation', and 'transposition' are supported here",
             ),
             (quote!(#[ryft(dispatch(batching, batching))]), "duplicate ryft dispatcher 'batching'"),
+            (quote!(#[ryft(identity, identity)]), "duplicate ryft attribute 'identity'"),
+            (quote!(#[ryft(identity)] #[ryft(identity)]), "duplicate ryft attribute 'identity'"),
+            (quote!(#[ryft(identity = true)]), "expected `,`"),
             (
                 quote!(#[ryft(dispatch(batching))] #[ryft(dispatch(transposition))]),
                 "duplicate ryft attribute 'dispatch(...)'",
@@ -3209,6 +3295,107 @@ mod tests {
         assert!(generated.contains("typeError=ryft::TypeError;"));
         assert!(generated_tokens.contains(r#""cannot project operation '{}' into a '{}' payload""#));
         assert!(generated_tokens.contains(r#""ArrayOperation<A>""#));
+    }
+
+    #[test]
+    fn test_operation_generate_identity() {
+        // Payload-delegating identity bounds each distinct (unboxed) payload type rather than the generic parameters,
+        // and it compares mismatched variants as unequal while hashing the discriminant before the payload.
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            #[ryft(identity)]
+            enum IdentityOperation<V: Value<Type = DataType>, Extension> {
+                Zero(ZeroOperation<DataType>),
+                Constant(ConstantOperation<V>),
+                Tag(Box<TagOperation<DataType>>),
+                First(Extension),
+                Second(Extension),
+            }
+        };
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let operation = parser.normalize_input(&input).unwrap();
+        assert!(parser.errors.is_empty());
+
+        let generated: syn::File = syn::parse2(operation.generate_identity()).unwrap();
+        let expected: syn::File = syn::parse_quote! {
+            #[automatically_derived]
+            impl<V: Value<Type = DataType>, Extension> ::std::cmp::PartialEq for IdentityOperation<V, Extension>
+            where
+                ZeroOperation<DataType>: ::std::cmp::PartialEq,
+                ConstantOperation<V>: ::std::cmp::PartialEq,
+                TagOperation<DataType>: ::std::cmp::PartialEq,
+                Extension: ::std::cmp::PartialEq
+            {
+                fn eq(&self, other: &Self) -> bool {
+                    match (self, other) {
+                        (Self::Zero(left), Self::Zero(right)) => left == right,
+                        (Self::Constant(left), Self::Constant(right)) => left == right,
+                        (Self::Tag(left), Self::Tag(right)) => left == right,
+                        (Self::First(left), Self::First(right)) => left == right,
+                        (Self::Second(left), Self::Second(right)) => left == right,
+                        _ => false,
+                    }
+                }
+            }
+
+            #[automatically_derived]
+            impl<V: Value<Type = DataType>, Extension> ::std::cmp::Eq for IdentityOperation<V, Extension>
+            where
+                ZeroOperation<DataType>: ::std::cmp::Eq,
+                ConstantOperation<V>: ::std::cmp::Eq,
+                TagOperation<DataType>: ::std::cmp::Eq,
+                Extension: ::std::cmp::Eq
+            {
+            }
+
+            #[automatically_derived]
+            impl<V: Value<Type = DataType>, Extension> ::std::hash::Hash for IdentityOperation<V, Extension>
+            where
+                ZeroOperation<DataType>: ::std::hash::Hash,
+                ConstantOperation<V>: ::std::hash::Hash,
+                TagOperation<DataType>: ::std::hash::Hash,
+                Extension: ::std::hash::Hash
+            {
+                fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
+                    ::std::hash::Hash::hash(&::std::mem::discriminant(self), state);
+                    match self {
+                        Self::Zero(operation) => ::std::hash::Hash::hash(operation, state),
+                        Self::Constant(operation) => ::std::hash::Hash::hash(operation, state),
+                        Self::Tag(operation) => ::std::hash::Hash::hash(operation, state),
+                        Self::First(operation) => ::std::hash::Hash::hash(operation, state),
+                        Self::Second(operation) => ::std::hash::Hash::hash(operation, state),
+                    }
+                }
+            }
+        };
+        assert_eq!(generated.to_token_stream().to_string(), expected.to_token_stream().to_string());
+
+        // A single-variant family has no mismatched-variant arm, which would otherwise be unreachable.
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            #[ryft(identity)]
+            enum SingleOperation<V: Value<Type = DataType>> {
+                Zero(ZeroOperation<DataType>),
+            }
+        };
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let generated = parser.normalize_input(&input).unwrap().generate_identity().to_string().replace(' ', "");
+        assert!(generated.contains("match(self,other){(Self::Zero(left),Self::Zero(right))=>left==right,}"));
+
+        // Identity is generated only on request.
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            enum PlainOperation<V: Value<Type = DataType>> {
+                Zero(ZeroOperation<DataType>),
+            }
+        };
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let generated = parser.normalize_input(&input).unwrap().generate().to_string().replace(' ', "");
+        assert!(!generated.contains("::std::cmp::PartialEqfor"));
+        assert!(!generated.contains("::std::hash::Hashfor"));
     }
 
     #[test]

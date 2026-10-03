@@ -30,7 +30,7 @@ use crate::tracing::{Tracer, TracingContext};
 pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
 
 /// Consumes an allocation reference, returning its final referent and invalidating its complete alias family.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceFreezeOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
 
 impl<T: Type, U: Type> ReferenceFreezeOperation<T, U> {

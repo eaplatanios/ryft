@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use super::*;
 
 /// Backend implementation requested for an attention operation.
@@ -26,7 +28,10 @@ impl Display for AttentionImplementation {
 }
 
 /// Value-independent semantics of scaled dot-product attention.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+///
+/// Equality and hashing compare the floating-point scale and dropout rate bitwise, so that configurations are faithful
+/// keys of the attributes that backends receive (e.g., `-0.0` and `+0.0` scales are distinct).
+#[derive(Copy, Clone, Debug, Default)]
 pub struct AttentionConfiguration {
     /// Explicit score scale, or [`None`] to use `1 / sqrt(head_dimension)`.
     scale: Option<f64>,
@@ -138,6 +143,31 @@ impl AttentionConfiguration {
     #[inline]
     pub fn dropout(&self) -> Option<(f64, u64)> {
         self.dropout
+    }
+}
+
+impl PartialEq for AttentionConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        self.scale.map(f64::to_bits) == other.scale.map(f64::to_bits)
+            && self.causal == other.causal
+            && self.local_window == other.local_window
+            && self.implementation == other.implementation
+            && self.return_residual == other.return_residual
+            && self.dropout.map(|(rate, seed)| (rate.to_bits(), seed))
+                == other.dropout.map(|(rate, seed)| (rate.to_bits(), seed))
+    }
+}
+
+impl Eq for AttentionConfiguration {}
+
+impl Hash for AttentionConfiguration {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.scale.map(f64::to_bits).hash(state);
+        self.causal.hash(state);
+        self.local_window.hash(state);
+        self.implementation.hash(state);
+        self.return_residual.hash(state);
+        self.dropout.map(|(rate, seed)| (rate.to_bits(), seed)).hash(state);
     }
 }
 

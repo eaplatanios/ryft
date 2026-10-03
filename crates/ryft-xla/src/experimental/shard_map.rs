@@ -892,7 +892,7 @@ where
 /// `in_shardings`, `out_shardings`, and `manual_axes`.
 ///
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ShardMap {
     /// Logical mesh that the manual computation is defined over.
     mesh: LogicalMesh,
@@ -2197,7 +2197,7 @@ mod tests {
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt, ToMlir};
+    use crate::{Array, FromPjrt, ToMlir, XlaSession};
 
     use super::*;
 
@@ -2291,6 +2291,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -2326,7 +2327,7 @@ mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(data_type, &[4 * shard_size], sharding),
             device_mesh,
             buffers,
@@ -3281,6 +3282,7 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         if client_devices.len() < 2 {
             return;
@@ -3355,7 +3357,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 Array::from_addressable_buffers(
-                    &client,
+                    &domain,
                     static_sharded_array_type(DataType::I32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
                     buffers,
@@ -3466,7 +3468,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 Array::from_addressable_buffers(
-                    &client,
+                    &domain,
                     static_sharded_array_type(DataType::F32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
                     buffers,
@@ -3498,7 +3500,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharding.clone()),
                 device_mesh.clone(),
                 buffers,
@@ -3682,6 +3684,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -3724,7 +3727,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -3767,6 +3770,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
             .expect("failed to create 8-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
 
@@ -3853,14 +3857,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         let lhs_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
             device_mesh.clone(),
             lhs_buffers,
         )
         .unwrap();
         let rhs_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding),
             device_mesh,
             rhs_buffers,
@@ -3984,6 +3988,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -4050,7 +4055,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -4095,6 +4100,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -4169,7 +4175,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -4287,6 +4293,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4356,7 +4363,7 @@ mod tests {
             })
             .collect();
         let input = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
             buffers,
@@ -4397,6 +4404,7 @@ mod tests {
             let client = plugin
                 .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
                 .unwrap();
+            let domain = XlaSession::new(&client).domain();
             let client_devices = client.addressable_devices().unwrap();
             assert_eq!(client_devices.len(), device_count);
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -4636,14 +4644,14 @@ mod tests {
                 .collect();
             let inputs = vec![
                 Array::from_addressable_buffers(
-                    &client,
+                    &domain,
                     static_sharded_array_type(DataType::F32, &[], replicated),
                     device_mesh.clone(),
                     shared_buffers,
                 )
                 .unwrap(),
                 Array::from_addressable_buffers(
-                    &client,
+                    &domain,
                     static_sharded_array_type(DataType::F32, &[device_count], sharded),
                     device_mesh,
                     weight_buffers,
@@ -4717,6 +4725,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4826,21 +4835,21 @@ mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[3], replicated),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[4], sharded),
                 device_mesh,
                 seed_buffers,
@@ -4887,6 +4896,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -4981,21 +4991,21 @@ mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated),
                 device_mesh,
                 seed_buffers,
@@ -5051,6 +5061,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let devices = client.addressable_devices().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let device_mesh =
@@ -5136,17 +5147,17 @@ mod tests {
             .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            Array::from_host_buffer(&client, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
+            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
             Array::from_host_buffer(
-                &client,
+                &domain,
                 key_type,
                 device_mesh.clone(),
                 &values_to_bytes(&[0.0_f32, 1.0, 0.0, 3.0]),
             )
             .unwrap(),
-            Array::from_host_buffer(&client, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
+            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
                 .unwrap(),
-            Array::from_host_buffer(&client, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
+            Array::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -5181,6 +5192,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -5274,14 +5286,14 @@ mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[], replicated),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[4], global),
                 device_mesh,
                 weight_buffers,
@@ -5324,6 +5336,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
         let mesh = LogicalMesh::new(vec![
@@ -5412,14 +5425,14 @@ mod tests {
             .collect();
         let inputs = vec![
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[2], shared_sharding),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 static_sharded_array_type(DataType::F32, &[2, 2], global),
                 device_mesh,
                 weight_buffers,
@@ -5467,6 +5480,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         ensure_add_one_handler_registered(&client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -5543,7 +5557,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -5928,6 +5942,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
 
@@ -6012,7 +6027,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::U64, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -6152,6 +6167,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -6236,7 +6252,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -6272,6 +6288,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -6338,7 +6355,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4], input_sharding),
             device_mesh,
             input_buffers,
@@ -6417,6 +6434,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -6475,7 +6493,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[16], sharding),
             device_mesh,
             input_buffers,
@@ -6540,6 +6558,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -6620,7 +6639,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -6660,6 +6679,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -6717,7 +6737,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
             device_mesh,
             input_buffers,
@@ -6754,6 +6774,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -6824,7 +6845,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
             input_buffers,
@@ -6863,6 +6884,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
 
@@ -6937,7 +6959,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -6977,6 +6999,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let device_mesh = DeviceMesh::new(
@@ -7041,7 +7064,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
-            &client,
+            &domain,
             static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
             device_mesh,
             input_buffers,

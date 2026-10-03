@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Memory, Parameter, Parameterized, ProjectedContext,
@@ -55,13 +55,11 @@ pub struct Array<'o> {
     /// associated with the launch. Cloned output arrays share the same fence.
     execution_fence: Option<ExecutionFence>,
 
-    /// Refer to the documentation of [`Self::client`] for information on this field.
-    client: Option<&'o Client<'o>>,
-
-    /// Execution association retained across clones and derived values. Explicit domains select their own scope;
-    /// receiver-based operations use this value's association, so `x + y` and `y + x` may select different scopes.
-    /// Arrays created without a session initialize an independent association on first dispatch.
-    execution_domain: Arc<OnceLock<XlaDomain<'o>>>,
+    /// [`XlaDomain`] this array belongs to, retained across clones and derived values. It determines the session
+    /// (and thus the PJRT client, compilation cache, and kernel runtimes), the effect scope, and the compilation
+    /// options that receiver-based operations on this array execute with. Explicit domains select their own scope;
+    /// receiver-based operations use this value's domain, so `x + y` and `y + x` may select different scopes.
+    domain: XlaDomain<'o>,
 
     /// Value-local, clone-shared cache of lazily padded bound-shaped device materializations.
     bounded_materializations: Arc<BoundedMaterializationCache<'o>>,
@@ -73,11 +71,9 @@ pub struct Array<'o> {
 // `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
 // have the same type and every materialized shard references the same underlying `Buffer` (by `Arc` pointer identity),
 // while bufferless zero-space shards compare equal because their type admits exactly one value. Arrays holding equal
-// ordinary data in distinct buffers deliberately compare unequal —
-// the conservative answer that consumers such as the scan/while loop-invariance fixed points of partial evaluation
-// need when they compare known values across replay rounds to detect passthrough (mirroring `Tracer`'s
-// staging-identity `PartialEq`). Element-wise equality would require device-to-host transfers and is deliberately
-// not what this implements.
+// ordinary data in distinct buffers deliberately compare unequal, which is the conservative answer that analyses
+// comparing flowing values need (mirroring `Tracer`'s staging-identity `PartialEq`). Element-wise equality would
+// require device-to-host transfers and is deliberately not what this implements.
 impl PartialEq for Array<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.r#type == other.r#type
@@ -95,8 +91,7 @@ impl<'o> Clone for Array<'o> {
             shards: self.shards.clone(),
             shard_index_by_device: self.shard_index_by_device.clone(),
             execution_fence: self.execution_fence.clone(),
-            client: self.client,
-            execution_domain: Arc::clone(&self.execution_domain),
+            domain: self.domain.clone(),
             bounded_materializations: Arc::clone(&self.bounded_materializations),
             logical_extent_scalars: Arc::clone(&self.logical_extent_scalars),
         }
@@ -133,39 +128,37 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT [`Client`] the new [`Array`] lives on, recoverable later via [`Self::client`] (which is
-    ///     what lets eager execution and free transforms recover the array's execution domain without a manual
-    ///     [`Self::with_client`] call). The client is attached through [`Self::with_client`], which validates that
-    ///     it owns every addressable shard buffer. Callers assembling metadata-only arrays with no local client
-    ///     (e.g., arrays whose shards all live on other processes) may pass `None` to build a client-less array.
+    ///   - `domain`: [`XlaDomain`] the new [`Array`] belongs to. Its client must own every provided buffer, and it is
+    ///     what eager execution and free transforms recover through [`Value::execution_domain`]. Metadata-only arrays
+    ///     whose shards all live on other processes pass the local domain with no buffers.
     ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
     ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
-    pub fn from_addressable_buffers<C: Into<Option<&'o Client<'o>>>>(
-        client: C,
+    pub fn from_addressable_buffers(
+        domain: &XlaDomain<'o>,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        Self::from_addressable_buffers_internal(client, r#type, mesh, buffers, true)
+        Self::from_addressable_buffers_internal(domain, r#type, mesh, buffers, true)
     }
 
     /// Creates an [`Array`] from backend-produced buffers whose zero-space carriers are known to be canonical. This is
     /// the trusted internal counterpart of [`Self::from_addressable_buffers`]; it avoids synchronizing device buffers
     /// back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input boundaries,
     /// and discards canonical zero-space carriers after extracting their placement metadata.
-    pub(crate) fn from_canonical_addressable_buffers<C: Into<Option<&'o Client<'o>>>>(
-        client: C,
+    pub(crate) fn from_canonical_addressable_buffers(
+        domain: &XlaDomain<'o>,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, Error> {
-        Self::from_addressable_buffers_internal(client, r#type, mesh, buffers, false)
+        Self::from_addressable_buffers_internal(domain, r#type, mesh, buffers, false)
     }
 
     /// Implements addressable-buffer construction with optional validation of private zero-space carrier payloads.
-    fn from_addressable_buffers_internal<C: Into<Option<&'o Client<'o>>>>(
-        client: C,
+    fn from_addressable_buffers_internal(
+        domain: &XlaDomain<'o>,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
@@ -187,10 +180,18 @@ impl<'o> Array<'o> {
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
-        // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device.
+        // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device and
+        // buffers that the domain's client does not own.
         let mut buffers_by_device = HashMap::with_capacity(buffers.len());
         for buffer in buffers {
             let device = Device::from_pjrt(buffer.device()?)?;
+            if !buffer.is_owned_by(domain.client()) {
+                return Err(PjrtError::invalid_argument(format!(
+                    "the domain's client does not own the addressable shard buffer for device {}",
+                    device.id(),
+                ))
+                .into());
+            }
             let device_id = device.id();
             if buffers_by_device.contains_key(&device_id) {
                 return Err(Error::MultipleBuffersOnDevice { device_id });
@@ -288,25 +289,20 @@ impl<'o> Array<'o> {
 
         // TODO(eaplatanios): Review this.
         crate::telemetry::array_constructed();
-        let array = Self {
+        Ok(Self {
             r#type,
             shards,
             shard_index_by_device,
             execution_fence: None,
-            client: None,
-            execution_domain: Arc::new(OnceLock::new()),
+            domain: domain.clone(),
             bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
             logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
-        };
-        match client.into() {
-            Some(client) => array.with_client(client),
-            None => Ok(array),
-        }
+        })
     }
 
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
-    pub(crate) fn from_zero_space(client: &'o Client<'o>, r#type: ArrayType, mesh: DeviceMesh) -> Result<Self, Error> {
+    pub(crate) fn from_zero_space(domain: &XlaDomain<'o>, r#type: ArrayType, mesh: DeviceMesh) -> Result<Self, Error> {
         if !r#type.data_type().is_zero() {
             return Err(PjrtError::invalid_argument(format!(
                 "bufferless zero-space construction requires zero element type but got {}",
@@ -322,6 +318,7 @@ impl<'o> Array<'o> {
         let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
+        let client = domain.client();
         let process_index = client.process_index()?;
         let addressable_device_ids =
             client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
@@ -345,17 +342,17 @@ impl<'o> Array<'o> {
             shards,
             shard_index_by_device,
             execution_fence: None,
-            client: Some(client),
-            execution_domain: Arc::new(OnceLock::new()),
+            domain: domain.clone(),
             bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
             logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
     /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
-    /// and `mesh`, while avoiding redundant allocations external to the PJRT backend of the provided [`Client`].
+    /// and `mesh`, while avoiding redundant allocations external to the PJRT backend of the domain's [`Client`].
     /// This function derives the per-device shard slices from the provided type/mesh pair, transfers only the shards
-    /// addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
+    /// addressable by that client, and returns an [`Array`] that belongs to `domain` and whose global shard metadata
+    /// covers the full mesh.
     ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
     /// default memory; host placements select its `pinned_host` or `unpinned_host` memory. A device without the requested
@@ -363,12 +360,13 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT [`Client`] used to transfer the local addressable shard buffers.
+    ///   - `domain`: [`XlaDomain`] the constructed array belongs to. Its client transfers the local addressable shard
+    ///     buffers.
     ///   - `r#type`: Global [`ArrayType`] of the constructed array.
     ///   - `mesh`: Destination [`DeviceMesh`] describing the device topology.
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
     pub fn from_host_buffer<B: AsRef<[u8]>>(
-        client: &'o Client<'_>,
+        domain: &XlaDomain<'o>,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffer: B,
@@ -387,10 +385,11 @@ impl<'o> Array<'o> {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
         }
         if r#type.data_type().is_zero() {
-            return Ok(Self::from_zero_space(client, r#type, mesh)?);
+            return Ok(Self::from_zero_space(domain, r#type, mesh)?);
         }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
+        let client = domain.client();
         let client_process_index = client.process_index()?;
         let addressable_devices = client.addressable_devices()?;
         let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -528,57 +527,28 @@ impl<'o> Array<'o> {
             }
         }
 
-        // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly; it
-        // also attaches the client that transferred the local shard buffers so that it can be recovered later via
-        // `Self::client`.
-        Ok(Self::from_canonical_addressable_buffers(client, r#type, mesh, addressable_buffers)?)
+        // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly.
+        Ok(Self::from_canonical_addressable_buffers(domain, r#type, mesh, addressable_buffers)?)
     }
 
-    /// Attaches the provided PJRT [`Client`] to this [`Array`] so that it can be recovered later via [`Self::client`],
-    /// after validating that every addressable [`ArrayShard`]'s [`Buffer`] is owned by that [`Client`] (via
-    /// [`Buffer::is_owned_by`]). Arrays constructed through [`Self::from_host_buffer`] and
-    /// [`Self::from_addressable_buffers`] already carry the client they were constructed with; this builder is how
-    /// arrays assembled without one (i.e., with a `None` client) get a client attached after the fact.
+    /// Associates this [`Array`] with `domain` for future receiver-based dispatch, keeping its storage. This selects a
+    /// different effect scope or set of compilation options (or a different session) on the same PJRT client. It does
+    /// not merge or retroactively order work that was previously submitted through the array's former scope.
     ///
     /// # Errors
     ///
-    /// Changing the client of a bufferless array resets its execution association. Clones retain their original
-    /// association, and reattaching the same client preserves the existing scope.
-    ///
-    /// Returns [`Error::PjrtError`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if any
-    /// addressable shard's buffer is owned by a different PJRT client than the provided one.
-    pub fn with_client(mut self, client: &'o Client<'o>) -> Result<Self, Error> {
-        for shard in self.shards.iter().filter(|shard| shard.is_addressable()) {
-            if let Some(buffer) = shard.buffer()
-                && !buffer.is_owned_by(client)
-            {
-                return Err(PjrtError::invalid_argument(format!(
-                    "the provided client does not own the addressable shard buffer for device {}",
-                    shard.device().id(),
-                ))
-                .into());
-            }
+    /// Returns [`Error::PjrtError`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if
+    /// `domain` belongs to a different PJRT client than this array. Arrays cannot move between clients because their
+    /// addressable shard buffers are owned by the client they were created on.
+    pub fn associate(mut self, domain: &XlaDomain<'o>) -> Result<Self, Error> {
+        if !std::ptr::eq(self.client(), domain.client()) {
+            return Err(PjrtError::invalid_argument(
+                "cannot associate an array with a domain of a different PJRT client",
+            )
+            .into());
         }
-        if self.client.is_some_and(|previous| !std::ptr::eq(previous, client)) {
-            self.execution_domain = Arc::new(OnceLock::new());
-        }
-        self.client = Some(client);
+        self.domain = domain.clone();
         Ok(self)
-    }
-
-    /// Test-only helper that detaches the attached client so that client-less code paths (e.g., the device-set
-    /// fallback of eager placement validation) can be exercised on arrays built through client-attaching
-    /// constructors.
-    #[cfg(test)]
-    pub(crate) fn detach_client_for_tests(&mut self) {
-        self.client = None;
-    }
-
-    /// Associates future receiver-based dispatch with `domain`. Execution paths validate client identity before
-    /// producing arrays; this internal function preserves that already-validated association on their outputs.
-    pub(crate) fn with_execution_domain(mut self, domain: XlaDomain<'o>) -> Self {
-        self.execution_domain = Arc::new(OnceLock::from(domain));
-        self
     }
 
     /// Attaches the whole-execution completion fence that produced this array. This never waits and is used by the
@@ -589,22 +559,23 @@ impl<'o> Array<'o> {
         self
     }
 
-    /// Returns the PJRT [`Client`] that this [`Array`] lives on, if one is attached. Arrays constructed through
-    /// [`Self::from_host_buffer`] carry the client that transferred their addressable shard buffers, arrays
-    /// constructed through [`Self::from_addressable_buffers`] carry the client passed at construction, and
-    /// [`Self::with_client`] attaches a client after the fact. This returns [`None`] for arrays constructed with a
-    /// `None` client and no subsequent [`Self::with_client`] call (e.g., metadata-only arrays with no addressable
-    /// shards, which are not tied to any local client).
+    /// Returns the PJRT [`Client`] that this [`Array`] lives on, which is the client of the session of its domain.
     ///
     /// Note that the client cannot be recovered from the addressable shard buffers themselves: [`Buffer`]s only store
     /// a raw handle to their owning PJRT client (by design, to avoid carrying the
     /// [`KeyValueStore`](ryft_pjrt::KeyValueStore) lifetime), and [`Client`] is an owning wrapper whose [`Drop`]
     /// implementation destroys the underlying PJRT client, so no `&Client` can be materialized from that raw handle.
-    /// The client is therefore threaded through explicitly at array construction time instead, and
-    /// [`Buffer::is_owned_by`] validates that the attached client matches the buffers' owning PJRT client.
+    /// The domain is therefore threaded through explicitly at array construction time instead, and
+    /// [`Buffer::is_owned_by`] validates that its client owns every addressable shard buffer.
     #[inline]
-    pub fn client(&self) -> Option<&'o Client<'o>> {
-        self.client
+    pub fn client(&self) -> &'o Client<'o> {
+        self.domain.client()
+    }
+
+    /// Returns the [`XlaDomain`] this [`Array`] belongs to.
+    #[inline]
+    pub fn domain(&self) -> &XlaDomain<'o> {
+        &self.domain
     }
 
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
@@ -691,7 +662,7 @@ impl<'o> Array<'o> {
     /// Returns the replicated device-resident `i32` scalar for `extent` and whether this call uploaded it.
     pub(crate) fn logical_extent_scalar(
         &self,
-        client: &'o Client<'o>,
+        domain: &XlaDomain<'o>,
         extent: i32,
     ) -> Result<(Array<'o>, bool), ArrayError> {
         let mut scalars = self.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
@@ -706,7 +677,7 @@ impl<'o> Array<'o> {
         let scalar_type = ArrayType::scalar(DataType::I32)
             .with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))
             .map_err(Error::from)?;
-        let scalar = Array::from_host_buffer(client, scalar_type, self.mesh(), extent.to_ne_bytes())?;
+        let scalar = Array::from_host_buffer(domain, scalar_type, self.mesh(), extent.to_ne_bytes())?;
         let mut scalars = self.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -835,19 +806,12 @@ impl<'o> Value for Array<'o> {
         self.execution_domain()
     }
 
-    /// Recovers the eager [`XlaDomain`] this [`Array`] executes in. When the array carries an attached client (see
-    /// [`Array::client`]), the returned domain is backed by that client and shares this array's compile cache
-    /// (lazily initialized on first recovery for raw-client arrays). Session-created arrays share their session and
-    /// selected effect scope. Association is per value: receiver-based `x + y` and `y + x` may choose different scopes
-    /// even when their numerical values match. Fork scopes at task boundaries rather than inside expressions. Arrays
-    /// without an attached client recover a clientless domain carrying the XLA staged operation universe, but eager
-    /// binds fail with a clear
-    /// "requires a PJRT client" error; attach a client via [`Array::with_client`] to make such arrays executable.
+    /// Recovers the eager [`XlaDomain`] this [`Array`] belongs to (see [`Array::domain`]), and with it the session,
+    /// compilation cache, effect scope, and compilation options that receiver-based operations execute with.
+    /// Association is per value: receiver-based `x + y` and `y + x` may choose different scopes even when their
+    /// numerical values match. Fork scopes at task boundaries rather than inside expressions.
     fn execution_domain(&self) -> Self::ExecutionDomain {
-        ProjectedContext::new(match self.client {
-            Some(client) => self.execution_domain.get_or_init(|| XlaDomain::new(client)).clone(),
-            None => XlaDomain::clientless(),
-        })
+        ProjectedContext::new(self.domain.clone())
     }
 }
 
@@ -1269,12 +1233,13 @@ mod tests {
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Error as CoreError,
         Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Reference, Shape, Sharding, ShardingDimension,
-        ShardingError, StaticShape, TiledLayout, Typed, Value,
+        ShardingError, StaticShape, TiledLayout, Typed,
     };
+    use ryft_pjrt::protos::{CompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
-    use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaSession};
+    use crate::{Error, FromPjrt, ToPjrt, XlaSession};
 
     use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout, block_until_ready};
 
@@ -1283,6 +1248,11 @@ mod tests {
     #[test]
     fn test_array_is_send_and_sync() {
         assert_send_sync::<Array<'static>>();
+    }
+
+    #[test]
+    fn test_xla_session_is_send_and_sync() {
+        assert_send_sync::<XlaSession<'static>>();
     }
 
     #[test]
@@ -1299,6 +1269,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
@@ -1321,7 +1292,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Construct via `Array::from_addressable_buffers` and exercise every canonical `Array` accessor.
-        let array = Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
+        let array = Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
 
         assert_eq!(array.r#type().as_ref(), &array_type);
         assert_eq!(array.data_type(), DataType::F32);
@@ -1354,7 +1325,7 @@ mod tests {
             .with_layout(layout.clone())
             .with_sharding(sharding)
             .unwrap();
-        let layout_array = Array::from_addressable_buffers(None, layout_type, mesh.clone(), Vec::new()).unwrap();
+        let layout_array = Array::from_addressable_buffers(&domain, layout_type, mesh.clone(), Vec::new()).unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
@@ -1364,7 +1335,7 @@ mod tests {
         // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let host_array =
-            Array::from_host_buffer(&client, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
+            Array::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
                 .unwrap();
 
         assert_eq!(host_array.shape(), StaticShape::new(vec![4, 4]));
@@ -1388,6 +1359,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![Device::from_pjrt(&device).unwrap()]).unwrap();
@@ -1400,7 +1372,7 @@ mod tests {
         assert_ne!(actual, "pinned_host");
         assert_eq!(
             Array::from_addressable_buffers(
-                &client,
+                &domain,
                 r#type.with_memory(Memory::Host { pinned: true }),
                 mesh,
                 vec![buffer],
@@ -1420,6 +1392,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![Device::from_pjrt(&device).unwrap()]).unwrap();
@@ -1431,7 +1404,7 @@ mod tests {
             for shape in [Shape::new(vec![]), Shape::new(vec![Dimension::Static(2)])] {
                 let count = if shape.rank() == 0 { 1 } else { 2 };
                 let r#type = ArrayType::new(DataType::I64, shape).with_memory(memory);
-                let array = Array::from_host_buffer(&client, r#type, mesh.clone(), &values[..count * 8]).unwrap();
+                let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), &values[..count * 8]).unwrap();
                 assert_eq!(array.r#type().memory(), memory);
                 let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
                 let actual = buffer.memory().unwrap();
@@ -1451,12 +1424,13 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
+        let array = Array::from_host_buffer(&domain, r#type, mesh, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
         assert_eq!(array.size_in_bytes(), Ok(0));
         let shard = array.addressable_shards().next().unwrap();
@@ -1465,7 +1439,7 @@ mod tests {
         assert_eq!(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap(), Vec::<u8>::new());
 
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(0)]));
-        let zero_sized = Array::from_host_buffer(&client, zero_sized_type, array.mesh(), []).unwrap();
+        let zero_sized = Array::from_host_buffer(&domain, zero_sized_type, array.mesh(), []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
         assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
     }
@@ -1476,6 +1450,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1483,7 +1458,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let error = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap_err();
+        let error = Array::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap_err();
 
         assert!(matches!(error, Error::NonCanonicalZeroBuffer { .. }));
     }
@@ -1494,6 +1469,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1501,7 +1477,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let array = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap();
+        let array = Array::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap();
 
         assert_eq!(array.addressable_shards().count(), 1);
         assert!(array.addressable_shards().next().unwrap().buffer().is_none());
@@ -1514,13 +1490,14 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
+        let array = Array::from_host_buffer(&domain, r#type, mesh, []).unwrap();
 
         assert_eq!(array.shards().len(), 2);
         assert!(array.shards()[0].is_addressable());
@@ -1535,6 +1512,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
+        let domain = XlaSession::new(&client).domain();
         let device = client.addressable_devices().unwrap().remove(0);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(device.clone()).unwrap()]).unwrap();
@@ -1543,7 +1521,7 @@ mod tests {
                 ArrayType::scalar(data_type).with_sharding(Sharding::replicated(logical_mesh.clone(), 0)).unwrap();
             let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
             assert!(matches!(
-                Array::from_addressable_buffers(&client, array_type, mesh.clone(), vec![buffer]),
+                Array::from_addressable_buffers(&domain, array_type, mesh.clone(), vec![buffer]),
                 Err(Error::BufferTypeMismatch { expected, actual })
                     if expected == ArrayType::scalar(DataType::Boolean) && actual == ArrayType::scalar(data_type),
             ));
@@ -1568,19 +1546,22 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
 
-        // Arrays constructed via `Array::from_host_buffer` carry the client that transferred their shard buffers,
-        // and cloning an array preserves the attached client.
+        // Arrays constructed via `Array::from_host_buffer` belong to the provided domain and live on its client, which
+        // transferred their shard buffers. Cloning an array preserves that association.
+        let session = XlaSession::new(&client);
+        let domain = session.domain();
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
-        let array = Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
-        let recovered_client = array.client().unwrap();
+        let array = Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
+        let recovered_client = array.client();
         assert!(std::ptr::eq(recovered_client, &client));
         assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
         assert_eq!(recovered_client.addressable_devices().unwrap().len(), client_devices.len());
-        assert!(std::ptr::eq(array.clone().client().unwrap(), &client));
+        assert!(std::ptr::eq(array.clone().client(), &client));
+        assert!(Arc::ptr_eq(array.clone().domain().session(), &session));
 
-        // Arrays constructed via `Array::from_addressable_buffers` carry the client passed at construction, which
-        // is validated to own every addressable shard buffer.
+        // Arrays constructed via `Array::from_addressable_buffers` belong to the provided domain, whose client is
+        // validated to own every addressable shard buffer.
         let shard_buffers = || {
             client_devices
                 .iter()
@@ -1591,39 +1572,30 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let array =
-            Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
-        assert!(std::ptr::eq(array.client().unwrap(), &client));
+            Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        assert!(std::ptr::eq(array.client(), &client));
+        assert!(Arc::ptr_eq(array.domain().session(), &session));
 
-        // A `None` client builds a client-less array, and `Array::with_client` attaches one after the fact with
-        // the same buffer-ownership validation.
-        let array = Array::from_addressable_buffers(None, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
-        assert!(array.client().is_none());
-        let array = array.with_client(&client).unwrap();
-        assert!(std::ptr::eq(array.client().unwrap(), &client));
-
-        // A client that does not own the addressable shard buffers is rejected — both at construction time and
-        // through `Array::with_client` — even when that client was created from the same plugin with identical
-        // options.
+        // A domain whose client does not own the addressable shard buffers is rejected, even when that client was
+        // created from the same plugin with identical options.
         let other_client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
-        let error = array.with_client(&other_client).unwrap_err();
-        assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
-        assert!(error.to_string().starts_with("the provided client does not own the addressable shard buffer"));
-        let error = Array::from_addressable_buffers(&other_client, array_type.clone(), mesh.clone(), shard_buffers())
+        let other_domain = XlaSession::new(&other_client).domain();
+        let error = Array::from_addressable_buffers(&other_domain, array_type.clone(), mesh.clone(), shard_buffers())
             .unwrap_err();
         assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
-        assert!(error.to_string().starts_with("the provided client does not own the addressable shard buffer"));
+        assert!(error.to_string().starts_with("the domain's client does not own the addressable shard buffer"));
 
-        // Arrays with no addressable shards constructed with a `None` client carry no client and accept any client
-        // trivially.
-        let array = Array::from_addressable_buffers(None, array_type, mesh, Vec::new()).unwrap();
-        assert!(array.client().is_none());
-        assert!(std::ptr::eq(array.with_client(&other_client).unwrap().client().unwrap(), &other_client));
+        // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to (and live
+        // on the client of) the provided domain.
+        let array = Array::from_addressable_buffers(&other_domain, array_type, mesh, Vec::new()).unwrap();
+        assert_eq!(array.addressable_shards().count(), 0);
+        assert!(std::ptr::eq(array.client(), &other_client));
     }
 
     #[test]
-    fn test_array_with_client_replaces_bufferless_execution_association() {
+    fn test_array_associate() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -1637,36 +1609,56 @@ mod tests {
             vec![device],
         )
         .unwrap();
-        let session = Arc::new(XlaSession::new(&client));
-        let array = session.array(ArrayType::scalar(DataType::Zero), mesh, []).unwrap();
+        let session = XlaSession::new(&client);
+        let array = session.array(ArrayType::scalar(DataType::F32), mesh.clone(), 1f32.to_ne_bytes()).unwrap();
         let original = array.clone();
-        let unchanged = array.clone().with_client(&client).unwrap();
-        assert!(Arc::ptr_eq(&unchanged.execution_domain, &original.execution_domain));
 
-        let reassociated = array.with_client(&other_client).unwrap();
-        assert!(std::ptr::eq(reassociated.client().unwrap(), &other_client));
-        assert!(reassociated.execution_domain.get().is_none());
-        let _domain = reassociated.execution_domain();
-        assert!(std::ptr::eq(reassociated.execution_domain.get().unwrap().client().unwrap(), &other_client));
-        assert!(std::ptr::eq(original.execution_domain.get().unwrap().client().unwrap(), &client));
+        // Associating with a sibling domain of the same session switches the domain configuration (here, the
+        // compilation options) while keeping the array's storage.
+        let mut compilation_options = CompilationOptions::default();
+        compilation_options.matrix_unit_operand_precision = Precision::Highest as i32;
+        let sibling = session.domain().with_compilation_options(compilation_options);
+        let reassociated = array.clone().associate(&sibling).unwrap();
+        assert!(Arc::ptr_eq(reassociated.domain().session(), &session));
+        assert!(std::ptr::eq(reassociated.domain().compilation_options(), sibling.compilation_options()));
+        assert!(!std::ptr::eq(reassociated.domain().compilation_options(), original.domain().compilation_options()));
+        assert_eq!(reassociated, original);
 
-        // Session association rejects a foreign client even when no numerical buffer can establish ownership.
-        let other_session = Arc::new(XlaSession::new(&other_client));
-        assert!(matches!(
-            other_session.associate(original),
-            Err(ArrayError::Error(Error::PjrtError(PjrtError::InvalidArgument { message, .. })))
-                if message == "array belongs to a different session client",
-        ));
+        // Associating with a domain of another session on the same client switches the session (and therefore its
+        // compilation cache and default effect scope) while keeping the array's storage.
+        let other_session = XlaSession::new(&client);
+        let reassociated = array.associate(&other_session.domain().fork_effect_scope()).unwrap();
+        assert!(Arc::ptr_eq(reassociated.domain().session(), &other_session));
+        assert!(std::ptr::eq(reassociated.client(), &client));
+        assert_eq!(reassociated, original);
+
+        // Re-association never affects the clones that existed beforehand, which keep their original domain.
+        assert!(Arc::ptr_eq(original.domain().session(), &session));
+        assert!(std::ptr::eq(original.domain().compilation_options(), session.domain().compilation_options()));
+
+        // Association rejects a domain of a different client, even when no numerical buffer could establish
+        // ownership (as is the case for bufferless zero-space arrays).
+        let other_client_domain = XlaSession::new(&other_client).domain();
+        for array in [original, session.array(ArrayType::scalar(DataType::Zero), mesh, []).unwrap()] {
+            assert!(matches!(
+                array.associate(&other_client_domain),
+                Err(Error::PjrtError(PjrtError::InvalidArgument { message, .. }))
+                    if message == "cannot associate an array with a domain of a different PJRT client",
+            ));
+        }
     }
 
     #[test]
     fn test_array_debug() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
         let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
-        let array = Array::from_addressable_buffers(None, array_type, device_mesh, Vec::new()).unwrap();
+        let array = Array::from_addressable_buffers(&domain, array_type, device_mesh, Vec::new()).unwrap();
         assert_eq!(
             format!("{array:?}"),
             concat!(

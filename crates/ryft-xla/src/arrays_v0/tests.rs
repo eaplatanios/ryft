@@ -10,7 +10,7 @@ use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precis
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
-use crate::{Array, Error, FromPjrt, ToMlir, XlaDomain};
+use crate::{Array, Error, FromPjrt, ToMlir, XlaSession};
 
 use super::*;
 
@@ -43,6 +43,9 @@ fn test_shape(dimensions: &[usize]) -> StaticShape {
 
 #[test]
 fn test_array_new_requires_sharding_without_single_buffer() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+    let domain = XlaSession::new(&client).domain();
     let mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 1)],
@@ -50,9 +53,10 @@ fn test_array_new_requires_sharding_without_single_buffer() {
     .unwrap();
     let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-    assert!(
-        matches!(Array::from_addressable_buffers(None, array_type, mesh, Vec::new()), Err(Error::MissingSharding),)
-    );
+    assert!(matches!(
+        Array::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
+        Err(Error::MissingSharding),
+    ));
 }
 
 #[test]
@@ -61,6 +65,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
         .unwrap();
+    let domain = XlaSession::new(&client).domain();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -76,7 +81,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
         .buffer(values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(), BufferType::F32, [2u64], None, device, None)
         .unwrap();
 
-    let array = Array::from_addressable_buffers(&client, array_type, mesh, vec![buffer]).unwrap();
+    let array = Array::from_addressable_buffers(&domain, array_type, mesh, vec![buffer]).unwrap();
 
     assert_eq!(array.shape(), StaticShape::new(vec![2]));
     assert_eq!(array.data_type(), DataType::F32);
@@ -89,6 +94,9 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
 
 #[test]
 fn test_array_new_rejects_dynamic_shape() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+    let domain = XlaSession::new(&client).domain();
     let mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 1)],
@@ -101,7 +109,7 @@ fn test_array_new_rejects_dynamic_shape() {
         .unwrap();
 
     assert!(matches!(
-        Array::from_addressable_buffers(None, array_type, mesh, Vec::new()),
+        Array::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
         Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
     ));
 }
@@ -112,6 +120,7 @@ fn test_device_put_visualizes_uneven_1d_partitioning() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
         .unwrap();
+    let domain = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
     let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
     let mesh =
@@ -124,7 +133,7 @@ fn test_device_put_visualizes_uneven_1d_partitioning() {
         .unwrap();
 
     let array =
-        Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
+        Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
             .unwrap();
 
     assert_eq!(array.addressable_shards().count(), 2);
@@ -147,6 +156,7 @@ fn test_device_put_visualizes_2d_partitioning() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let domain = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
     let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
     let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
@@ -161,7 +171,7 @@ fn test_device_put_visualizes_2d_partitioning() {
         .unwrap();
 
     let array =
-        Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
+        Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
             .unwrap();
 
     assert_eq!(array.addressable_shards().count(), 4);
@@ -246,6 +256,7 @@ fn test_array_put_reshards_fully_addressable_array() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -263,7 +274,7 @@ fn test_array_put_reshards_fully_addressable_array() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array = Array::from_host_buffer(
-        &client,
+        &engine,
         source_type,
         source_mesh,
         values_to_bytes::<f32>(source_values.as_slice()).as_slice(),
@@ -279,7 +290,6 @@ fn test_array_put_reshards_fully_addressable_array() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-    let engine = XlaDomain::new(&client);
     let moved_array = source_array
         .to_placement(
             &engine,
@@ -328,6 +338,7 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -344,9 +355,8 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
-    let engine = XlaDomain::new(&client);
     let copied_array = source_array
         .to_placement(&engine, crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding })
         .unwrap();
@@ -375,6 +385,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let domain = XlaSession::new(&client).domain();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -392,7 +403,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&client, source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&domain, source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(remote_device_id, 1), Device::new(local_device_id, client.process_index().unwrap())],
@@ -426,6 +437,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0), Device::new(1, 1)],
@@ -436,7 +448,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
         .with_sharding(source_sharding)
         .unwrap();
-    let source_array = Array::from_addressable_buffers(None, source_array_type, source_mesh, Vec::new()).unwrap();
+    let source_array = Array::from_addressable_buffers(&engine, source_array_type, source_mesh, Vec::new()).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0)],
@@ -444,7 +456,6 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     .unwrap();
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
-    let engine = XlaDomain::new(&client);
     assert!(matches!(
         source_array.to_placement(
             &engine,
@@ -460,6 +471,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -471,7 +483,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         .with_sharding(source_sharding.clone())
         .unwrap();
     let first_source_array = Array::from_host_buffer(
-        &client,
+        &engine,
         first_source_type,
         source_mesh.clone(),
         values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0]).as_slice(),
@@ -481,7 +493,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
         .with_sharding(source_sharding)
         .unwrap();
     let second_source_array = Array::from_host_buffer(
-        &client,
+        &engine,
         second_source_type,
         source_mesh,
         values_to_bytes::<f32>(&[10.0, 11.0, 12.0, 13.0]).as_slice(),
@@ -496,7 +508,6 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-    let engine = XlaDomain::new(&client);
     let moved_arrays = device_put(
         &engine,
         (first_source_array, second_source_array),
@@ -561,6 +572,7 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -577,9 +589,8 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
-    let engine = XlaDomain::new(&client);
     let copied_array = device_put(&engine, source_array, DevicePutOptions::defaults()).unwrap();
     let expected_visualization =
         format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
@@ -606,6 +617,7 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -622,9 +634,8 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
-    let engine = XlaDomain::new(&client);
     let copied_array = source_array
         .into_placement(&engine, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
         .unwrap();
@@ -653,6 +664,7 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let client_device = client.addressable_devices().unwrap().remove(0);
     let source_device = Device::from_pjrt(client_device).unwrap();
     let source_mesh = DeviceMesh::new(
@@ -665,7 +677,7 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
         .with_sharding(source_sharding.clone())
         .unwrap();
     let source_array = Array::from_host_buffer(
-        &client,
+        &engine,
         source_type,
         source_mesh.clone(),
         values_to_bytes::<f32>(&[0.0, 1.0]).as_slice(),
@@ -674,7 +686,6 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
     let expected_src = DevicePutTarget::device(Device::new(source_device.id() + 1, 0)).resolve(1).unwrap();
     let actual_src = (source_mesh, source_sharding);
 
-    let engine = XlaDomain::new(&client);
     assert!(matches!(
         device_put(
             &engine,
@@ -705,6 +716,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
         .expect("failed to create 8-device CPU client");
+    let domain = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
     assert_eq!(client_devices.len(), 8);
 
@@ -767,8 +779,8 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let rhs_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]))
         .with_sharding(rhs_sharding)
         .unwrap();
-    let lhs_array = Array::from_addressable_buffers(&client, lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
-    let rhs_array = Array::from_addressable_buffers(&client, rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
+    let lhs_array = Array::from_addressable_buffers(&domain, lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
+    let rhs_array = Array::from_addressable_buffers(&domain, rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
 
     assert_eq!(lhs_array.data_type(), DataType::F32);
     assert_eq!(rhs_array.data_type(), DataType::F32);
@@ -858,8 +870,8 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
 
     let values = [10.0f32, 11.0, 12.0, 13.0];
     let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -867,7 +879,7 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -902,8 +914,8 @@ fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
     let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
     let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
     let source_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(4)]))
@@ -911,7 +923,7 @@ fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
         .with_memory(Memory::Host { pinned: true })
         .with_sharding(source_sharding)
         .unwrap();
-    let source = Array::from_host_buffer(&client, source_type, mesh.clone(), []).unwrap();
+    let source = Array::from_host_buffer(&engine, source_type, mesh.clone(), []).unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     let resharded = source
@@ -931,8 +943,8 @@ fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
 
     let values = [20.0f32, 21.0, 22.0, 23.0];
     let sharded_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -940,7 +952,7 @@ fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
         .with_sharding(sharded_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let replicated_target = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -974,6 +986,7 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -981,7 +994,6 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         .map(|device| Device::from_pjrt(device).unwrap())
         .collect::<Vec<_>>();
     let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
-    let engine = XlaDomain::new(&client);
 
     let row_values = [
         100.0f32, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 120.0, 121.0, 122.0, 123.0, 130.0, 131.0, 132.0,
@@ -997,7 +1009,7 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         .with_sharding(sharded_along_x)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&row_values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&row_values).as_slice())
             .unwrap();
 
     let sharded_along_y = Sharding::new(
@@ -1036,6 +1048,7 @@ fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
 
     // Source lives on a 1-device sub-mesh.
@@ -1050,13 +1063,12 @@ fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     // Reshard onto the full 4-device mesh, sharded along "x".
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding =
         Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let engine = XlaDomain::new(&client);
     let resharded = source_array
         .to_placement(
             &engine,
@@ -1087,8 +1099,8 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
 
     let values = [300.0f32, 301.0, 302.0, 303.0];
     let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -1096,7 +1108,7 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     // to_device consumes self and donates the source's input buffers to the compiled SPMD
@@ -1135,14 +1147,14 @@ fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
     let values = (0..4096).map(|index| index as f32).collect::<Vec<_>>();
     let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
@@ -1178,13 +1190,13 @@ fn test_compilation_context_preserves_custom_base_options() {
         .unwrap();
     let mesh = four_device_mesh_x(&client);
 
-    // Construct contexts with two distinct base option templates. Different `Debug`
-    // representations should produce different cache keys, so the same MLIR program compiles
-    // separately under each context.
+    // Construct sibling domains of one session with two distinct base option templates. Different `Debug`
+    // representations should produce different cache keys, so the same MLIR program compiles separately under each
+    // domain even though both domains share the session's compilation cache.
     let mut custom_options = CompilationOptions::default();
     custom_options.matrix_unit_operand_precision = Precision::Highest as i32;
-    let default_engine = XlaDomain::new(&client);
-    let custom_engine = XlaDomain::with_compilation_options(&client, custom_options);
+    let default_engine = XlaSession::new(&client).domain();
+    let custom_engine = default_engine.with_compilation_options(custom_options);
 
     let values = [200.0f32, 201.0, 202.0, 203.0];
     let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -1192,11 +1204,15 @@ fn test_compilation_context_preserves_custom_base_options() {
         .with_sharding(replicated_sharding)
         .unwrap();
 
-    // Reshard once per context with identical inputs. Each context compiles independently.
+    // Reshard once per domain with identical inputs. Each domain compiles its own executable.
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let source_for_default =
-        Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-            .unwrap();
+    let source_for_default = Array::from_host_buffer(
+        &default_engine,
+        source_type.clone(),
+        mesh.clone(),
+        values_to_bytes::<f32>(&values).as_slice(),
+    )
+    .unwrap();
     let _ = source_for_default
         .to_placement(
             &default_engine,
@@ -1204,14 +1220,15 @@ fn test_compilation_context_preserves_custom_base_options() {
         )
         .unwrap();
     let source_for_custom =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&custom_engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let _ = source_for_custom
         .to_placement(&custom_engine, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: sharded_target })
         .unwrap();
 
-    assert_eq!(default_engine.cache_size(), 1);
-    assert_eq!(custom_engine.cache_size(), 1);
+    // Both domains observe the shared session cache, which holds one executable per option template.
+    assert_eq!(default_engine.cache_size(), 2);
+    assert_eq!(custom_engine.cache_size(), 2);
     assert_eq!(
         custom_engine.compilation_options().matrix_unit_operand_precision,
         Precision::Highest as i32,
@@ -1225,10 +1242,10 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
-    let engine = XlaDomain::new(&client);
 
     // Source array on the local device, replicated on a 1-device sub-mesh.
     let source_mesh = DeviceMesh::new(
@@ -1241,7 +1258,7 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     // Destination mesh contains a device on a remote process (process_index 1) that is not
     // addressable from the current client. The compiled cross-mesh path surfaces this as a typed
@@ -1275,6 +1292,7 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1288,7 +1306,6 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
         devices,
     )
     .unwrap();
-    let engine = XlaDomain::new(&client);
 
     let values = [400.0f32, 401.0, 402.0, 403.0];
     let replicated_sharding = Sharding::replicated(explicit_mesh.logical_mesh().clone(), 1);
@@ -1296,7 +1313,7 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array = Array::from_host_buffer(
-        &client,
+        &engine,
         source_type,
         explicit_mesh.clone(),
         values_to_bytes::<f32>(&values).as_slice(),
@@ -1335,6 +1352,7 @@ fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1344,7 +1362,6 @@ fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     let manual_mesh =
         DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(), devices)
             .unwrap();
-    let engine = XlaDomain::new(&client);
 
     let values = [40.0f32, 41.0, 42.0, 43.0];
     let replicated_sharding = Sharding::replicated(manual_mesh.logical_mesh().clone(), 1);
@@ -1352,7 +1369,7 @@ fn test_to_with_manual_mesh_axes_uses_host_fallback() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, manual_mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, manual_mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     // Manual mesh axes cannot be planned by the SPMD partitioner — the compiled path declines.
@@ -1404,7 +1421,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
-    let engine = XlaDomain::new(&client);
+    let engine = XlaSession::new(&client).domain();
 
     // Source: sharded along "x" on a 2-device sub-mesh (devices 0 and 1 each hold half the data).
     let source_mesh = two_device_sub_mesh_x(&client);
@@ -1415,7 +1432,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     // Destination: replicated on the full 4-device mesh. The sharded source first all-gathers on
     // src_mesh, broadcasts onto dst_mesh, and (since the intermediate sharding matches the
@@ -1452,7 +1469,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
-    let engine = XlaDomain::new(&client);
+    let engine = XlaSession::new(&client).domain();
 
     // Source: sharded along "x" on a 2-device sub-mesh.
     let source_mesh = two_device_sub_mesh_x(&client);
@@ -1463,7 +1480,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     // Destination: sharded along "x" on the full 4-device mesh. Each destination shard holds
     // exactly one element of the global array.
@@ -1500,7 +1517,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
-    let engine = XlaDomain::new(&client);
+    let engine = XlaSession::new(&client).domain();
 
     let source_mesh = two_device_sub_mesh_x(&client);
     let source_sharding =
@@ -1510,7 +1527,7 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding =
@@ -1534,6 +1551,7 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let client_devices = client.addressable_devices().unwrap();
 
     // Source: replicated on a 1-device sub-mesh.
@@ -1548,14 +1566,13 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
 
     // Target: replicated on the full 4-device mesh. The fast path matches every destination shard
     // to the source's single full-array shard. With the bitcast branch removed, copy_to_device
     // produces independent buffers on each device and copy_to_host works on every one of them.
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
-    let engine = XlaDomain::new(&client);
     let resharded = source_array
         .to_placement(
             &engine,
@@ -1586,8 +1603,8 @@ fn test_compiled_reshard_caches_executable_across_calls() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
 
     let values = [30.0f32, 31.0, 32.0, 33.0];
     let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -1595,7 +1612,7 @@ fn test_compiled_reshard_caches_executable_across_calls() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1636,7 +1653,7 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
         .collect::<Vec<_>>();
     let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
     // Capacity = 2 so that the third distinct reshard evicts the first.
-    let engine = XlaDomain::with_cache_capacity(&client, 2);
+    let engine = XlaSession::with_cache_capacity(&client, 2).domain();
 
     // Replicated source on the 2x2 mesh. Three reshards to three different non-replicated
     // shardings all force the compiled path (the fast path returns `None` because no destination
@@ -1647,7 +1664,7 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let make_source = || {
-        Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap()
     };
     let sharded_along_x = Sharding::new(
@@ -1707,10 +1724,14 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     // First context: cold compile, disk cache picks up the serialized executable.
-    let engine_one = XlaDomain::with_disk_cache(&client, cache_dir.path()).unwrap();
-    let source =
-        Array::from_host_buffer(&client, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-            .unwrap();
+    let engine_one = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
+    let source = Array::from_host_buffer(
+        &engine_one,
+        source_type.clone(),
+        mesh.clone(),
+        values_to_bytes::<f32>(&values).as_slice(),
+    )
+    .unwrap();
     let _ = source
         .to_placement(
             &engine_one,
@@ -1718,13 +1739,14 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
         )
         .unwrap();
     assert_eq!(engine_one.cache_size(), 1, "first reshard should populate the in-memory cache");
+    drop(source);
     drop(engine_one);
 
     // Second context starts with an empty in-memory cache but loads from the disk cache.
-    let engine_two = XlaDomain::with_disk_cache(&client, cache_dir.path()).unwrap();
+    let engine_two = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
     assert_eq!(engine_two.cache_size(), 0, "fresh context starts empty in-memory");
     let source_two =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let _ = source_two
         .to_placement(&engine_two, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding })
@@ -1742,8 +1764,8 @@ fn test_compilation_context_clear_cache() {
     let client = plugin
         .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
         .unwrap();
+    let engine = XlaSession::new(&client).domain();
     let mesh = four_device_mesh_x(&client);
-    let engine = XlaDomain::new(&client);
 
     let values = [80.0f32, 81.0, 82.0, 83.0];
     let replicated_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -1751,7 +1773,7 @@ fn test_compilation_context_clear_cache() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&client, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 

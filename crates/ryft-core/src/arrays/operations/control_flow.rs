@@ -19,11 +19,11 @@ use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::EagerContext;
-use crate::interpretation::InterpretationDriver;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::control_flow::scan::{
-    SCAN_OPERATION_NAME, ScanInterpretation, read_scan_iteration, stacked_scan_type, validate_scan_runtime_length,
-    write_scan_iteration,
+    SCAN_OPERATION_NAME, ScanOperation, read_scan_iteration, stacked_scan_type, validate_scan_length,
+    validate_scan_runtime_length, write_scan_iteration,
 };
 use crate::operations::control_flow::{
     TemporalResidualOperation, TemporalResidualType, WhileResidualStackOperation, WhileResidualStackType,
@@ -224,31 +224,36 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
     }
 }
 
-impl<A, O> ScanInterpretation<EagerContext<ArrayIrValue<A>, O>> for ArrayIrType
+// Composite scans interpret their array stacks through the homogeneous array [`EagerContext`], pass reference stacks
+// to the body as whole roots (the body selects its own per-iteration view with the explicit index), and take a dynamic
+// trip count from the trailing first-class dimension input.
+impl<A, O> InterpretableOperation<EagerContext<ArrayIrValue<A>, O>> for ScanOperation<ArrayIrType>
 where
     A: Reshape + Slice + UpdateSlice + Value<Type = ArrayType>,
     O: Operation<Type = ArrayIrType>,
     EagerContext<A, ArrayOperation<A>>: Fill<i64, A> + Zero<A>,
 {
-    fn interpret_scan<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, O>>>(
-        carry_count: usize,
-        length: &Dimension,
-        reverse: bool,
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, O>>>(
+        &self,
         context: &EagerContext<ArrayIrValue<A>, O>,
         driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
+        validate_scan_length(self.length())?;
+        let carry_count = self.carry_count();
+        let length = self.length();
+        let reverse = self.reverse();
         let (inputs, length) = match length {
             Dimension::Static(length) => (inputs, *length),
             Dimension::Dynamic(_) => {
-                let (runtime_length, stacked_inputs) =
+                let (runtime_length, scan_inputs) =
                     inputs.split_last().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
                 // The runtime-length safety rule is defined once, in the types space. Applying it to the actual input
                 // types keeps eager interpretation and staged type inference exactly in step.
                 let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
-                validate_scan_runtime_length(length, input_types.as_slice(), carry_count, stacked_inputs.len())?;
+                validate_scan_runtime_length(length, input_types.as_slice(), carry_count, scan_inputs.len())?;
                 let runtime_length = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(runtime_length)?;
-                (stacked_inputs, runtime_length.extent())
+                (scan_inputs, runtime_length.extent())
             }
         };
         let body = driver.region(0)?;
@@ -288,8 +293,10 @@ where
                 array_context.zero(&stacked_scan_type(&r#type.clone().with_shape(Shape::new(dimensions)), length))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let iterations: Box<dyn Iterator<Item = usize>> =
-            if reverse { Box::new((0..length).rev()) } else { Box::new(0..length) };
+        let mut iterations = (0..length).collect::<Vec<_>>();
+        if reverse {
+            iterations.reverse();
+        }
         for iteration in iterations {
             let mut iteration_inputs =
                 vec![ArrayIrValue::Array(array_context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?)];
@@ -919,7 +926,7 @@ mod tests {
         /// the per-iteration slice reference and then folds the updated slice into the carry, and that returns the
         /// final carry.
         fn scanned(
-            operation: ScanOperation<TestValue>,
+            operation: ScanOperation<ArrayIrType>,
             length: usize,
         ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
             let scalar_type = ArrayType::scalar(DataType::F32);
@@ -1150,6 +1157,73 @@ mod tests {
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![array(Array::scalar(24.0).unwrap()), array(Array::vector(vec![12.0, 8.0, 6.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_scan_jvp_shapes_a_disconnected_dynamic_carry_tangent_from_its_primal() {
+        // Body `[extent, carry, x] -> [extent, carry + x]` over a dynamically shaped carry whose initial value has its
+        // tangent severed. The severed carry still receives a tangent carry slot because the body makes it active
+        // through `x`, so its structurally zero initial tangent must be shaped from its own primal.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let stacked_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent_type.variable().clone())]),
+        );
+        let body = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let _index = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+            let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+            let carry = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let x = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let sum = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                    Vec::new(),
+                    vec![carry, x],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![extent, sum], vec![Placeholder; 4], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let initial = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let values = builder.add_input(ArrayIrType::Array(stacked_type));
+        let severed = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
+                Vec::new(),
+                vec![initial],
+                None,
+            )
+            .unwrap()[0];
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Scan(ScanOperation::new(2, 3)),
+                vec![region],
+                vec![extent, severed, values],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(vec![outputs[1]], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                dimension(&extent_type, 2),
+                array(Array::vector(vec![1.0, 2.0]).unwrap()),
+                array(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                array(Array::vector(vec![7.0, 7.0]).unwrap()),
+                array(Array::matrix(3, 2, vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]).unwrap()),
+            ]),
+            Ok(vec![array(Array::vector(vec![10.0, 14.0]).unwrap()), array(Array::vector(vec![4.5, 6.0]).unwrap()),]),
         );
     }
 

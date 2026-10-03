@@ -31,7 +31,7 @@ pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
 /// Applies an ordered additive update that preserves the selected referent's exact type. The root and update are the
 /// first two inputs. Dynamic bindings follow them in transform order and the path is stored in `Transform` metadata.
 /// An empty path accesses the complete referent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceAddUpdateOperation<
     T: Type,
     U: Type,

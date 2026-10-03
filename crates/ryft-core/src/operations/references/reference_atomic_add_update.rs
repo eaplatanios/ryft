@@ -34,7 +34,7 @@ pub const REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME: &str = "reference_atomic_a
 ///
 /// Refer to the documentation of [`ReferenceAtomicAddUpdate`] for information on the ordering, scope,
 /// and caller contract.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceAtomicAddUpdateOperation<
     T: Type,
     U: Type,

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use approx::assert_abs_diff_eq;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
@@ -9,6 +12,13 @@ use crate::parameters::Placeholder;
 use crate::tracing::TracingContext;
 
 use super::*;
+
+/// Returns the hash of `value` under the standard library's default hasher.
+fn hash_of<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
 
 #[test]
 fn test_attention_configuration() {
@@ -27,6 +37,29 @@ fn test_attention_configuration() {
     assert!(configuration.return_residual());
     assert_eq!(configuration.dropout(), Some((0.1, 7)));
     assert_eq!(AttentionConfiguration::new().with_symmetric_local_window(3).local_window(), Some((3, 3)));
+}
+
+#[test]
+fn test_attention_configuration_identity() {
+    // Equal configurations are equal and hash identically, so they work as map keys.
+    let configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout((0.1, 7));
+    let same_configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout((0.1, 7));
+    assert_eq!(configuration, same_configuration);
+    assert_eq!(hash_of(&configuration), hash_of(&same_configuration));
+    let configurations = HashMap::from([(configuration, "configuration")]);
+    assert_eq!(configurations.get(&same_configuration), Some(&"configuration"));
+    assert_ne!(configuration, configuration.with_causal(false));
+
+    // The scale and the dropout rate compare bitwise, so signed zeros are distinct even though `-0.0 == 0.0`.
+    assert_ne!(AttentionConfiguration::new().with_scale(-0.0), AttentionConfiguration::new().with_scale(0.0));
+    assert_ne!(AttentionConfiguration::new().with_scale(0.0), AttentionConfiguration::new());
+    assert_ne!(configuration, configuration.with_dropout((0.2, 7)));
+    assert_ne!(configuration, configuration.with_dropout((0.1, 8)));
+    assert_ne!(
+        AttentionConfiguration::new().with_dropout((-0.0, 7)),
+        AttentionConfiguration::new().with_dropout((0.0, 7)),
+    );
+    assert_eq!(configurations.get(&configuration.with_dropout((0.2, 7))), None);
 }
 
 #[test]

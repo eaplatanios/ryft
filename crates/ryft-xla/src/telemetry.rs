@@ -67,10 +67,11 @@ pub(crate) fn array_dropped() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Array;
+    use crate::{Array, XlaSession};
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     /// The telemetry hooks advance their respective cumulative counters. Because both counters
     /// are monotonically non-decreasing, concurrent `Array` activity from other tests can only
@@ -107,6 +108,9 @@ mod tests {
     /// `Array`s other tests construct or drop concurrently.
     #[test]
     fn test_live_array_count_tracks_array_construction_and_drop() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
@@ -116,7 +120,7 @@ mod tests {
         let constructed_baseline = constructed_array_count();
         let arrays: Vec<Array<'_>> = (0..200)
             .map(|_| {
-                Array::from_addressable_buffers(None, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
+                Array::from_addressable_buffers(&domain, array_type.clone(), device_mesh.clone(), Vec::new()).unwrap()
             })
             .collect();
         let after_construct = constructed_array_count();

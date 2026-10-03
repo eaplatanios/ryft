@@ -74,7 +74,7 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 /// represented by a [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation) instead, whose
 /// transposition applies that rule inline rather than swapping regions. Keeping such maps out of this operation
 /// means that every consumer of a linear call can rely on its forward region.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LinearCallOperation<T: DifferentiableType> {
     /// Number of leading residual inputs.
     residual_count: usize,

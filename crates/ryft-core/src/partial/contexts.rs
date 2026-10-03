@@ -1339,9 +1339,8 @@ impl<C: Context> PartialTracer<C> {
 
 // `PartialTracer` equality is *value identity* and not payload equality. Two values are equal if and only if they are
 // clones of one logical partial-evaluation value (witnessed by sharing one materialization slot). Two values that would
-// evaluate to equal payloads but were produced separately are considered unequal, which is the conservative answer
-// analyses such as the scan/while loop-invariance fixed points of partial evaluation need (they degrade to passthrough
-// detection, mirroring `Tracer`'s staging-identity `PartialEq`).
+// evaluate to equal payloads but were produced separately are considered unequal, which is the conservative answer that
+// analyses comparing flowing values need (mirroring `Tracer`'s staging-identity `PartialEq`).
 impl<C: Context> PartialEq for PartialTracer<C> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {

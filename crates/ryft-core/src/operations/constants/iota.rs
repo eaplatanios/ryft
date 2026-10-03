@@ -33,7 +33,7 @@ pub const IOTA_OPERATION_NAME: &str = "iota";
 /// index-generating counterpart of constructing a scalar literal and broadcasting it. Rather than filling every
 /// element with one scalar value, it synthesizes the per-position index through the [`Iota`] trait when interpreted.
 /// It mirrors StableHLO's [`iota`](https://openxla.org/stablehlo/spec#iota).
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IotaOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     r#type: T,

@@ -28,7 +28,7 @@ use ryft_core::{
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 use ryft_xla::experimental::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
-use ryft_xla::{Array, FromPjrt};
+use ryft_xla::{Array, FromPjrt, XlaSession};
 
 /// Schema version emitted by this binary and accepted by the Python comparison harness.
 const SCHEMA: &str = "ryft-jax-differential-v1";
@@ -177,7 +177,7 @@ fn execute_collective_module(
     let input_type =
         ArrayType::new(DataType::F32, Shape::new(global_shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)?;
-    let input = Array::from_addressable_buffers(client, input_type, device_mesh, buffers)?;
+    let input = Array::from_addressable_buffers(&XlaSession::new(client).domain(), input_type, device_mesh, buffers)?;
     let executable =
         client.compile(&Program::Mlir { bytecode: module.as_bytes().to_vec() }, &collective_compilation_options())?;
     let execution_device_ids =

@@ -68,7 +68,7 @@ pub(crate) fn reshard_with_donation<'o>(
 ) -> Result<Array<'o>, ArrayError> {
     if source.data_type().is_zero() {
         let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
-        return Ok(Array::from_zero_space(engine.client()?, r#type, dst_mesh.clone())?);
+        return Ok(Array::from_zero_space(engine, r#type, dst_mesh.clone())?);
     }
     // `Manual` axes are managed explicitly by the user (e.g. inside `shard_map`) and cannot be
     // planned by the SPMD partitioner from the top level. `Auto` and `Explicit` axes both go
@@ -83,7 +83,7 @@ pub(crate) fn reshard_with_donation<'o>(
     // Source shards on the current process must carry a local buffer (a missing one indicates a
     // real misconfiguration). Shards on other processes are normal — they're served by the
     // cross-host transfers extension when the compiled path needs them.
-    let client_process_index = engine.client()?.process_index().map_err(XlaError::from)?;
+    let client_process_index = engine.client().process_index().map_err(XlaError::from)?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
             return Err(ArrayError::MissingAddressableShardForMove {
@@ -159,7 +159,7 @@ fn try_replicated_cross_mesh<'o>(
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
 ) -> Result<Array<'o>, ArrayError> {
-    let client = engine.client()?;
+    let client = engine.client();
     let client_process_index = client.process_index().map_err(XlaError::from)?;
     let addressable_devices = client.addressable_devices().map_err(XlaError::from)?;
     let mut dst_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -300,7 +300,7 @@ fn try_replicated_cross_mesh<'o>(
     let intermediate_type = ArrayType::new(element_type, shape.into())
         .with_sharding(replicated_on_dst)
         .map_err(XlaError::from)?;
-    let intermediate = Array::from_addressable_buffers(client, intermediate_type, dst_mesh.clone(), buffers)?;
+    let intermediate = Array::from_addressable_buffers(engine, intermediate_type, dst_mesh.clone(), buffers)?;
 
     // The intermediate is owned exclusively by this function and is never observed by callers.
     // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.

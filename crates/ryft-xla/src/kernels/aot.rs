@@ -130,8 +130,7 @@ impl KernelAotBundle {
         let binding =
             options.kernel_compiler.as_ref().ok_or_else(|| Self::invalid("a compiler binding is required"))?;
         let configuration = binding.configuration().to_vec();
-        let facts =
-            XlaKernelExecutionFacts::from_client(domain.client().map_err(XlaDomainError::from)?, &options.mesh)?;
+        let facts = XlaKernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
         let staged =
@@ -281,7 +280,7 @@ impl KernelAotBundle {
         if binding.configuration() != self.manifest.configuration {
             return Err(Self::invalid("compiler binding configuration mismatch"));
         }
-        let facts = XlaKernelExecutionFacts::from_client(domain.client().map_err(XlaDomainError::from)?, mesh)?;
+        let facts = XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?;
         if facts.configuration_key()? != self.manifest.execution {
             return Err(Self::invalid("live execution compatibility mismatch"));
         }
@@ -376,11 +375,11 @@ impl<'c> LoadedKernel<'c> {
 pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayIrValue, DataType, Device, LogicalMesh, Typed};
-    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::FromPjrt;
     use crate::kernels::staging::tests::binding;
     use crate::kernels::tests::definition;
+    use crate::{FromPjrt, XlaSession};
 
     use super::*;
 
@@ -421,7 +420,6 @@ pub(crate) mod tests {
     /// Compiles a real ordinary CPU executable to isolate the AOT loader's stateless boundary checks.
     /// This fixture does not claim execution of a mock adapter's custom call.
     pub(crate) fn executable_bundle<'c>(
-        client: &'c Client<'c>,
         domain: &XlaDomain<'c>,
         mesh: &DeviceMesh,
         data_type: DataType,
@@ -431,7 +429,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
             vec![ArrayIrValue::Array(
-                Array::from_host_buffer(client, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
+                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {
             vec![]
@@ -452,15 +450,17 @@ pub(crate) mod tests {
         bundle.manifest.configuration = compiler.configuration().to_vec();
         bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         bundle.manifest.execution =
-            XlaKernelExecutionFacts::from_client(client, mesh).unwrap().configuration_key().unwrap();
+            XlaKernelExecutionFacts::from_target(domain.target().unwrap(), mesh).unwrap().configuration_key().unwrap();
         bundle
     }
 
     #[test]
     fn test_kernel_aot_bundle_compile_missing_binding() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
-            KernelAotBundle::compile(&definition(), &XlaDomain::clientless(), XlaOptions::new(mesh), 1),
+            KernelAotBundle::compile(&definition(), &domain, XlaOptions::new(mesh), 1),
             Err(KernelAotError::Invalid { message }) if message == "a compiler binding is required",
         ));
     }
@@ -471,9 +471,11 @@ pub(crate) mod tests {
 
         let operation = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
-            KernelAotBundle::compile(&definition, &XlaDomain::clientless(), XlaOptions::new(mesh), 1),
+            KernelAotBundle::compile(&definition, &domain, XlaOptions::new(mesh), 1),
             Err(KernelAotError::Invalid { message })
                 if message == "aot compilation requires at least one ordinary kernel input",
         ));
@@ -582,9 +584,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_load_configuration() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
         assert!(matches!(
-            bundle().load(&XlaDomain::clientless(), &binding(2), &mesh),
+            bundle().load(&domain, &binding(2), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "compiler binding configuration mismatch",
         ));
     }
@@ -597,7 +601,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&domain, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "live execution compatibility mismatch",
@@ -615,12 +619,12 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let original = executable_bundle(&client, &domain, &mesh, DataType::I32, false, &binding(1));
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let original = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
         let loaded = decoded.load(&domain, &binding(1), &mesh).unwrap();
         let input =
-            Array::from_host_buffer(&client, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
+            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
                 .unwrap();
         let execution = loaded.call(vec![input]).unwrap();
         execution.fence().block_until_ready().unwrap();
@@ -639,12 +643,12 @@ pub(crate) mod tests {
         assert_eq!(i32::from_ne_bytes(bytes.as_slice().try_into().unwrap()), 23);
 
         let expected = "loaded executable boundary differs from the kernel bundle";
-        let wrong_input = executable_bundle(&client, &domain, &mesh, DataType::F32, false, &binding(1));
+        let wrong_input = executable_bundle(&domain, &mesh, DataType::F32, false, &binding(1));
         assert!(matches!(
             wrong_input.load(&domain, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == expected,
         ));
-        let captured = executable_bundle(&client, &domain, &mesh, DataType::I32, true, &binding(1));
+        let captured = executable_bundle(&domain, &mesh, DataType::I32, true, &binding(1));
         assert!(matches!(
             captured.load(&domain, &binding(1), &mesh),
             Err(KernelAotError::Invalid { message }) if message == expected,
@@ -660,8 +664,8 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let bundle = executable_bundle(&client, &domain, &mesh, DataType::I32, false, &binding(1));
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let bundle = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let mut loaded = bundle.load(&domain, &binding(1), &mesh).unwrap();
         assert!(loaded.validate_distributed_effects().is_ok());
         for effect in

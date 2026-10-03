@@ -3,8 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::hash::Hash;
-use std::marker::PhantomData;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
@@ -22,7 +21,8 @@ use ryft_core::{
     ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
     ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
-    ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, StageRequest, StagedFunction,
+    RegionRef, RegionStructure, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
+    SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction,
     StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
     TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
@@ -181,22 +181,25 @@ impl<'c> PreparedXlaExecution<'c> {
 
 /// Shared compilation and effect resources for execution on one externally owned PJRT [`Client`].
 ///
-/// Keep one session alive across array creation and domain construction to share the cache and default effect scope.
-/// Separate sessions are independent, even on the same client. Domains can fork their scope while sharing this cache.
-/// Cached executables retain neither sessions nor arrays, so the ownership graph has no cache/session cycle.
-/// Call [`Self::effects_barrier`] before dropping the client when its effects must be observed; destruction adds no
-/// implicit barrier and backend behavior with unfinished device work is plugin-specific.
+/// A session is the handle through which `ryft-xla` executes on a client: every [`XlaDomain`] belongs to exactly one
+/// session, and every [`Array`] belongs to exactly one domain. Create one session per client and derive every domain
+/// from it (through [`Self::domain`], [`XlaDomain::with_compilation_options`], or [`XlaDomain::fork_effect_scope`]) so
+/// that all arrays and domains on that client share one compilation cache, one default effect scope, and one set of
+/// kernel runtimes, much like JAX's process-wide caches. Separate sessions remain independent, even on the same
+/// client, so creating a second session is an explicit request for an isolated cache and effect ordering. Cached
+/// executables retain neither sessions nor arrays, so the ownership graph has no cache/session cycle. Call
+/// [`Self::effects_barrier`] before dropping the client when its effects must be observed; destruction adds no implicit
+/// barrier and backend behavior with unfinished device work is plugin-specific.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use std::sync::Arc;
 /// use ryft_core::{ArrayType, DataType, DeviceMesh, Print};
 /// use ryft_pjrt::Client;
 /// use ryft_xla::XlaSession;
 ///
 /// fn print_values<'c>(client: &'c Client<'c>, mesh: DeviceMesh) -> Result<(), Box<dyn std::error::Error>> {
-///     let session = Arc::new(XlaSession::new(client));
+///     let session = XlaSession::new(client);
 ///     let value = session.array(ArrayType::scalar(DataType::F64), mesh, 1.0f64.to_ne_bytes())?;
 ///     value.print("value");
 ///     session.effects_barrier()?;
@@ -216,8 +219,17 @@ impl<'c> PreparedXlaExecution<'c> {
 pub struct XlaSession<'c> {
     /// Externally owned client, which outlives cached executables and effect carriers.
     client: &'c Client<'c>,
+
+    /// Compile target of [`Self::client`], read lazily on first use and retained (including a failed read) for the
+    /// lifetime of the session.
+    target: OnceLock<Result<XlaTarget, ryft_pjrt::Error>>,
+
     /// Cached artifacts contain no runtime execution association.
     cache: CompilationContext<XlaDomain<'c>>,
+
+    /// Compiled programs of eager operation applications, keyed in front of tracing and lowering. Refer to the
+    /// documentation of [`XlaEagerDispatchKey`] for information on what the key captures.
+    eager_dispatch_cache: SpecializationCache<XlaEagerDispatchKey, Arc<XlaCompiledProgram<'c>>>,
     /// Default ordering and completion scope shared by domains and arrays created through this session.
     default_effect_scope: Arc<EffectScope<'c>>,
 
@@ -263,16 +275,18 @@ impl Drop for XlaSession<'_> {
 }
 
 impl<'c> XlaSession<'c> {
-    /// Creates an independent session with an empty compilation cache and effect scope.
-    pub fn new(client: &'c Client<'c>) -> Self {
+    /// Creates an independent session with an empty in-memory compilation cache and a fresh default effect scope.
+    pub fn new(client: &'c Client<'c>) -> Arc<Self> {
         Self::with_compilation_context(client, CompilationContext::new())
     }
 
     /// Creates a session with an explicitly configured compilation cache.
-    pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<XlaDomain<'c>>) -> Self {
-        Self {
+    pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<XlaDomain<'c>>) -> Arc<Self> {
+        Arc::new(Self {
             client,
+            target: OnceLock::new(),
             cache,
+            eager_dispatch_cache: SpecializationCache::new(EAGER_DISPATCH_CACHE_CAPACITY),
             default_effect_scope: Arc::new(EffectScope::default()),
             cuda_kernel_runtime: Mutex::new(None),
             cuda_kernel_completions: Mutex::new(Vec::new()),
@@ -280,7 +294,40 @@ impl<'c> XlaSession<'c> {
             rocm_kernel_runtime: Mutex::new(None),
             #[cfg(feature = "rocm")]
             rocm_kernel_completions: Mutex::new(Vec::new()),
-        }
+        })
+    }
+
+    /// Creates a session whose in-memory compilation cache retains at most `capacity` compiled programs. A `capacity`
+    /// of zero is clamped to one entry.
+    pub fn with_cache_capacity(client: &'c Client<'c>, capacity: usize) -> Arc<Self> {
+        Self::with_compilation_context(client, CompilationContext::with_capacity(capacity))
+    }
+
+    /// Creates a session whose compilation cache also writes through to a [`DiskCache`] rooted at `directory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] only when the directory itself cannot be opened or created.
+    pub fn with_disk_cache(client: &'c Client<'c>, directory: impl Into<PathBuf>) -> std::io::Result<Arc<Self>> {
+        Ok(Self::with_compilation_context(client, CompilationContext::new().with_disk_cache(directory)?))
+    }
+
+    /// Creates a session whose compilation cache uses an already configured persistent [`DiskCache`]. This is the
+    /// constructor to use when callers need explicit capacity or write thresholds rather than the defaults of
+    /// [`Self::with_disk_cache`].
+    pub fn with_configured_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Arc<Self> {
+        Self::with_compilation_context(client, CompilationContext::new().with_configured_disk_cache(disk_cache))
+    }
+
+    /// Creates a session whose compilation cache also writes through to a [`DiskCache`] configured via the
+    /// [`DiskCache::ENV_VAR`](ryft_core::compilation::DiskCache::ENV_VAR) environment variable, if it is set. An absent
+    /// variable produces an in-memory-only cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns the corresponding [`std::io::Error`] when the configured cache directory is invalid.
+    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> std::io::Result<Arc<Self>> {
+        Ok(Self::with_compilation_context(client, CompilationContext::new().with_disk_cache_from_env()?))
     }
 
     /// Returns the externally owned PJRT client.
@@ -288,33 +335,36 @@ impl<'c> XlaSession<'c> {
         self.client
     }
 
+    /// Returns the [`XlaTarget`] of this session's client, reading it from the client on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XlaDomainError::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
+    /// failure is retained, so every later call returns the same error.
+    pub fn target(&self) -> Result<&XlaTarget, XlaDomainError> {
+        self.target.get_or_init(|| XlaTarget::from_client(self.client)).as_ref().map_err(|error| error.clone().into())
+    }
+
     /// Returns the shared compilation cache.
     pub fn compilation_context(&self) -> &CompilationContext<XlaDomain<'c>> {
         &self.cache
     }
 
-    /// Creates a domain sharing this session's cache and default scope.
+    /// Creates a domain sharing this session's cache and default scope, with the default [`CompilationOptions`] and no
+    /// domain mesh.
     pub fn domain(self: &Arc<Self>) -> XlaDomain<'c> {
         XlaDomain::from_session_configuration(Arc::clone(self), None, XlaDomain::default_compilation_options())
     }
 
-    /// Uploads host bytes and associates the resulting array with this session's default scope.
+    /// Uploads host bytes into an array that belongs to [`Self::domain`]. Refer to the documentation of
+    /// [`Array::from_host_buffer`] for more information.
     pub fn array<B: AsRef<[u8]>>(
         self: &Arc<Self>,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffer: B,
     ) -> Result<Array<'c>, ArrayError> {
-        Ok(Array::from_host_buffer(self.client, r#type, mesh, buffer)?.with_execution_domain(self.domain()))
-    }
-
-    /// Associates an existing array with this session for future dispatch, validating client ownership first.
-    /// This does not merge or retroactively order previously submitted work from its former scope.
-    pub fn associate(self: &Arc<Self>, array: Array<'c>) -> Result<Array<'c>, ArrayError> {
-        if array.client().is_some_and(|client| !std::ptr::eq(client, self.client)) {
-            return Err(ryft_pjrt::Error::invalid_argument("array belongs to a different session client").into());
-        }
-        Ok(array.with_client(self.client)?.with_execution_domain(self.domain()))
+        Array::from_host_buffer(&self.domain(), r#type, mesh, buffer)
     }
 
     /// Waits for the default scope's previously reserved effects, including unordered I/O and local assertions.
@@ -327,6 +377,186 @@ impl<'c> XlaSession<'c> {
     /// This never waits, repairs reference state, or changes errors retained by existing arrays/executions.
     pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
         self.default_effect_scope.acknowledge()
+    }
+}
+
+/// Compile target of an [`XlaSession`]: the platform, plugin, and device facts that lowering, compilation keys, and
+/// persisted-executable validation read, as opposed to the runtime resources (loading, execution, buffers, and kernel
+/// runtimes) that require the live PJRT [`Client`].
+///
+/// Keeping these facts separate from the client makes the client-independence of lowering explicit: everything that
+/// lowering reads besides the program and its [`XlaOptions`] is fixed per session, which is what lets compiled
+/// programs be cached per session. It is also the seam for compiling ahead of time without devices, where the same
+/// facts would come from a PJRT topology description instead of a live client.
+#[derive(Clone, Debug)]
+pub struct XlaTarget {
+    /// PJRT platform name (e.g., `"cpu"` or `"cuda"`).
+    platform_name: String,
+
+    /// PJRT platform implementation version.
+    platform_version: String,
+
+    /// PJRT C API version of the plugin.
+    pjrt_version: ryft_pjrt::Version,
+
+    /// Whether the plugin exposes the PJRT FFI extension.
+    has_ffi_extension: bool,
+
+    /// Plugin attributes, in deterministic name order.
+    attributes: BTreeMap<String, PjrtValue>,
+
+    /// Index of the current process.
+    process_index: usize,
+
+    /// Every device of the target, in the client's enumeration order.
+    devices: Vec<XlaTargetDevice>,
+}
+
+/// Facts about one device of an [`XlaTarget`].
+#[derive(Clone, Debug)]
+pub struct XlaTargetDevice {
+    /// Identity and owning process of the device.
+    device: Device,
+
+    /// PJRT device kind, including the implementation's architecture description.
+    kind: String,
+
+    /// Typed device attributes, including compute capability when the plugin exposes it.
+    attributes: BTreeMap<String, PjrtValue>,
+
+    /// Whether the device is addressable from the current process.
+    addressable: bool,
+}
+
+impl XlaTarget {
+    /// Reads the target facts of a live PJRT [`Client`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ryft_pjrt::Error`] of the first failed platform, plugin, or device query.
+    pub fn from_client(client: &Client<'_>) -> Result<Self, ryft_pjrt::Error> {
+        let addressable_device_ids =
+            client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
+        let devices = client
+            .devices()?
+            .iter()
+            .map(|device| {
+                let device_facts = Device::from_pjrt(device)?;
+                Ok(XlaTargetDevice {
+                    device: device_facts,
+                    kind: device.kind()?.into_owned(),
+                    attributes: device
+                        .attributes()?
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                    addressable: addressable_device_ids.contains(&device_facts.id()),
+                })
+            })
+            .collect::<Result<Vec<_>, ryft_pjrt::Error>>()?;
+        Ok(Self {
+            platform_name: client.platform_name()?.into_owned(),
+            platform_version: client.platform_version()?.into_owned(),
+            pjrt_version: client.version(),
+            has_ffi_extension: client.ffi_extension().is_ok(),
+            attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            process_index: client.process_index()?,
+            devices,
+        })
+    }
+
+    /// Returns the PJRT platform name (e.g., `"cpu"` or `"cuda"`).
+    #[inline]
+    pub fn platform_name(&self) -> &str {
+        self.platform_name.as_str()
+    }
+
+    /// Returns the PJRT platform implementation version.
+    #[inline]
+    pub fn platform_version(&self) -> &str {
+        self.platform_version.as_str()
+    }
+
+    /// Returns the PJRT C API version of the plugin.
+    #[inline]
+    pub fn pjrt_version(&self) -> ryft_pjrt::Version {
+        self.pjrt_version
+    }
+
+    /// Returns whether the plugin exposes the PJRT FFI extension.
+    #[inline]
+    pub fn has_ffi_extension(&self) -> bool {
+        self.has_ffi_extension
+    }
+
+    /// Returns the plugin attributes, in deterministic name order.
+    #[inline]
+    pub fn attributes(&self) -> &BTreeMap<String, PjrtValue> {
+        &self.attributes
+    }
+
+    /// Returns the index of the current process.
+    #[inline]
+    pub fn process_index(&self) -> usize {
+        self.process_index
+    }
+
+    /// Returns every device of the target, in the client's enumeration order.
+    #[inline]
+    pub fn devices(&self) -> &[XlaTargetDevice] {
+        self.devices.as_slice()
+    }
+
+    /// Returns the device with the provided identifier, if the target has one.
+    pub fn device(&self, device_id: DeviceId) -> Option<&XlaTargetDevice> {
+        self.devices.iter().find(|device| device.device.id() == device_id)
+    }
+
+    /// Returns the kinds of the devices of `mesh`, in mesh order, matching devices by identifier. Lowered and
+    /// persisted programs record these kinds so that executables are only reused on equivalent hardware.
+    pub(crate) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, XlaDomainError> {
+        mesh.devices()
+            .iter()
+            .map(|mesh_device| {
+                self.device(mesh_device.id()).map(|device| device.kind.clone()).ok_or_else(|| {
+                    persistent_error(format!("device {} is not visible to the live client", mesh_device.id()))
+                })
+            })
+            .collect()
+    }
+
+    /// Returns whether every device of `mesh` is owned by the current process and addressable from it.
+    pub fn is_fully_addressable_single_process_mesh(&self, mesh: &DeviceMesh) -> bool {
+        mesh.devices().iter().all(|mesh_device| {
+            mesh_device.process_index() == self.process_index
+                && self.device(mesh_device.id()).is_some_and(|device| device.addressable)
+        })
+    }
+}
+
+impl XlaTargetDevice {
+    /// Returns the identity and owning process of this device.
+    #[inline]
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    /// Returns the PJRT device kind, including the implementation's architecture description.
+    #[inline]
+    pub fn kind(&self) -> &str {
+        self.kind.as_str()
+    }
+
+    /// Returns the typed device attributes.
+    #[inline]
+    pub fn attributes(&self) -> &BTreeMap<String, PjrtValue> {
+        &self.attributes
+    }
+
+    /// Returns whether this device is addressable from the current process.
+    #[inline]
+    pub fn is_addressable(&self) -> bool {
+        self.addressable
     }
 }
 
@@ -671,11 +901,13 @@ fn ensure_effect_dispatch_allowed() -> Result<(), XlaDomainError> {
 /// dependencies, including serialization of multi-device launches. Opaque registered handlers must not reenter
 /// dispatch or barriers. Managed print/assertion handlers reject such reentrancy before acquiring scope locks.
 ///
-/// The same domain type covers both staged tracing and concrete execution. Nested traced code can borrow
-/// [`XlaDomain::token`] when it needs a clientless domain for static staging instead of defining a separate token type.
+/// The same domain type covers both staged tracing and concrete execution. Every domain belongs to an [`XlaSession`]
+/// and is therefore backed by a live PJRT client: tracing only uses the domain as a type witness and never needs a
+/// clientless instance, while compiling ahead of time without devices requires a compile-target abstraction rather
+/// than an execution domain without a client.
 pub struct XlaDomain<'c> {
-    /// PJRT client used by this domain.
-    client: Option<&'c Client<'c>>,
+    /// Session that owns the client, compilation cache, default effect scope, and kernel runtimes of this domain.
+    session: Arc<XlaSession<'c>>,
 
     /// Concrete device mesh that eager binds prefer when deriving their execution mesh and that the
     /// constant-materialization fast path requires.
@@ -685,17 +917,8 @@ pub struct XlaDomain<'c> {
     /// [`XlaDomain`] values are cloned into every transform tracer that executes through this domain.
     compilation_options: Arc<CompilationOptions>,
 
-    /// Shared execution resources; absent for clientless tracing domains.
-    session: Option<Arc<XlaSession<'c>>>,
-
-    /// Empty cache retained only for clientless tracing compatibility.
-    tracing_cache: Option<Arc<CompilationContext<XlaDomain<'c>>>>,
-
     /// Selected ordering scope, which may be a fork of the session default.
-    effect_scope: Option<Arc<EffectScope<'c>>>,
-
-    /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
-    marker: PhantomData<fn() -> Array<'c>>,
+    effect_scope: Arc<EffectScope<'c>>,
 }
 
 /// Deterministic stateful-runtime failure point used by transaction protocol regressions.
@@ -748,13 +971,10 @@ pub(crate) type XlaTracer<'context> = DomainTracer<XlaDomain<'context>>;
 impl<'c> Clone for XlaDomain<'c> {
     fn clone(&self) -> Self {
         Self {
-            client: self.client,
+            session: Arc::clone(&self.session),
             mesh: self.mesh.clone(),
             compilation_options: Arc::clone(&self.compilation_options),
-            session: self.session.clone(),
-            tracing_cache: self.tracing_cache.clone(),
-            effect_scope: self.effect_scope.clone(),
-            marker: PhantomData,
+            effect_scope: Arc::clone(&self.effect_scope),
         }
     }
 }
@@ -779,172 +999,52 @@ impl<'c> XlaDomain<'c> {
         Arc::clone(&DEFAULT)
     }
 
-    /// Creates a new [`XlaDomain`] from a PJRT [`Client`] with default [`CompilationOptions`]
-    /// and an empty compile cache.
-    #[inline]
-    pub fn new(client: &'c Client<'c>) -> Self {
-        Self::with_compilation_options(client, CompilationOptions::default())
-    }
-
-    /// Creates a new [`XlaDomain`] with an explicit [`CompilationOptions`] template.
-    #[inline]
-    pub fn with_compilation_options(client: &'c Client<'c>, compilation_options: CompilationOptions) -> Self {
-        Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::new())),
-            None,
-            Arc::new(compilation_options),
-        )
-    }
-
-    /// Creates a new [`XlaDomain`] with an explicit in-memory cache capacity. `capacity` must be
-    /// greater than zero; values of zero are silently clamped to one entry.
-    #[inline]
-    pub fn with_cache_capacity(client: &'c Client<'c>, capacity: usize) -> Self {
-        Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::with_capacity(capacity))),
-            None,
-            Self::default_compilation_options(),
-        )
-    }
-
-    /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
-    /// [`DiskCache`] rooted at `directory`. Returns an
-    /// [`std::io::Error`] only when the directory itself can't be opened or created.
-    #[inline]
-    pub fn with_disk_cache(client: &'c Client<'c>, directory: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let cache = CompilationContext::new().with_disk_cache(directory)?;
-        Ok(Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(client, cache)),
-            None,
-            Self::default_compilation_options(),
-        ))
-    }
-
-    /// Creates a new [`XlaDomain`] using an already configured persistent [`DiskCache`]. This is the constructor to
-    /// use when callers need explicit capacity or write thresholds rather than [`Self::with_disk_cache`]'s defaults.
-    #[inline]
-    pub fn with_configured_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Self {
-        Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(
-                client,
-                CompilationContext::new().with_configured_disk_cache(disk_cache),
-            )),
-            None,
-            Self::default_compilation_options(),
-        )
-    }
-
-    /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
-    /// [`DiskCache`] configured via the
-    /// [`DiskCache::ENV_VAR`](ryft_core::compilation::DiskCache::ENV_VAR) environment variable,
-    /// if it is set. An absent variable produces an in-memory-only cache; an invalid cache directory returns the
-    /// corresponding I/O error.
-    #[inline]
-    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> std::io::Result<Self> {
-        Ok(Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(
-                client,
-                CompilationContext::new().with_disk_cache_from_env()?,
-            )),
-            None,
-            Self::default_compilation_options(),
-        ))
-    }
-
-    /// Returns the singleton tracing-only domain token that carries the XLA staged operation
-    /// universe but no PJRT execution context. The token's cache is empty and unused.
-    ///
-    /// This token is sufficient for nested transforms over already-traced XLA values because
-    /// those paths only need the backend's operation types; they never materialize concrete
-    /// arrays via eager [`Context::bind`] of the nullary identity operations.
-    #[inline]
-    pub fn token() -> &'static Self {
-        static TOKEN: LazyLock<XlaDomain<'static>> = LazyLock::new(|| XlaDomain {
-            client: None,
-            mesh: None,
-            compilation_options: XlaDomain::default_compilation_options(),
-            session: None,
-            tracing_cache: Some(Arc::new(CompilationContext::new())),
-            effect_scope: None,
-            marker: PhantomData,
-        });
-        &TOKEN
-    }
-
-    /// Creates a domain using the session's default scope and the supplied execution configuration.
+    /// Creates a domain over `session` using the session's default effect scope and the supplied execution
+    /// configuration.
     fn from_session_configuration(
         session: Arc<XlaSession<'c>>,
         mesh: Option<DeviceMesh>,
         compilation_options: Arc<CompilationOptions>,
     ) -> Self {
-        Self {
-            client: Some(session.client),
-            mesh,
-            compilation_options,
-            effect_scope: Some(Arc::clone(&session.default_effect_scope)),
-            session: Some(session),
-            tracing_cache: None,
-            marker: PhantomData,
-        }
+        Self { effect_scope: Arc::clone(&session.default_effect_scope), session, mesh, compilation_options }
     }
 
-    /// Creates a new clientless [`XlaDomain`] equivalent to [`Self::token`] but owned by value. Like the token, the
-    /// returned domain carries the XLA staged operation universe but no PJRT execution context, so eager
-    /// [`Context::bind`] calls on it fail with the existing "requires a PJRT client" errors. This is the
-    /// [`Array::execution_domain`](ryft_core::programs::Value::execution_domain) fallback for arrays that carry no
-    /// attached client (e.g., arrays assembled through [`Array::from_addressable_buffers`] with a `None` client and
-    /// no subsequent [`Array::with_client`] call).
-    #[inline]
-    pub(crate) fn clientless() -> Self {
-        Self {
-            client: None,
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            session: None,
-            tracing_cache: Some(Arc::new(CompilationContext::new())),
-            effect_scope: None,
-            marker: PhantomData,
-        }
+    /// Returns a sibling of this domain that shares its session, effect scope, and mesh but forwards
+    /// `compilation_options` to the compile path. Arrays produced through the returned domain inherit it.
+    pub fn with_compilation_options(&self, compilation_options: CompilationOptions) -> Self {
+        Self { compilation_options: Arc::new(compilation_options), ..self.clone() }
     }
 
-    /// Returns the PJRT [`Client`] this domain was constructed with, or [`Error::MissingClient`] for token and
-    /// clientless domains.
-    #[inline]
-    pub fn client(&self) -> Result<&'c Client<'c>, Error> {
-        self.client.ok_or(Error::MissingClient)
-    }
-
-    /// Returns the session shared by this domain, if it can execute device work.
-    pub fn session(&self) -> Option<&Arc<XlaSession<'c>>> {
-        self.session.as_ref()
+    /// Test-only builder that attaches a concrete [`DeviceMesh`] to a sibling of this domain. Used by XLA-internal unit
+    /// tests that exercise the [`Self::constant`] materialization helper.
+    #[cfg(test)]
+    pub(crate) fn with_mesh(&self, mesh: DeviceMesh) -> Self {
+        Self { mesh: Some(mesh), ..self.clone() }
     }
 
     /// Forks ordering and completion state while retaining the session, compilation cache, and configuration.
     /// Use forks at independent task boundaries. References retain their own identity-based coordination.
     pub fn fork_effect_scope(&self) -> Self {
-        let mut domain = self.clone();
-        domain.effect_scope = self.session.as_ref().map(|_| Arc::new(EffectScope::default()));
-        domain
+        Self { effect_scope: Arc::new(EffectScope::default()), ..self.clone() }
     }
 
-    /// Waits for this scope's previously reserved effects, including unordered I/O and local assertions.
-    /// Backend-selected inline execution is allowed; this function waits only for work still pending. Later
-    /// reservations and other scopes are excluded. Call before client destruction to ensure effects are observed.
-    /// On clientless tracing domains this succeeds without accessing PJRT or allocating runtime state.
-    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
-        match &self.effect_scope {
-            Some(scope) => scope.barrier(),
-            None => Ok(()),
-        }
+    /// Returns the PJRT [`Client`] of this domain's session.
+    #[inline]
+    pub fn client(&self) -> &'c Client<'c> {
+        self.session.client
     }
 
-    /// Acknowledges barrier-reported failures after affected work has completed, without waiting or repairing
-    /// references. If work is pending or unreported, call `effects_barrier()` and retry this function.
-    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
-        match &self.effect_scope {
-            Some(scope) => scope.acknowledge(),
-            None => Ok(()),
-        }
+    /// Returns the session shared by this domain.
+    #[inline]
+    pub fn session(&self) -> &Arc<XlaSession<'c>> {
+        &self.session
+    }
+
+    /// Returns the [`XlaTarget`] of this domain's session. Refer to the documentation of [`XlaSession::target`] for
+    /// more information.
+    #[inline]
+    pub fn target(&self) -> Result<&XlaTarget, XlaDomainError> {
+        self.session.target()
     }
 
     /// Returns the [`DeviceMesh`] this domain resolves shard placement against, or [`Error::MissingMesh`] when the
@@ -966,32 +1066,42 @@ impl<'c> XlaDomain<'c> {
         self.compilation_context().cache_size()
     }
 
-    /// Returns this domain's shared compilation context.
+    /// Returns this domain's shared compilation context, which is owned by its session.
     #[inline]
     pub fn compilation_context(&self) -> &CompilationContext<Self> {
-        match &self.session {
-            Some(session) => &session.cache,
-            None => self.tracing_cache.as_ref().unwrap(),
-        }
+        &self.session.cache
     }
 
-    /// Removes every entry from the in-memory cache. Mirrors JAX's
-    /// `clear_in_memory_compilation_cache()`.
+    /// Returns a snapshot of the activity of the session's eager dispatch cache, which maps eager operation
+    /// applications directly to compiled programs, in front of tracing and lowering.
+    #[inline]
+    pub fn eager_dispatch_statistics(&self) -> SpecializationCacheStatistics {
+        self.session.eager_dispatch_cache.statistics()
+    }
+
+    /// Removes every entry from the in-memory compilation cache and the eager dispatch cache of this domain's session.
+    /// Mirrors JAX's `clear_caches()`, which also clears the per-primitive eager dispatch cache.
+    ///
+    /// Eager dispatch cache hits do not re-read the `XLA_FLAGS` environment variable (the miss path still records it
+    /// in the compilation key), so call this function after changing it if the change must apply to eager operations
+    /// that already ran. XLA itself reads the variable when it initializes its debug options.
     #[inline]
     pub fn clear_cache(&self) {
         self.compilation_context().clear_cache();
+        self.session.eager_dispatch_cache.clear();
     }
 
-    /// Test-only constructor that attaches a concrete [`DeviceMesh`] to this domain. Used by
-    /// XLA-internal unit tests that exercise the [`Self::constant`] materialization helper.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn with_mesh(client: &'c Client<'c>, mesh: DeviceMesh) -> Self {
-        Self::from_session_configuration(
-            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::new())),
-            Some(mesh),
-            Self::default_compilation_options(),
-        )
+    /// Waits for this scope's previously reserved effects, including unordered I/O and local assertions.
+    /// Backend-selected inline execution is allowed; this function waits only for work still pending. Later
+    /// reservations and other scopes are excluded. Call before client destruction to ensure effects are observed.
+    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
+        self.effect_scope.barrier()
+    }
+
+    /// Acknowledges barrier-reported failures after affected work has completed, without waiting or repairing
+    /// references. If work is pending or unreported, call `effects_barrier()` and retry this function.
+    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
+        self.effect_scope.acknowledge()
     }
 }
 
@@ -1025,26 +1135,25 @@ impl<'c> Context for XlaDomain<'c> {
             .into()),
             XlaConstant::Dimension(value) => Ok(ArrayIrValue::Dimension(value)),
             XlaConstant::Boolean(value) => {
-                let client =
-                    self.client().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 let output_type = ArrayType::scalar(DataType::Boolean);
-                let mesh = self.eager_mesh(client, &[], std::slice::from_ref(&output_type))?;
+                let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
                 let output_type = output_type
                     .replicated(&mesh)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                let output = Array::from_host_buffer(client, output_type, mesh, [u8::from(value)])
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
-                    .with_execution_domain(self.clone());
+                let output = Array::from_host_buffer(self, output_type, mesh, [u8::from(value)])
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 Ok(ArrayIrValue::Array(output))
             }
         }
     }
 
-    /// Eagerly executes `operation` on concrete input [`Array`]s, mirroring JAX's op-by-op dispatch: the operation
-    /// is traced into a single-instruction program over the inputs' physical [`ArrayType`]s (shardings included),
-    /// compiled through this domain's compile cache, and executed on this domain's PJRT client via the crate-private
-    /// `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the constant
-    /// directly through the runtime client without compiling a program.
+    /// Eagerly executes `operation` on concrete input [`Array`]s, mirroring JAX's op-by-op dispatch: a repeated
+    /// application (including one whose attached regions are structurally equal to those of an earlier application) is
+    /// served from the session's eager dispatch cache, and otherwise the operation is traced into a
+    /// single-instruction program over the inputs' physical [`ArrayType`]s (shardings included), compiled through this
+    /// domain's compile cache, and executed on this domain's PJRT client via the crate-private `eager_bind` path. The
+    /// nullary additive/multiplicative identities keep a fast path that materializes the constant directly through the
+    /// runtime client without compiling a program.
     fn bind<P, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
@@ -1073,14 +1182,13 @@ impl<'c> Context for XlaDomain<'c> {
         self.eager_bind(operation, driver, inputs)
     }
 
-    /// A client-backed domain executes every bound operation for real and its concrete [`Array`]s support host
-    /// readback through [`Concretizable<bool>`](ryft_core::Concretizable) and
-    /// [`WhilePredicate`](ryft_core::operations::control_flow::WhilePredicate), so strategies that fold
-    /// data-dependent work through host-visible values — the eager data-dependent `while` rules and
-    /// concretizable-`while` unrolling — apply. Clientless domains (the static staging [`token`](Self::token) and
-    /// domains recovered from arrays without an attached client) cannot execute operations and stay non-eager.
+    /// Every [`XlaDomain`] is client-backed, so it executes every bound operation for real and its concrete [`Array`]s
+    /// support host readback through [`Concretizable<bool>`](ryft_core::Concretizable) and
+    /// [`WhilePredicate`](ryft_core::operations::control_flow::WhilePredicate). Strategies that fold data-dependent
+    /// work through host-visible values (the eager data-dependent `while` rules and concretizable-`while` unrolling)
+    /// therefore always apply.
     fn is_eager(&self) -> bool {
-        self.client.is_some()
+        true
     }
 
     // `XlaDomain` is a terminal execution domain: it dispatches operations to compiled per-operation programs
@@ -1209,13 +1317,17 @@ impl<'c> XlaDomain<'c> {
     /// Eagerly executes one staged operation on concrete input [`Array`]s — the JAX-style op-by-op dispatch path
     /// behind [`Context::bind`].
     ///
-    /// The operation is traced into a single-instruction flat program over the inputs' physical [`ArrayType`]s
-    /// (shardings included), compiled through this domain's compile cache, and executed on this domain's PJRT client.
-    /// The cache key contains the complete lowered computation, its effective compilation options, and the derived
-    /// mesh, so repeated eager binds of the same lowering reuse one compiled executable without conflating distinct
-    /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their
-    /// nested programs as attached regions and flow through this same path — the compiler handles the control flow, so
-    /// no host interpreter loops are needed.
+    /// An application is first looked up in the session's eager dispatch cache, keyed by the operation, the structure
+    /// of its attached regions, its inputs, the lowering mesh, and the compilation options (refer to
+    /// [`XlaEagerDispatchKey`]). A hit validates the input placement and executes the cached program directly, skipping
+    /// tracing, lowering, and compilation-key construction. On a miss, the operation is traced into a
+    /// single-instruction flat program over the inputs' physical [`ArrayType`]s (shardings included), compiled through
+    /// this domain's compile cache, and executed on this domain's PJRT client. The compile cache key contains the
+    /// complete lowered computation, its effective compilation options, and the derived mesh, so repeated eager binds
+    /// of the same lowering reuse one compiled executable without conflating distinct computations. Higher-order
+    /// operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their nested programs as attached
+    /// regions and flow through this same path, and the compiler handles their control flow, so no host interpreter
+    /// loops are needed.
     fn eager_bind<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
         &self,
         operation: XlaOperation,
@@ -1285,14 +1397,6 @@ impl<'c> XlaDomain<'c> {
             return Ok(vec![ArrayIrValue::Dimension(array.to_dimension(operation.output_type().variable().clone())?)]);
         }
 
-        let Some(client) = self.client else {
-            return Err(ProgramError::InvalidArgument {
-                message: format!(
-                    "xla domain cannot eagerly execute operation `{}` without a PJRT client",
-                    operation.name(),
-                ),
-            });
-        };
         if matches!(&operation, XlaOperation::DimensionToScalar(_)) {
             if driver.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension_to_scalar does not accept attached regions").into());
@@ -1302,20 +1406,76 @@ impl<'c> XlaDomain<'c> {
                 <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
             let extent = i64::try_from(dimension.extent()).unwrap();
             let output_type = ArrayType::scalar(DataType::I64);
-            let mesh = self.eager_mesh(client, &[], std::slice::from_ref(&output_type))?;
+            let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
             let output_type = output_type
                 .replicated(&mesh)
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            let output = Array::from_host_buffer(client, output_type, mesh, extent.to_ne_bytes().as_slice())
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
-                .with_execution_domain(self.clone());
+            let output = Array::from_host_buffer(self, output_type, mesh, extent.to_ne_bytes().as_slice())
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
             return Ok(vec![ArrayIrValue::Array(output)]);
         }
 
-        let mut array_inputs = Vec::new();
+        let array_inputs = inputs
+            .iter()
+            .filter_map(|input| match input {
+                ArrayIrValue::Array(array) => Some(array.clone()),
+                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => None,
+            })
+            .collect::<Vec<_>>();
 
-        // Trace the single-instruction program over the inputs' physical types, shardings included, attaching the
-        // provided region bodies to that instruction.
+        // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
+        // and its inputs directly to a compiled program, so a repeated application skips tracing, lowering, and
+        // compilation-key construction and only revalidates its input placement.
+        let key = XlaEagerDispatchKey {
+            operation: operation.clone(),
+            regions: driver.regions().map(RegionRef::structure).collect(),
+            inputs: inputs
+                .iter()
+                .map(|input| match input {
+                    ArrayIrValue::Array(array) => XlaEagerDispatchInput::Array(array.r#type().into_owned()),
+                    ArrayIrValue::Dimension(dimension) => XlaEagerDispatchInput::Dimension(dimension.clone()),
+                    ArrayIrValue::Reference(_) => {
+                        unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
+                    }
+                })
+                .collect(),
+            mesh: self.mesh.clone().or_else(|| array_inputs.first().map(Array::mesh)),
+            compilation_options: XlaCompilationOptionsIdentity(Arc::clone(&self.compilation_options)),
+        };
+        let entry = self
+            .session
+            .eager_dispatch_cache
+            .try_entry(key)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let compiled = match entry {
+            SpecializationCacheEntry::Occupied(compiled) => {
+                self.validate_eager_placement(array_inputs.as_slice())?;
+                compiled
+            }
+            SpecializationCacheEntry::Vacant(producer) => {
+                producer.insert(self.compile_eager_operation(operation, driver, inputs, array_inputs.as_slice())?)
+            }
+        };
+
+        // Execution produces outputs that belong to this domain, so chained eager operations and transforms over them
+        // keep executing in the same session and effect scope.
+        let outputs = self
+            .execute_xla_program(&compiled, array_inputs)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        Ok(outputs.into_iter().map(ArrayIrValue::Array).collect())
+    }
+
+    /// Traces one eager operation application into a single-instruction program over the inputs' physical types
+    /// (shardings included), validates the placement of its array inputs, lowers the program, and compiles it through
+    /// this domain's compilation cache (so that equal lowerings share one compiled program).
+    fn compile_eager_operation<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
+        &self,
+        operation: XlaOperation,
+        driver: D,
+        inputs: &[ArrayIrValue<Array<'c>>],
+        array_inputs: &[Array<'c>],
+    ) -> Result<Arc<XlaCompiledProgram<'c>>, ProgramError> {
+        // Trace the single-instruction program, attaching the provided region bodies to that instruction.
         let region_input_types = vec![None; driver.regions().count()];
         let builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
         let region_ids = driver.import_into(&builder, &region_input_types)?;
@@ -1325,7 +1485,6 @@ impl<'c> XlaDomain<'c> {
                 .iter()
                 .map(|input| match input {
                     ArrayIrValue::Array(array) => {
-                        array_inputs.push(array.clone());
                         Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
                     }
                     ArrayIrValue::Dimension(dimension) => {
@@ -1340,22 +1499,21 @@ impl<'c> XlaDomain<'c> {
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             builder.add_instruction(operation, region_ids, input_atoms, None)?.to_vec()
         };
-        self.validate_eager_placement(client, array_inputs.as_slice())?;
+        self.validate_eager_placement(array_inputs)?;
         let output_count = output_atoms.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program: FlatXlaProgram =
             builder.build(output_atoms, vec![Placeholder; array_inputs.len()], vec![Placeholder; output_count])?;
 
         // Derive the mesh after tracing so that input-free operations can fall back to their inferred output
-        // shardings, then compile through the domain's cache (a repeated eager operation is a cache hit) and
-        // execute via PJRT.
+        // shardings, and then compile through the domain's compilation cache.
         let output_types = program
             .output_types()
             .iter()
             .map(<&ArrayType>::try_from)
             .map(|result| result.cloned())
             .collect::<Result<Vec<_>, _>>()?;
-        let mesh = self.eager_mesh(client, array_inputs.as_slice(), output_types.as_slice())?;
+        let mesh = self.eager_mesh(array_inputs, output_types.as_slice())?;
         let options = XlaOptions::new(mesh);
         let lowered = self
             .lower_xla_program(&program, 0, &options)
@@ -1363,60 +1521,26 @@ impl<'c> XlaDomain<'c> {
         let cache_key = self
             .compilation_key(&lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let compiled = self
-            .compilation_context()
+        self.compilation_context()
             .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let outputs = self
-            .execute_xla_program(&compiled, array_inputs)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-
-        // Execution already attached this domain's client to every output, so attaching the compile cache is all
-        // that is left for chained eager operations and transforms over the outputs to recover a context that keeps
-        // executing on the same client and keeps hitting the same compile cache.
-        Ok(outputs
-            .into_iter()
-            .map(|output| ArrayIrValue::Array(output.with_execution_domain(self.clone())))
-            .collect())
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
     }
 
     /// Validates that every input lives on this domain's PJRT client and that all inputs share one device placement,
-    /// mirroring JAX's "received incompatible devices for jitted computation" error for the eager path. Inputs that
-    /// carry an attached client (see [`Array::client`]) are checked by client identity, which also rejects
-    /// same-device-id arrays owned by a *different* client; inputs with no attached client fall back to membership of
-    /// every shard device in the executing client's device set as the placement proxy.
-    fn validate_eager_placement(&self, client: &'c Client<'c>, inputs: &[Array<'c>]) -> Result<(), ProgramError> {
+    /// mirroring JAX's "received incompatible devices for jitted computation" error for the eager path. Every [`Array`]
+    /// belongs to a client-backed domain whose client owns its addressable shard buffers (validated at construction),
+    /// so client identity is exact and also rejects same-device-id arrays owned by a *different* client.
+    fn validate_eager_placement(&self, inputs: &[Array<'c>]) -> Result<(), ProgramError> {
         if inputs.is_empty() {
             return Ok(());
         }
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
-        let client_device_ids = client
-            .devices()
-            .map_err(|error| invalid_argument(error.to_string()))?
-            .iter()
-            .map(|device| device.id())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| invalid_argument(error.to_string()))?;
         for (index, input) in inputs.iter().enumerate() {
-            if let Some(input_client) = input.client() {
-                // Client identity is exact: `Array::with_client` already validated that this client owns every
-                // addressable shard buffer, so no per-shard device check is needed.
-                if !std::ptr::eq(input_client, client) {
-                    return Err(invalid_argument(format!(
-                        "received incompatible devices for eager xla execution: input #{index} is owned by a \
-                         different PJRT client than this domain's client",
-                    )));
-                }
-                continue;
-            }
-            for shard in input.shards() {
-                let device_id = shard.device().id();
-                if !client_device_ids.contains(&device_id) {
-                    return Err(invalid_argument(format!(
-                        "received incompatible devices for eager xla execution: input #{index} is placed on device \
-                         {device_id}, which does not belong to this domain's PJRT client",
-                    )));
-                }
+            if !std::ptr::eq(input.client(), self.client()) {
+                return Err(invalid_argument(format!(
+                    "received incompatible devices for eager xla execution: input #{index} is owned by a different \
+                     PJRT client than this domain's client",
+                )));
             }
         }
         let first_device_ids = inputs[0].mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
@@ -1438,12 +1562,7 @@ impl<'c> XlaDomain<'c> {
     /// sharded outputs, such as the nullary sharded constants that transform machinery synthesizes through
     /// [`Zero`] / [`One`] / [`Fill`] / [`Iota`] on mesh-less recovered domains), otherwise a single-device mesh over
     /// the client's first addressable device (for input-free operations over unsharded data).
-    fn eager_mesh(
-        &self,
-        client: &'c Client<'c>,
-        inputs: &[Array<'c>],
-        output_types: &[ArrayType],
-    ) -> Result<DeviceMesh, ProgramError> {
+    fn eager_mesh(&self, inputs: &[Array<'c>], output_types: &[ArrayType]) -> Result<DeviceMesh, ProgramError> {
         if let Some(mesh) = self.mesh.as_ref() {
             return Ok(mesh.clone());
         }
@@ -1451,7 +1570,7 @@ impl<'c> XlaDomain<'c> {
             return Ok(input.mesh());
         }
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
-        let devices = client.addressable_devices().map_err(|error| invalid_argument(error.to_string()))?;
+        let devices = self.client().addressable_devices().map_err(|error| invalid_argument(error.to_string()))?;
         if let Some(logical_mesh) =
             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh().clone()))
         {
@@ -1483,9 +1602,7 @@ impl<'c> XlaDomain<'c> {
 
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaDomainError> {
-        let client = self.client.ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
-            reason: "xla runtime constants require a PJRT client".to_string(),
-        })?;
+        let client = self.client();
         let mesh = self.mesh.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
             reason: "xla runtime constants require a concrete device mesh".to_string(),
         })?;
@@ -1495,9 +1612,7 @@ impl<'c> XlaDomain<'c> {
             None => array_type.replicated(mesh).map_err(ArrayError::from)?,
         };
         if array_type.data_type().is_zero() {
-            return Ok(
-                Array::from_zero_space(client, effective_type, mesh.clone())?.with_execution_domain(self.clone())
-            );
+            return Ok(Array::from_zero_space(self, effective_type, mesh.clone())?);
         }
         let addressable_ids = addressable_device_ids(client, mesh)?;
         let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
@@ -1514,9 +1629,7 @@ impl<'c> XlaDomain<'c> {
                 Shape::from(&shard_shape).element_count().map_err(Error::from)?.expect("shard shapes are static");
             let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let device = self
-                .client
-                .expect("checked above")
+            let device = client
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
@@ -1535,10 +1648,9 @@ impl<'c> XlaDomain<'c> {
             addressable_buffers.push(buffer);
         }
 
-        // Attach this domain's client and compile cache so that chained eager operations and transforms over the
-        // materialized constant recover a context that keeps the same client and compile cache.
-        Ok(Array::from_canonical_addressable_buffers(client, effective_type, mesh.clone(), addressable_buffers)?
-            .with_execution_domain(self.clone()))
+        // The constant belongs to this domain so that chained eager operations and transforms over it recover a
+        // context that keeps the same session, effect scope, and compilation options.
+        Ok(Array::from_canonical_addressable_buffers(self, effective_type, mesh.clone(), addressable_buffers)?)
     }
 }
 
@@ -1656,13 +1768,6 @@ fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<
     Ok(addressable)
 }
 
-/// Returns whether every mesh device is owned by this process and addressable through `client`.
-fn is_fully_addressable_single_process_mesh(client: &Client<'_>, mesh: &DeviceMesh) -> Result<bool, XlaDomainError> {
-    let process_index = client.process_index()?;
-    Ok(mesh.devices().iter().all(|device| device.process_index() == process_index)
-        && addressable_device_ids(client, mesh)?.len() == mesh.devices().len())
-}
-
 /// Returns the shard descriptors implied by `array_type` and `mesh`.
 fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, ArrayError> {
     let sharding = array_type.sharding().ok_or(Error::MissingSharding)?;
@@ -1758,6 +1863,73 @@ enum XlaDispatchKeyKind {
 
     /// Alpha-normalized bounded signature used when bucketing is enabled.
     Bucketed(BucketedDispatchSignature),
+}
+
+/// Default capacity of the eager dispatch cache of an [`XlaSession`].
+const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
+
+/// Key of the eager dispatch cache of an [`XlaSession`], which maps one eager operation application directly to its
+/// compiled program so that a repeated application skips tracing, lowering, and compilation-key construction, like
+/// JAX's per-primitive `(primitive, params)` cache in front of its dispatch path.
+///
+/// The key must capture everything that the eager lowering reads besides the session itself (whose client, and thus
+/// [`XlaTarget`], is fixed): the operation including all of its attributes, the structure of every attached region
+/// (for operations such as `condition`, `while`, `scan`, `jit_call`, or `shard_map`), the physical type of every array
+/// input (shardings included), the value of every dimension input (because eager binding bakes dimension inputs into
+/// the traced program as constants), the device mesh that the lowering compiles against, and the domain's compilation
+/// options. Attached regions are keyed structurally (refer to [`RegionStructure`]), so applications whose closures are
+/// traced afresh on every call still hit the cache when they trace to the same regions. Instruction provenance is not
+/// part of region structure, so applications that differ only in provenance share one compiled program, whose debug
+/// locations are those of the first application.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct XlaEagerDispatchKey {
+    /// Applied operation, compared and hashed with all of its attributes.
+    operation: XlaOperation,
+
+    /// Structures of the regions attached to the application, in operation-defined order.
+    regions: Arc<[RegionStructure<XlaConstant, XlaOperation>]>,
+
+    /// Inputs of the application, in order.
+    inputs: Arc<[XlaEagerDispatchInput]>,
+
+    /// Mesh that eager lowering compiles against when it is not derived from the operation alone: the domain mesh if
+    /// it has one, and otherwise the mesh of the first array input. It is [`None`] only for an input-free operation of
+    /// a domain without a mesh, whose mesh is then determined by the operation and the session's client.
+    mesh: Option<DeviceMesh>,
+
+    /// Compilation options of the dispatching domain, compared by identity.
+    compilation_options: XlaCompilationOptionsIdentity,
+}
+
+/// One input of an [`XlaEagerDispatchKey`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum XlaEagerDispatchInput {
+    /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
+    Array(ArrayType),
+
+    /// Dimension input, keyed by its [`DimensionValue`] (including its extent).
+    Dimension(DimensionValue),
+}
+
+/// Compilation options of an [`XlaDomain`], compared and hashed by the address of their shared allocation. Domains
+/// created through [`XlaSession::domain`] share one default allocation, so they share eager dispatch cache entries,
+/// while each [`XlaDomain::with_compilation_options`] call creates a distinct identity. Options that are equal but
+/// separately allocated therefore only miss each other's entries.
+#[derive(Clone)]
+struct XlaCompilationOptionsIdentity(Arc<CompilationOptions>);
+
+impl PartialEq for XlaCompilationOptionsIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for XlaCompilationOptionsIdentity {}
+
+impl Hash for XlaCompilationOptionsIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
 }
 
 /// Alpha-normalized bounded input signature used as the bucketed retained-dispatch key.
@@ -3069,12 +3241,9 @@ impl<'c> XlaDomain<'c> {
                     reason: "cuda artifact calls require a cuda platform".to_owned(),
                 });
             }
-            let session = self.session.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
-                reason: "cuda artifact calls require an owning XlaSession".to_owned(),
-            })?;
-            let mut runtime = session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
+            let mut runtime = self.session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
             if runtime.is_none() {
-                *runtime = Some(Box::new(CudaKernelRuntime::new(self.client()?)?));
+                *runtime = Some(Box::new(CudaKernelRuntime::new(self.client())?));
             }
         }
         if signature.requires_rocm_kernel_runtime() {
@@ -3089,12 +3258,9 @@ impl<'c> XlaDomain<'c> {
             });
             #[cfg(feature = "rocm")]
             {
-                let session = self.session.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
-                    reason: "rocm artifact calls require an owning XlaSession".into(),
-                })?;
-                let mut runtime = session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
+                let mut runtime = self.session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
                 if runtime.is_none() {
-                    *runtime = Some(Box::new(RocmKernelRuntime::new(self.client()?)?));
+                    *runtime = Some(Box::new(RocmKernelRuntime::new(self.client())?));
                 }
             }
         }
@@ -3104,7 +3270,7 @@ impl<'c> XlaDomain<'c> {
         let has_print_handler = platform_name.eq_ignore_ascii_case("cpu")
             || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
         if (signature.has_ordered_io() || signature.has_unordered_io()) && has_print_handler {
-            super::debugging::ensure_print_handler_registered(self.client()?)?;
+            super::debugging::ensure_print_handler_registered(self.client())?;
         }
         if !signature.requires_assertion_handler() {
             return Ok(());
@@ -3114,13 +3280,13 @@ impl<'c> XlaDomain<'c> {
         if !supported {
             return Err(XlaDomainError::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
         }
-        super::assertions::ensure_assertion_handler_registered(self.client()?)?;
+        super::assertions::ensure_assertion_handler_registered(self.client())?;
         Ok(())
     }
 
     /// Validates that this domain's PJRT client owns `program`.
     fn validate_xla_program_owner(&self, program: &XlaCompiledProgram<'c>) -> Result<(), XlaDomainError> {
-        if program.executable.is_owned_by(self.client()?) {
+        if program.executable.is_owned_by(self.client()) {
             Ok(())
         } else {
             Err(XlaDomainError::ExecutableClientMismatch)
@@ -3150,7 +3316,7 @@ impl<'c> XlaDomain<'c> {
         let (physical_outputs, fence) = execution.into_parts();
         let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
         let outputs = reconstruct_compiled_outputs(
-            self.client()?,
+            self,
             program,
             &mut physical_outputs,
             fence.clone(),
@@ -3162,10 +3328,7 @@ impl<'c> XlaDomain<'c> {
                 ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
             );
         }
-        Ok(Execution::new(
-            outputs.into_iter().map(|output| output.with_execution_domain(self.clone())).collect(),
-            fence,
-        ))
+        Ok(Execution::new(outputs, fence))
     }
 
     /// Materializes and validates physical execution arguments without submitting device work.
@@ -3181,7 +3344,7 @@ impl<'c> XlaDomain<'c> {
             || program.signature.requires_cuda_kernel_runtime()
             || program.signature.requires_rocm_kernel_runtime()
         {
-            crate::kernels::distributed::validate_kernel_participants(self.client()?, &program.mesh)?;
+            crate::kernels::distributed::validate_kernel_participants(self.client(), &program.mesh)?;
         }
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
@@ -3210,14 +3373,14 @@ impl<'c> XlaDomain<'c> {
                 .map_err(ProgramError::from)?;
         let physical_input_types = program.signature.physical_input_types(&program.input_types);
         let inputs = materialize_bounded_dynamic_inputs(
-            self.client()?,
+            self,
             &program.signature,
             &program.input_types,
             actual_input_types.as_slice(),
             inputs,
         )?
         .inputs;
-        let inputs = materialize_zero_space_carriers(self.client()?, physical_input_types.as_slice(), inputs)?;
+        let inputs = materialize_zero_space_carriers(self, physical_input_types.as_slice(), inputs)?;
         let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
         let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
             .chain(program.donation_flags.iter().copied())
@@ -3784,7 +3947,7 @@ impl<'c> XlaDomain<'c> {
                     });
                 }
                 let hidden_outputs = reconstruct_compiled_outputs(
-                    self.client()?,
+                    self,
                     program,
                     &mut physical_outputs,
                     fence.clone(),
@@ -3803,7 +3966,6 @@ impl<'c> XlaDomain<'c> {
                     .map(|(logical_output_index, _)| {
                         hidden_outputs
                             .remove(logical_output_index)
-                            .map(|output| output.with_execution_domain(self.clone()))
                             .ok_or_else(|| {
                                 ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
                             })
@@ -3867,7 +4029,7 @@ impl<'c> XlaDomain<'c> {
                     });
                 }
                 let public_outputs = reconstruct_compiled_outputs(
-                    self.client()?,
+                    self,
                     program,
                     &mut physical_outputs,
                     fence,
@@ -3888,10 +4050,7 @@ impl<'c> XlaDomain<'c> {
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
                 Request::reconstruct(
                     &executable,
-                    public_outputs
-                        .into_iter()
-                        .map(|output| ArrayIrValue::Array(output.with_execution_domain(self.clone())))
-                        .collect(),
+                    public_outputs.into_iter().map(ArrayIrValue::Array).collect(),
                 )
             })();
             Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
@@ -3925,10 +4084,10 @@ impl<'c> XlaDomain<'c> {
         // Kernel selection validates the actual attached body and discharges only its owned local state before the
         // ordinary reference-discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
         let selected = crate::kernels::select_kernels(program, options.kernel_compiler.as_ref(), || {
-            let client = self
-                .client()
+            let target = self
+                .target()
                 .map_err(|error| crate::kernels::KernelEmbeddingError::Invalid { message: error.to_string() })?;
-            crate::kernels::XlaKernelExecutionFacts::from_client(client, &options.mesh)
+            crate::kernels::XlaKernelExecutionFacts::from_target(target, &options.mesh)
         })?;
         let program = selected.as_ref().unwrap_or(program);
         if capture_count > program.input_count() {
@@ -4006,7 +4165,7 @@ impl<'c> XlaDomain<'c> {
             ))
             .into());
         }
-        if !reference_states.is_empty() && !is_fully_addressable_single_process_mesh(self.client()?, &options.mesh)? {
+        if !reference_states.is_empty() && !self.target()?.is_fully_addressable_single_process_mesh(&options.mesh) {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
                 reason: "external reference state requires a fully addressable single-process mesh".to_string(),
             });
@@ -4205,8 +4364,8 @@ impl<'c> XlaDomain<'c> {
         );
         // The target platform gates platform-specific lowerings such as fused attention; a failed
         // platform query degrades to the portable lowerings instead of failing compilation.
-        let target_platform =
-            self.client.and_then(|client| client.platform_name().ok()).map(|platform| platform.into_owned());
+        let target = self.target()?;
+        let target_platform = Some(target.platform_name());
         // Shardy currently rejects bounded-dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
@@ -4231,7 +4390,6 @@ impl<'c> XlaDomain<'c> {
             }
         }
         let expected_argument_shardings = signature.physical_input_shardings(logical_argument_shardings.as_slice());
-        let client = self.client()?;
 
         Ok(XlaLoweredProgram {
             stable_hlo: stable_hlo.into(),
@@ -4246,9 +4404,9 @@ impl<'c> XlaDomain<'c> {
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh: options.mesh.clone(),
-            platform_name: client.platform_name()?.into_owned().into(),
-            platform_version: client.platform_version()?.into_owned().into(),
-            device_kinds: ordered_device_kinds(client, &options.mesh)?.into(),
+            platform_name: target.platform_name().into(),
+            platform_version: target.platform_version().into(),
+            device_kinds: target.mesh_device_kinds(&options.mesh)?.into(),
             kernel_execution_facts: if program.entry_region_ref().computation_regions().any(|region| {
                 region.instructions().iter().any(|instruction| match instruction.operation() {
                     XlaOperation::CustomCall(operation)
@@ -4259,7 +4417,7 @@ impl<'c> XlaDomain<'c> {
                     _ => false,
                 })
             }) {
-                Some(crate::kernels::XlaKernelExecutionFacts::from_client(client, &options.mesh)?.configuration_key()?)
+                Some(crate::kernels::XlaKernelExecutionFacts::from_target(target, &options.mesh)?.configuration_key()?)
             } else {
                 None
             },
@@ -4315,7 +4473,7 @@ impl<'c> XlaDomain<'c> {
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
-        let executable = self.client()?.compile(&pjrt_program, &program.compilation_options)?;
+        let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
         let compilation_duration = compilation_start.elapsed();
         Ok(XlaCompiledProgram {
             executable: Arc::new(executable),
@@ -4463,8 +4621,9 @@ impl<'c> XlaDomain<'c> {
         {
             return Ok(None);
         }
-        if metadata.platform_name != self.client()?.platform_name()?.as_ref()
-            || metadata.platform_version != self.client()?.platform_version()?.as_ref()
+        let target = self.target()?;
+        if metadata.platform_name != target.platform_name()
+            || metadata.platform_version != target.platform_version()
             || metadata.compiler_identity != XLA_COMPILER_IDENTITY.as_str()
             || metadata.xla_flags != std::env::var("XLA_FLAGS").unwrap_or_default()
         {
@@ -4479,8 +4638,7 @@ impl<'c> XlaDomain<'c> {
             return Err(persistent_error("rocm kernel executable is missing execution facts"));
         }
         if let Some(expected) = &metadata.kernel_execution_facts {
-            let actual =
-                crate::kernels::XlaKernelExecutionFacts::from_client(self.client()?, &mesh)?.configuration_key()?;
+            let actual = crate::kernels::XlaKernelExecutionFacts::from_target(target, &mesh)?.configuration_key()?;
             if expected != &actual {
                 return Ok(None);
             }
@@ -4488,15 +4646,13 @@ impl<'c> XlaDomain<'c> {
         let capture_count = checked_usize(metadata.capture_count)?;
         let output_count = checked_usize(metadata.output_count)?;
         let reference_states = decode_persistent_reference_states(metadata.reference_states, capture_count)?;
-        if !reference_states.is_empty() && !is_fully_addressable_single_process_mesh(self.client()?, &mesh)? {
+        if !reference_states.is_empty() && !target.is_fully_addressable_single_process_mesh(&mesh) {
             return Err(persistent_error("reference-state mesh is not fully addressable by this process"));
         }
-        if metadata.device_kinds != ordered_device_kinds(self.client()?, &mesh)? {
+        if metadata.device_kinds != target.mesh_device_kinds(&mesh)? {
             return Ok(None);
         }
-        let live_devices =
-            self.client()?.devices()?.into_iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
-        if mesh.devices().iter().any(|device| !live_devices.contains(device)) {
+        if mesh.devices().iter().any(|device| target.device(device.id()).is_none_or(|live| live.device != *device)) {
             return Ok(None);
         }
         let (input_types, output_types) = metadata.signature.decode()?;
@@ -4644,7 +4800,7 @@ impl<'c> XlaDomain<'c> {
         // Register before deserialization because loading an executable may resolve its custom-call target. The
         // persisted flag is authoritative on cache hits, where the source program is no longer available to inspect.
         self.ensure_runtime_requirements(&signature, metadata.platform_name.as_str())?;
-        let executable = self.client()?.deserialize_and_load_executable(
+        let executable = self.client().deserialize_and_load_executable(
             &bytes[metadata_end..],
             Some(&compilation_options),
             &LoadOptions::default(),
@@ -4738,20 +4894,6 @@ fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result
         }
     }
     Ok(devices)
-}
-
-fn ordered_device_kinds(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<String>, XlaDomainError> {
-    let devices = client.devices()?;
-    mesh.devices()
-        .iter()
-        .map(|mesh_device| {
-            let device =
-                devices.iter().find(|device| device.id().is_ok_and(|id| id == mesh_device.id())).ok_or_else(|| {
-                    persistent_error(format!("device {} is not visible to the live client", mesh_device.id()))
-                })?;
-            device.kind().map(|kind| kind.into_owned()).map_err(Into::into)
-        })
-        .collect()
 }
 
 pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
@@ -5574,7 +5716,7 @@ fn bounded_input_packing(actual_shape: &StaticShape, physical_shape: &StaticShap
 
 /// Completes one already-issued host copy and issues its bound-shaped upload without publishing it.
 fn upload_bounded_input_host_copy<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     input: &Array<'c>,
     pending: PendingBoundedInputHostCopy<'c>,
     report: &mut BoundedInputMaterializationReport,
@@ -5589,7 +5731,7 @@ fn upload_bounded_input_host_copy<'c>(
         pending.physical_type.data_type(),
     )?;
     report.host_padding_payload_allocations += padding_payload_allocations;
-    let physical = Array::from_host_buffer(client, pending.physical_type, input.mesh(), padded_bytes)?;
+    let physical = Array::from_host_buffer(domain, pending.physical_type, input.mesh(), padded_bytes)?;
     report.host_to_device_shard_uploads += physical.shards().iter().filter(|shard| shard.buffer().is_some()).count();
     Ok(PendingBoundedInputPublication {
         physical_input_index: pending.physical_input_index,
@@ -5625,14 +5767,14 @@ fn publish_bounded_input_uploads<'c>(
 /// bytes plus O(shard-segment-count) overlap bookkeeping; ready hits perform no pad-path allocation or transport. A
 /// failed asynchronous upload stores no cache entry and a later call retries the ordinary cold path.
 fn materialize_bounded_dynamic_inputs<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     signature: &XlaExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
     inputs: Vec<Array<'c>>,
 ) -> Result<MaterializedBoundedInputs<'c>, XlaDomainError> {
     materialize_bounded_dynamic_inputs_with_readiness(
-        client,
+        domain,
         signature,
         declared_types,
         actual_types,
@@ -5648,7 +5790,7 @@ fn materialize_bounded_dynamic_inputs<'c>(
 
 /// Implements bounded-input materialization with an injectable batch readiness check for deterministic failure tests.
 fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     signature: &XlaExecutableSignature,
     declared_types: &[ArrayType],
     actual_types: &[ArrayType],
@@ -5739,7 +5881,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
     let mut pending_publications = Vec::with_capacity(pending_host_copies.len());
     for pending in pending_host_copies {
         let input = &inputs[pending.logical_input_index];
-        pending_publications.push(upload_bounded_input_host_copy(client, input, pending, &mut report)?);
+        pending_publications.push(upload_bounded_input_host_copy(domain, input, pending, &mut report)?);
     }
     publish_bounded_input_uploads(pending_publications, &mut physical_inputs, &mut check_readiness)?;
 
@@ -5771,7 +5913,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
                     host_copy: begin_materialize_dense_array_bytes(input)?,
                     producer,
                 };
-                let publication = upload_bounded_input_host_copy(client, input, pending, &mut report)?;
+                let publication = upload_bounded_input_host_copy(domain, input, pending, &mut report)?;
                 publish_bounded_input_uploads(vec![publication], &mut physical_inputs, &mut check_readiness)?;
             }
         }
@@ -5785,7 +5927,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
         let extent = i32::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
             message: format!("runtime dimension extent {extent} does not fit in a StableHLO i32 scalar"),
         })?;
-        let (extent_scalar, uploaded) = input.logical_extent_scalar(client, extent)?;
+        let (extent_scalar, uploaded) = input.logical_extent_scalar(domain, extent)?;
         report.extent_scalar_uploads += usize::from(uploaded);
         physical_inputs.push(extent_scalar);
     }
@@ -5912,7 +6054,7 @@ fn copy_dense_array_into_padding(
 /// value's runtime type: the compiled module declares the bound-shaped `i1` argument, and the hidden extent scalar
 /// transports the logical size, so a below-bound zero-space input must still hand PJRT a bound-shaped buffer.
 fn materialize_zero_space_carriers<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     physical_input_types: &[ArrayType],
     inputs: Vec<Array<'c>>,
 ) -> Result<Vec<Array<'c>>, XlaDomainError> {
@@ -5930,14 +6072,14 @@ fn materialize_zero_space_carriers<'c>(
                 .element_count()
                 .map_err(Error::from)?
                 .expect("physical bounded input types should only have static shapes");
-            Ok(Array::from_host_buffer(client, carrier_type, input.mesh(), vec![0u8; element_count])?)
+            Ok(Array::from_host_buffer(domain, carrier_type, input.mesh(), vec![0u8; element_count])?)
         })
         .collect()
 }
 
 /// Reconstructs selected logical outputs from one submitted execution's physical buffers.
 fn reconstruct_compiled_outputs<'c>(
-    client: &'c Client<'c>,
+    domain: &XlaDomain<'c>,
     program: &XlaCompiledProgram<'c>,
     physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
     fence: ryft_pjrt::ExecutionFence,
@@ -5963,7 +6105,7 @@ fn reconstruct_compiled_outputs<'c>(
                 ))
             })?;
         let scalar = Array::from_canonical_addressable_buffers(
-            client,
+            domain,
             scalar_type.clone(),
             program.mesh.clone(),
             physical_output,
@@ -6015,7 +6157,7 @@ fn reconstruct_compiled_outputs<'c>(
                         None => output_type.replicated(&program.mesh).map_err(ArrayError::from)?,
                     };
                     Ok(Array::from_canonical_addressable_buffers(
-                        client,
+                        domain,
                         output_type,
                         program.mesh.clone(),
                         physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
@@ -6027,7 +6169,7 @@ fn reconstruct_compiled_outputs<'c>(
                     )?
                     .with_execution_fence(fence.clone()))
                 }
-                None => Ok(Array::from_zero_space(client, output_type.clone(), program.mesh.clone())?
+                None => Ok(Array::from_zero_space(domain, output_type.clone(), program.mesh.clone())?
                     .with_execution_fence(fence.clone())),
             }
         })
@@ -6086,7 +6228,7 @@ impl<'c> XlaDomain<'c> {
                     ),
                 });
             }
-            if !is_fully_addressable_single_process_mesh(self.client()?, &program.mesh)? {
+            if !self.target()?.is_fully_addressable_single_process_mesh(&program.mesh) {
                 return Err(XlaDomainError::EffectScope {
                     reason: "ordered I/O requires a fixed fully addressable single-process device assignment"
                         .to_string(),
@@ -6101,7 +6243,7 @@ impl<'c> XlaDomain<'c> {
         }
         let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
         let mut reservation = if program.signature.has_effects() {
-            Some(self.effect_scope.as_ref().unwrap().reserve(device)?)
+            Some(self.effect_scope.reserve(device)?)
         } else {
             None
         };
@@ -6115,7 +6257,7 @@ impl<'c> XlaDomain<'c> {
                 let tokens = match predecessor {
                     Some(tokens) => tokens,
                     None => {
-                        let client = self.client()?;
+                        let client = self.client();
                         let devices = client.addressable_devices()?;
                         let mut tokens = Vec::with_capacity(addressable_device_count);
                         for &device_id in arguments.addressable_device_ids() {
@@ -6155,18 +6297,18 @@ impl<'c> XlaDomain<'c> {
             });
         }
         let context = if program.signature.requires_cuda_kernel_runtime() {
-            let session = self.session.as_ref().unwrap();
+            let session = &self.session;
             let runtime = session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
             // ensure_runtime_requirements initialized the stable boxed owner. This session cannot drop during this
             // borrow; immediately after successful submission its existing fence is retained before output work.
-            Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()?) }?)
+            Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()) }?)
         } else if program.signature.requires_rocm_kernel_runtime() {
             #[cfg(feature = "rocm")]
             {
-                let session = self.session.as_ref().unwrap();
+                let session = &self.session;
                 let runtime = session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
                 // Preparation established the stable boxed allocation; the fence below retains it through completion.
-                Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()?) }?)
+                Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()) }?)
             }
             #[cfg(not(feature = "rocm"))]
             return Err(XlaDomainError::InvalidCompilationOptions {
@@ -6180,7 +6322,7 @@ impl<'c> XlaDomain<'c> {
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, Some(file!()), None, None)?
             .into_parts();
         if program.signature.requires_cuda_kernel_runtime() {
-            let session = self.session.as_ref().unwrap();
+            let session = &self.session;
             let mut completions = session.cuda_kernel_completions.lock().expect("cuda completion owner mutex poisoned");
             // Failed fences are terminal and retain their diagnostics in the caller's existing execution object.
             completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
@@ -6188,7 +6330,7 @@ impl<'c> XlaDomain<'c> {
         }
         #[cfg(feature = "rocm")]
         if program.signature.requires_rocm_kernel_runtime() {
-            let session = self.session.as_ref().unwrap();
+            let session = &self.session;
             let mut completions = session.rocm_kernel_completions.lock().expect("rocm completion owner mutex poisoned");
             completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
             completions.push(fence.clone());
@@ -6299,7 +6441,7 @@ mod tests {
     /// Checks compiled basic and broadcast advanced reads and repeated indexed updates on the provided backend.
     fn assert_compiled_indexing(client: &Client<'_>) {
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_types = vec![
             ArrayType::new_static(DataType::F64, [3, 4]),
             ArrayType::new_static(DataType::I64, [2, 1]),
@@ -6330,7 +6472,7 @@ mod tests {
         let inputs = input_types
             .into_iter()
             .zip(bytes)
-            .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+            .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
             .collect::<Vec<_>>();
         let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
@@ -6347,7 +6489,7 @@ mod tests {
     /// Replays one symbolic indexing graph at distinct concrete extents on the provided backend.
     fn assert_compiled_indexing_symbolic_extent(client: &Client<'_>) {
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
@@ -6410,7 +6552,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect::<Vec<_>>();
             domain
                 .interpret(&compiled.executable_function(), inputs)
@@ -6490,7 +6632,7 @@ mod tests {
     }
 
     fn array_domain<'c>(client: &'c Client<'c>) -> ProjectedContext<XlaDomain<'c>, ArrayType> {
-        ProjectedContext::new(XlaDomain::new(client))
+        ProjectedContext::new(XlaSession::new(client).domain())
     }
 
     fn program_array<'a, 'c>(value: &'a ArrayIrValue<Array<'c>>) -> &'a Array<'c> {
@@ -6512,34 +6654,34 @@ mod tests {
             .unwrap()
     }
 
-    fn f32_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
+    fn f32_vector<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
         let r#type = replicated_vector_type(mesh, values.len());
-        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
     }
 
-    fn f32_scalar<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
+    fn f32_scalar<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, value: f32) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::F32);
-        Array::from_host_buffer(client, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
-    fn f64_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+    fn f64_vector<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
     }
 
-    fn boolean_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+    fn boolean_vector<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
         let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
-        Array::from_host_buffer(client, r#type, mesh.clone(), values.as_slice()).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), values.as_slice()).unwrap()
     }
 
-    fn boolean_scalar<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
+    fn boolean_scalar<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
-        Array::from_host_buffer(client, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
     }
 
     fn read_f32s(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
@@ -6944,8 +7086,8 @@ mod tests {
     fn test_prepare_compiled_execution_kernel_participants() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "device", 1);
-        let domain = XlaDomain::new(&client);
-        let input = f32_vector(&client, &mesh, &[2.0, 5.0]);
+        let domain = XlaSession::new(&client).domain();
+        let input = f32_vector(&domain, &mesh, &[2.0, 5.0]);
         let mut builder = XlaProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         let source = builder
@@ -6956,7 +7098,7 @@ mod tests {
         // Attach the same validated marker carried by native-kernel executables. The identity program isolates
         // submission admission from any backend-specific kernel compiler or custom-call handler.
         program.kernel_execution_facts = Some(
-            crate::kernels::XlaKernelExecutionFacts::from_client(&client, &mesh)
+            crate::kernels::XlaKernelExecutionFacts::from_target(domain.target().unwrap(), &mesh)
                 .unwrap()
                 .configuration_key()
                 .unwrap(),
@@ -7120,7 +7262,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
 
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
@@ -7143,7 +7285,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh);
         let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
@@ -7163,7 +7305,7 @@ mod tests {
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
-        let domain = XlaDomain::with_mesh(&client, mesh);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh);
 
         let array = domain.constant(&array_type, ConstantKind::One).unwrap();
 
@@ -7182,10 +7324,12 @@ mod tests {
     #[test]
     fn test_domain_identity_synthesis_rejects_unsupported_constant_type() {
         use ryft_core::OneOperation;
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::Token);
 
         assert!(matches!(
-            XlaDomain::token().bind(OneOperation::new(array_type.clone()), Vec::new(), &[]),
+            domain.bind(OneOperation::new(array_type.clone()), Vec::new(), &[]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "data type `token` cannot represent one"
         ));
@@ -7198,7 +7342,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh);
         let array_type = ArrayType::scalar(DataType::F32);
         let operations = [
             XlaOperation::provide(ZeroOperation::new(ArrayIrType::Array(array_type.clone())), &[]).unwrap(),
@@ -7226,7 +7370,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let cloned = domain.clone();
 
         assert_eq!(domain.mesh().unwrap(), &mesh);
@@ -7244,7 +7388,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let lhs_type = ArrayType::new_static(DataType::F32, [5, 2]);
         let rhs_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
@@ -7290,7 +7434,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh);
         let left = DimensionValue::constant(2).unwrap();
         let right = DimensionValue::constant(3).unwrap();
         let add = DimensionAddOperation::new(left.r#type().as_ref(), right.r#type().as_ref()).unwrap();
@@ -7341,7 +7485,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
@@ -7367,11 +7511,11 @@ mod tests {
         assert!(compiled.requires_assertion_handler);
 
         let valid =
-            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), 4_i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4_i64.to_ne_bytes().as_slice()).unwrap();
         let valid = domain.execute_xla_program(&compiled, vec![valid]).unwrap();
         assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
 
-        let invalid = Array::from_host_buffer(&client, input_type, mesh, 9_i64.to_ne_bytes().as_slice()).unwrap();
+        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9_i64.to_ne_bytes().as_slice()).unwrap();
         let error = domain.execute_xla_program(&compiled, vec![invalid]).unwrap_err();
         assert!(
             error.to_string().contains(
@@ -7388,7 +7532,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let first_type = DimensionType::new("first", bounds);
@@ -7469,7 +7613,7 @@ mod tests {
         assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 5, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
 
         let error = domain.execute_xla_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
@@ -7484,7 +7628,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -7597,7 +7741,7 @@ mod tests {
             let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap()
             };
             let error = domain.execute_xla_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
@@ -7628,9 +7772,9 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let values = f32_vector(&client, &mesh, &[1., -2., 3., -4.]);
-        let limits = f32_vector(&client, &mesh, &[0., 0., 0., 0.]);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let values = f32_vector(&domain, &mesh, &[1., -2., 3., -4.]);
+        let limits = f32_vector(&domain, &mesh, &[0., 0., 0., 0.]);
         let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
             vec![values.r#type().into_owned(), limits.r#type().into_owned()],
@@ -7667,10 +7811,10 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         for mode in [0, 1, 2] {
-            let predicates = boolean_vector(&client, &mesh, &[true, false, false, false]);
-            let observations = f32_vector(&client, &mesh, &[10., 20., 30., 40.]);
+            let predicates = boolean_vector(&domain, &mesh, &[true, false, false, false]);
+            let observations = f32_vector(&domain, &mesh, &[10., 20., 30., 40.]);
             let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     if mode == 1 {
@@ -7728,7 +7872,7 @@ mod tests {
                 omitted: 1,
             };
             assert!(error.to_string().contains(&expected.to_string()), "{error}");
-            let predicates = boolean_vector(&client, &mesh, &[true; 4]);
+            let predicates = boolean_vector(&domain, &mesh, &[true; 4]);
             assert!(domain.execute_xla_program(&compiled, vec![predicates, observations]).unwrap().is_empty());
         }
     }
@@ -7742,7 +7886,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         for (data_type, values) in [
             (DataType::I1, [0., -1., 0., -1.]),
             (DataType::U1, [0., 1., 0., 1.]),
@@ -7751,8 +7895,8 @@ mod tests {
             (DataType::I4, [0., -8., -1., 7.]),
             (DataType::U4, [0., 1., 8., 15.]),
         ] {
-            let predicates = boolean_vector(&client, &mesh, &[false; 4]);
-            let observations = f32_vector(&client, &mesh, &values);
+            let predicates = boolean_vector(&domain, &mesh, &[false; 4]);
+            let observations = f32_vector(&domain, &mesh, &values);
             let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let observation = inputs[1].convert_element_type(data_type).unwrap();
@@ -7800,7 +7944,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
         for observations in [
             vec![],
@@ -7835,13 +7979,13 @@ mod tests {
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             for passed in [true, false] {
                 let mut inputs = vec![
-                    Array::from_host_buffer(&client, predicate_type.clone(), mesh.clone(), &[u8::from(passed)])
+                    Array::from_host_buffer(&domain, predicate_type.clone(), mesh.clone(), &[u8::from(passed)])
                         .unwrap(),
                 ];
                 for (_, data_type, bytes, _) in &observations {
                     inputs.push(
                         Array::from_host_buffer(
-                            &client,
+                            &domain,
                             replicated_scalar_type(&mesh, *data_type),
                             mesh.clone(),
                             bytes,
@@ -7866,8 +8010,8 @@ mod tests {
             }
         }
 
-        let predicates = boolean_vector(&client, &mesh, &[true, false, false]);
-        let observations = f32_vector(&client, &mesh, &[10., 20., 30.]);
+        let predicates = boolean_vector(&domain, &mesh, &[true, false, false]);
+        let observations = f32_vector(&domain, &mesh, &[10., 20., 30.]);
         let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 batch(
@@ -7904,7 +8048,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
@@ -7960,7 +8104,7 @@ mod tests {
                 let inputs = [size, limit]
                     .into_iter()
                     .map(|value| {
-                        Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes())
+                        Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes())
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
@@ -7969,7 +8113,7 @@ mod tests {
             let inputs = [3_i64, 1_i64]
                 .into_iter()
                 .map(|value| {
-                    Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
+                    Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
                 })
                 .collect::<Vec<_>>();
             let error = domain.execute_xla_program(&compiled, inputs).unwrap_err();
@@ -8008,7 +8152,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         for bounded in [false, true] {
             let context = TracingContext::<XlaConstant, XlaOperation>::new();
@@ -8045,10 +8189,10 @@ mod tests {
             let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let empty =
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
             assert!(domain.execute_xla_program(&compiled, vec![empty]).unwrap().is_empty());
             let nonempty =
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &3_i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &3_i64.to_ne_bytes()).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {
@@ -8082,7 +8226,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -8125,7 +8269,7 @@ mod tests {
             assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let input = |value: i64| {
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap()
             };
 
@@ -8172,7 +8316,7 @@ mod tests {
             .unwrap();
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -8231,7 +8375,7 @@ mod tests {
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let input = |value: i64| {
-            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
 
         let (output, lines) = with_captured_prints(|| {
@@ -8252,8 +8396,8 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         let extent = domain
             .bind(
@@ -8314,7 +8458,7 @@ mod tests {
     fn test_compiled_symbolic_manipulation_primal_and_pullback() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in
         // the pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals
         // internal to a fused primal/pullback; this verifies retained
@@ -8686,7 +8830,7 @@ mod tests {
                 let inputs = input_types
                     .into_iter()
                     .zip(bytes)
-                    .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                    .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                     .collect();
                 let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
                 assert_eq!(outputs.len(), 2);
@@ -8776,7 +8920,7 @@ mod tests {
         // module) at empty and nonempty mapped extents, through both the primal and its pullback.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), Dimension::Static(4)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![extent, Dimension::Static(1)]));
@@ -8875,7 +9019,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
             let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
             assert_eq!(outputs.len(), 2);
@@ -8901,7 +9045,7 @@ mod tests {
         type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(0, Some(6)).unwrap()));
         let staged_types = vec![
             ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), Dimension::Static(4)])),
@@ -8996,7 +9140,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
             let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
             assert_eq!(outputs.len(), 3, "n={size}");
@@ -9114,7 +9258,7 @@ mod tests {
         // in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
         let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| vec![inputs[0].dynamic_update_slice(&inputs[1], &inputs[2..]).unwrap()],
@@ -9198,7 +9342,7 @@ mod tests {
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)
-                .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                .map(|(r#type, bytes)| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
                 .collect();
             let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
             assert_eq!(outputs.len(), 2, "n={size}, row={row}");
@@ -9321,7 +9465,7 @@ mod tests {
     fn test_production_composite_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -9406,13 +9550,13 @@ mod tests {
         let static_lowering = domain.lower_xla_program(&static_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         let compiled = domain.compile_xla_program(&static_lowering).unwrap();
         let vector = Array::from_host_buffer(
-            &client,
+            &domain,
             static_vector_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
-        let scalar = f32_scalar(&client, &mesh, 7.0);
+        let scalar = f32_scalar(&domain, &mesh, 7.0);
         let outputs = domain.execute_xla_program(&compiled, vec![vector, scalar]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape().as_slice(), &[4]);
@@ -9449,7 +9593,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -9470,7 +9614,7 @@ mod tests {
             let input_type = replicated_vector_type(&mesh, size);
             let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 input_type,
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
@@ -9509,10 +9653,10 @@ mod tests {
             );
         let call = |size: i64| {
             let size =
-                Array::from_host_buffer(&client, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&client, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)])
         };
@@ -9535,7 +9679,7 @@ mod tests {
     fn test_production_composite_lowering_executes_dynamic_slice_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
@@ -9579,7 +9723,7 @@ mod tests {
         assert!(!lowering.stable_hlo().contains("stablehlo.real_dynamic_slice"));
         let compiled = domain.compile_xla_program(&lowering).unwrap();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
                 .unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
 
@@ -9594,7 +9738,7 @@ mod tests {
         // values so this fixture tests both the strided forward and point-scatter adjoint, including an empty result.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let mut builder = XlaProgramBuilder::new();
@@ -9647,15 +9791,15 @@ mod tests {
         let lowered = domain.lower_xla_program(&combined, 0, &XlaOptions::new(mesh.clone())).unwrap();
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&[0_f32, 1., 2., 3., 4., 5.]))
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0_f32, 1., 2., 3., 4., 5.]))
                 .unwrap();
         let size =
-            Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), values_to_bytes(&[2_i64])).unwrap();
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2_i64])).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
-        let size = Array::from_host_buffer(&client, size_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0_i64])).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input, size]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 6]);
@@ -9668,7 +9812,7 @@ mod tests {
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
         let scalar_type = ArrayType::scalar(DataType::I64);
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
@@ -9754,11 +9898,11 @@ mod tests {
             f32::NAN,
             f32::NAN,
         ];
-        let input = Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
         let rows =
-            Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3_i64])).unwrap();
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3_i64])).unwrap();
         let columns =
-            Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4_i64])).unwrap();
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4_i64])).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
@@ -9766,7 +9910,7 @@ mod tests {
             read_f32s(&client, &outputs[1]),
             vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
         );
-        let rows = Array::from_host_buffer(&client, scalar_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0_i64])).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input, rows, columns]).unwrap();
         assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 20]);
@@ -9782,7 +9926,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let engine = XlaDomain::with_mesh(&client, mesh.clone());
+        let engine = XlaSession::new(&client).domain().with_mesh(mesh.clone());
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -9798,7 +9942,7 @@ mod tests {
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -9855,7 +9999,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -9905,7 +10049,7 @@ mod tests {
             domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
         );
 
-        let input = Array::from_host_buffer(&client, input_type, mesh, []).unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, mesh, []).unwrap();
         let output =
             ryft_core::compilation::call_function(&domain, compiled.executable_function(), ArrayIrValue::Array(input))
                 .unwrap();
@@ -9923,7 +10067,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding.clone())
@@ -9948,13 +10092,13 @@ mod tests {
             (ArrayIrType, ArrayIrType),
         > = domain.compile(lowered).unwrap();
         let value = Array::from_host_buffer(
-            &client,
+            &domain,
             value_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
         )
         .unwrap();
-        let zero = Array::from_host_buffer(&client, zero_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh, []).unwrap();
 
         let (zero_output, value_output) = ryft_core::compilation::call_function(
             &domain,
@@ -9994,7 +10138,7 @@ mod tests {
         // count, exactly like the reference backend's cumulative maximum.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
@@ -10014,7 +10158,7 @@ mod tests {
         for rows in [2usize, 4] {
             let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 ArrayType::new_static(DataType::F32, [rows, 5]).with_sharding(sharding.clone()).unwrap(),
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
@@ -10056,6 +10200,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -10068,7 +10213,7 @@ mod tests {
         // only new value is its hidden logical-extent scalar.
         let exact_type = replicated_vector_type(&mesh, 8);
         let exact = Array::from_host_buffer(
-            &client,
+            &domain,
             exact_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[0.0; 8]).as_slice(),
@@ -10080,7 +10225,7 @@ mod tests {
         );
         let exact_storage = exact.clone();
         let at_bound = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&exact_type),
@@ -10109,14 +10254,14 @@ mod tests {
             BoundedInputPacking::Pad,
         );
         let smaller = Array::from_host_buffer(
-            &client,
+            &domain,
             smaller_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let cold = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&smaller_type),
@@ -10142,7 +10287,7 @@ mod tests {
             Array::into_execute_arguments_with_donation(vec![cold.inputs[0].clone()], &[device_id], &[true]).unwrap();
         assert!(!donation_arguments.inputs_by_device()[0][0].donatable);
         let warm =
-            materialize_bounded_dynamic_inputs(&client, &signature, &[declared_type], &[smaller_type], vec![smaller])
+            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[smaller_type], vec![smaller])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained_storage);
         assert_eq!(
@@ -10164,6 +10309,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -10172,14 +10318,14 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let left = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
@@ -10193,7 +10339,7 @@ mod tests {
         // loop awaits either one. The path-local report guards the two independent cold jobs and the warm zero-work
         // result without relying on scheduler timing.
         let cold = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             &declared_types,
             &actual_types,
@@ -10216,7 +10362,7 @@ mod tests {
         let retained = [cold.inputs[0].clone(), cold.inputs[1].clone()];
 
         let warm =
-            materialize_bounded_dynamic_inputs(&client, &signature, &declared_types, &actual_types, vec![left, right])
+            materialize_bounded_dynamic_inputs(&domain, &signature, &declared_types, &actual_types, vec![left, right])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained[0]);
         assert_eq!(warm.inputs[1], retained[1]);
@@ -10238,6 +10384,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -10246,14 +10393,14 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let left = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
         let right = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[5.0, 6.0, 7.0, 8.0]).as_slice(),
@@ -10268,7 +10415,7 @@ mod tests {
         // The injected failure runs only after both physical arrays and their H2D uploads exist. Returning the error
         // before publication drops both producer reservations, so neither failed result can become a warm cache hit.
         let error = match materialize_bounded_dynamic_inputs_with_readiness(
-            &client,
+            &domain,
             &signature,
             &declared_types,
             &actual_types,
@@ -10292,7 +10439,7 @@ mod tests {
         assert_eq!(observed_uploads, 2);
 
         let retry = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             &declared_types,
             &actual_types,
@@ -10306,7 +10453,7 @@ mod tests {
         let retained = [retry.inputs[0].clone(), retry.inputs[1].clone()];
 
         let warm =
-            materialize_bounded_dynamic_inputs(&client, &signature, &declared_types, &actual_types, vec![left, right])
+            materialize_bounded_dynamic_inputs(&domain, &signature, &declared_types, &actual_types, vec![left, right])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained[0]);
         assert_eq!(warm.inputs[1], retained[1]);
@@ -10322,6 +10469,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
+        let domain = XlaSession::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -10333,7 +10481,7 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
         let source = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -10342,7 +10490,7 @@ mod tests {
         let signature = XlaExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
 
         let cold = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&actual_type),
@@ -10356,7 +10504,7 @@ mod tests {
         let retained = cold.inputs[0].clone();
 
         let warm =
-            materialize_bounded_dynamic_inputs(&client, &signature, &[declared_type], &[actual_type], vec![source])
+            materialize_bounded_dynamic_inputs(&domain, &signature, &[declared_type], &[actual_type], vec![source])
                 .unwrap();
         assert_eq!(warm.inputs[0], retained);
         assert_eq!(warm.report.cache_hits, 1);
@@ -10371,7 +10519,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
@@ -10411,7 +10559,7 @@ mod tests {
                     .unwrap();
             let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 actual_type,
                 mesh.clone(),
                 values_to_bytes(values.as_slice()).as_slice(),
@@ -10471,7 +10619,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10508,9 +10656,9 @@ mod tests {
 
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let size =
-            Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), 3_i64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 3_i64.to_ne_bytes().as_slice()).unwrap();
         let value = Array::from_host_buffer(
-            &client,
+            &domain,
             value_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
@@ -10569,7 +10717,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -10582,10 +10730,10 @@ mod tests {
 
         let call = |size: i64| {
             let size =
-                Array::from_host_buffer(&client, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&client, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)]).unwrap()
         };
@@ -10709,7 +10857,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -10718,7 +10866,7 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
                 .interpret_in_context(&domain, vec![ArrayIrValue::Array(input.clone())])
@@ -10839,7 +10987,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program =
@@ -10850,7 +10998,7 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
                 .interpret_in_context(&domain, vec![ArrayIrValue::Array(input.clone())])
@@ -10932,7 +11080,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let zero = Array::from_host_buffer(&client, size_type, mesh, 0_i64.to_ne_bytes().as_slice()).unwrap();
+        let zero = Array::from_host_buffer(&domain, size_type, mesh, 0_i64.to_ne_bytes().as_slice()).unwrap();
         let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
@@ -10954,7 +11102,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let program = data_derived_padding_fixture(size_type.clone(), extent);
@@ -10962,7 +11110,7 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             domain.execute_xla_program(&compiled, vec![input]).unwrap()
         };
@@ -11014,7 +11162,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         for (scaled_element_type, scaled_scale_type) in [
             (DataType::F4E2M1FN, DataType::F8E4M3FN),
             (DataType::F8E4M3FN, DataType::F8E8M0FNU),
@@ -11039,7 +11187,7 @@ mod tests {
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let execute = |size: i64| {
                 let input =
-                    Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                         .unwrap();
                 domain.execute_xla_program(&compiled, vec![input]).unwrap()
             };
@@ -11081,7 +11229,7 @@ mod tests {
             });
 
             let zero =
-                Array::from_host_buffer(&client, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(
@@ -11105,7 +11253,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let [batch, sequence, heads, head_dimension] = [4, 2048, 32, 128];
         let r#type = ArrayType::new(
             DataType::BF16,
@@ -11148,7 +11296,7 @@ mod tests {
         let one = 0x3f80_u16.to_ne_bytes();
         let mut bytes = vec![0_u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
         bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
-        let input = Array::from_host_buffer(&client, r#type, mesh, bytes.as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
         input.block_until_ready().unwrap();
         let execute = || {
             let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
@@ -11184,7 +11332,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(input_sharding.clone())
@@ -11233,9 +11381,9 @@ mod tests {
 
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let values = || f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
         let execute = |mask: &[bool]| {
-            domain.execute_xla_program(&compiled, vec![boolean_vector(&client, &mesh, mask), values()]).unwrap()
+            domain.execute_xla_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
         };
 
         let two = execute(&[true, false, true, false]);
@@ -11250,7 +11398,7 @@ mod tests {
     fn test_bounded_dynamic_bitcast_element_type_preserves_prefix_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -11306,7 +11454,7 @@ mod tests {
         // Splitting and joining the static bit-width axis preserves an independent dynamic prefix and its live bytes.
         for count in [2usize, 4] {
             let outputs =
-                domain.execute_xla_program(&compiled, vec![f32_vector(&client, &mesh, &vec![1.0; count])]).unwrap();
+                domain.execute_xla_program(&compiled, vec![f32_vector(&domain, &mesh, &vec![1.0; count])]).unwrap();
             assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
             assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
             assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0; count]);
@@ -11331,7 +11479,7 @@ mod tests {
     fn test_data_derived_dynamic_slice_checks_runtime_input_and_result_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -11374,7 +11522,7 @@ mod tests {
         assert!(lowered.stable_hlo().contains("@ryft.assert"));
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let scalar =
-            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap();
+            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap();
         let inputs = |input_size: i64, result_size: i64| {
             vec![
                 scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
@@ -11404,7 +11552,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
         let mut builder = XlaProgramBuilder::new();
@@ -11589,14 +11737,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = try_jit_with_options(
             &domain,
             |(), input| trace(input),
             XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
         );
         let call = |values: &[f32]| {
-            let input = f32_vector(&client, &mesh, values);
+            let input = f32_vector(&domain, &mesh, values);
             function.call((), ArrayIrValue::Array(input)).unwrap()
         };
 
@@ -11627,7 +11775,8 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
-        let single_device_domain = XlaDomain::with_mesh(&single_device_client, single_device_mesh.clone());
+        let single_device_domain =
+            XlaSession::new(&single_device_client).domain().with_mesh(single_device_mesh.clone());
         let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert!(matches!(
             single_device_domain.dispatch_signature(
@@ -11675,7 +11824,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
-        let multi_device_domain = XlaDomain::with_mesh(&multi_device_client, multi_device_mesh.clone());
+        let multi_device_domain = XlaSession::new(&multi_device_client).domain().with_mesh(multi_device_mesh.clone());
         assert!(matches!(
             multi_device_domain.dispatch_signature(
                 vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into()],
@@ -11707,7 +11856,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let options = XlaOptions::new(mesh).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo);
         let bounds = DimensionBounds::new(0, Some(5)).unwrap();
         let vector_type =
@@ -11761,7 +11910,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -11832,6 +11981,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let declared_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()).into()]),
@@ -11840,7 +11990,7 @@ mod tests {
         .unwrap();
         let actual_type = replicated_vector_type(&mesh, 4);
         let source = Array::from_host_buffer(
-            &client,
+            &domain,
             actual_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -11854,7 +12004,7 @@ mod tests {
             let left_actual_type = actual_type.clone();
             let left = scope.spawn(|| {
                 materialize_bounded_dynamic_inputs(
-                    &client,
+                    &domain,
                     &signature,
                     &[left_declared_type],
                     &[left_actual_type],
@@ -11864,7 +12014,7 @@ mod tests {
             });
             let right = scope.spawn(|| {
                 materialize_bounded_dynamic_inputs(
-                    &client,
+                    &domain,
                     &signature,
                     std::slice::from_ref(&declared_type),
                     std::slice::from_ref(&actual_type),
@@ -11891,6 +12041,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // The compiled module declares the bound-shaped `[3]` argument, so a below-bound `[2]` runtime value must
         // still produce a `[3]` carrier; the hidden extent scalar transports the logical size.
@@ -11900,9 +12051,9 @@ mod tests {
         let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&client, runtime_zero_type, mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&domain, runtime_zero_type, mesh, []).unwrap();
 
-        let carriers = materialize_zero_space_carriers(&client, &[physical_zero_type], vec![zero]).unwrap();
+        let carriers = materialize_zero_space_carriers(&domain, &[physical_zero_type], vec![zero]).unwrap();
 
         assert_eq!(carriers.len(), 1);
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
@@ -11927,6 +12078,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let declared_type = ArrayType::new(
             DataType::Zero,
@@ -11938,12 +12090,12 @@ mod tests {
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
-        let zero = Array::from_host_buffer(&client, actual_type.clone(), mesh, []).unwrap();
+        let zero = Array::from_host_buffer(&domain, actual_type.clone(), mesh, []).unwrap();
 
         // The below-bound zero-space input must bypass the retained-cache and byte-pad tiers (its dense host copy is
         // empty) and rely on the carrier materialization to synthesize the bound-shaped predicate argument.
         let materialized = materialize_bounded_dynamic_inputs(
-            &client,
+            &domain,
             &signature,
             std::slice::from_ref(&declared_type),
             std::slice::from_ref(&actual_type),
@@ -11957,7 +12109,7 @@ mod tests {
         );
 
         let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
-        let carriers = materialize_zero_space_carriers(&client, &physical_types, materialized.inputs).unwrap();
+        let carriers = materialize_zero_space_carriers(&domain, &physical_types, materialized.inputs).unwrap();
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
         assert_eq!(carriers[0].shape().as_slice(), &[3]);
         assert_eq!(carriers[1].data_type(), DataType::I32);
@@ -11972,7 +12124,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -11987,8 +12139,8 @@ mod tests {
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
-        let clientless_domain = XlaDomain::clientless();
-        let repeated = clientless_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
+        let independent_domain = XlaSession::new(&client).domain();
+        let repeated = independent_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
 
         assert_eq!(key, repeated);
         assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
@@ -12012,12 +12164,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let capture = Array::from_host_buffer(
-            &client,
+            &domain,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -12071,7 +12223,7 @@ mod tests {
         let mut matching: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(matching.kernel_execution_facts, None);
-        let facts = crate::kernels::XlaKernelExecutionFacts::from_client(&client, &mesh).unwrap();
+        let facts = crate::kernels::XlaKernelExecutionFacts::from_target(domain.target().unwrap(), &mesh).unwrap();
         matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
         let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
         assert_eq!(matching.kernel_execution_facts, Some(facts.configuration_key().unwrap()));
@@ -12127,7 +12279,7 @@ mod tests {
         assert!(domain.deserialize_program(incompatible.as_slice()).unwrap().is_none());
 
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             input_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -12157,10 +12309,11 @@ mod tests {
             .unwrap();
         let directory = tempdir().unwrap();
 
-        let first_domain = XlaDomain::with_configured_disk_cache(
+        let first_domain = XlaSession::with_configured_disk_cache(
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
-        );
+        )
+        .domain();
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
@@ -12175,10 +12328,11 @@ mod tests {
         drop(first);
         drop(first_domain);
 
-        let second_domain = XlaDomain::with_configured_disk_cache(
+        let second_domain = XlaSession::with_configured_disk_cache(
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
-        );
+        )
+        .domain();
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type,
@@ -12238,7 +12392,7 @@ mod tests {
 
         // The foreign executable keeps the requesting lowering's boundary types so that it loads and passes every
         // core-level output-type check, and differs only in the donation contract the runtime call path trusts.
-        let producer = XlaDomain::new(&client);
+        let producer = XlaSession::new(&client).domain();
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type.clone(),
@@ -12252,7 +12406,7 @@ mod tests {
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
         let exchange: Arc<dyn CompilationArtifactExchange> = Arc::new(CollidingArtifactExchange { artifact });
-        let consumer = Arc::new(XlaSession::with_compilation_context(
+        let consumer = XlaSession::with_compilation_context(
             &client,
             CompilationContext::new().with_artifact_exchange(
                 exchange,
@@ -12261,7 +12415,7 @@ mod tests {
                     fallback_to_local_compile: true,
                 },
             ),
-        ))
+        )
         .domain();
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
@@ -12291,7 +12445,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         assert!(matches!(
             domain.deserialize_program(b"truncated"),
@@ -12353,8 +12507,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
-        let left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
-        let right = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let right = f32_vector(domain.parent(), &mesh, &[10.0, 20.0, 30.0, 40.0]);
         let outputs = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -12368,9 +12522,10 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
 
-        let unique = ArrayReference::new(f32_scalar(&client, &mesh, 1.0));
+        let unique = ArrayReference::new(f32_scalar(&domain, &mesh, 1.0));
         let unique_guard = unique.lock_storage().unwrap();
         let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
@@ -12380,7 +12535,7 @@ mod tests {
         assert!(arguments.inputs_by_device()[0][0].donatable);
         unique_taken.poison("test transaction consumed unique input");
 
-        let shared_value = f32_scalar(&client, &mesh, 2.0);
+        let shared_value = f32_scalar(&domain, &mesh, 2.0);
         let retained = shared_value.clone();
         let shared = ArrayReference::new(shared_value);
         let shared_guard = shared.lock_storage().unwrap();
@@ -12396,10 +12551,17 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_unresolved_references_before_special_cases_or_tracing() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+
         // The guard is operation-agnostic: it keys off unresolved reference state rather than the specific reference
         // operation, so one representative operation pins the diagnostic.
         assert_eq!(
-            XlaDomain::token().bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]),
+            domain.bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]),
             Err(ProgramError::UnsupportedOperation {
                 message: "`reference_new` carries reference state that XLA eager execution cannot lower; discharge \
                           references before lowering"
@@ -12407,13 +12569,7 @@ mod tests {
             }),
         );
 
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
-        let reference = ArrayIrValue::Reference(ArrayReference::new(f32_vector(&client, &mesh, &[1.0])));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(f32_vector(&domain, &mesh, &[1.0])));
         assert_eq!(
             domain.bind(AddOperation::new(), Vec::new(), &[reference]),
             Err(ProgramError::UnsupportedOperation {
@@ -12445,7 +12601,7 @@ mod tests {
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new()).unwrap()
         };
         assert_eq!(
-            XlaDomain::token().bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &[]),
+            domain.bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &[]),
             Err(ProgramError::UnsupportedOperation {
                 message: "`while` carries reference state that XLA eager execution cannot lower; discharge \
                           references before lowering"
@@ -12480,7 +12636,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            XlaDomain::token().bind(
+            domain.bind(
                 XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                     CustomFunctionJvpRule::Explicit,
                     false,
@@ -12514,7 +12670,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            XlaDomain::token().bind(
+            domain.bind(
                 XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                     CustomFunctionJvpRule::Explicit,
                     false,
@@ -12537,7 +12693,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
@@ -12617,7 +12773,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
@@ -12737,7 +12893,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = XlaProgramBuilder::new();
@@ -12784,7 +12940,7 @@ mod tests {
         assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain
-            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 3.0), f32_scalar(&client, &mesh, 5.0)])
+            .execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 3.0), f32_scalar(&domain, &mesh, 5.0)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
@@ -12804,7 +12960,7 @@ mod tests {
     fn test_xla_lowering_accumulates_slice_cotangents_into_existing_state() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
         let output = builder
@@ -12838,7 +12994,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = XlaProgramBuilder::new();
@@ -12940,9 +13096,9 @@ mod tests {
             .execute_xla_program(
                 &compiled,
                 vec![
-                    f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]),
-                    f32_vector(&client, &mesh, &[10.0, 20.0]),
-                    f32_vector(&client, &mesh, &[1.0, 2.0]),
+                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]),
+                    f32_vector(&domain, &mesh, &[10.0, 20.0]),
+                    f32_vector(&domain, &mesh, &[1.0, 2.0]),
                 ],
             )
             .unwrap();
@@ -12958,7 +13114,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
         let mut builder = XlaProgramBuilder::new();
@@ -12986,7 +13142,7 @@ mod tests {
         let outputs = domain
             .execute_xla_program(
                 &compiled,
-                vec![f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&client, &mesh, &[10.0, 20.0])],
+                vec![f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&domain, &mesh, &[10.0, 20.0])],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 10.0, 20.0, 4.0]);
@@ -12999,7 +13155,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = XlaProgramBuilder::new();
@@ -13080,9 +13236,9 @@ mod tests {
             .execute_xla_program(
                 &compiled,
                 vec![
-                    f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]),
-                    f32_scalar(&client, &mesh, 10.0),
-                    f32_scalar(&client, &mesh, 3.0),
+                    f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 3.0),
                 ],
             )
             .unwrap();
@@ -13097,7 +13253,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
 
@@ -13126,7 +13282,7 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 1, &XlaOptions::new(mesh.clone())).unwrap();
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain
-            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 7.0), boolean_scalar(&client, &mesh, true)])
+            .execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 7.0), boolean_scalar(&domain, &mesh, true)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0]);
     }
@@ -13138,7 +13294,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(scalar_type.into());
@@ -13160,7 +13316,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -13242,9 +13398,9 @@ mod tests {
             .execute_xla_program(
                 &compiled,
                 vec![
-                    boolean_scalar(&client, &mesh, true),
-                    f32_scalar(&client, &mesh, 10.0),
-                    f32_scalar(&client, &mesh, 7.0),
+                    boolean_scalar(&domain, &mesh, true),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 7.0),
                 ],
             )
             .unwrap();
@@ -13255,9 +13411,9 @@ mod tests {
             .execute_xla_program(
                 &compiled,
                 vec![
-                    boolean_scalar(&client, &mesh, false),
-                    f32_scalar(&client, &mesh, 10.0),
-                    f32_scalar(&client, &mesh, 7.0),
+                    boolean_scalar(&domain, &mesh, false),
+                    f32_scalar(&domain, &mesh, 10.0),
+                    f32_scalar(&domain, &mesh, 7.0),
                 ],
             )
             .unwrap();
@@ -13272,7 +13428,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(vector_type.clone());
@@ -13365,7 +13521,7 @@ mod tests {
             let outputs = domain
                 .execute_xla_program(
                     &compiled,
-                    vec![boolean_scalar(&client, &mesh, predicate), f32_vector(&client, &mesh, &[1.0, 2.0, 3.0])],
+                    vec![boolean_scalar(&domain, &mesh, predicate), f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])],
                 )
                 .unwrap();
             assert_eq!(read_f32s(&client, &outputs[0]), expected);
@@ -13379,7 +13535,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -13425,7 +13581,7 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
 
         // Three bounded iterations accumulate the constant `1.0` into the initial `2.0` state.
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
@@ -13438,7 +13594,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -13469,7 +13625,7 @@ mod tests {
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scan_outputs = builder
-            .add_instruction(ScanOperation::<XlaConstant>::new(1, 3), vec![body], vec![reference], None)
+            .add_instruction(ScanOperation::new(1, 3), vec![body], vec![reference], None)
             .unwrap()
             .to_vec();
         let final_value = builder
@@ -13486,7 +13642,7 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
 
         // Three scan iterations accumulate the constant `1.0` into the initial `2.0` state, and the body's second
         // output stacks the state observed after each iteration.
@@ -13501,7 +13657,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
@@ -13534,7 +13690,7 @@ mod tests {
         let runtime_length = builder.add_constant(XlaConstant::Dimension(length.clone()));
         let reference = builder
             .add_instruction(
-                ScanOperation::<XlaConstant>::new(1, Dimension::Dynamic(length_variable.clone())),
+                ScanOperation::new(1, Dimension::Dynamic(length_variable.clone())),
                 vec![body],
                 vec![reference, runtime_length],
                 None,
@@ -13560,7 +13716,7 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0)]).unwrap();
 
         // The runtime length is three, so the scan accumulates the constant `1.0` into the initial `2.0` state three
         // times.
@@ -13574,7 +13730,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
@@ -13618,7 +13774,7 @@ mod tests {
         assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain
-            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0), f32_scalar(&client, &mesh, 4.0)])
+            .execute_xla_program(&compiled, vec![f32_scalar(&domain, &mesh, 2.0), f32_scalar(&domain, &mesh, 4.0)])
             .unwrap();
 
         let immutable_oracle = 2.0f32 + 4.0;
@@ -13632,7 +13788,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
@@ -13655,7 +13811,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         let mut builder = XlaProgramBuilder::new();
@@ -13689,7 +13845,7 @@ mod tests {
         assert_eq!(restored.output_count, compiled.output_count);
         assert_eq!(restored.reference_states, compiled.reference_states);
         let outputs = domain
-            .execute_xla_program(&restored, vec![f32_scalar(&client, &mesh, 1.0), f32_scalar(&client, &mesh, 2.0)])
+            .execute_xla_program(&restored, vec![f32_scalar(&domain, &mesh, 1.0), f32_scalar(&domain, &mesh, 2.0)])
             .unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0]);
@@ -13900,7 +14056,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -13930,7 +14086,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let state_sharding =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -13988,8 +14144,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
-        let scalar = f32_scalar(&client, &mesh, 2.0);
-        let vector = f64_vector(&client, &mesh, &[1.0, 2.0, 4.0, 8.0]);
+        let scalar = f32_scalar(domain.parent(), &mesh, 2.0);
+        let vector = f64_vector(domain.parent(), &mesh, &[1.0, 2.0, 4.0, 8.0]);
 
         let divide = domain.bind(DivOperation::new(), Vec::new(), &[scalar.clone(), vector.clone()]).unwrap();
         assert_eq!(read_f64s(&client, &divide[0]), vec![2.0, 1.0, 0.5, 0.25]);
@@ -14010,13 +14166,13 @@ mod tests {
         assert_eq!(read_booleans(&client, &compare[0]), vec![false, false, true, true]);
 
         let select = domain
-            .bind(SelectOperation::new(), Vec::new(), &[boolean_scalar(&client, &mesh, true), scalar, vector])
+            .bind(SelectOperation::new(), Vec::new(), &[boolean_scalar(domain.parent(), &mesh, true), scalar, vector])
             .unwrap();
         assert_eq!(read_f64s(&client, &select[0]), vec![2.0, 2.0, 2.0, 2.0]);
 
-        let boolean_vector = boolean_vector(&client, &mesh, &[true, false, true, false]);
+        let boolean_vector = boolean_vector(domain.parent(), &mesh, &[true, false, true, false]);
         let and = domain
-            .bind(AndOperation::new(), Vec::new(), &[boolean_scalar(&client, &mesh, true), boolean_vector])
+            .bind(AndOperation::new(), Vec::new(), &[boolean_scalar(domain.parent(), &mesh, true), boolean_vector])
             .unwrap();
         assert_eq!(read_booleans(&client, &and[0]), vec![true, false, true, false]);
     }
@@ -14030,7 +14186,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
-        let input = f32_vector(&client, &mesh, &[1.0, -2.0, 3.5, 0.0]);
+        let input = f32_vector(domain.parent(), &mesh, &[1.0, -2.0, 3.5, 0.0]);
         let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -14086,8 +14242,8 @@ mod tests {
         let domain = array_domain(&client);
         assert_eq!(domain.parent().cache_size(), 0);
 
-        let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let right = f32_vector(&client, &mesh, &[3.0, 4.0]);
+        let left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
+        let right = f32_vector(domain.parent(), &mesh, &[3.0, 4.0]);
         let first = domain.bind(AddOperation::new(), Vec::new(), &[left.clone(), right.clone()]).unwrap();
         assert_eq!(domain.parent().cache_size(), 1);
 
@@ -14096,10 +14252,411 @@ mod tests {
         assert_eq!(read_f32s(&client, &first[0]), read_f32s(&client, &second[0]));
 
         // A different input signature compiles (and caches) a distinct executable.
-        let wider_left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let wider_right = f32_vector(&client, &mesh, &[4.0, 5.0, 6.0]);
+        let wider_left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0, 3.0]);
+        let wider_right = f32_vector(domain.parent(), &mesh, &[4.0, 5.0, 6.0]);
         domain.bind(AddOperation::new(), Vec::new(), &[wider_left, wider_right]).unwrap();
         assert_eq!(domain.parent().cache_size(), 2);
+    }
+
+    #[test]
+    fn test_independent_arrays_share_compile_cache() {
+        use ryft_core::Value;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+
+        // Arrays constructed independently of each other in one session dispatch through their own recovered domains,
+        // which share that session's compilation context so that the same eager operation compiles exactly once.
+        let first = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let second = f32_vector(&domain, &mesh, &[3.0, 4.0]);
+        let first_sum = ryft_core::Add::add(&first, &first).unwrap();
+        let second_sum = ryft_core::Add::add(&second, &second).unwrap();
+        let first_domain = first_sum.execution_domain();
+        let second_domain = second_sum.execution_domain();
+        assert!(std::ptr::eq(
+            first_domain.parent().compilation_context(),
+            second_domain.parent().compilation_context(),
+        ));
+        assert_eq!(first_domain.parent().compilation_context().statistics().compilations, 1);
+        assert_eq!(read_f32s(&client, &first_sum), vec![2.0, 4.0]);
+        assert_eq!(read_f32s(&client, &second_sum), vec![6.0, 8.0]);
+    }
+
+    #[test]
+    fn test_eager_dispatch_cache_skips_tracing_and_lowering() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let left = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let right = f32_vector(&domain, &mesh, &[3.0, 4.0]);
+        let inputs = [ArrayIrValue::Array(left), ArrayIrValue::Array(right)];
+
+        let first = domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).unwrap();
+        let second = domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&first[0])), vec![4.0, 6.0]);
+        assert_eq!(read_f32s(&client, program_array(&second[0])), vec![4.0, 6.0]);
+        let statistics = domain.eager_dispatch_statistics();
+        assert_eq!((statistics.misses, statistics.hits, statistics.productions), (1, 1, 1));
+
+        // The hit never reached the compilation cache, so it skipped tracing, lowering, and key construction.
+        let compilation_statistics = domain.compilation_context().statistics();
+        assert_eq!((compilation_statistics.misses, compilation_statistics.memory_hits), (1, 0));
+        assert_eq!(compilation_statistics.compilations, 1);
+    }
+
+    #[test]
+    fn test_eager_dispatch_cache_keys_every_lowering_input() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = XlaSession::new(&client).domain();
+        fn negate<'c>(domain: &XlaDomain<'c>, input: Array<'c>) {
+            let inputs = [ArrayIrValue::Array(input)];
+            domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
+        }
+        let misses = |domain: &XlaDomain<'_>| domain.eager_dispatch_statistics().misses;
+
+        let vector = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        negate(&domain, vector.clone());
+        negate(&domain, vector.clone());
+        assert_eq!(misses(&domain), 1);
+
+        // A different shape, element type, or sharding is a different key.
+        negate(&domain, f32_vector(&domain, &mesh, &[1.0, 2.0]));
+        assert_eq!(misses(&domain), 2);
+        let f64_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        negate(&domain, Array::from_host_buffer(&domain, f64_type, mesh.clone(), values_to_bytes(&[1f64; 4])).unwrap());
+        assert_eq!(misses(&domain), 3);
+        let sharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let sharded_bytes = values_to_bytes(&[1f32; 4]);
+        negate(&domain, Array::from_host_buffer(&domain, sharded_type, mesh.clone(), sharded_bytes).unwrap());
+        assert_eq!(misses(&domain), 4);
+
+        // A domain with different compilation options does not reuse the entries of the default domain.
+        let mut compilation_options = CompilationOptions::default();
+        compilation_options.profile_version = 1;
+        let sibling = domain.with_compilation_options(compilation_options);
+        negate(&sibling, vector.clone().associate(&sibling).unwrap());
+        assert_eq!(misses(&domain), 5);
+
+        // Dimension inputs are keyed by their values (their extents and dimension identities), because eager binding
+        // bakes them into the traced program and the output types refer to their identities. Dynamic reshapes execute
+        // on a single device, so this part uses a single-device session.
+        let single_device_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
+        let single_device_domain = XlaSession::new(&single_device_client).domain();
+        let single_device_vector = f32_vector(&single_device_domain, &single_device_mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let reshape = |rows: &DimensionValue, columns: &DimensionValue| {
+            let inputs = [
+                ArrayIrValue::Array(single_device_vector.clone()),
+                ArrayIrValue::Dimension(rows.clone()),
+                ArrayIrValue::Dimension(columns.clone()),
+            ];
+            single_device_domain.bind(DynamicReshapeOperation::new(), Vec::new(), &inputs).unwrap().remove(0)
+        };
+        let rows = DimensionValue::constant(2).unwrap();
+        let columns = DimensionValue::constant(2).unwrap();
+        assert_eq!(program_array(&reshape(&rows, &columns)).shape().as_slice(), &[2, 2]);
+        assert_eq!(program_array(&reshape(&rows, &columns)).shape().as_slice(), &[2, 2]);
+        assert_eq!(misses(&single_device_domain), 1);
+        let one = DimensionValue::constant(1).unwrap();
+        let four = DimensionValue::constant(4).unwrap();
+        assert_eq!(program_array(&reshape(&one, &four)).shape().as_slice(), &[1, 4]);
+        assert_eq!(misses(&single_device_domain), 2);
+        // A fresh dimension identity with the same extent is a different key.
+        let other_rows = DimensionValue::constant(2).unwrap();
+        assert_eq!(program_array(&reshape(&other_rows, &columns)).shape().as_slice(), &[2, 2]);
+        assert_eq!(misses(&single_device_domain), 3);
+    }
+
+    #[test]
+    fn test_eager_dispatch_cache_keys_attached_regions_structurally() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let branch = |operation: XlaOperation| {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let output = builder.add_instruction(operation, Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
+                .unwrap()
+        };
+        let inputs = [
+            ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)),
+            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+        ];
+
+        // Branches that are rebuilt for every application but are structurally equal share one cache entry.
+        for _ in 0..2 {
+            let branches = [
+                branch(XlaOperation::Array(AddOperation::new().into())),
+                branch(XlaOperation::Array(MulOperation::new().into())),
+            ];
+            let outputs = domain.bind(XlaOperation::Condition(ConditionOperation::new()), branches, &inputs).unwrap();
+            assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![2.0, 4.0]);
+        }
+        let statistics = domain.eager_dispatch_statistics();
+        assert_eq!((statistics.misses, statistics.hits), (1, 1));
+
+        // A structurally different branch is a different key.
+        let branches = [
+            branch(XlaOperation::Array(SubOperation::new().into())),
+            branch(XlaOperation::Array(MulOperation::new().into())),
+        ];
+        let outputs = domain.bind(XlaOperation::Condition(ConditionOperation::new()), branches, &inputs).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![0.0, 0.0]);
+        assert_eq!(domain.eager_dispatch_statistics().misses, 2);
+        assert_eq!(domain.compilation_context().statistics().compilations, 2);
+    }
+
+    #[test]
+    fn test_eager_dispatch_cache_does_not_retain_failures() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let inputs = [
+            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])),
+        ];
+        for _ in 0..2 {
+            assert!(domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).is_err());
+        }
+        let statistics = domain.eager_dispatch_statistics();
+        assert_eq!((statistics.misses, statistics.hits), (2, 0));
+        assert_eq!((statistics.productions, statistics.abandoned_productions), (0, 2));
+    }
+
+    #[test]
+    fn test_eager_dispatch_cache_hits_still_validate_placement() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let other_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let other_domain = XlaSession::new(&other_client).domain();
+        let local = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let foreign = f32_vector(&other_domain, &mesh, &[3.0, 4.0]);
+        let operation = XlaOperation::Array(AddOperation::new().into());
+        let local_inputs = [ArrayIrValue::Array(local.clone()), ArrayIrValue::Array(local.clone())];
+        domain.bind(operation.clone(), Vec::new(), &local_inputs).unwrap();
+
+        // The second input's type and the first input's mesh match the cached entry, so this lookup hits the cache,
+        // and placement validation must still reject the foreign input.
+        let mixed_inputs = [ArrayIrValue::Array(local), ArrayIrValue::Array(foreign)];
+        let error = domain.bind(operation, Vec::new(), &mixed_inputs).unwrap_err();
+        assert!(error.to_string().contains("different PJRT client"), "{error}");
+        assert_eq!(domain.eager_dispatch_statistics().hits, 1);
+    }
+
+    #[test]
+    fn test_clear_cache_clears_the_eager_dispatch_cache() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let inputs = [ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]))];
+        domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
+        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (1, 1));
+        domain.clear_cache();
+        assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (0, 0));
+        domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
+        assert_eq!(domain.eager_dispatch_statistics().misses, 2);
+    }
+
+    // TODO(eaplatanios): Temporary profiling harness for `.tasks/plan_execute_path_overhead.md`; delete it once that
+    //  plan's measurements are recorded.
+    #[test]
+    #[ignore = "profiling harness"]
+    fn test_profile_eager_dispatch_loop() {
+        use std::time::{Duration, Instant};
+
+        use crate::jit::{JittedXlaFunction, XlaCompileTracer, jitted};
+
+        let case = std::env::var("RYFT_PROFILE_CASE").unwrap_or_else(|_| "eager".to_string());
+        let seconds = std::env::var("RYFT_PROFILE_SECONDS").map(|value| value.parse().unwrap()).unwrap_or(10u64);
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let input = f32_vector(&domain, &mesh, &[1.0; 8]);
+        let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+            |_, value: XlaCompileTracer<'_>| ryft_core::Add::add(&value, &value).unwrap(),
+            &domain,
+            mesh.clone(),
+        );
+        let array_type = ArrayIrType::Array(input.r#type().into_owned());
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(array_type.clone());
+        let right = builder.add_input(array_type);
+        let operation = XlaOperation::Array(AddOperation::new().into());
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap().to_vec();
+        let program: FlatXlaProgram = builder.build(outputs, vec![Placeholder; 2], vec![Placeholder; 1]).unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let buffer = Arc::clone(input.addressable_shards().next().unwrap().buffer().unwrap());
+        let execution_inputs = [
+            ryft_pjrt::ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
+            ryft_pjrt::ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
+        ];
+
+        let mut step: Box<dyn FnMut()> = match case.as_str() {
+            "eager" => Box::new(|| {
+                ryft_core::Add::add(&input, &input).unwrap();
+            }),
+            "jit" => Box::new(|| {
+                function.call((), input.clone()).unwrap();
+            }),
+            "execute" => Box::new(|| {
+                domain.execute_xla_program(&compiled, vec![input.clone(), input.clone()]).unwrap();
+            }),
+            "pjrt" => Box::new(|| {
+                let inputs = vec![ryft_pjrt::ExecutionDeviceInputs::from(&execution_inputs[..])];
+                compiled.executable.execute(inputs, Vec::new(), 0, None, None, None, None).unwrap();
+            }),
+            _ => panic!("unknown profiling case `{case}`"),
+        };
+        for _ in 0..1000 {
+            step();
+        }
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let start = Instant::now();
+        let mut count = 0u64;
+        while Instant::now() < deadline {
+            for _ in 0..100 {
+                step();
+            }
+            count += 100;
+        }
+        let mean = start.elapsed().as_secs_f64() * 1e6 / count as f64;
+        println!("profile {case}: {mean:.2} us/op over {count} operations");
+    }
+
+    /// Measures eager dispatch overhead for `.tasks/plan_eager_dispatch_front_cache.md`. Compares repeated eager `add`
+    /// calls against a warm jitted function over the same input, and then times each stage of the eager dispatch path
+    /// (tracing, lowering, compilation-key construction, compile-cache lookup, and execution) in isolation.
+    #[test]
+    #[ignore = "phase 0 baseline measurement"]
+    fn test_baseline_eager_dispatch_overhead() {
+        use std::time::Instant;
+
+        use crate::jit::{JittedXlaFunction, XlaCompileTracer, jitted};
+
+        const REPETITIONS: usize = 10_000;
+        let measure = |label: &str, function: &mut dyn FnMut()| {
+            for _ in 0..100 {
+                function();
+            }
+            let start = Instant::now();
+            for _ in 0..REPETITIONS {
+                function();
+            }
+            let mean = start.elapsed().as_secs_f64() * 1e6 / REPETITIONS as f64;
+            println!("phase 0 baseline: {label}: {mean:.2} us/op");
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let input = f32_vector(&domain, &mesh, &[1.0; 8]);
+
+        measure("eager add (end to end)", &mut || {
+            ryft_core::Add::add(&input, &input).unwrap();
+        });
+        let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+            |_, value: XlaCompileTracer<'_>| ryft_core::Add::add(&value, &value).unwrap(),
+            &domain,
+            mesh.clone(),
+        );
+        measure("jitted add (warm dispatch)", &mut || {
+            function.call((), input.clone()).unwrap();
+        });
+        let vector_type = ArrayIrType::Array(input.r#type().into_owned());
+        let branch = |operation: XlaOperation| {
+            let mut builder = XlaProgramBuilder::new();
+            let value = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(operation, Vec::new(), vec![value, value], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
+                .unwrap()
+        };
+        let condition_inputs =
+            [ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)), ArrayIrValue::Array(input.clone())];
+        measure("eager condition with freshly built branches (end to end)", &mut || {
+            let branches = [
+                branch(XlaOperation::Array(AddOperation::new().into())),
+                branch(XlaOperation::Array(MulOperation::new().into())),
+            ];
+            domain.bind(XlaOperation::Condition(ConditionOperation::new()), branches, &condition_inputs).unwrap();
+        });
+
+        let array_type = ArrayIrType::Array(input.r#type().into_owned());
+        let trace = || -> FlatXlaProgram {
+            let mut builder = XlaProgramBuilder::new();
+            let left = builder.add_input(array_type.clone());
+            let right = builder.add_input(array_type.clone());
+            let operation = XlaOperation::Array(AddOperation::new().into());
+            let outputs = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap().to_vec();
+            builder.build(outputs, vec![Placeholder; 2], vec![Placeholder; 1]).unwrap()
+        };
+        let program = trace();
+        let options = XlaOptions::new(mesh.clone());
+        let lowered = domain.lower_xla_program(&program, 0, &options).unwrap();
+        let key = domain.compilation_key(&lowered).unwrap();
+        let compiled =
+            domain.compilation_context().get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered));
+        let compiled = compiled.unwrap();
+        measure("stage: trace one-instruction program", &mut || {
+            trace();
+        });
+        measure("stage: lower to StableHLO", &mut || {
+            domain.lower_xla_program(&program, 0, &options).unwrap();
+        });
+        measure("stage: build compilation key", &mut || {
+            domain.compilation_key(&lowered).unwrap();
+        });
+        measure("stage: compile-cache lookup (hit)", &mut || {
+            domain
+                .compilation_context()
+                .get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered))
+                .unwrap();
+        });
+        measure("stage: execute", &mut || {
+            domain.execute_xla_program(&compiled, vec![input.clone(), input.clone()]).unwrap();
+        });
     }
 
     #[test]
@@ -14113,24 +14670,15 @@ mod tests {
             .unwrap();
         let foreign_mesh = domain_mesh(&foreign_client, "x", 2);
         let domain = array_domain(&domain_client);
+        let foreign_domain = XlaSession::new(&foreign_client).domain();
 
-        // An input that carries an attached client is rejected by client identity.
-        let input = f32_vector(&foreign_client, &foreign_mesh, &[1.0, 2.0]);
+        // An input that belongs to a session over a different client is rejected by client identity.
+        let input = f32_vector(&foreign_domain, &foreign_mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(NegOperation::new(), Vec::new(), &[input.clone()]),
+            domain.bind(NegOperation::new(), Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
                     different PJRT client than this domain's client",
-        ));
-
-        // An input with no attached client falls back to the device-set membership check.
-        let mut clientless_input = input;
-        clientless_input.detach_client_for_tests();
-        assert!(matches!(
-            domain.bind(NegOperation::new(), Vec::new(), &[clientless_input]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "received incompatible devices for eager xla execution: input #0 is placed on device \
-                    1, which does not belong to this domain's PJRT client",
         ));
     }
 
@@ -14141,7 +14689,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 4);
 
         let doubled = {
@@ -14162,12 +14710,12 @@ mod tests {
         };
         let operation = XlaOperation::Condition(ConditionOperation::new());
 
-        let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let true_outputs = domain
             .bind(
                 operation.clone(),
                 [doubled.clone(), squared.clone()],
-                &[ArrayIrValue::Array(boolean_scalar(&client, &mesh, true)), ArrayIrValue::Array(input.clone())],
+                &[ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)), ArrayIrValue::Array(input.clone())],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&true_outputs[0])), vec![2.0, 4.0, 6.0, 8.0]);
@@ -14176,7 +14724,7 @@ mod tests {
             .bind(
                 operation,
                 [doubled, squared],
-                &[ArrayIrValue::Array(boolean_scalar(&client, &mesh, false)), ArrayIrValue::Array(input)],
+                &[ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)), ArrayIrValue::Array(input)],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
@@ -14190,7 +14738,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let extent = DimensionValue::constant(3).unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
@@ -14215,14 +14763,14 @@ mod tests {
                 .unwrap()
         };
         let operation = XlaOperation::Condition(ConditionOperation::new());
-        let scalar = f32_scalar(&client, &mesh, 2.0);
+        let scalar = f32_scalar(&domain, &mesh, 2.0);
 
         let true_outputs = domain
             .bind(
                 operation.clone(),
                 [branch(false), branch(true)],
                 &[
-                    ArrayIrValue::Array(boolean_scalar(&client, &mesh, true)),
+                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)),
                     ArrayIrValue::Dimension(extent.clone()),
                     ArrayIrValue::Array(scalar.clone()),
                 ],
@@ -14236,7 +14784,7 @@ mod tests {
                 operation,
                 [branch(false), branch(true)],
                 &[
-                    ArrayIrValue::Array(boolean_scalar(&client, &mesh, false)),
+                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)),
                     ArrayIrValue::Dimension(extent),
                     ArrayIrValue::Array(scalar),
                 ],
@@ -14253,7 +14801,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         // Loop `state = state + 1` while `state < 3`, starting from `0`.
@@ -14291,7 +14839,7 @@ mod tests {
         let operation = XlaOperation::While(WhileOperation::new());
 
         let outputs = domain
-            .bind(operation, vec![condition, body], &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0))])
+            .bind(operation, vec![condition, body], &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
@@ -14313,7 +14861,7 @@ mod tests {
             .with_sharding(sharding.clone())
             .unwrap();
         let input = Array::from_host_buffer(
-            &client,
+            domain.parent(),
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -14344,10 +14892,10 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
-        let input = ArrayIrValue::Array(f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]));
+        let domain = XlaSession::new(&client).domain();
+        let input = ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
         let index = ArrayIrValue::Array(
-            Array::from_host_buffer(&client, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
+            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
                 .unwrap(),
         );
 
@@ -14364,7 +14912,7 @@ mod tests {
             .bind(
                 XlaOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
                 Vec::new(),
-                &[input, ArrayIrValue::Array(f32_vector(&client, &mesh, &[9.0])), index],
+                &[input, ArrayIrValue::Array(f32_vector(&domain, &mesh, &[9.0])), index],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&updated[0])), vec![1.0, 2.0, 9.0]);
@@ -14379,7 +14927,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
         // Carry-only scan body `(index, carry) -> (carry + 1, carry + 1)`: the first output is the next carry and the second
@@ -14399,10 +14947,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::new(1, 4);
 
         let outputs = domain
-            .bind(XlaOperation::Scan(scan), [body], &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0))])
+            .bind(XlaOperation::Scan(scan), [body], &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![4.0]);
@@ -14417,7 +14965,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::I64);
         let body = {
             let mut builder = XlaProgramBuilder::new();
@@ -14433,13 +14981,25 @@ mod tests {
         };
 
         // The carry records the last visited index; stacked results retain slice order even when visits reverse.
-        // Check the same contract for looped, partially unrolled, and fully unrolled lowering.
-        for (reverse, unroll, last_index) in
-            [(false, 1, 3), (true, 1, 0), (false, 2, 3), (true, 2, 0), (false, 4, 3), (true, 4, 0)]
-        {
+        // Check the same contract for looped, partially unrolled (with and without remaining iterations after the
+        // loop), and fully unrolled lowering.
+        for (reverse, unroll, last_index) in [
+            (false, 1, 3),
+            (true, 1, 0),
+            (false, 2, 3),
+            (true, 2, 0),
+            (false, 3, 3),
+            (true, 3, 0),
+            (false, 4, 3),
+            (true, 4, 0),
+            (false, 8, 3),
+            (true, 8, 0),
+            (false, usize::MAX, 3),
+            (true, usize::MAX, 0),
+        ] {
             let initial =
-                Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), &(-1_i64).to_ne_bytes()).unwrap();
-            let scan = ScanOperation::<XlaConstant>::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
+                Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), &(-1_i64).to_ne_bytes()).unwrap();
+            let scan = ScanOperation::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
             let outputs =
                 domain.bind(XlaOperation::Scan(scan), [body.clone()], &[ArrayIrValue::Array(initial)]).unwrap();
             assert_eq!(read_i64s(&client, program_array(&outputs[0])), vec![last_index]);
@@ -14456,7 +15016,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let length =
             DimensionValue::new(DimensionType::new("length", DimensionBounds::new(0, Some(9)).unwrap()), 3).unwrap();
@@ -14476,17 +15036,20 @@ mod tests {
                 )
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, length.r#type().to_dimension());
-        let outputs = domain
-            .bind(
-                XlaOperation::Scan(scan),
-                [body],
-                &[ArrayIrValue::Array(f32_scalar(&client, &mesh, 0.0)), ArrayIrValue::Dimension(length)],
-            )
-            .unwrap();
-
-        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
-        assert_eq!(outputs.len(), 1);
+        // An unroll factor that does not divide the runtime length runs the remaining iterations in a second loop, and
+        // factors beyond the length's upper bound are clamped to it.
+        for unroll in [1, 2, 4, usize::MAX] {
+            let scan = ScanOperation::new(1, length.r#type().to_dimension()).with_unroll(unroll).unwrap();
+            let outputs = domain
+                .bind(
+                    XlaOperation::Scan(scan),
+                    [body.clone()],
+                    &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0)), ArrayIrValue::Dimension(length.clone())],
+                )
+                .unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
+        }
     }
 
     #[test]
@@ -14498,7 +15061,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         // Cumulative-sum scan body `(index, carry, x) -> (carry + x, carry + x)` over the stacked input `[1, 2, 3, 4]`
@@ -14515,10 +15078,10 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::new(1, 4);
 
-        let carry = f32_scalar(&client, &mesh, 0.0);
-        let xs = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let carry = f32_scalar(&domain, &mesh, 0.0);
+        let xs = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let outputs = domain
             .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
             .unwrap();
@@ -14537,7 +15100,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         // The same cumulative-sum scan as above, but with the stacked input sharded over the scanned (leading) axis
@@ -14553,20 +15116,20 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let scan = ScanOperation::<XlaConstant>::new(1, 4);
+        let scan = ScanOperation::new(1, 4);
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
         let xs = Array::from_host_buffer(
-            &client,
+            &domain,
             xs_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let carry = f32_scalar(&client, &mesh, 0.0);
+        let carry = f32_scalar(&domain, &mesh, 0.0);
         let outputs = domain
             .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
             .unwrap();
@@ -14586,7 +15149,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = replicated_vector_type(&mesh, 4);
 
         // A staged jitted callee `x -> x * x` bound eagerly on concrete arrays dispatches straight through the
@@ -14602,7 +15165,7 @@ mod tests {
         let operation = XlaOperation::JitCall(JitCallOperation::new(0));
         let callee = Arc::new(callee);
 
-        let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain
             .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[ArrayIrValue::Array(input.clone())])
             .unwrap();
@@ -14632,7 +15195,7 @@ mod tests {
             .collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         // Manual shard-map body `local -> local + local` over `f32[4]` sharded across the 2-device mesh: each device
         // doubles its own 2-element shard inside the manual region.
@@ -14669,7 +15232,7 @@ mod tests {
             .with_sharding(sharding.clone())
             .unwrap();
         let input = Array::from_host_buffer(
-            &client,
+            &domain,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -14706,7 +15269,7 @@ mod tests {
         // mirroring JAX's "unbound axis name" error for a top-level `psum`. The value-level `ParallelReduce`
         // capability is not even implemented for `Array` (its dispatch domain carries no named-axis environment), so
         // this binds the operation directly and asserts the axis-resolution failure surfaced at compile time.
-        let input = f32_vector(&client, &mesh, &[1.0, 2.0]);
+        let input = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
         let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
         assert!(matches!(
             domain.bind(operation, Vec::new(), &[input]),
@@ -14751,7 +15314,7 @@ mod tests {
         use ryft_core::Print;
 
         let mesh = domain_mesh(client, "x", 1);
-        let session = Arc::new(XlaSession::new(client));
+        let session = XlaSession::new(client);
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
         let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
@@ -14837,10 +15400,10 @@ mod tests {
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let mesh = domain_mesh(client, "x", 1);
-        let session = Arc::new(XlaSession::new(client));
+        let session = XlaSession::new(client);
         let domain = session.domain();
         ensure_print_handler_registered(client).unwrap();
-        let input = f64_vector(client, &mesh, &[3.0]);
+        let input = f64_vector(&domain, &mesh, &[3.0]);
         let mut builder = XlaProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder.add_instruction(PrintOperation::new("ordered"), Vec::new(), vec![argument], None).unwrap();
@@ -14930,7 +15493,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         ensure_print_handler_registered(&client).unwrap();
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
             .with_sharding(
@@ -14939,9 +15502,9 @@ mod tests {
             )
             .unwrap();
         let first =
-            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
         let second =
-            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
         let local_type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(local_type.clone().into());
@@ -14996,7 +15559,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let scope = domain.effect_scope.as_ref().unwrap();
+        let scope = domain.effect_scope.as_ref();
         let mut predecessor = scope
             .reserve(Some(devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect()))
             .unwrap();
@@ -15069,9 +15632,13 @@ mod tests {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let input =
-            Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f64>(&[1.5, 2.5]).as_slice())
-                .unwrap();
+        let input = Array::from_host_buffer(
+            domain.parent(),
+            r#type,
+            mesh.clone(),
+            values_to_bytes::<f64>(&[1.5, 2.5]).as_slice(),
+        )
+        .unwrap();
         let (outputs, lines) =
             with_captured_prints(|| domain.bind(PrintOperation::new("x"), Vec::new(), &[input]).unwrap());
 
@@ -15101,8 +15668,8 @@ mod tests {
 
         // Mismatched operand shapes fail at bind time through type inference on the traced single-instruction
         // program — never reaching PJRT compilation or execution.
-        let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let right = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
+        let left = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
+        let right = f32_vector(domain.parent(), &mesh, &[1.0, 2.0, 3.0]);
         assert!(matches!(
             domain.bind(AddOperation::new(), Vec::new(), &[left, right]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -15214,7 +15781,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::F64);
 
         // Builds `-(x * x)` with the multiplication carrying the provided provenance.
@@ -15266,7 +15833,7 @@ mod tests {
         // Provenance does not affect numeric results.
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let value =
-            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), 3.0_f64.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3.0_f64.to_ne_bytes().as_slice())
                 .unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![value]).unwrap();
         assert_eq!(read_f64s(&client, &outputs[0]), vec![-9.0]);
@@ -15466,13 +16033,14 @@ mod tests {
 
     #[test]
     fn test_effect_scope_managed_callback_reentrancy() {
+        let client = execution_client();
+        let domain = XlaSession::new(&client).domain();
         let scope = EffectScope::default();
         let guard = EffectCallbackGuard::enter();
         let reason = "execution and effect barriers cannot be entered from a managed callback";
         assert!(matches!(scope.reserve(None), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
         assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
         assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
-        let domain = XlaDomain::token();
         assert!(matches!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
             Err(ProgramError::InvalidArgument { message })
@@ -15480,15 +16048,6 @@ mod tests {
         ));
         drop(guard);
         assert!(scope.barrier().is_ok());
-    }
-
-    #[test]
-    fn test_xla_domain_effects_barrier_clientless() {
-        let domain = XlaDomain::token();
-        assert!(domain.session().is_none());
-        assert!(domain.effects_barrier().is_ok());
-        assert!(domain.acknowledge_effect_errors().is_ok());
-        assert!(domain.fork_effect_scope().session().is_none());
     }
 
     #[cfg(feature = "cuda-13")]
@@ -15517,7 +16076,7 @@ mod tests {
             }))
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
-        let session = Arc::new(XlaSession::new(&client));
+        let session = XlaSession::new(&client);
         let domain = session.domain();
         let definition: KernelDefinition =
             KernelDefinition::trace(crate::kernels::tests::definition().operation().clone(), |(references, _)| {
@@ -15641,7 +16200,7 @@ mod tests {
         let input = session.array(scalar, mesh, 42_i32.to_ne_bytes()).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![input.clone()]).unwrap();
         let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
-        let restored_session = Arc::new(XlaSession::new(&client));
+        let restored_session = XlaSession::new(&client);
         let restored_domain = restored_session.domain();
         let restored = restored_domain.deserialize_xla_program(&bytes).unwrap().unwrap();
         assert!(restored.signature.requires_cuda_kernel_runtime());
@@ -15737,7 +16296,7 @@ mod tests {
     fn test_xla_domain_cuda_runtime_rejects_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Arc::new(XlaSession::new(&client));
+        let session = XlaSession::new(&client);
         let signature = XlaExecutableSignature::new(&[], &[]).with_cuda_kernel_runtime(true);
         assert!(!signature.has_effects());
         assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
@@ -15749,7 +16308,7 @@ mod tests {
     fn test_xla_domain_rocm_runtime_rejects_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Arc::new(XlaSession::new(&client));
+        let session = XlaSession::new(&client);
         let signature = XlaExecutableSignature::new(&[], &[]).with_rocm_kernel_runtime(true);
         assert!(!signature.has_effects());
         assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
@@ -15765,7 +16324,7 @@ mod tests {
     fn test_xla_session_domain() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let session = Arc::new(XlaSession::new(&client));
+        let session = XlaSession::new(&client);
         let retained = Arc::downgrade(&session);
         let domain = session.domain();
         let another = session.domain();
@@ -15773,9 +16332,9 @@ mod tests {
         assert!(std::ptr::eq(session.client(), &client));
         assert!(std::ptr::eq(domain.compilation_context(), session.compilation_context()));
         assert!(std::ptr::eq(fork.compilation_context(), session.compilation_context()));
-        assert!(Arc::ptr_eq(domain.effect_scope.as_ref().unwrap(), another.effect_scope.as_ref().unwrap()));
-        assert!(!Arc::ptr_eq(domain.effect_scope.as_ref().unwrap(), fork.effect_scope.as_ref().unwrap()));
-        let pending = domain.effect_scope.as_ref().unwrap().reserve(None).unwrap();
+        assert!(Arc::ptr_eq(&domain.effect_scope, &another.effect_scope));
+        assert!(!Arc::ptr_eq(&domain.effect_scope, &fork.effect_scope));
+        let pending = domain.effect_scope.reserve(None).unwrap();
         assert!(fork.effects_barrier().is_ok());
         drop(pending);
         assert!(session.effects_barrier().is_ok());
@@ -15785,5 +16344,65 @@ mod tests {
         drop(another);
         drop(fork);
         assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_xla_domain_with_compilation_options() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let mut compilation_options = CompilationOptions::default();
+        compilation_options.compile_portable_executable = true;
+        let sibling = domain.with_compilation_options(compilation_options.clone());
+        assert!(Arc::ptr_eq(domain.session(), sibling.session()));
+        assert!(Arc::ptr_eq(&domain.effect_scope, &sibling.effect_scope));
+        assert_eq!(sibling.compilation_options(), &compilation_options);
+        assert_eq!(domain.compilation_options(), &CompilationOptions::default());
+    }
+
+    #[test]
+    fn test_xla_target_from_client() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let target = domain.target().unwrap();
+        assert!(std::ptr::eq(target, domain.session().target().unwrap()));
+        assert_eq!(target.platform_name(), client.platform_name().unwrap());
+        assert_eq!(target.platform_version(), client.platform_version().unwrap());
+        assert_eq!(target.pjrt_version(), client.version());
+        assert_eq!(target.has_ffi_extension(), client.ffi_extension().is_ok());
+        assert_eq!(target.process_index(), client.process_index().unwrap());
+        let devices = client.devices().unwrap();
+        assert_eq!(target.devices().len(), devices.len());
+        for (target_device, device) in target.devices().iter().zip(devices.iter()) {
+            assert_eq!(target_device.device(), Device::from_pjrt(device).unwrap());
+            assert_eq!(target_device.kind(), device.kind().unwrap());
+            assert!(target_device.is_addressable());
+        }
+        assert!(target.device(usize::MAX).is_none());
+
+        // Lowering records the target facts, and a mesh over the target's devices is fully addressable.
+        let mesh = domain_mesh(&client, "x", 2);
+        assert!(target.is_fully_addressable_single_process_mesh(&mesh));
+        let remote_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(mesh.devices()[0].id(), target.process_index() + 1)],
+        )
+        .unwrap();
+        assert!(!target.is_fully_addressable_single_process_mesh(&remote_mesh));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Array(replicated_vector_type(&mesh, 2)));
+        let output = builder
+            .add_instruction(XlaOperation::Array(NegOperation::new().into()), Vec::new(), vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program: FlatXlaProgram = builder.build(output, vec![Placeholder], vec![Placeholder]).unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.platform_name.as_ref(), target.platform_name());
+        assert_eq!(lowered.platform_version.as_ref(), target.platform_version());
+        let device_kinds = devices.iter().map(|device| device.kind().unwrap().into_owned()).collect::<Vec<_>>();
+        assert_eq!(lowered.device_kinds.as_ref(), device_kinds.as_slice());
     }
 }

@@ -329,7 +329,9 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, StatisticsError> {
             let mesh = mesh.clone();
             move |inputs| {
                 shard_map::<_, (ShardMapTracer, ShardMapTracer), ArrayType, ShardMapTracer>(
-                    |(lhs, rhs): (ShardMapTracer, ShardMapTracer)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+                    |(lhs, rhs): (ShardMapTracer, ShardMapTracer)| {
+                        lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap()
+                    },
                     inputs,
                     mesh.clone(),
                     (lhs_spec.clone(), rhs_spec.clone()),

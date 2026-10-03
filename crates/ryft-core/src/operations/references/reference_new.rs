@@ -26,7 +26,7 @@ use crate::programs::{
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
 
 /// Creates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceNewOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
 
 impl<T: Type, U: Type> ReferenceNewOperation<T, U> {

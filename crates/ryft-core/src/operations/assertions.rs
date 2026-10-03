@@ -259,7 +259,7 @@ pub const ASSERT_OPERATION_NAME: &str = "assert";
 /// one unused padding item so that diagnostic selection remains valid; the padded extent must also fit `i32`.
 ///
 /// Refer to the documentation of [`Assert`] for more information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AssertOperation<T: Type> {
     /// Refer to the documentation of [`message`](Self::message) for more information.
     message: String,

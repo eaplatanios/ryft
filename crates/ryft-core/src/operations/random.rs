@@ -75,7 +75,7 @@ use crate::programs::{
 /// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
 /// Both algorithms come from [Salmon et al. paper](https://doi.org/10.1145/2063384.2063405), and their states hold
 /// a `u64` key followed by a counter that every draw advances by the number of cipher invocations it performs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RandomAlgorithm {
     /// The 20-round ThreeFry-2x32 generator, whose `u64[2]` state holds `[key, counter]`.
     ThreeFry,
@@ -151,7 +151,7 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 /// draws exactly the bits that its own state produces unbatched and the staged program size is independent of the
 /// batch size. The composite form threads its output extents through that scan as invariant carries, which requires
 /// them to be replicated.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RngBitGeneratorOperation<T: Type> {
     /// Algorithm generating the random bits.
     algorithm: RandomAlgorithm,
@@ -373,7 +373,7 @@ impl<
     C: Context<
             Type = ArrayType,
             Value: Transpose,
-            Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
+            Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Type>>,
         >,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for RngBitGeneratorOperation<ArrayType>
@@ -409,7 +409,7 @@ impl<
         let outputs = builder.add_instruction(self.clone(), Vec::new(), vec![state], None)?.to_vec();
         let body =
             builder.build::<Vec<C::Constant>, Vec<C::Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])?;
-        let scan = ScanOperation::<C::Constant>::new(0, P::axis_size(context)?);
+        let scan = ScanOperation::<C::Type>::new(0, P::axis_size(context)?);
         let mut outputs = context.parent().bind(scan, vec![body], std::slice::from_ref(states.value()))?;
         check_count!("output", outputs, 2, ProgramError);
         let bits = outputs.remove(1);
@@ -427,7 +427,7 @@ where
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<RngBitGeneratorOperation<ArrayIrType>>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -479,7 +479,7 @@ where
         // A dynamic batch extent becomes the scan length, which the scan consumes as a trailing runtime input.
         let extent_type = context.axis_extent().r#type();
         let length = <&DimensionType>::try_from(extent_type.as_ref())?.to_dimension();
-        let scan = ScanOperation::<C::Constant>::new(output_dimensions.len(), length.clone());
+        let scan = ScanOperation::<C::Type>::new(output_dimensions.len(), length.clone());
         let mut scan_inputs = output_dimensions
             .iter()
             .map(|output_dimension| output_dimension.value().clone())

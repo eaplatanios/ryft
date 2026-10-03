@@ -411,7 +411,7 @@ where
                 reason: "adaptive profile-guided recompilation requires an unprofiled baseline".to_string(),
             });
         }
-        let client = domain.client()?;
+        let client = domain.client();
         validate_adaptive_profile_guided_platform(client.platform_name()?.as_ref())?;
         client.profiler_extension()?;
         let profile_sidecar_key = adaptive_profile_sidecar_key(&domain, &lowered_program, options)?;
@@ -517,7 +517,7 @@ where
             raise_error_on_start_failure: true,
             ..ProfileOptions::default()
         };
-        let profiler = match self.inner.domain.client()?.profiler(&profiler_options) {
+        let profiler = match self.inner.domain.client().profiler(&profiler_options) {
             Ok(profiler) => profiler,
             Err(error) => {
                 let outputs = self.inner.domain.interpret(&executable, inputs)?;

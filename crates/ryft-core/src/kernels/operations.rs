@@ -89,7 +89,7 @@ pub trait KernelExtension: ReferenceAccessOperation<Type = ArrayIrType, Transfor
 /// Empty extension family for kernels containing only portable operations.
 ///
 /// This enum has no values, so a portable kernel cannot contain an unknown or unchecked target payload.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NoKernelExtension {}
 
 impl KernelExtension for NoKernelExtension {
@@ -167,7 +167,7 @@ impl ReferenceAccessOperation for NoKernelExtension {
 /// Partial evaluation uses the existing conservative fold-or-residualize rule for the complete operation. This
 /// preserves effects and nested regions without pretending that a nested portable program has a different operation
 /// universe. More specialized partitioning rules can be added when the owning kernel transform contract requires them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum KernelOperation<Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
     /// An operation from the existing array, dimension, and reference family.
     Portable(ArrayIrOperation<Array>),

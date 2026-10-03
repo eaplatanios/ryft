@@ -121,10 +121,10 @@ pub use operations::{
     GatherMode, GatherOperation, GatherOptions, IOTA_OPERATION_NAME, IndexInteger, IndexMask, IndexSelector,
     IndexSlice, Indexed, Indexing, Iota, IotaOperation, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME,
     LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules,
-    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
-    LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManualVariationAlignment, Max,
-    MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation, Not,
-    NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation,
+    LinearCallOperation, LiteralIdentity, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation,
+    Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManualVariationAlignment,
+    Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation,
+    Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation,
     OneOperation, Or, OrOperation, PAD_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME,
     POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce, ParallelReduceOperation, ParallelVary,
     ParallelVaryOperation, Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME,
@@ -142,17 +142,17 @@ pub use operations::{
     Round, RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME,
     SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
     SORT_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot,
-    ScaledDotOperation, ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterMode,
-    ScatterOperation, ScatterOptions, ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sort, SortDirection, SortOperation, SortOrdering, Sqrt, SqrtOperation,
-    StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME, TANH_OPERATION_NAME,
-    TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, Tolerance,
-    TopK, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
-    UnavailableCustomRules, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration,
-    WhileOperation, WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching,
-    WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    check_batching_rule_consistency, custom_function, transpose_primal_condition, transpose_primal_scan,
+    ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+    ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sort,
+    SortDirection, SortOperation, SortOrdering, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    StopGradients, Sub, SubOperation, TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, Tolerance, TopK, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
+    UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation,
+    WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
+    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
+    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
+    check_batching_rule_consistency, custom_function, transpose_primal_condition,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -190,8 +190,8 @@ pub use programs::{
     ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis,
     ReferenceViewAnalysisError, ReferenceViewOverlap, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
     RegionInterface, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
-    ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError,
-    TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    RegionStructure, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
+    TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
     ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, batch_reference_transforms,
     discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
     fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
@@ -811,7 +811,7 @@ pub(crate) mod tests {
     /// impose their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture
     /// declares arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures
     /// whose failures cannot be masked by control-flow inference.
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub enum TestRegionOperation {
         /// Region-free binary addition stand-in used inside region bodies.
         Add,

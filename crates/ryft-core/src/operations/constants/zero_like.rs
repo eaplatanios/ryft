@@ -17,7 +17,7 @@ pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
 
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _zero_ value
 /// with the same [`Type`] as that input.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ZeroLikeOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> Copy for ZeroLikeOperation<T> {}

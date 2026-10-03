@@ -87,7 +87,7 @@ mod control_flow;
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and
 /// [`Dot`](Self::Dot) a [`DotOperation`].
 #[derive(Clone, Debug, Operation)]
-#[ryft(dispatch(batching, differentiation, transposition))]
+#[ryft(identity, dispatch(batching, differentiation, transposition))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation<ArrayType>),
@@ -165,7 +165,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Select(SelectOperation<ArrayType>),
     Condition(ConditionOperation<V>),
     While(WhileOperation<ArrayType>),
-    Scan(ScanOperation<V>),
+    Scan(ScanOperation<ArrayType>),
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
     ReducePrecision(ReducePrecisionOperation<ArrayType>),
     TransferToMemory(TransferToMemoryOperation),
@@ -278,6 +278,7 @@ where
 
 /// [`Operation`] family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
+#[ryft(identity)]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
     Add(DimensionAddOperation),
@@ -376,6 +377,7 @@ where
 #[derive(Clone, Debug, Operation)]
 #[ryft(
     crate = "crate",
+    identity,
     type = ArrayIrType,
     constant = ArrayIrValue<A>,
     members(ArrayType, structural(DimensionType)),
@@ -523,10 +525,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// transforms/backends remain unsupported until discharge.
     While(WhileOperation<ArrayIrType>),
 
-    /// Composite scan whose body uses the complete array IR storage universe. Validated local, nonescaping reference
-    /// state can execute eagerly; reference-valued sequences/carries/results and generic transforms/backends remain
-    /// unsupported until discharge.
-    Scan(ScanOperation<ArrayIrValue<A>>),
+    /// Composite scan whose body uses the complete array IR storage universe, including first-class dimension carries,
+    /// dynamic trip counts, reference carries, and reference stacks (refer to the documentation of [`ScanOperation`]).
+    Scan(ScanOperation<ArrayIrType>),
 
     /// Composite custom function call whose primal region uses the complete array IR storage universe, with either
     /// attached rule regions in that universe or retained rules registered in this family. Generic differentiation
@@ -718,10 +719,12 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::While(operation) => {
                 Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
             }
-            ArrayOperation::Scan(operation) => {
-                let captures = operation.captures().iter().cloned().map(ArrayIrValue::Array).collect();
-                Self::Scan(operation.with_captures(captures))
-            }
+            ArrayOperation::Scan(operation) => Self::Scan(
+                ScanOperation::new(operation.carry_count(), operation.length().clone())
+                    .with_reverse(operation.reverse())
+                    .with_unroll(operation.unroll())
+                    .unwrap(),
+            ),
             // Custom function calls and carriers with attached rules store no source, so they follow their regions
             // into the native variants. Those with retained rules keep their member definition, which specializes their
             // rules for this family on demand.
@@ -1071,6 +1074,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1121,6 +1127,16 @@ mod tests {
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
+    /// Asserts at compile time that `T` implements the complete operation identity contract.
+    fn assert_identity<T: Eq + Hash>() {}
+
+    /// Returns the hash of `value` under the standard library's default hasher.
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[test]
     fn test_array_operations_holds_for_every_canonical_array_value() {
         // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
@@ -1131,6 +1147,35 @@ mod tests {
         requires_array_operations::<Tracer<ArrayTracingContext>>();
         requires_array_operations::<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>();
         requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>();
+    }
+
+    #[test]
+    fn test_array_operation_identity() {
+        assert_identity::<ArrayOperation<Array>>();
+
+        // Operations of the same variant with equal payloads are equal and hash identically, so they work as map keys.
+        let add = ArrayOperation::<Array>::Add(AddOperation::new());
+        assert_eq!(add, ArrayOperation::Add(AddOperation::new()));
+        assert_eq!(hash_of(&add), hash_of(&ArrayOperation::<Array>::Add(AddOperation::new())));
+        assert_ne!(add, ArrayOperation::Sub(SubOperation::new()));
+        let sum = ArrayOperation::<Array>::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum));
+        let same_sum = ArrayOperation::<Array>::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum));
+        assert_eq!(sum, same_sum);
+        assert_eq!(hash_of(&sum), hash_of(&same_sum));
+        let operations = HashMap::from([(sum.clone(), "sum")]);
+        assert_eq!(operations.get(&same_sum), Some(&"sum"));
+        assert_eq!(operations.get(&add), None);
+
+        // Payload attributes participate in the identity.
+        assert_ne!(sum, ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)));
+        assert_ne!(sum, ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Product)));
+
+        // Constant payloads follow literal identity rather than IEEE value equality.
+        let constant =
+            |value: f64| ArrayOperation::<Array>::Constant(ConstantOperation::new(Array::scalar(value).unwrap()));
+        assert_eq!(constant(f64::NAN), constant(f64::NAN));
+        assert_eq!(hash_of(&constant(f64::NAN)), hash_of(&constant(f64::NAN)));
+        assert_ne!(constant(-0.0), constant(0.0));
     }
 
     #[test]
@@ -1148,6 +1193,33 @@ mod tests {
         requires_dimension_operations::<
             <Tracer<TracingContext<TestValue, TestOperation>> as ValueProjection<DimensionType>>::Projected,
         >();
+    }
+
+    #[test]
+    fn test_dimension_operation_identity() {
+        assert_identity::<DimensionOperation<DimensionValue>>();
+
+        // Operations of the same variant with equal payloads are equal and hash identically.
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
+        let add =
+            DimensionOperation::<DimensionValue>::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
+        let same_add =
+            DimensionOperation::<DimensionValue>::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
+        assert_eq!(add, same_add);
+        assert_eq!(hash_of(&add), hash_of(&same_add));
+        assert_ne!(add, DimensionOperation::Mul(DimensionMulOperation::new(&left_type, &right_type).unwrap()));
+        assert_ne!(add, DimensionOperation::Add(DimensionAddOperation::new(&right_type, &left_type).unwrap()));
+
+        // Constant payloads follow the dimension literal identity.
+        let dimension = DimensionValue::constant(3).unwrap();
+        let constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(dimension.clone()));
+        let same_constant = DimensionOperation::<DimensionValue>::Constant(ConstantOperation::new(dimension));
+        assert_eq!(constant, same_constant);
+        assert_eq!(hash_of(&constant), hash_of(&same_constant));
+        let fresh_dimension = DimensionValue::constant(3).unwrap();
+        assert_ne!(constant, DimensionOperation::Constant(ConstantOperation::new(fresh_dimension)));
     }
 
     #[test]
@@ -1618,8 +1690,8 @@ mod tests {
             Err(TypeError::invalid("expected array type but got reference type")),
         );
 
-        // Member control-flow operations promote to their direct composite carriers. Scan promotion also lifts its
-        // capture values while preserving every semantic and lowering attribute.
+        // Member control-flow operations promote to their direct composite carriers, preserving every semantic and
+        // lowering attribute.
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ArrayOperation::Condition(ConditionOperation::new())),
             ArrayIrOperation::Condition(_),
@@ -1631,12 +1703,7 @@ mod tests {
             ArrayIrOperation::While(operation)
                 if operation.iteration_bound() == while_operation.iteration_bound()
         ));
-        let capture = Array::vector(vec![3.0_f32, 4.0, 5.0, 6.0]).unwrap();
-        let scan_operation = ScanOperation::<Array>::new(1, 4)
-            .with_reverse(true)
-            .with_unroll(2)
-            .unwrap()
-            .with_captures(vec![capture.clone()]);
+        let scan_operation = ScanOperation::<ArrayType>::new(1, 4).with_reverse(true).with_unroll(2).unwrap();
         let promoted_scan = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(scan_operation));
         let ArrayIrOperation::Scan(promoted_scan) = promoted_scan else {
             panic!("expected a direct composite scan operation");
@@ -1645,7 +1712,6 @@ mod tests {
         assert_eq!(promoted_scan.length(), &Dimension::Static(4));
         assert!(promoted_scan.reverse());
         assert_eq!(promoted_scan.unroll(), 2);
-        assert_eq!(promoted_scan.captures(), &[ArrayIrValue::Array(capture)]);
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -1866,6 +1932,49 @@ mod tests {
                     .into()
             ]),
         );
+    }
+
+    #[test]
+    fn test_array_ir_operation_identity() {
+        assert_identity::<ArrayIrOperation<Array>>();
+
+        // Operations of the same variant with equal payloads are equal and hash identically.
+        let add = ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new()));
+        let same_add = ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new()));
+        assert_eq!(add, same_add);
+        assert_eq!(hash_of(&add), hash_of(&same_add));
+        assert_ne!(add, ArrayIrOperation::from(ArrayOperation::Mul(MulOperation::new())));
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
+        let dimension_add = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
+            DimensionAddOperation::new(&left_type, &right_type).unwrap(),
+        ));
+        assert_eq!(dimension_add, dimension_add.clone());
+        assert_ne!(dimension_add, add);
+
+        // Region-carrying marker payloads are identical within their family; their regions live on the instruction.
+        let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
+        let same_condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
+        assert_eq!(condition, same_condition);
+        assert_eq!(hash_of(&condition), hash_of(&same_condition));
+        assert_ne!(condition, add);
+
+        // The identity distinguishes encodings, so a mixed zero constructor differs from the homogeneous one.
+        let zero_type = ArrayType::scalar(DataType::F32);
+        assert_ne!(
+            ArrayIrOperation::<Array>::Zero(ZeroOperation::new(zero_type.clone())),
+            ArrayIrOperation::Array(ArrayOperation::Zero(ZeroOperation::new(zero_type))),
+        );
+
+        // Constant payloads nested in the array member follow literal identity.
+        let constant = |value: f64| {
+            ArrayIrOperation::<Array>::Array(ArrayOperation::Constant(ConstantOperation::new(
+                Array::scalar(value).unwrap(),
+            )))
+        };
+        assert_eq!(constant(f64::NAN), constant(f64::NAN));
+        assert_ne!(constant(-0.0), constant(0.0));
     }
 
     #[test]

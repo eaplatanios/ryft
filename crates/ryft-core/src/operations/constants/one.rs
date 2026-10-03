@@ -34,7 +34,7 @@ pub const ONE_OPERATION_NAME: &str = "one";
 /// This operation also serves as an [`OperationProvider`] request: it carries the requested output type while the
 /// provider receives no input types. Composite operation families select the appropriate member operation from this
 /// type; homogeneous families use their ordinary `From<OneOperation<T>>` conversion.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OneOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     r#type: T,

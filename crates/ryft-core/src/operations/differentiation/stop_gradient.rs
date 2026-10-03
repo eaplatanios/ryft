@@ -22,7 +22,7 @@ pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 /// values in either forward- or reverse-mode differentiation. Because the rule stages only those zero tangents,
 /// [`StopGradientOperation`] can never appear in a valid tangent program, and its
 /// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> StopGradientOperation<T> {

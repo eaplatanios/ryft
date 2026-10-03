@@ -1721,6 +1721,60 @@ fn test_operation_default_crate_path_is_ryft() {
     assert_eq!(ryft::Operation::name(&linear_operation), "zero");
 }
 
+#[derive(Clone, Debug, ryft::Operation)]
+#[ryft(identity)]
+enum IdentityOperation<V: ryft::Value<Type = ryft::ArrayType>> {
+    Zero(ryft::ZeroOperation<ryft::ArrayType>),
+    Add(ryft::AddOperation<ryft::ArrayType>),
+    Constant(ryft::ConstantOperation<V>),
+}
+
+#[test]
+fn test_operation_generates_payload_identity() {
+    use std::collections::HashMap;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    /// Asserts at compile time that `T` implements the complete operation identity contract.
+    fn assert_identity<T: Eq + Hash>() {}
+
+    /// Returns the hash of `value` under the standard library's default hasher.
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // The generated bounds constrain the payload types rather than `V`, so the family is identity-comparable even
+    // though `ryft::Array` itself implements neither `Eq` nor `Hash`.
+    assert_identity::<IdentityOperation<ryft::Array>>();
+
+    // Operations of the same variant with equal payloads are equal and hash identically, so they work as map keys.
+    let zero = |data_type: ryft::DataType| {
+        IdentityOperation::<ryft::Array>::Zero(ryft::ZeroOperation::new(ryft::ArrayType::scalar(data_type)))
+    };
+    let add = IdentityOperation::<ryft::Array>::Add(ryft::AddOperation::new());
+    assert_eq!(zero(ryft::DataType::F64), zero(ryft::DataType::F64));
+    assert_eq!(hash_of(&zero(ryft::DataType::F64)), hash_of(&zero(ryft::DataType::F64)));
+    assert_eq!(add, IdentityOperation::Add(ryft::AddOperation::new()));
+    assert_eq!(hash_of(&add), hash_of(&IdentityOperation::<ryft::Array>::Add(ryft::AddOperation::new())));
+    let operations = HashMap::from([(zero(ryft::DataType::F64), "zero"), (add.clone(), "add")]);
+    assert_eq!(operations.get(&zero(ryft::DataType::F64)), Some(&"zero"));
+    assert_eq!(operations.get(&add), Some(&"add"));
+    assert_eq!(operations.get(&zero(ryft::DataType::F32)), None);
+
+    // Different payloads and different variants are unequal.
+    assert_ne!(zero(ryft::DataType::F64), zero(ryft::DataType::F32));
+    assert_ne!(zero(ryft::DataType::F64), add);
+
+    // Payload identity is delegated as-is, so constants keep their bitwise literal identity.
+    let constant = |value: f64| {
+        IdentityOperation::<ryft::Array>::Constant(ryft::ConstantOperation::new(ryft::Array::scalar(value).unwrap()))
+    };
+    assert_eq!(constant(f64::NAN), constant(f64::NAN));
+    assert_eq!(hash_of(&constant(f64::NAN)), hash_of(&constant(f64::NAN)));
+    assert_ne!(constant(-0.0), constant(0.0));
+}
+
 /// Mixed-boundary fixtures for the declared-member machinery. Unlike the rest of this file, this module builds on the
 /// real `ryft` member vocabulary instead of stand-ins, because the mixed contracts the derive emits against
 /// ([`MemberOperation`](ryft::MemberOperation), the member zero constructor selected per output universe, and
@@ -3560,6 +3614,7 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_conflicting_variant_classes.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
+    test_cases.compile_fail("tests/operations/error_duplicate_identity_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");

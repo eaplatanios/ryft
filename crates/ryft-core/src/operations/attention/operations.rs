@@ -34,7 +34,7 @@ pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 /// is a backend-recognizable inference boundary and is intentionally not directly differentiable; use
 /// [`differentiable_dot_product_attention`] for reverse-mode differentiation. Its batching rule folds a mapped leading
 /// axis into the logical batch axis while retaining this boundary for fused lowering.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DotProductAttentionOperation {
     /// Value-independent attention semantics.
     configuration: AttentionConfiguration,
@@ -213,7 +213,7 @@ pub const DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME: &str = "dot_product_att
 /// owned by [`dot_product_attention_backward_ir_composition`]; this operation remains only so a fused forward's
 /// transpose can select the matching backend backward ABI. Higher-order derivatives should differentiate the ordinary
 /// portable composition instead of differentiating this boundary.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DotProductAttentionBackwardOperation {
     /// Value-independent semantics of the differentiated forward operation.
     configuration: AttentionConfiguration,

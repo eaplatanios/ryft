@@ -143,9 +143,8 @@ impl<C: Context> Tracer<C> {
 // `Tracer` equality is *staging identity*, not value equality. Two tracers are equal if and only if they correspond to
 // the same staged `Atom` of the same `ProgramBuilder` (or are both poisoned in the same builder). Two tracers that
 // would evaluate to equal runtime values but were staged as distinct atoms are considered unequal, which is the
-// conservative answer trace-time analyses need. For example, the loop invariance fixed points of the `scan` and `while`
-// partial evaluation rules degrade to syntactic passthrough detection under a staging known-side context precisely
-// because of these semantics.
+// conservative answer trace-time analyses need: an analysis that treats equal values as interchangeable can never
+// conflate two distinct staged values.
 impl<C: StagingContext> PartialEq for Tracer<C> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {

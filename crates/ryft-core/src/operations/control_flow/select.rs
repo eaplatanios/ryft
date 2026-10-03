@@ -99,7 +99,7 @@ pub const SELECT_OPERATION_NAME: &str = "select";
 /// branch. The `T` parameter fixes the operation's [`Type`] universe, and so `SelectOperation<DataType>` and
 /// `SelectOperation<ArrayType>` are distinct zero-sized operations that each implement exactly one [`Operation`]
 /// contract. Refer to the documentation of [`Select`] for more information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SelectOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> SelectOperation<T> {

@@ -31,7 +31,7 @@ pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
 /// Replaces the selected reference state with an exactly matching value and returns its previous contents. The root
 /// and replacement are the first two inputs. Dynamic bindings follow them in transform order and the path is stored
 /// in `Transform` metadata. An empty path accesses the complete referent.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceSwapOperation<
     T: Type,
     U: Type,

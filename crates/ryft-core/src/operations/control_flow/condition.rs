@@ -5,6 +5,7 @@
 //! and lowers to [StableHLO's `if`](https://openxla.org/stablehlo/spec#if).
 
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -98,6 +99,23 @@ impl<F: Value> Default for ConditionOperation<F> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// A condition carries no attributes besides its value-family marker (its branches are attached regions), so every two
+// conditions of one family are identical. These implementations are written by hand so that they do not require the
+// marker's value family to be comparable or hashable.
+impl<F: Value> PartialEq for ConditionOperation<F> {
+    #[inline]
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<F: Value> Eq for ConditionOperation<F> {}
+
+impl<F: Value> Hash for ConditionOperation<F> {
+    #[inline]
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
 }
 
 impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {

@@ -31,7 +31,7 @@ pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &str = "transfer_to_memory";
 /// Differentiation moves derivatives along with the value (i.e., the JVP transfers the primal and the tangent to the
 /// destination, and the staged linear transfer transposes into a transfer that moves the cotangent back to the input's
 /// source memory, which is read off the input type during transposition).
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TransferToMemoryOperation {
     /// Destination [`Memory`] that the input is moved into.
     destination: Memory,

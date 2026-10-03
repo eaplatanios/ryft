@@ -182,10 +182,10 @@ mod xla_backend {
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use ryft::pjrt::{Client, ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
+    use ryft::pjrt::{ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
-    use ryft::xla::{Array, FromPjrt};
+    use ryft::xla::{Array, FromPjrt, XlaDomain, XlaSession};
     use ryft::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
@@ -199,7 +199,7 @@ mod xla_backend {
 
     /// Constructs a replicated `f32` array on the selected XLA device.
     fn array<'c>(
-        client: &'c Client<'c>,
+        domain: &XlaDomain<'c>,
         mesh: &DeviceMesh,
         dimensions: &[usize],
         values: &[f32],
@@ -207,7 +207,7 @@ mod xla_backend {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-        Ok(Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes(values))?)
+        Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
     }
 
     /// Copies a replicated `f32` XLA array back to the host.
@@ -291,22 +291,23 @@ mod xla_backend {
         let device = Device::from_pjrt(device)?;
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
         let mesh = DeviceMesh::new(logical_mesh, vec![device])?;
+        let domain = XlaSession::new(&client).domain();
 
         let model = Mlp {
             layers: initial_layer_values()
                 .into_iter()
                 .map(|(input_size, output_size, weights, bias)| -> ExampleResult<_> {
                     Ok(Linear::new(
-                        array(&client, &mesh, &[input_size, output_size], &weights)?,
-                        bias.map(|bias| array(&client, &mesh, &[output_size], &bias)).transpose()?,
+                        array(&domain, &mesh, &[input_size, output_size], &weights)?,
+                        bias.map(|bias| array(&domain, &mesh, &[output_size], &bias)).transpose()?,
                     ))
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let inputs = array(&client, &mesh, &[4, 2], &input_values())?;
-        let targets = array(&client, &mesh, &[4, 1], &target_values())?;
-        let learning_rate = array(&client, &mesh, &[], &[0.1])?;
-        let mean_scale = array(&client, &mesh, &[], &[0.25])?;
+        let inputs = array(&domain, &mesh, &[4, 2], &input_values())?;
+        let targets = array(&domain, &mesh, &[4, 1], &target_values())?;
+        let learning_rate = array(&domain, &mesh, &[], &[0.1])?;
+        let mean_scale = array(&domain, &mesh, &[], &[0.25])?;
         super::train("xla", model, inputs, targets, learning_rate, mean_scale, |array| {
             Ok(read_f32s(array)?.into_iter().map(f64::from).collect())
         })

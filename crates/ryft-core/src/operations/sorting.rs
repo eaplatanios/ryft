@@ -96,7 +96,7 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 /// Direction in which a [`SortOperation`] orders its key inputs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SortDirection {
     /// Orders keys from smallest to largest.
     Ascending,
@@ -117,7 +117,7 @@ impl Display for SortDirection {
 
 /// Order in which a [`SortOperation`] compares floating-point keys, including the real and imaginary parts of complex
 /// keys. Boolean keys order `false` before `true`, and integer keys order by value, under both orderings.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SortOrdering {
     /// Orders floating-point keys by value: `-0.0` and `+0.0` compare equal, and every NaN, regardless of its sign and
     /// payload, compares equal to every other NaN and greater than `+∞`. Complex keys order lexicographically by their
@@ -169,7 +169,7 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// The permutation is piecewise constant in the keys, so every input, including each key, differentiates as a
 /// passenger: tangents ride a sort of their primal keys, and the transpose of that permutation sorts the output
 /// cotangents by the permutation itself, which applies its inverse.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SortOperation {
     /// Axis along which the inputs are sorted.
     axis: usize,

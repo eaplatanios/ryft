@@ -338,8 +338,9 @@ fn linear_collective_output_type(
 ///
 ///   - Type inference validates the shared input contract (a nonzero axis size and exactly one statically shaped input
 ///     that satisfies the requested array-type checks) and then delegates the payload-dependent output type.
-///   - Interpretation outside any binder is the identity over a degenerate single-participant axis and an error over
-///     any larger axis, because the other participants do not exist per item.
+///   - Interpretation outside any binder is defined only over a degenerate single-participant axis, where it is the
+///     identity unless the invocation provides its own `interpret` rule. Any larger axis is an error, because the other
+///     participants do not exist per item.
 ///   - Partial evaluation uses the default fold-or-residualize behavior of `Program::partially_evaluate`.
 ///
 /// Batching rules and value-level capabilities are written next to each invocation, because every collective consumes
@@ -380,7 +381,65 @@ fn linear_collective_output_type(
 ///   - `infer_output_type`: Closure-like rule that returns the output type as a `Result<ArrayType, TypeError>`. It
 ///     binds the operation, the validated input type, and the input's static dimensions to the provided names. The
 ///     closure-like syntax only names these values; it does not create a runtime closure.
+///   - `interpret<$context> where $bounds { |operation, input| ... }`: Optional closure-like rule that returns the
+///     output of a degenerate single-participant collective as a `Result<C::Value, ProgramError>`, for collectives
+///     whose single participant does not simply keep its value (e.g., an untargeted `parallel_permute` participant,
+///     which receives zeros). Its `where` predicates (e.g., `C::Value: ZeroLike`) bound the generated
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation. When it is omitted, the single
+///     participant keeps its value.
 macro_rules! define_linear_collective_operation {
+    // This branch generates the default interpretation, under which the single participant of a degenerate axis keeps
+    // its value, by forwarding an identity rule to the custom interpretation branch.
+    (@interpret $operation:ident, $name:ident) => {
+        define_linear_collective_operation!(
+            @interpret $operation,
+            $name,
+            C,
+            [C::Value: ::std::clone::Clone],
+            _operation,
+            input,
+            { Ok::<_, $crate::ProgramError>(input.clone()) },
+        );
+    };
+
+    // This branch generates the interpretation of a collective outside any binder from its degenerate-axis rule.
+    (
+        @interpret $operation:ident,
+        $name:ident,
+        $context:ident,
+        [$($bounded:ty: $bound:path),+],
+        $interpret_operation:ident,
+        $interpret_input:ident,
+        $interpret:block $(,)?
+    ) => {
+        impl<$context: $crate::Domain<Type = $crate::ArrayType>> $crate::InterpretableOperation<$context> for $operation
+        where
+            $($bounded: $bound),+
+        {
+            fn interpret<D: $crate::InterpretationDriver<$context>>(
+                &self,
+                _context: &$context,
+                _driver: &D,
+                inputs: &[<$context as $crate::Domain>::Value],
+            ) -> Result<Vec<<$context as $crate::Domain>::Value>, $crate::ProgramError> {
+                // Outside any binder, only the degenerate single-participant axis has defined per-item semantics. Any
+                // larger axis is an error because the other participants do not exist per item.
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                if self.axis_size != 1 {
+                    return Err($crate::ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                            $name, self.axis_name, self.axis_size,
+                        ),
+                    });
+                }
+                let $interpret_operation = self;
+                let $interpret_input = &inputs[0];
+                Ok(vec![$interpret?])
+            }
+        }
+    };
+
     // This branch accepts the public form and generates the operation struct together with its base implementations.
     (
         $(#[$documentation:meta])*
@@ -388,7 +447,12 @@ macro_rules! define_linear_collective_operation {
         $name:ident,
         fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
         $(check_array_types = [$(@$array_type_check:ident),* $(,)?],)?
-        infer_output_type = |$operation_binding:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
+        infer_output_type = |$operation_binding:ident, $input_type:ident, $dimensions:ident| $infer:block,
+        $(
+            interpret<$context:ident> where $($bounded:ty: $bound:path),+ {
+                |$interpret_operation:ident, $interpret_input:ident| $interpret:block
+            } $(,)?
+        )?
     ) => {
         $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -472,27 +536,11 @@ macro_rules! define_linear_collective_operation {
             }
         }
 
-        impl<C: $crate::Domain<Type = $crate::ArrayType>> $crate::InterpretableOperation<C> for $operation {
-            fn interpret<D: $crate::InterpretationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
-                // Outside any binder, only the degenerate single-participant axis has defined per-item semantics (the
-                // identity). Any larger axis is an error because the other participants do not exist per item.
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                if self.axis_size != 1 {
-                    return Err($crate::ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                            $name, self.axis_name, self.axis_size,
-                        ),
-                    });
-                }
-                Ok(vec![inputs[0].clone()])
-            }
-        }
+        define_linear_collective_operation!(
+            @interpret $operation,
+            $name
+            $(, $context, [$($bounded: $bound),+], $interpret_operation, $interpret_input, $interpret)?
+        );
 
         // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
         impl<C: $crate::Context<Type = $crate::ArrayType>> $crate::PartiallyEvaluatableOperation<C> for $operation where

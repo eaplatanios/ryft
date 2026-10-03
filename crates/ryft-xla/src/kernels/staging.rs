@@ -25,6 +25,7 @@ use ryft_core::{
     TypeIdentityRenaming, Typed, Value,
 };
 
+use crate::XlaTarget;
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
 
@@ -32,7 +33,7 @@ use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding
 ///
 /// Portable operations remain ordinary `KernelOperation` variants. This enum owns only the typed conversion between
 /// enabled adapter families and XLA staging; it does not choose a compiler or erase extension semantics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum XlaKernelExtension {
     /// Exact Mosaic GPU instruction semantics, admitted only by an explicitly selected Mosaic compiler.
     #[cfg(feature = "mosaic-gpu")]
@@ -259,7 +260,7 @@ impl Operation for XlaKernelExtension {
 /// The payload contains only operation metadata. Its computations remain ordinary attached regions of the XLA
 /// program, so effect, reference, identity, and structural validation continue to inspect the actual current body.
 /// Generic differentiation and reference discharge require an owner-supported kernel rule and reject this carrier.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaKernelOperation(pub(crate) KernelOperation<XlaKernelExtension>);
 
 impl XlaKernelOperation {
@@ -827,41 +828,25 @@ pub struct XlaKernelExecutionFacts {
 }
 
 impl XlaKernelExecutionFacts {
-    /// Reads target facts from the live execution owner without loading an additional device runtime.
-    pub fn from_client(
-        client: &ryft_pjrt::Client<'_>,
-        mesh: &ryft_core::DeviceMesh,
-    ) -> Result<Self, KernelEmbeddingError> {
-        let devices = client.devices()?;
+    /// Selects the facts of the devices of `mesh`, in mesh order, from the [`XlaTarget`] of the execution owner,
+    /// without loading an additional device runtime.
+    pub fn from_target(target: &XlaTarget, mesh: &ryft_core::DeviceMesh) -> Result<Self, KernelEmbeddingError> {
         let devices = mesh
             .devices()
             .iter()
             .map(|mesh_device| {
-                let device = devices
-                    .iter()
-                    .find(|device| device.id().is_ok_and(|id| id == mesh_device.id()))
-                    .ok_or_else(|| KernelEmbeddingError::Invalid {
-                        message: format!(
-                            "kernel execution device {} is not visible to the live client",
-                            mesh_device.id()
-                        ),
-                    })?;
-                Ok(XlaKernelDeviceFacts {
-                    kind: device.kind()?.into_owned(),
-                    attributes: device
-                        .attributes()?
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect(),
-                })
+                let device = target.device(mesh_device.id()).ok_or_else(|| KernelEmbeddingError::Invalid {
+                    message: format!("kernel execution device {} is not visible to the live client", mesh_device.id()),
+                })?;
+                Ok(XlaKernelDeviceFacts { kind: device.kind().to_owned(), attributes: device.attributes().clone() })
             })
             .collect::<Result<Vec<_>, KernelEmbeddingError>>()?;
         Ok(Self {
-            platform_name: client.platform_name()?.into_owned(),
-            platform_version: client.platform_version()?.into_owned(),
-            pjrt_version: client.version(),
-            has_ffi_extension: client.ffi_extension().is_ok(),
-            attributes: client.attributes()?.iter().map(|(name, value)| (name.clone(), value.clone())).collect(),
+            platform_name: target.platform_name().to_owned(),
+            platform_version: target.platform_version().to_owned(),
+            pjrt_version: target.pjrt_version(),
+            has_ffi_extension: target.has_ffi_extension(),
+            attributes: target.attributes().clone(),
             devices,
         })
     }
@@ -1208,9 +1193,9 @@ pub(crate) mod tests {
     use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_core::operations::custom_call::CustomCallOperation;
 
-    use crate::FromPjrt;
     use crate::experimental::ops::XlaProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
+    use crate::{FromPjrt, XlaSession};
 
     use super::*;
 
@@ -1360,7 +1345,7 @@ pub(crate) mod tests {
             vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
         )
         .unwrap();
-        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
         let request = CompilationStagingRequest::<_, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
             |_, _, inputs| replay(program, inputs),
             vec![],
@@ -1375,7 +1360,7 @@ pub(crate) mod tests {
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
                 ArrayIrValue::Array(
-                    crate::Array::from_host_buffer(&client, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
+                    crate::Array::from_host_buffer(&domain, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1872,7 +1857,7 @@ pub(crate) mod tests {
             devices.iter().map(|device| ryft_core::Device::from_pjrt(device.clone()).unwrap()).collect(),
         )
         .unwrap();
-        let facts = XlaKernelExecutionFacts::from_client(&client, &mesh).unwrap();
+        let facts = XlaKernelExecutionFacts::from_target(&XlaTarget::from_client(&client).unwrap(), &mesh).unwrap();
         assert_eq!(facts.platform_name, client.platform_name().unwrap());
         assert_eq!(facts.platform_version, client.platform_version().unwrap());
         assert_eq!(facts.pjrt_version, client.version());

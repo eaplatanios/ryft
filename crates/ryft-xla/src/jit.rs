@@ -1140,11 +1140,7 @@ impl<'c> XlaDomainWitness<'c> {
     /// Returns whether `domain` is interchangeable with the domain that produced the retained artifact.
     fn matches(&self, domain: &XlaDomain<'c>) -> bool {
         std::ptr::eq(self.domain.compilation_context(), domain.compilation_context())
-            && match (self.domain.client().ok(), domain.client().ok()) {
-                (Some(retained), Some(current)) => std::ptr::eq(retained, current),
-                (None, None) => true,
-                _ => false,
-            }
+            && std::ptr::eq(self.domain.client(), domain.client())
             && self.domain.compilation_options() == domain.compilation_options()
             && self.domain.mesh().ok() == domain.mesh().ok()
     }
@@ -1880,7 +1876,7 @@ mod tests {
         compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions};
+    use crate::{AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions, XlaSession};
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
     #[derive(Clone)]
@@ -2081,7 +2077,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -2091,7 +2087,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -2115,7 +2111,7 @@ mod tests {
     fn test_compile_converted_broadcast() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2132,7 +2128,7 @@ mod tests {
         assert_eq!(compiled.source_program().program().input_ids().len(), 1);
         assert_eq!(compiled.source_program().captures().len(), 0);
         let input =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -2156,7 +2152,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -2164,7 +2160,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let value =
-            Array::from_host_buffer(&client, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
             vec![value],
@@ -2175,7 +2171,7 @@ mod tests {
         .unwrap();
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
-        let input = Array::from_host_buffer(&client, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4f32; 6]);
     }
@@ -2184,7 +2180,7 @@ mod tests {
     fn test_compile_reduce_product() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2199,7 +2195,7 @@ mod tests {
             ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
         ] {
             let input =
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
             let output = engine.interpret(&compiled.executable_function(), input.clone()).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
@@ -2214,7 +2210,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -2226,7 +2222,7 @@ mod tests {
             [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
         {
             let input =
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
@@ -2250,7 +2246,7 @@ mod tests {
     fn test_compile_reduce_narrow_floating_point() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         // Product retains the small growth of each factor; the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
@@ -2279,7 +2275,7 @@ mod tests {
             )
             .unwrap();
             let input =
-                Array::from_host_buffer(&client, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
@@ -2290,7 +2286,7 @@ mod tests {
     fn test_compile_reduce_mean_empty() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F32, [0])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2301,7 +2297,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&client, input_type, mesh, &[]).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert!(read_f32_array(&client, &output)[0].is_nan());
     }
@@ -2310,7 +2306,7 @@ mod tests {
     fn test_compile_reduce_complex() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
         // to compare the imaginary component against the identity rather than deciding on the real component.
         for (kind, components, expected) in [
@@ -2326,7 +2322,7 @@ mod tests {
             let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
-                Array::from_host_buffer(&client, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), expected);
         }
@@ -2339,7 +2335,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -2347,7 +2343,7 @@ mod tests {
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let source = || {
             Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&values).as_slice(),
@@ -2386,7 +2382,7 @@ mod tests {
     fn test_compile_reduce_log_sum_exp_gradient() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F64, [2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2397,13 +2393,13 @@ mod tests {
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
         let input =
-            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled finite-shift guard must retain the undefined weight at an infinite input.
-        let input = Array::from_host_buffer(&client, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         let values = read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
@@ -2414,7 +2410,7 @@ mod tests {
     fn test_compile_reduce_log_sum_exp_narrow_jvp() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::F16, [65536])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2424,7 +2420,7 @@ mod tests {
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = engine.interpret(&differentiated.executable_function(), (input.clone(), input)).unwrap();
         assert_eq!(read_f32_array(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
@@ -2436,14 +2432,14 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source = |values: [f32; 4]| {
             Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&values).as_slice(),
@@ -2488,7 +2484,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -2510,7 +2506,7 @@ mod tests {
         assert_eq!(executable.output_types(), &[input_type.clone()]);
 
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = domain.interpret(&executable, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
@@ -2522,7 +2518,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -2562,7 +2558,7 @@ mod tests {
             [(3.0_f32, 36.0, 6.0, 24.0), (5.0, 100.0, 10.0, 40.0), (3.0, 36.0, 6.0, 24.0)]
         {
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[initial]).as_slice(),
@@ -2582,7 +2578,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
             let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]));
             let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
@@ -2729,7 +2725,7 @@ mod tests {
             let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
             let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
             let input =
-                Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                     .unwrap();
             let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &outputs), expected);
@@ -2744,7 +2740,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
@@ -2758,13 +2754,13 @@ mod tests {
         )
         .unwrap();
         let initial =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(initial.r#type().sharding().is_some());
         let reference = ArrayReference::new(initial);
         let retained_snapshot = reference.read().unwrap();
         let rejected_update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
             ryft_core::call_function(
@@ -2779,7 +2775,7 @@ mod tests {
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
                 .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
@@ -2816,7 +2812,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2857,7 +2853,7 @@ mod tests {
         // Both references are committed after the call: the primal holder accumulates the update and the tangent
         // holder accumulates the tangent update, and the outputs read the committed states.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
@@ -2887,7 +2883,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
 
@@ -2922,7 +2918,7 @@ mod tests {
         // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
         // while leaving the destination unchanged, so both end at `5 + 2`.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
@@ -2950,7 +2946,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::new_static(DataType::F32, [3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -2975,7 +2971,7 @@ mod tests {
         }
         let input = || {
             Array::from_host_buffer(
-                &client,
+                &domain,
                 array_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&values).as_slice(),
@@ -3008,7 +3004,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::new_static(DataType::F32, [4]);
 
         // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
@@ -3034,7 +3030,7 @@ mod tests {
             },
         );
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
         };
         let input = ArrayIrValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
@@ -3083,7 +3079,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32);
 
         // A reference allocated inside the program has no host identity the ABI could hand back.
@@ -3127,7 +3123,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3141,7 +3137,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.call_statefully(&domain, ArrayIrValue::Array(input)).unwrap();
         let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -3158,7 +3154,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3172,7 +3168,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.call_statefully_async(&domain, ArrayIrValue::Array(input)).r#await().unwrap();
         let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -3186,7 +3182,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3198,7 +3194,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
             let output = compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap();
@@ -3215,7 +3211,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3232,7 +3228,7 @@ mod tests {
         // than enqueueing an execution whose hidden final-state outputs nothing would publish.
         let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             ExecutableXlaFunction { function: compiled.executable_function().clone() };
-        let input = Array::from_host_buffer(&client, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             domain.interpret_async(&executable, input),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
@@ -3247,7 +3243,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3267,7 +3263,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
@@ -3283,12 +3279,11 @@ mod tests {
         std::thread::scope(|scope| {
             let (mutation_finished, mutation_result) = mpsc::channel();
             let mutation_reference = reference.clone();
-            let client = &client;
             let domain = &domain;
             let mutate = &mutate;
             scope.spawn(move || {
                 let update =
-                    Array::from_host_buffer(client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                    Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
                     .send(mutate.call_statefully(
                         domain,
@@ -3317,7 +3312,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3329,10 +3324,10 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
             .call_statefully_async(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
             .r#await()
@@ -3347,7 +3342,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3359,20 +3354,20 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(predecessor.clone()));
         let first_update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let first = compiled.call_statefully_async(
             &domain,
             (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(first_update)),
         );
         let second_update =
-            Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.call_statefully_async(
             &domain,
             (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(second_update)),
@@ -3400,7 +3395,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -3412,12 +3407,12 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(completion.clone()));
-        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(
             compiled.call_statefully_async(
                 &domain,
@@ -3436,7 +3431,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -3451,7 +3446,7 @@ mod tests {
         )
         .unwrap();
         let root = ArrayReference::new(
-            Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
         let view = root
@@ -3474,7 +3469,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let shape = Shape::new(vec![Dimension::Static(2)]);
         let replicated_type = ArrayType::new(DataType::F32, shape.clone())
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -3491,7 +3486,7 @@ mod tests {
         .unwrap();
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &client,
+                &domain,
                 alternate_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(),
@@ -3518,7 +3513,7 @@ mod tests {
         )
         .unwrap();
         let update = Array::from_host_buffer(
-            &client,
+            &domain,
             replicated_type.clone(),
             mesh,
             values_to_bytes::<f32>(&[3.0, 4.0]).as_slice(),
@@ -3545,7 +3540,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding)
@@ -3562,7 +3557,7 @@ mod tests {
         .unwrap();
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &client,
+                &domain,
                 array_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3570,7 +3565,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &client,
+            &domain,
             array_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -3591,7 +3586,7 @@ mod tests {
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
         let reversed_reference = ArrayReference::new(
             Array::from_host_buffer(
-                &client,
+                &domain,
                 array_type.clone(),
                 reversed_mesh,
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3599,7 +3594,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &client,
+            &domain,
             array_type,
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -3624,7 +3619,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
         let inputs = program.input_types();
         let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
@@ -3636,7 +3631,7 @@ mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
@@ -3672,7 +3667,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
         let mut input_types = program.input_types();
         let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
@@ -3701,7 +3696,7 @@ mod tests {
         )
         .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
         };
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
@@ -3736,7 +3731,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let sharding = Sharding::replicated(logical_mesh.clone(), 1);
         let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
@@ -3777,7 +3772,7 @@ mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
@@ -3801,7 +3796,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
@@ -3853,7 +3848,7 @@ mod tests {
 
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &client,
+                &domain,
                 sharded_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3861,7 +3856,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &client,
+            &domain,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
@@ -3894,7 +3889,7 @@ mod tests {
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Manual);
         let logical_mesh = mesh.logical_mesh().clone();
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
@@ -3952,7 +3947,7 @@ mod tests {
 
         let reference = ArrayReference::new(
             Array::from_host_buffer(
-                &client,
+                &domain,
                 replicated_type,
                 mesh.clone(),
                 values_to_bytes::<f32>(&[100.0, 200.0]).as_slice(),
@@ -3960,7 +3955,7 @@ mod tests {
             .unwrap(),
         );
         let update = Array::from_host_buffer(
-            &client,
+            &domain,
             sharded_type,
             mesh,
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -3987,7 +3982,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4018,7 +4013,7 @@ mod tests {
                 .unwrap();
             let reference = ArrayReference::new(
                 Array::from_host_buffer(
-                    &client,
+                    &domain,
                     actual_type,
                     mesh.clone(),
                     values_to_bytes(expected.as_slice()).as_slice(),
@@ -4042,7 +4037,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4055,13 +4050,13 @@ mod tests {
             mesh.clone(),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
                 .call_statefully((), (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
@@ -4081,12 +4076,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -4100,7 +4095,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let output = compiled.call_statefully(&domain, ArrayIrValue::Array(update)).unwrap();
         let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![3.0]);
@@ -4114,13 +4109,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, public_reference| {
@@ -4153,12 +4148,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -4182,7 +4177,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4199,16 +4194,16 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
-        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
             .call_statefully(
@@ -4239,7 +4234,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4255,20 +4250,20 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
         let higher_first_update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let lower_first_update =
-            Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         // The two calls present the same holders in opposite argument order and start together. Both must finish:
         // internal identity ordering serializes their retained-guard windows without creating a lock cycle.
@@ -4314,7 +4309,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4333,7 +4328,7 @@ mod tests {
         .unwrap();
         let reference_new = |value: f32| {
             ArrayReference::new(
-                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap(),
             )
         };
@@ -4346,7 +4341,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let wrong_update =
-            Array::from_host_buffer(&client, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
+            Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
         let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type {} does not refine declared type {declared_update_type}",
@@ -4373,7 +4368,7 @@ mod tests {
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
@@ -4399,7 +4394,7 @@ mod tests {
         let post_handoff_second = reference_new(10.0);
         let post_handoff_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
@@ -4433,7 +4428,7 @@ mod tests {
         let pre_commit_second = reference_new(10.0);
         let pre_commit_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
@@ -4465,7 +4460,7 @@ mod tests {
         let committed_first = reference_new(1.0);
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
-        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.call_statefully(
@@ -4492,7 +4487,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let array_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4509,15 +4504,15 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let frozen = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         frozen.freeze().unwrap();
-        let update = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
@@ -4535,7 +4530,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4619,7 +4614,7 @@ mod tests {
 
         for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
@@ -4631,7 +4626,7 @@ mod tests {
         }
 
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
             domain.interpret(&second.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
@@ -4644,7 +4639,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -4672,10 +4667,10 @@ mod tests {
         .unwrap();
 
         let scalar =
-            Array::from_host_buffer(&client, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
+            Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
                 .unwrap();
         let vector =
-            Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
         let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
             domain.interpret(&forward.executable_function(), (scalar, vector)).unwrap();
@@ -4696,7 +4691,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4706,7 +4701,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&client, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
+            Array::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
 
         let output = domain.interpret(&executable, input).unwrap();
@@ -4726,8 +4721,8 @@ mod tests {
             .unwrap();
         let mesh = single_device_mesh(&client);
         let other_mesh = single_device_mesh(&other_client);
-        let domain = XlaDomain::new(&client);
-        let other_domain = XlaDomain::new(&other_client);
+        let domain = XlaSession::new(&client).domain();
+        let other_domain = XlaSession::new(&other_client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -4743,7 +4738,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         assert!(matches!(
             other_domain.interpret(&executable, input.clone()),
@@ -4784,7 +4779,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -4793,7 +4788,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let output =
             std::thread::scope(|scope| scope.spawn(move || domain.interpret(&executable, input)).join().unwrap())
@@ -4808,7 +4803,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -4828,7 +4823,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
         let function: JittedXlaFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
             |apply_sine, input: XlaCompileTracer<'_>| if apply_sine { input.sin().unwrap() } else { input },
             &domain,
@@ -4839,7 +4834,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let sine = function.call(true, source.clone()).unwrap();
         let warm_sine = function.call(true, source.clone()).unwrap();
@@ -4863,7 +4858,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -4873,7 +4868,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -4913,14 +4908,14 @@ mod tests {
         .unwrap();
         let other_values = [4.0f32, 3.0, 2.0, 1.0];
         let first = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
         let second =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = engine.interpret(&variadic.executable_function(), (first, second)).unwrap();
         assert_eq!(read_f32_array(&client, &first), values);
@@ -4935,7 +4930,7 @@ mod tests {
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
         let device_id = device.id().unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new_static(DataType::I64, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -4953,7 +4948,7 @@ mod tests {
             {
                 assert!(!available);
                 assert!(matches!(
-                    Array::from_host_buffer(&client, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
+                    Array::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
                     Err(ArrayError::Error(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
                         if actual_device == device_id && actual_memory == memory,
                 ));
@@ -4961,7 +4956,7 @@ mod tests {
             }
             assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
             let source =
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
                     .unwrap();
 
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device buffer.
@@ -5031,7 +5026,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -5057,7 +5052,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -5065,7 +5060,7 @@ mod tests {
         let compiled: CompiledXlaFunction<'_, ArrayType, ()> =
             compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
 
         let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
         assert_eq!(execution.output(), &());
@@ -5089,7 +5084,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -5123,7 +5118,7 @@ mod tests {
         // Execute and compare against the mathematical reference.
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -5155,13 +5150,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
@@ -5181,7 +5176,7 @@ mod tests {
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
 
         let input = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -5199,11 +5194,11 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let capture = Array::from_host_buffer(&client, zero_type.clone(), mesh.clone(), []).unwrap();
+        let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, _| captures[0].clone(),
             vec![capture],
@@ -5212,7 +5207,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
 
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
 
@@ -5228,13 +5223,13 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
@@ -5254,7 +5249,7 @@ mod tests {
         assert_eq!(outer.source_program().captures().len(), 1);
 
         let input = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -5274,20 +5269,20 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let left_bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
         let right_bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[10.0, 10.0, 10.0, 10.0]).as_slice(),
@@ -5320,7 +5315,7 @@ mod tests {
         assert_eq!(outer.source_program().captures().len(), 2);
 
         let input = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
@@ -5340,12 +5335,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
@@ -5365,14 +5360,14 @@ mod tests {
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
         let primal = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -5388,12 +5383,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
@@ -5412,7 +5407,7 @@ mod tests {
         assert_eq!(gradient.source_program().captures().len(), 1);
 
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![2.0]);
@@ -5431,7 +5426,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5471,7 +5466,7 @@ mod tests {
         }
         expected_gradient *= expected_value.cos();
         let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert!((read_f32_array(&client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
     }
@@ -5486,7 +5481,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5505,7 +5500,7 @@ mod tests {
         // executable produce different, correct value-dependent gradients (`d(x*x)/dx = 2x`).
         for point in [3.0f32, -5.0f32] {
             let input = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
@@ -5516,7 +5511,7 @@ mod tests {
         }
 
         // A different domain identity misses, produces a fresh derivative, and replaces the retained slot.
-        let other_engine = XlaDomain::new(&client);
+        let other_engine = XlaSession::new(&client).domain();
         let third = compiled.gradient(&other_engine).unwrap();
         assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
         let other_statistics = other_engine.compilation_context().statistics();
@@ -5534,7 +5529,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5551,14 +5546,14 @@ mod tests {
 
         // The retained JVP computes `(x * x, 2 * x * t)` for runtime `(x, t)` supplied per call.
         let primal = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&second.executable_function(), (primal, tangent)).unwrap();
         assert_eq!(read_f32_array(&client, &primal_output), vec![9.0]);
@@ -5572,12 +5567,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0]).as_slice(),
@@ -5622,14 +5617,14 @@ mod tests {
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
         let primal = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[3.0]).as_slice(),
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -5648,7 +5643,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5676,14 +5671,14 @@ mod tests {
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
             let primal_array = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
             let tangent_array = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
@@ -5736,7 +5731,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5747,8 +5742,8 @@ mod tests {
         let zero_identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let primal_input = Array::from_host_buffer(&client, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
-        let tangent_input = Array::from_host_buffer(&client, tangent_type.clone(), mesh, []).unwrap();
+        let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
+        let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp.executable_function(), (primal_input, tangent_input)).unwrap();
 
@@ -5782,7 +5777,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -5895,14 +5890,14 @@ mod tests {
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
             let primal_array = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
             let tangent_array = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
@@ -5937,7 +5932,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let scalar_input_type =
@@ -5959,7 +5954,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let shape = Shape::new(vec![Dimension::Static(3)]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -5970,14 +5965,14 @@ mod tests {
         let a_values = [10.0f32, 20.0, 30.0];
         let b_values = [1.0f32, 2.0, 3.0];
         let a = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&a_values).as_slice(),
         )
         .unwrap();
         let b =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), (a, b)).unwrap();
 
@@ -6002,7 +5997,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6023,7 +6018,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6044,7 +6039,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6054,7 +6049,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6084,7 +6079,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6118,7 +6113,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6138,7 +6133,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         // input_type carries the abstract shape & dtype but a "wrong" sharding (replicated). The
         // `in_shardings` override replaces it with a 2-way shard along "x" before tracing, so
@@ -6158,7 +6153,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape).with_sharding(sharded).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6189,7 +6184,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6209,7 +6204,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -6226,7 +6221,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -6257,7 +6252,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         // The executable expects a 2-way shard along "x", but the caller will pass a fully
         // replicated array. `CompiledXlaFunction::interpret` should silently reshard before executing.
@@ -6271,7 +6266,7 @@ mod tests {
         let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
-            &client,
+            &engine,
             replicated_input_type,
             mesh.clone(),
             values_to_bytes::<f32>(&values).as_slice(),
@@ -6308,7 +6303,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6327,7 +6322,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(7)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
@@ -6349,7 +6344,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .unwrap();
         let mesh = two_device_mesh(&client, MeshAxisType::Auto);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -6372,7 +6367,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -6419,7 +6414,7 @@ mod tests {
             devices,
         )
         .unwrap();
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -6448,7 +6443,7 @@ mod tests {
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
         let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6479,7 +6474,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6497,7 +6492,7 @@ mod tests {
         let input_value = 0.5f32;
         let make_input = || {
             Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
@@ -6521,12 +6516,12 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
         let bias = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[0.25]).as_slice(),
@@ -6549,7 +6544,7 @@ mod tests {
 
         let input_value = 0.5f32;
         let input = Array::from_host_buffer(
-            &client,
+            &engine,
             input_type,
             mesh.clone(),
             values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
@@ -6569,7 +6564,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
@@ -6594,7 +6589,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
@@ -6611,7 +6606,7 @@ mod tests {
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
             let input = Array::from_host_buffer(
-                &client,
+                &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
@@ -6675,7 +6670,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -6707,7 +6702,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
@@ -6742,7 +6737,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -6763,7 +6758,7 @@ mod tests {
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
         for index in 0..BASELINE_REPETITIONS {
             let input = Array::from_host_buffer(
-                &client,
+                &domain,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[index as f32]).as_slice(),
@@ -6860,7 +6855,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let domain = XlaDomain::new(&client);
+        let domain = XlaSession::new(&client).domain();
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -7426,7 +7421,7 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
         let mesh = single_device_mesh(&client);
-        let engine = XlaDomain::new(&client);
+        let engine = XlaSession::new(&client).domain();
         if attention == DecodeAttention::CustomCall {
             ensure_decode_attention_handler_registered(&client).unwrap();
         }
@@ -7472,7 +7467,7 @@ mod tests {
         .unwrap();
 
         let device_input = |index: usize, bytes: Vec<u8>| {
-            Array::from_host_buffer(&client, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
+            Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
         };
         let mut device_inputs = vec![
             device_input(0, values_to_bytes::<i32>(&[0])),

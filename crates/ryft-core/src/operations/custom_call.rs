@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
@@ -41,7 +42,9 @@ use crate::programs::{
 /// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String`
 /// become [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), and `bool`, `i64`, and `f64`
 /// become their corresponding scalar variants. Backends must preserve these values or reject unsupported variants.
-#[derive(Clone, Debug, PartialEq)]
+/// Equality and hashing compare [`F64`](Self::F64) values bitwise, so that attributes are faithful keys of the values
+/// that backends receive (e.g., `-0.0` and `+0.0` are distinct, and every NaN equals itself).
+#[derive(Clone, Debug)]
 pub enum CustomCallAttribute {
     /// UTF-8 string value.
     String(String),
@@ -67,6 +70,34 @@ impl Display for CustomCallAttribute {
             Self::Boolean(boolean) => write!(formatter, "{boolean}"),
             Self::I64(integer) => write!(formatter, "{integer}"),
             Self::F64(float) => write!(formatter, "{float:?}"),
+        }
+    }
+}
+
+impl PartialEq for CustomCallAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Bytes(left), Self::Bytes(right)) => left == right,
+            (Self::Boolean(left), Self::Boolean(right)) => left == right,
+            (Self::I64(left), Self::I64(right)) => left == right,
+            (Self::F64(left), Self::F64(right)) => left.to_bits() == right.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CustomCallAttribute {}
+
+impl Hash for CustomCallAttribute {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::String(string) => string.hash(state),
+            Self::Bytes(bytes) => bytes.hash(state),
+            Self::Boolean(boolean) => boolean.hash(state),
+            Self::I64(integer) => integer.hash(state),
+            Self::F64(float) => float.to_bits().hash(state),
         }
     }
 }
@@ -167,7 +198,7 @@ impl Display for CustomCallInputOutputAlias {
 ///     not be reused. [`BroadcastAll`](Self::BroadcastAll) is the aliasing-compatible member of that pair.
 ///   - `legacy_vectorized` (a mode in which the kernel silently promises to handle arbitrary leading axes) is an
 ///     XLA-legacy mode that JAX has already removed, so Ryft never introduces it.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CustomCallBatching {
     /// Report a [`BatchingError::UnsupportedOperation`] naming the mapped input. This is the default because a foreign
     /// kernel's contract is opaque: silently choosing a strategy could execute the kernel on buffers it never agreed to
@@ -183,7 +214,7 @@ pub enum CustomCallBatching {
     /// [`ScanOperation::with_unroll`], and is a lowering-only knob that trades code size for loop overhead.
     Sequential {
         /// Lowering-only number of body copies emitted per loop trip, or [`None`] to keep one call per trip. The
-        /// factor must be at least `1` and must evenly divide the batch extent.
+        /// factor must be at least `1`.
         unroll: Option<usize>,
     },
 
@@ -208,7 +239,7 @@ impl Display for CustomCallBatching {
 /// Names one packed custom-call input axis whose live extent is carried by another, already-declared input. The bound
 /// [`DimensionVariable`] gives the ragged dimension stable identity across transformation replays, while
 /// `extent_input_index` identifies the ordinary integer scalar input that the unbatched foreign kernel receives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallRaggedInputBinding {
     /// Name used by output bindings to refer to this input binding.
     name: String,
@@ -280,7 +311,7 @@ impl Display for CustomCallRaggedInputBinding {
 }
 
 /// Declares how one positional custom-call output relates to the operation's ragged input bindings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomCallRaggedOutputBinding {
     /// Preserve the named input binding on the output axis `axis`, reusing the exact same extent value and dimension
     /// identity. The axis may be relocated when the output does not alias its input.
@@ -337,7 +368,7 @@ impl Display for CustomCallRaggedOutputBinding {
 /// Runtime extent values must lie within the declared [`DimensionVariable`] bounds and must not exceed their packed
 /// physical axis. Eager foreign-kernel implementations are responsible for checking that precondition when decoding
 /// their ordinary extent inputs and outputs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallRaggedContract {
     /// Named packed-input bindings, in declaration order.
     input_bindings: Vec<CustomCallRaggedInputBinding>,
@@ -565,7 +596,7 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// this payload: encodings such as XLA's FFI API version, `backend_config` representation, tuple alias paths, result
 /// tiling attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
 /// operation). If a configuration knob only makes sense for one backend, it does not belong on this operation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallOperation {
     /// Name under which the foreign kernel is registered with the executing backend.
     target_name: String,
@@ -1491,7 +1522,7 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOpe
     for CustomCallOperation
 where
     C::Value: PartialEq,
-    C::Operation: From<CustomCallOperation> + From<ScanOperation<C::Constant>>,
+    C::Operation: From<CustomCallOperation> + From<ScanOperation<C::Type>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -1574,7 +1605,7 @@ where
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
-                let mut scan = ScanOperation::<C::Constant>::new(carry_inputs.len(), P::axis_size(context)?);
+                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), P::axis_size(context)?);
                 if let Some(unroll) = unroll {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -1782,10 +1813,10 @@ where
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + From<ScanOperation<C::Constant>>
+        + From<ScanOperation<C::Type>>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<CustomCallOperation>
-        + From<ScanOperation<<C::Constant as ValueProjection<ArrayType>>::Projected>>
+        + From<ScanOperation<ArrayType>>
         + From<TransposeOperation>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1888,7 +1919,7 @@ where
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
-                let mut scan = ScanOperation::<C::Constant>::new(carry_inputs.len(), batch_dimension.clone());
+                let mut scan = ScanOperation::<C::Type>::new(carry_inputs.len(), batch_dimension.clone());
                 if let Some(unroll) = unroll {
                     scan = scan.with_unroll(unroll)?;
                 }
@@ -2038,6 +2069,8 @@ where
 mod tests {
     use std::borrow::Cow;
     use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::hash::DefaultHasher;
     use std::rc::Rc;
 
     use indoc::indoc;
@@ -2059,6 +2092,13 @@ mod tests {
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
+
+    /// Returns the hash of `value` under the standard library's default hasher.
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
 
     /// Returns the `f32[2]` array type used throughout these tests.
     fn vector_type() -> ArrayType {
@@ -2169,6 +2209,31 @@ mod tests {
             CustomCallOperation::new("binary", vec![]).with_attribute("payload", bytes.clone()).attributes(),
             &[("payload".to_owned(), CustomCallAttribute::Bytes(bytes))],
         );
+    }
+
+    #[test]
+    fn test_custom_call_attribute_identity() {
+        // Equal attributes are equal and hash identically, so they work as map keys.
+        let attribute = CustomCallAttribute::F64(2.5);
+        assert_eq!(attribute, CustomCallAttribute::from(2.5));
+        assert_eq!(hash_of(&attribute), hash_of(&CustomCallAttribute::from(2.5)));
+        assert_eq!(hash_of(&CustomCallAttribute::from("name")), hash_of(&CustomCallAttribute::from("name")));
+        let attributes = HashMap::from([(attribute, "scale")]);
+        assert_eq!(attributes.get(&CustomCallAttribute::F64(2.5)), Some(&"scale"));
+        assert_eq!(attributes.get(&CustomCallAttribute::F64(3.5)), None);
+
+        // Floating-point attributes compare bitwise: every NaN equals itself, and signed zeros are distinct.
+        let nan = CustomCallAttribute::F64(f64::NAN);
+        assert_eq!(nan, nan.clone());
+        assert_eq!(hash_of(&nan), hash_of(&CustomCallAttribute::F64(f64::NAN)));
+        assert_ne!(nan, CustomCallAttribute::F64(-f64::NAN));
+        assert_ne!(CustomCallAttribute::F64(-0.0), CustomCallAttribute::F64(0.0));
+
+        // Attributes of different variants never compare equal, even when they render identically.
+        assert_ne!(CustomCallAttribute::I64(1), CustomCallAttribute::F64(1.0));
+        assert_ne!(CustomCallAttribute::I64(1), CustomCallAttribute::Boolean(true));
+        assert_ne!(CustomCallAttribute::String("true".to_owned()), CustomCallAttribute::Boolean(true));
+        assert_ne!(CustomCallAttribute::String(String::new()), CustomCallAttribute::Bytes(vec![]));
     }
 
     #[test]
@@ -3384,26 +3449,26 @@ mod tests {
             .trim_end(),
         );
 
-        // An unroll factor that does not divide the batch extent is rejected by the scan contract.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
-                let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
-                    .with_batching(CustomCallBatching::Sequential { unroll: Some(3) });
-                Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
-            },
-            vec![vector_type()],
-        )
-        .unwrap();
-        assert!(
-            program
-                .batched(
-                    4,
-                    ShardingDimension::Replicated,
-                    &[BatchAxis::new(0)],
-                    ProgramBatchingOutputAxesPolicy::Natural
-                )
-                .is_err(),
-        );
+        // An unroll factor that does not divide the batch extent is accepted (lowerings run the remaining iterations
+        // after the unrolled loop), while a zero factor is rejected by the scan contract.
+        for (unroll, accepted) in [(3, true), (0, false)] {
+            let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                    let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
+                        .with_batching(CustomCallBatching::Sequential { unroll: Some(unroll) });
+                    Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
+                },
+                vec![vector_type()],
+            )
+            .unwrap();
+            let batched = program.batched(
+                4,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            );
+            assert_eq!(batched.is_ok(), accepted);
+        }
     }
 
     /// `BroadcastAll` materializes every input on the batch axis and rebinds exactly one call whose declared outputs

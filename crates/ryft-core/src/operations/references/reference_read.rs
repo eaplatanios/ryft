@@ -36,7 +36,7 @@ pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
 /// Reads the current value selected from a reference in the enclosing type universe `U`. The root is the first input.
 /// Dynamic bindings follow it in transform order; the path is stored in `Transform` metadata. An empty path reads the
 /// complete referent, and a nonempty path returns its selected referent type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceReadOperation<
     T: Type,
     U: Type,

@@ -103,6 +103,13 @@
 //! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
 //! [`CompilationContext`] below still deduplicates the expensive backend compile.
 //!
+//! That argument does not carry over to eager (op-by-op) dispatch, where a compiled program is reused for every
+//! application of the same operation and the relevant comparison is with _executing_ one small operation rather than
+//! with compiling it. Backends that execute eager operations through compiled programs therefore key applications of
+//! operations directly to compiled programs in front of tracing and lowering, using the operation's identity (refer to
+//! the `#[ryft(identity)]` attribute of `#[derive(Operation)]`) together with the input types, like JAX's
+//! `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of its sessions.
+//!
 //! Cloned [`CompiledFunctionDispatcher`] handles share one cache, and the dispatcher is usable from multiple threads
 //! whenever its domain, closure, static parameters, and artifact types are thread-safe: same-thread recursive dispatch
 //! of the specialization currently being produced is rejected with an error, while concurrent cold misses on

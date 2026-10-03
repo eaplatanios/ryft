@@ -1496,9 +1496,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationTracer<C, P> {
 }
 
 // A dual compares by its two halves (through the carried values' own `PartialEq`, which is identity-shaped for its
-// tracer-valued halves), ignoring the stamped context: consumers such as the scan/while loop-invariance fixed points
-// of partial evaluation compare flowing values across replay rounds to detect passthrough, and a dual passes through
-// exactly when both its halves do.
+// tracer-valued halves), ignoring the stamped context, so two duals are equal exactly when both of their halves are.
 impl<C: Context<Value: PartialEq>, P: DifferentiationPolicy<C>> PartialEq for DifferentiationTracer<C, P> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -5669,8 +5667,9 @@ pub(crate) mod tests {
         let index_type = ArrayType::scalar(DataType::I64);
         let body = builder.import_program(unary(SinOperation::new().into(), vec![index_type, vector.clone()]));
         let x = builder.add_input(vector.clone());
-        let output =
-            builder.add_instruction(ScanOperation::<Array>::new(1, 2usize), vec![body], vec![x], None).unwrap()[0];
+        let output = builder
+            .add_instruction(ScanOperation::<ArrayType>::new(1, 2usize), vec![body], vec![x], None)
+            .unwrap()[0];
         let scan = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let expected = rows.iter().map(|x| x.sin().cos() * x.cos()).collect::<Vec<_>>();
         assert_abs_diff_eq!(gradient(scan, Vec::new()).as_slice(), expected.as_slice(), epsilon = 1e-12);
