@@ -273,6 +273,25 @@ pub enum RaggedMaskIdentity {
     Highest,
 }
 
+impl RaggedMaskIdentity {
+    /// Returns the identity of a reduction of the provided `kind`, which a batching rule writes over the padding of the
+    /// ragged axes that the reduction collapses, so that the padding cannot affect the result. Boolean disjunctions and
+    /// conjunctions use the lowest (i.e., `false`) and highest (i.e., `true`) Boolean values, respectively. Returns
+    /// [`None`] for [`ReductionKind::Mean`], whose result also depends on how many elements it averages, which no
+    /// padding value can leave unchanged.
+    #[inline]
+    pub fn from_reduction_kind(kind: ReductionKind) -> Option<Self> {
+        match kind {
+            ReductionKind::Sum => Some(Self::Zero),
+            ReductionKind::Product => Some(Self::One),
+            ReductionKind::LogSumExp => Some(Self::LowestReal),
+            ReductionKind::Max | ReductionKind::Any => Some(Self::Lowest),
+            ReductionKind::Min | ReductionKind::All => Some(Self::Highest),
+            ReductionKind::Mean => None,
+        }
+    }
+}
+
 impl Display for RaggedMaskIdentity {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1751,9 +1770,9 @@ where
                            + From<ZeroLikeOperation<ArrayType>>,
         >,
 {
-    // Zero is both the identity of the one reduction kind whose padding this policy neutralizes and the identity of
-    // a contraction, so those two disciplines are the zero case of the generalized identity masking that serves all
-    // three, and they differ only in the discipline-specific validation they perform first.
+    // Reduction masking and contraction zeroing are special cases of the generalized identity masking that serves all
+    // three disciplines: a reduction writes the identity of its kind and a contraction writes zero, and they differ
+    // only in the discipline-specific validation that they perform first.
 
     fn mask_reduction_input(
         context: &BatchingContext<
@@ -1764,20 +1783,24 @@ where
         reduced_axes: &[usize],
         kind: ReductionKind,
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        // Zero is the identity of a sum and nothing else, so a reduction that actually reduces a ragged axis under any
-        // other kind would observe the padding this policy can only zero.
-        if kind != ReductionKind::Sum
-            && input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "ragged reduction kind `{}` is not supported; use kind `{}`",
-                    kind,
-                    ReductionKind::Sum,
-                ),
-            });
+        // Every reduction kind except a mean has an identity that padding can take without changing the result, while a
+        // mean also depends on how many elements it averages and so cannot reduce a ragged axis at all. A payload-free
+        // structural zero needs no masking, because every one of its elements, padding included, is the same zero.
+        let Some(identity) = RaggedMaskIdentity::from_reduction_kind(kind) else {
+            if input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis())) {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "reduction kind `{kind}` cannot reduce bounded ragged axes because padding changes its \
+                         element count",
+                    ),
+                });
+            }
+            return Ok(input.clone());
+        };
+        if input.unbatched_type().data_type().is_zero() {
+            return Ok(input.clone());
         }
-        Self::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Zero)
+        Self::mask_identity_input(context, input, reduced_axes, identity)
     }
 
     #[inline]
@@ -4177,8 +4200,8 @@ mod tests {
         AddOperation, CompareOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         DimensionAddOperation, DimensionFromScalar, DimensionSize, DimensionToScalar, DimensionToScalarOperation,
         DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation, NegOperation, OneLike, ParallelReduceOperation,
-        ParallelReductionKind, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
+        Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -4299,6 +4322,23 @@ mod tests {
             Err(BatchingError::InvalidBatchMetadata { message })
                 if message == "ragged axis 1 maps more than one extent axis to packed axis 0",
         ));
+    }
+
+    #[test]
+    fn test_ragged_mask_identity_from_reduction_kind() {
+        // Every reduction kind except a mean has an identity that padding can take without changing the result.
+        for (kind, identity) in [
+            (ReductionKind::Sum, Some(RaggedMaskIdentity::Zero)),
+            (ReductionKind::Product, Some(RaggedMaskIdentity::One)),
+            (ReductionKind::Mean, None),
+            (ReductionKind::LogSumExp, Some(RaggedMaskIdentity::LowestReal)),
+            (ReductionKind::Max, Some(RaggedMaskIdentity::Lowest)),
+            (ReductionKind::Min, Some(RaggedMaskIdentity::Highest)),
+            (ReductionKind::Any, Some(RaggedMaskIdentity::Lowest)),
+            (ReductionKind::All, Some(RaggedMaskIdentity::Highest)),
+        ] {
+            assert_eq!(RaggedMaskIdentity::from_reduction_kind(kind), identity);
+        }
     }
 
     #[test]
@@ -5440,16 +5480,18 @@ mod tests {
         let input = ArrayBatch::new(packed.into_projected()?, BatchAxis::new(0))?
             .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected()?, length.clone(), vec![0])])?;
 
-        // Zero is the identity of a sum and nothing else, so reducing a ragged axis under any other kind would observe
-        // the padding this policy can only zero. A reduction that leaves the ragged axis alone is not affected.
+        // A mean also depends on how many elements it averages, so it cannot reduce a ragged axis, while a mean that
+        // leaves the ragged axis alone is not affected.
         assert_eq!(
-            DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Max),
+            DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Mean),
             Err(BatchingError::UnsupportedOperation {
-                message: "ragged reduction kind `max` is not supported; use kind `sum`".to_string(),
+                message: "reduction kind `mean` cannot reduce bounded ragged axes because padding changes its element \
+                          count"
+                    .to_string(),
             }),
         );
         assert_eq!(
-            DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[0], ReductionKind::Max),
+            DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[0], ReductionKind::Mean),
             Ok(input.clone()),
         );
 
@@ -5457,6 +5499,34 @@ mod tests {
         let output =
             DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Sum)?;
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.ragged_axes(), input.ragged_axes());
+        let output_id = output.into_value().into_value().atom_id().unwrap();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
+                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
+                    %4:dimension<3> = constant [value=3]
+                    %5:i32[3] = iota [type=i32[3], dimension=0]
+                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4
+                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4
+                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7
+                    %9:f32[items, 3] = zero_like %1
+                    %10:f32[items, 3] = select %8 %1 %9
+                in (%10)
+            "}
+            .trim_end(),
+        );
+
+        // Every other kind writes its own identity over the padding (here, the lowest value for a maximum).
+        // The trace still holds the sum's mask from above, ahead of this one.
+        let output =
+            DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Max)?;
         assert_eq!(output.ragged_axes(), input.ragged_axes());
         let output_id = output.into_value().into_value().atom_id().unwrap();
         let program = trace
@@ -5481,9 +5551,17 @@ mod tests {
                     %8:bool[items, 3] = compare [direction=LessThan] %6 %7
                     %9:f32[items, 3] = zero_like %1
                     %10:f32[items, 3] = select %8 %1 %9
-                in (%10)
-            "}
-            .trim_end(),
+                    %11:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
+                    %12:dimension<3> = constant [value=3]
+                    %13:i32[3] = iota [type=i32[3], dimension=0]
+                    %14:i32[items, 3] = broadcast [output_axes=[1]] %13 %11 %12
+                    %15:i32[items, 3] = broadcast [output_axes=[0]] %2 %11 %12
+                    %16:bool[items, 3] = compare [direction=LessThan] %14 %15
+                    %17:f32[] = constant [value=-inf]
+                    %18:f32[items, 3] = broadcast [output_axes=[]] %17 %11 %12
+                    %19:f32[items, 3] = select %16 %1 %18
+                in (%19)"
+            },
         );
         Ok(())
     }
@@ -8272,7 +8350,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
-                ParallelReduceOperation::new("items".to_string(), ParallelReductionKind::Sum),
+                ParallelReduceOperation::new("items".to_string(), ReductionKind::Sum),
                 Vec::new(),
                 vec![input],
                 None,

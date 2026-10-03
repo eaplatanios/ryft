@@ -517,10 +517,9 @@ impl Array {
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
         (0..addressing.element_count())
             .map(|index| {
-                Self::element_as_f64(data_type, &self.bytes[addressing.byte_range_for_flat_index(index)])
-                    .unwrap_or_else(|| {
-                        panic!("cannot view an array of element data type `{data_type}` as `f64` values")
-                    })
+                data_type.element_as_f64(&self.bytes[addressing.byte_range_for_flat_index(index)]).unwrap_or_else(
+                    || panic!("cannot view an array of element data type `{data_type}` as `f64` values"),
+                )
             })
             .collect()
     }
@@ -558,44 +557,6 @@ impl Array {
                 (output_index / output_strides[output_axis]) % output_shape[output_axis]
             };
             index + coordinate * input_strides[input_axis]
-        })
-    }
-
-    /// Decodes one real-valued element as `f64`, returning `None` for complex and payload-free element data types.
-    /// Integer conversions use Rust's ordinary `as f64` semantics.
-    pub(crate) fn element_as_f64(data_type: DataType, bytes: &[u8]) -> Option<f64> {
-        Some(match data_type {
-            DataType::Boolean => f64::from(u8::from(bool::decode(bytes))),
-            DataType::I1 => f64::from(i1::decode(bytes).value()),
-            DataType::I2 => f64::from(i2::decode(bytes).value()),
-            DataType::I4 => f64::from(i4::decode(bytes).value()),
-            DataType::I8 => f64::from(i8::decode(bytes)),
-            DataType::I16 => f64::from(i16::decode(bytes)),
-            DataType::I32 => f64::from(i32::decode(bytes)),
-            DataType::I64 => i64::decode(bytes) as f64,
-            DataType::U1 => f64::from(u1::decode(bytes).value()),
-            DataType::U2 => f64::from(u2::decode(bytes).value()),
-            DataType::U4 => f64::from(u4::decode(bytes).value()),
-            DataType::U8 => f64::from(u8::decode(bytes)),
-            DataType::U16 => f64::from(u16::decode(bytes)),
-            DataType::U32 => f64::from(u32::decode(bytes)),
-            DataType::U64 => u64::decode(bytes) as f64,
-            DataType::F4E2M1FN => f4e2m1fn::decode(bytes).to_f64(),
-            DataType::F6E2M3FN => f6e2m3fn::decode(bytes).to_f64(),
-            DataType::F6E3M2FN => f6e3m2fn::decode(bytes).to_f64(),
-            DataType::F8E3M4 => f8e3m4::decode(bytes).to_f64(),
-            DataType::F8E4M3 => f8e4m3::decode(bytes).to_f64(),
-            DataType::F8E4M3FN => f8e4m3fn::decode(bytes).to_f64(),
-            DataType::F8E4M3FNUZ => f8e4m3fnuz::decode(bytes).to_f64(),
-            DataType::F8E4M3B11FNUZ => f8e4m3b11fnuz::decode(bytes).to_f64(),
-            DataType::F8E5M2 => f8e5m2::decode(bytes).to_f64(),
-            DataType::F8E5M2FNUZ => f8e5m2fnuz::decode(bytes).to_f64(),
-            DataType::F8E8M0FNU => f8e8m0fnu::decode(bytes).to_f64(),
-            DataType::BF16 => bf16::decode(bytes).to_f64(),
-            DataType::F16 => f16::decode(bytes).to_f64(),
-            DataType::F32 => f64::from(f32::decode(bytes)),
-            DataType::F64 => f64::decode(bytes),
-            DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
         })
     }
 
@@ -853,8 +814,8 @@ impl AbsDiffEq for Array {
         if data_type.is_floating_point() {
             return (0..addressing.element_count()).all(|index| {
                 let range = addressing.byte_range_for_flat_index(index);
-                let left = Self::element_as_f64(data_type, &self.bytes[range.clone()]).unwrap();
-                let right = Self::element_as_f64(data_type, &other.bytes[range]).unwrap();
+                let left = data_type.element_as_f64(&self.bytes[range.clone()]).unwrap();
+                let right = data_type.element_as_f64(&other.bytes[range]).unwrap();
                 (left - right).abs() <= epsilon
             });
         }

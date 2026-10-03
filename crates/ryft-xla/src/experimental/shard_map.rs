@@ -2275,6 +2275,80 @@ mod tests {
         }
     }
 
+    /// Executes `local.parallel_reduce("x", kind)` inside a `shard_map` over the manual axis `"x"` of four CPU devices,
+    /// on the global vector of `4 · shard_size` elements of `data_type` whose device shards hold the raw `shards`, and
+    /// returns the raw bytes of every device's output shard in device order.
+    fn execute_parallel_reduce_on_cpu(
+        kind: ReductionKind,
+        data_type: DataType,
+        buffer_type: BufferType,
+        shard_size: usize,
+        shards: [Vec<u8>; 4],
+    ) -> Vec<Vec<u8>> {
+        use ryft_core::ParallelReduce;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", kind).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new_static(data_type, [4 * shard_size]),
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: traced.to_mlir_module("main").unwrap().into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+        let buffers = devices
+            .iter()
+            .zip(shards)
+            .map(|(device, shard)| {
+                client
+                    .buffer(shard.as_slice(), buffer_type, [shard_size as u64], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(data_type, &[4 * shard_size], sharding),
+            device_mesh,
+            buffers,
+        )
+        .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap()
+            .into_iter()
+            .map(|output| output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap())
+            .collect()
+    }
+
     #[test]
     fn test_shard_map_uses_manual_axes_from_mesh() {
         let mesh = test_logical_mesh_2x2();
@@ -4015,7 +4089,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_parallel_sum_lowers_to_all_reduce_and_executes_on_cpu() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4043,7 +4117,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4126,8 +4200,197 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_parallel_reduce_kinds_execute_on_cpu() {
+        // Every primitive kind lowers to a `stablehlo.all_reduce` with the scalar combiner of the matching `reduce`, so
+        // every device receives the elementwise reduction of the four local shards.
+        let f32_shards = [[1.0f32, -2.0], [3.0, 4.0], [-5.0, 0.5], [2.0, 8.0]].map(|shard| values_to_bytes(&shard));
+        for (kind, expected) in [
+            (ReductionKind::Sum, [1.0f32, 10.5]),
+            (ReductionKind::Product, [-30.0, -32.0]),
+            (ReductionKind::Mean, [0.25, 2.625]),
+            (ReductionKind::Max, [3.0, 8.0]),
+            (ReductionKind::Min, [-5.0, -2.0]),
+        ] {
+            for output in execute_parallel_reduce_on_cpu(kind, DataType::F32, BufferType::F32, 2, f32_shards.clone()) {
+                assert_eq!(values_from_bytes::<f32>(&output), expected, "{kind}");
+            }
+        }
+        let i32_shards = [[1i32, -2], [3, 4], [-5, 7], [2, 8]].map(|shard| values_to_bytes(&shard));
+        for (kind, expected) in [
+            (ReductionKind::Sum, [1i32, 17]),
+            (ReductionKind::Product, [-30, -448]),
+            (ReductionKind::Max, [3, 8]),
+            (ReductionKind::Min, [-5, -2]),
+        ] {
+            for output in execute_parallel_reduce_on_cpu(kind, DataType::I32, BufferType::I32, 2, i32_shards.clone()) {
+                assert_eq!(values_from_bytes::<i32>(&output), expected, "{kind}");
+            }
+        }
+        let boolean_shards = [[true, false, false], [true, true, false], [true, false, false], [true, false, false]]
+            .map(|shard| values_to_bytes(&shard));
+        for (kind, expected) in [(ReductionKind::Any, [true, true, false]), (ReductionKind::All, [true, false, false])]
+        {
+            for output in execute_parallel_reduce_on_cpu(
+                kind,
+                DataType::Boolean,
+                BufferType::Predicate,
+                3,
+                boolean_shards.clone(),
+            ) {
+                assert_eq!(values_from_bytes::<bool>(&output), expected, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_map_parallel_log_sum_exp_executes_on_cpu() {
+        // A logarithmic sum of exponentials over a manual mesh axis is composed from a mesh maximum and a mesh sum of
+        // the shifted exponentials, so it stays finite for large inputs and matches the single-device reduction for
+        // infinite inputs. Columns hold large equal inputs, all `-∞`, one `+∞`, mixed magnitudes, and one NaN.
+        let shards = [
+            [1000.0f32, f32::NEG_INFINITY, f32::INFINITY, -1000.0, 0.0],
+            [1000.0, f32::NEG_INFINITY, 1.0, 0.0, f32::NAN],
+            [1000.0, f32::NEG_INFINITY, 2.0, 1.0, 0.0],
+            [1000.0, f32::NEG_INFINITY, 3.0, 2.0, 0.0],
+        ]
+        .map(|shard| values_to_bytes(&shard));
+        let mixed = (0f64.exp() + 1f64.exp() + 2f64.exp()).ln() as f32;
+        for output in
+            execute_parallel_reduce_on_cpu(ReductionKind::LogSumExp, DataType::F32, BufferType::F32, 5, shards)
+        {
+            let values = values_from_bytes::<f32>(&output);
+            assert!((values[0] - (1000.0 + 4f32.ln())).abs() <= 1e-4, "{values:?}");
+            assert_eq!(values[1..3], [f32::NEG_INFINITY, f32::INFINITY]);
+            assert!((values[3] - mixed).abs() <= 1e-6, "{values:?}");
+            assert!(values[4].is_nan(), "{values:?}");
+        }
+
+        // Complex inputs are shifted by the maximum of their real components, so large real components stay finite
+        // and the imaginary components rotate every term before the terms are summed.
+        let shards = [[1000.0f32, 0.0], [1000.0, std::f32::consts::FRAC_PI_2], [1000.0, 0.0], [1000.0, 0.0]]
+            .map(|shard| values_to_bytes(&shard));
+        let expected = num_complex::Complex64::new(3.0, 1.0).ln() + 1000.0;
+        for output in
+            execute_parallel_reduce_on_cpu(ReductionKind::LogSumExp, DataType::C64, BufferType::C64, 1, shards)
+        {
+            let values = values_from_bytes::<f32>(&output);
+            assert!((values[0] as f64 - expected.re).abs() <= 1e-4, "{values:?}");
+            assert!((values[1] as f64 - expected.im).abs() <= 1e-6, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn test_shard_map_parallel_log_sum_exp_gradient_executes_on_cpu() {
+        use ryft_core::ParallelReduce;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // The gradient of a logarithmic sum of exponentials is the softmax of its inputs. The composed mesh form
+        // differentiates through its mesh sum alone, because its mesh maximum only shifts the exponents.
+        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+            {
+                let replicated = replicated.clone();
+                let sharded = sharded.clone();
+                move |x: ShardMapTracer| {
+                    let (value, gradient) = x
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at(x.into_value())
+                        .value_and_gradient(|x| {
+                            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                            Ok(shard_map::<_, _, ArrayType, _>(
+                                |local_x: ShardMapTracer| {
+                                    local_x
+                                        .reduce(&[0], ReductionKind::Sum)
+                                        .unwrap()
+                                        .parallel_reduce("x", ReductionKind::LogSumExp)
+                                        .unwrap()
+                                },
+                                x,
+                                mesh.clone(),
+                                sharded.clone(),
+                                replicated.clone(),
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                    ]
+                }
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(std::slice::from_ref(&sharded)),
+                Some(&[replicated, sharded.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let inputs = [1000.0f32, 1001.0, 1002.0, f32::NEG_INFINITY];
+        let buffers = devices
+            .iter()
+            .zip(inputs)
+            .map(|(device, input)| {
+                client
+                    .buffer(values_to_bytes(&[input]).as_slice(), BufferType::F32, [1], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[4], sharded),
+            device_mesh,
+            buffers,
+        )
+        .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let normalizer = 0f64.exp() + 1f64.exp() + 2f64.exp();
+        let softmax = [0f64.exp() / normalizer, 1f64.exp() / normalizer, 2f64.exp() / normalizer, 0.0];
+        assert_eq!(outputs.len(), 4);
+        for (output, expected_gradient) in outputs.into_iter().zip(softmax) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap())[0])
+                .collect::<Vec<_>>();
+            assert!((values[0] as f64 - (1000.0 + normalizer.ln())).abs() <= 1e-4, "{values:?}");
+            assert!((values[1] as f64 - expected_gradient).abs() <= 1e-6, "{values:?}");
+        }
+    }
+
+    #[test]
     fn test_shard_map_checked_variation_gradients_execute_on_cpu() {
-        use ryft_core::{Fill, ParallelReduce, ParallelReductionKind};
+        use ryft_core::{Fill, ParallelReduce, ReductionKind};
 
         for device_count in [1, 2] {
             let plugin = load_cpu_plugin().unwrap();
@@ -4162,7 +4425,7 @@ mod tests {
                                         (shared.clone() * shared * weights)
                                             .reduce(&[0], ReductionKind::Sum)
                                             .unwrap()
-                                            .parallel_reduce("x", ParallelReductionKind::Sum)
+                                            .parallel_reduce("x", ReductionKind::Sum)
                                             .unwrap()
                                     },
                                     (shared, weights),
@@ -4186,7 +4449,7 @@ mod tests {
                                         (varying.clone() * varying)
                                             .reduce(&[0], ReductionKind::Sum)
                                             .unwrap()
-                                            .parallel_reduce("x", ParallelReductionKind::Sum)
+                                            .parallel_reduce("x", ReductionKind::Sum)
                                             .unwrap()
                                     },
                                     varying,
@@ -4217,7 +4480,7 @@ mod tests {
                                                 (shared.clone() * shared * weights)
                                                     .reduce(&[0], ReductionKind::Sum)
                                                     .unwrap()
-                                                    .parallel_reduce("x", ParallelReductionKind::Sum)
+                                                    .parallel_reduce("x", ReductionKind::Sum)
                                                     .unwrap()
                                             },
                                             (shared, weights),
@@ -4306,7 +4569,7 @@ mod tests {
                             |input: ShardMapTracer| {
                                 let constant: ShardMapTracer =
                                     input.dispatch_domain().fill(&input.r#type(), 3.0_f32).unwrap();
-                                constant.parallel_reduce("x", ParallelReductionKind::Sum).unwrap()
+                                constant.parallel_reduce("x", ReductionKind::Sum).unwrap()
                             },
                             inputs[0].clone(),
                             mesh.clone(),
@@ -4448,7 +4711,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_gather_varying_indices_gradient_executes_on_cpu() {
-        use ryft_core::{ConvertElementType, Gather, GatherMode, ParallelReduce, ParallelReductionKind};
+        use ryft_core::{Gather, GatherMode, ParallelReduce, ReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4497,14 +4760,7 @@ mod tests {
                     let gradient = pullback.apply(inputs[2].clone().into_value()).unwrap();
                     let maxima = shard_map::<_, _, (ArrayType, ArrayType), _>(
                         |input: ShardMapTracer| {
-                            // The CPU backend recognizes integer maximum as an all-reduce reducer.
-                            let maximum = input
-                                .convert_element_type(DataType::I32)
-                                .unwrap()
-                                .parallel_reduce("x", ParallelReductionKind::Max)
-                                .unwrap()
-                                .convert_element_type(DataType::F32)
-                                .unwrap();
+                            let maximum = input.parallel_reduce("x", ReductionKind::Max).unwrap();
                             let varying = maximum.parallel_vary("x").unwrap();
                             (maximum, varying)
                         },
@@ -4919,7 +5175,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_nested_variation_gradients_execute_on_cpu() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4960,7 +5216,7 @@ mod tests {
                                             (shared.clone() * shared * weights.clone() * weights)
                                                 .reduce(&[0], ReductionKind::Sum)
                                                 .unwrap()
-                                                .parallel_reduce("y", ParallelReductionKind::Sum)
+                                                .parallel_reduce("y", ReductionKind::Sum)
                                                 .unwrap()
                                         },
                                         inputs,
@@ -4970,7 +5226,7 @@ mod tests {
                                         vec!["y".to_string()],
                                     )
                                     .unwrap()
-                                    .parallel_reduce("x", ParallelReductionKind::Sum)
+                                    .parallel_reduce("x", ReductionKind::Sum)
                                     .unwrap()
                                 },
                                 (shared, weights),
@@ -5062,7 +5318,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_mixed_variation_gradients_execute_on_cpu() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -5104,7 +5360,7 @@ mod tests {
                                     (shared.clone() * shared * weights)
                                         .reduce(&[0, 1], ReductionKind::Sum)
                                         .unwrap()
-                                        .parallel_reduce("x", ParallelReductionKind::Sum)
+                                        .parallel_reduce("x", ReductionKind::Sum)
                                         .unwrap()
                                 },
                                 (shared, weights),
@@ -5319,7 +5575,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_parallel_mean_lowers_to_all_reduce_with_axis_size_division() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5331,7 +5587,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Mean).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Mean).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -5370,7 +5626,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_parallel_mean_preserves_group_order_and_uses_group_divisor() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5383,7 +5639,7 @@ mod tests {
                             local_x
                                 .parallel_reduce_with_axis_index_groups(
                                     "x",
-                                    ParallelReductionKind::Mean,
+                                    ReductionKind::Mean,
                                     vec![vec![0, 2], vec![3, 1]],
                                 )
                                 .unwrap()
@@ -5407,7 +5663,7 @@ mod tests {
 
     #[test]
     fn test_batch_inside_shard_map_forwards_mesh_collective_to_all_reduce() {
-        use ryft_core::{Batch, BatchAxis, BatchAxisSpecification, ParallelReduce, ParallelReductionKind};
+        use ryft_core::{Batch, BatchAxis, BatchAxisSpecification, ParallelReduce, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5427,7 +5683,7 @@ mod tests {
                             let context = local_x.dispatch_domain();
                             let summed: ShardMapTracer = Batch::batch(
                                 &context,
-                                |item| item.parallel_reduce("x", ParallelReductionKind::Sum),
+                                |item| item.parallel_reduce("x", ReductionKind::Sum),
                                 local_x,
                                 BatchAxis::new(0),
                                 BatchAxis::new(0),
@@ -5473,7 +5729,7 @@ mod tests {
 
     #[test]
     fn test_parallel_reduce_inside_condition_inside_shard_map_lowers_to_all_reduce() {
-        use ryft_core::{ConditionOperation, ParallelReduceOperation, ParallelReductionKind};
+        use ryft_core::{ConditionOperation, ParallelReduceOperation, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5495,7 +5751,7 @@ mod tests {
                                 let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
-                                        ParallelReduceOperation::new("x".to_string(), ParallelReductionKind::Sum),
+                                        ParallelReduceOperation::new("x".to_string(), ReductionKind::Sum),
                                         Vec::new(),
                                         vec![input],
                                         None,
@@ -5560,8 +5816,47 @@ mod tests {
     }
 
     #[test]
+    fn test_ordinary_parallel_log_sum_exp_inside_shard_map_is_rejected_by_lowering() {
+        use ryft_core::{ParallelReduceOperation, ReductionKind};
+
+        // The `ParallelReduce` capability composes a logarithmic sum over a manual mesh axis from primitive mesh
+        // reductions, so only a hand-staged ordinary reduction can reach the lowering, which has no combiner for it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            move |x: ShardMapTracer| {
+                shard_map::<_, _, ArrayType, _>(
+                    |local_x: ShardMapTracer| {
+                        let context = local_x.value().context().clone();
+                        let mut outputs = context
+                            .stage_operation(
+                                ParallelReduceOperation::new("x".to_string(), ReductionKind::LogSumExp),
+                                Vec::new(),
+                                &[local_x.into_value()],
+                            )
+                            .unwrap();
+                        ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()
+                    },
+                    x,
+                    mesh.clone(),
+                    sharding.clone(),
+                    sharding.clone(),
+                )
+                .unwrap()
+            },
+            ArrayType::new_static(DataType::F32, [8]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap_err().to_string(),
+            "`parallel_reduce` with kind `log_sum_exp` has no all-reduce combiner; stage it through the \
+             `ParallelReduce` capability, which composes it from primitive mesh reductions",
+        );
+    }
+
+    #[test]
     fn test_two_shard_maps_with_collectives_receive_unique_channel_ids() {
-        use ryft_core::{ParallelReduce, ParallelReductionKind};
+        use ryft_core::{ParallelReduce, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5575,7 +5870,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     let first = shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -5583,7 +5878,7 @@ mod tests {
                     )
                     .expect("first shard_map should trace");
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
                         first,
                         mesh.clone(),
                         sharding.clone(),
@@ -5816,7 +6111,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_collective_over_unbound_axis_is_rejected_at_trace_time() {
-        use ryft_core::{AxisError, ParallelReduce, ParallelReductionKind};
+        use ryft_core::{AxisError, ParallelReduce, ReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -5831,7 +6126,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            let error = local_x.parallel_reduce("y", ParallelReductionKind::Sum).unwrap_err();
+                            let error = local_x.parallel_reduce("y", ReductionKind::Sum).unwrap_err();
                             assert_eq!(
                                 error,
                                 ProgramError::Axis(AxisError::UnboundAxisName { name: "y".to_string() }),

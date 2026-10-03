@@ -770,7 +770,7 @@ mod tests {
         OffloadDotsWithNoBatchDimensions, SaveOnlyTheseNames, differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
-    use crate::operations::collectives::parallel_reduce::{ParallelReduceOperation, ParallelReductionKind};
+    use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
@@ -779,6 +779,7 @@ mod tests {
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
     use crate::operations::manipulation::memory::TransferToMemory;
+    use crate::operations::reductions::ReductionKind;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
     };
@@ -1492,7 +1493,7 @@ mod tests {
         let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = body.add_input(varying_type.clone());
         let y = body.add_input(invariant_type.clone());
-        let sum = ParallelReduceOperation::new("m".to_string(), ParallelReductionKind::Sum).with_mesh(mesh);
+        let sum = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh);
         let sum = body.add_instruction(sum, Vec::new(), vec![x], None).unwrap()[0];
         let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![sum, y], None).unwrap()[0];
         let body = body

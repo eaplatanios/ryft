@@ -38,31 +38,31 @@ use crate::operations::complex::{
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::operations::{
-    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Assert, AssertOperation, Atan2, Atan2Operation, Broadcast,
-    BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation, Concatenate,
-    ConcatenateOperation, ConditionOperation, ConstantOperation, ConstrainShardingOperation, ConvertElementType,
-    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeOperation, CustomFunctionOperation,
-    CustomFunctionTransposeOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
-    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation,
-    DynamicReshape, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation,
-    IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation,
-    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
-    ParallelReduceOperation, ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation,
-    Reduce, ReduceOperation, ReducePrecisionOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation,
-    ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
-    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    Abs, AbsOperation, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, Assert,
+    AssertOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation,
+    Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
+    ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, Cumulative,
+    CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
+    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
+    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
+    DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
+    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
+    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
+    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
+    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation,
+    ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
+    ReducePrecisionOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation, ReshardOperation,
+    Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
+    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -137,6 +137,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     DotProductAttention(DotProductAttentionOperation),
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Reduce(ReduceOperation),
+    ArgMax(ArgMaxOperation),
+    ArgMin(ArgMinOperation),
     Cumulative(CumulativeOperation),
     Sort(SortOperation),
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
@@ -225,8 +227,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     and the operation-family `From` bounds that transforms require of a domain.
 ///
 /// Derived conveniences that a member already implies are also left out, because bounding them would only duplicate
-/// solver work: [`TopK`](crate::operations::TopK), [`ArgMax`](crate::operations::ArgMax), and
-/// [`ArgMin`](crate::operations::ArgMin) all follow from [`Sort`], [`Slice`], and [`Reshape`], and
+/// solver work: [`TopK`](crate::operations::TopK) follows from [`Sort`], [`Slice`], and [`Reshape`], and
 /// [`DotOps`](crate::operations::dot::DotOps) follows from [`Dot`] and [`Transpose`].
 ///
 /// # Tracers
@@ -253,7 +254,7 @@ pub trait ArrayOperations:
     + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
     + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
-    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + Cumulative
+    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + ArgMax + ArgMin + Cumulative
     // Constants and differentiation barriers.
     + ZeroLike + OneLike + StopGradient + Assert
 {
@@ -271,7 +272,7 @@ where
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
-    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + Cumulative,
+    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + ArgMax + ArgMin + Cumulative,
     V: ZeroLike + OneLike + StopGradient + Assert,
 {
 }

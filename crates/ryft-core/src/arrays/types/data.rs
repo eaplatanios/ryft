@@ -1,9 +1,14 @@
 use std::backtrace::Backtrace;
 use std::fmt::Display;
 
+use half::{bf16, f16};
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::arrays::elements::{
+    ArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+};
 use crate::parameters::Parameter;
 use crate::programs::{NoIdentity, NoReferent, ReferenceMemberType, ReferenceType, Type};
 
@@ -1277,6 +1282,95 @@ impl DataType {
     pub fn is_promotable_to(self, other: Self) -> bool {
         DATA_TYPE_PROMOTION_UPPER_BOUNDS_BITMASKS[self.index()] & DataTypePromotionNode::DataType(other).bitmask() != 0
     }
+
+    /// Decodes one real-valued element as `f64`, returning `None` for complex and payload-free element data types.
+    /// Integer conversions use Rust's ordinary `as f64` semantics. The caller must provide one complete element
+    /// encoding of this data type, following [`ArrayElement`].
+    pub(crate) fn element_as_f64(self, bytes: &[u8]) -> Option<f64> {
+        Some(match self {
+            DataType::Boolean => f64::from(u8::from(bool::decode(bytes))),
+            DataType::I1 => f64::from(i1::decode(bytes).value()),
+            DataType::I2 => f64::from(i2::decode(bytes).value()),
+            DataType::I4 => f64::from(i4::decode(bytes).value()),
+            DataType::I8 => f64::from(i8::decode(bytes)),
+            DataType::I16 => f64::from(i16::decode(bytes)),
+            DataType::I32 => f64::from(i32::decode(bytes)),
+            DataType::I64 => i64::decode(bytes) as f64,
+            DataType::U1 => f64::from(u1::decode(bytes).value()),
+            DataType::U2 => f64::from(u2::decode(bytes).value()),
+            DataType::U4 => f64::from(u4::decode(bytes).value()),
+            DataType::U8 => f64::from(u8::decode(bytes)),
+            DataType::U16 => f64::from(u16::decode(bytes)),
+            DataType::U32 => f64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes) as f64,
+            DataType::F4E2M1FN => f4e2m1fn::decode(bytes).to_f64(),
+            DataType::F6E2M3FN => f6e2m3fn::decode(bytes).to_f64(),
+            DataType::F6E3M2FN => f6e3m2fn::decode(bytes).to_f64(),
+            DataType::F8E3M4 => f8e3m4::decode(bytes).to_f64(),
+            DataType::F8E4M3 => f8e4m3::decode(bytes).to_f64(),
+            DataType::F8E4M3FN => f8e4m3fn::decode(bytes).to_f64(),
+            DataType::F8E4M3FNUZ => f8e4m3fnuz::decode(bytes).to_f64(),
+            DataType::F8E4M3B11FNUZ => f8e4m3b11fnuz::decode(bytes).to_f64(),
+            DataType::F8E5M2 => f8e5m2::decode(bytes).to_f64(),
+            DataType::F8E5M2FNUZ => f8e5m2fnuz::decode(bytes).to_f64(),
+            DataType::F8E8M0FNU => f8e8m0fnu::decode(bytes).to_f64(),
+            DataType::BF16 => bf16::decode(bytes).to_f64(),
+            DataType::F16 => f16::decode(bytes).to_f64(),
+            DataType::F32 => f64::from(f32::decode(bytes)),
+            DataType::F64 => f64::decode(bytes),
+            DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
+        })
+    }
+
+    /// Returns an order-preserving `u64` key for one real-valued element, so that comparing the order keys of two
+    /// elements of the same data type compares the elements themselves, or `None` for complex and payload-free element
+    /// data types. Booleans and unsigned integers are keyed by value, and signed integers by their sign-biased two's
+    /// complement (i.e., with the sign bit flipped), so that negative values compare below nonnegative ones. Every
+    /// floating-point value converts exactly to `f64` and is keyed as documented on
+    /// [`DataType::floating_point_element_order_key`]. Order keys are exact for every data type, including 64-bit
+    /// integers that `f64` cannot represent exactly.
+    ///
+    /// # Parameters
+    ///
+    ///   - `bytes`: Complete encoding of one element of this data type, following [`ArrayElement`].
+    ///   - `canonicalize`: Whether floating-point elements are keyed after canonicalizing their signed zeros and NaNs,
+    ///     as documented on [`DataType::floating_point_element_order_key`].
+    pub(crate) fn element_order_key(self, bytes: &[u8], canonicalize: bool) -> Option<u64> {
+        Some(match self {
+            DataType::Boolean => u64::from(bool::decode(bytes)),
+            DataType::I1 => (i1::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I2 => (i2::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I4 => (i4::decode(bytes).value() as u64) ^ (1 << 63),
+            DataType::I8 => (i8::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I16 => (i16::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I32 => (i32::decode(bytes) as u64) ^ (1 << 63),
+            DataType::I64 => (i64::decode(bytes) as u64) ^ (1 << 63),
+            DataType::U1 => u64::from(u1::decode(bytes).value()),
+            DataType::U2 => u64::from(u2::decode(bytes).value()),
+            DataType::U4 => u64::from(u4::decode(bytes).value()),
+            DataType::U8 => u64::from(u8::decode(bytes)),
+            DataType::U16 => u64::from(u16::decode(bytes)),
+            DataType::U32 => u64::from(u32::decode(bytes)),
+            DataType::U64 => u64::decode(bytes),
+            DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
+            _ => Self::floating_point_element_order_key(self.element_as_f64(bytes)?, canonicalize),
+        })
+    }
+
+    /// Returns the order key of `value` in the IEEE 754 total order (i.e., `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞
+    /// < +NaN`, with NaNs of the same sign ordered by payload) as an order-preserving `u64`. The key flips every bit
+    /// of a negative value and only the sign bit of a nonnegative one. When `canonicalize` is `true`, both signed zeros
+    /// are keyed as `+0.0` and every NaN is keyed as the same positive quiet NaN, so that signed zeros compare equal
+    /// and NaNs compare equal and greater than `+∞`.
+    pub(crate) fn floating_point_element_order_key(value: f64, canonicalize: bool) -> u64 {
+        let value = match canonicalize {
+            true if value == 0.0 => 0.0,
+            true if value.is_nan() => f64::NAN,
+            _ => value,
+        };
+        let bits = value.to_bits();
+        if bits >> 63 == 1 { !bits } else { bits | (1 << 63) }
+    }
 }
 
 impl Display for DataType {
@@ -1918,6 +2012,163 @@ mod tests {
         assert!(!DataType::F6E3M2FN.is_promotable_to(DataType::F6E2M3FN));
         assert!(!DataType::F8E3M4.is_promotable_to(DataType::F8E4M3FN));
         assert!(!DataType::F8E4M3B11FNUZ.is_promotable_to(DataType::BF16));
+    }
+
+    #[test]
+    fn test_data_type_element_as_f64() {
+        assert_eq!(DataType::Boolean.element_as_f64(&[0]), Some(0.0));
+        assert_eq!(DataType::Boolean.element_as_f64(&[1]), Some(1.0));
+        assert_eq!(DataType::I4.element_as_f64(&[0b1000]), Some(-8.0));
+        assert_eq!(DataType::U4.element_as_f64(&[0b1111]), Some(15.0));
+        assert_eq!(DataType::I64.element_as_f64(&i64::MIN.to_le_bytes()), Some(i64::MIN as f64));
+        assert_eq!(DataType::U64.element_as_f64(&u64::MAX.to_le_bytes()), Some(u64::MAX as f64));
+        assert_eq!(DataType::BF16.element_as_f64(&bf16::from_f64(1.5).to_bits().to_le_bytes()), Some(1.5));
+        assert_eq!(DataType::F16.element_as_f64(&f16::from_f64(-1.5).to_bits().to_le_bytes()), Some(-1.5));
+        assert_eq!(DataType::F32.element_as_f64(&1.5f32.to_le_bytes()), Some(1.5));
+        assert_eq!(DataType::F64.element_as_f64(&(-0.0f64).to_le_bytes()).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(DataType::F64.element_as_f64(&f64::NAN.to_le_bytes()).unwrap().is_nan());
+        for data_type in [DataType::C64, DataType::C128, DataType::Token, DataType::Zero] {
+            assert_eq!(data_type.element_as_f64(&[]), None);
+        }
+    }
+
+    #[test]
+    fn test_data_type_element_order_key_integers() {
+        // Encode each scalar through the canonical codec and assert strict ordering across signed and unsigned ranges.
+        macro_rules! check_order {
+            ($element:ty, $values:expr) => {{
+                let data_type = <$element>::data_type();
+                let keys = $values.map(|value: $element| {
+                    let mut bytes = vec![0; data_type.bit_width().div_ceil(8)];
+                    value.encode(&mut bytes);
+                    let key = data_type.element_order_key(&bytes, false).unwrap();
+                    assert_eq!(data_type.element_order_key(&bytes, true), Some(key));
+                    key
+                });
+                assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+            }};
+        }
+        check_order!(bool, [false, true]);
+        check_order!(i1, [i1::MIN, i1::MAX]);
+        check_order!(i2, [i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]);
+        check_order!(i4, [i4::MIN, i4::new(-1).unwrap(), i4::new(0).unwrap(), i4::MAX]);
+        check_order!(i8, [i8::MIN, -1, 0, i8::MAX]);
+        check_order!(i16, [i16::MIN, -1, 0, i16::MAX]);
+        check_order!(i32, [i32::MIN, -1, 0, i32::MAX]);
+        check_order!(i64, [i64::MIN, -1, 0, (1i64 << 53), (1i64 << 53) + 1, i64::MAX]);
+        check_order!(u1, [u1::MIN, u1::MAX]);
+        check_order!(u2, [u2::MIN, u2::MAX]);
+        check_order!(u4, [u4::MIN, u4::MAX]);
+        check_order!(u8, [0, u8::MAX]);
+        check_order!(u16, [0, u16::MAX]);
+        check_order!(u32, [0, u32::MAX]);
+        check_order!(u64, [0, (1u64 << 53), (1u64 << 53) + 1, u64::MAX - 1, u64::MAX]);
+        // These adjacent integers collide when converted to f64 but must retain distinct order keys.
+        assert_eq!((1u64 << 53) as f64, ((1u64 << 53) + 1) as f64);
+        for data_type in [DataType::C64, DataType::C128, DataType::Token, DataType::Zero] {
+            assert_eq!(data_type.element_order_key(&[], false), None);
+            assert_eq!(data_type.element_order_key(&[], true), None);
+        }
+    }
+
+    #[test]
+    fn test_data_type_element_order_key_floating_point() {
+        // Exhaust each small format and compare its encoded-element keys with Rust's total-order comparator.
+        macro_rules! check_format {
+            ($element:ty, $count:expr) => {{
+                let data_type = <$element>::data_type();
+                let mut elements = (0..$count)
+                    .map(|bits| {
+                        let encoding = (bits as u64).to_le_bytes();
+                        let bytes = &encoding[..data_type.bit_width().div_ceil(8)];
+                        let value = <$element>::decode(bytes).to_f64();
+                        assert_eq!(data_type.element_as_f64(bytes).unwrap().to_bits(), value.to_bits());
+                        let canonical_key = data_type.element_order_key(bytes, true).unwrap();
+                        if value.is_nan() {
+                            assert_eq!(canonical_key, DataType::floating_point_element_order_key(f64::NAN, true));
+                        } else if value == 0.0 {
+                            assert_eq!(canonical_key, DataType::floating_point_element_order_key(0.0, true));
+                        } else {
+                            assert_eq!(canonical_key, data_type.element_order_key(bytes, false).unwrap());
+                        }
+                        (value, data_type.element_order_key(bytes, false).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                elements.sort_by(|left, right| left.0.total_cmp(&right.0));
+                for pair in elements.windows(2) {
+                    assert_eq!(pair[0].1.cmp(&pair[1].1), pair[0].0.total_cmp(&pair[1].0));
+                }
+            }};
+        }
+        check_format!(f4e2m1fn, 16u16);
+        check_format!(f6e2m3fn, 64u16);
+        check_format!(f6e3m2fn, 64u16);
+        check_format!(f8e3m4, 256u16);
+        check_format!(f8e4m3, 256u16);
+        check_format!(f8e4m3fn, 256u16);
+        check_format!(f8e4m3fnuz, 256u16);
+        check_format!(f8e4m3b11fnuz, 256u16);
+        check_format!(f8e5m2, 256u16);
+        check_format!(f8e5m2fnuz, 256u16);
+        check_format!(f8e8m0fnu, 256u16);
+        check_format!(bf16, 65536u32);
+        check_format!(f16, 65536u32);
+        for value in [f64::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
+            for canonicalize in [false, true] {
+                assert_eq!(
+                    DataType::F32.element_order_key(&(value as f32).to_le_bytes(), canonicalize),
+                    Some(DataType::floating_point_element_order_key(value, canonicalize)),
+                );
+                assert_eq!(
+                    DataType::F64.element_order_key(&value.to_le_bytes(), canonicalize),
+                    Some(DataType::floating_point_element_order_key(value, canonicalize)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_data_type_floating_point_element_order_key() {
+        // Include both NaN signs, signaling/quiet NaNs, and distinct payloads in their specified total order.
+        let values = [
+            f64::from_bits(0xfff8_0000_0000_0002),
+            f64::from_bits(0xfff8_0000_0000_0001),
+            f64::from_bits(0xfff0_0000_0000_0001),
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -f64::from_bits(1),
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::from_bits(0x7ff0_0000_0000_0001),
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0x7ff8_0000_0000_0002),
+        ];
+        for pair in values.windows(2) {
+            assert!(
+                DataType::floating_point_element_order_key(pair[0], false)
+                    < DataType::floating_point_element_order_key(pair[1], false)
+            );
+        }
+        let zero_key = DataType::floating_point_element_order_key(0.0, true);
+        let nan_key = DataType::floating_point_element_order_key(f64::NAN, true);
+        assert!(nan_key > DataType::floating_point_element_order_key(f64::INFINITY, true));
+        for value in values {
+            let key = DataType::floating_point_element_order_key(value, true);
+            if value.is_nan() {
+                assert_eq!(key, nan_key);
+            } else if value == 0.0 {
+                assert_eq!(key, zero_key);
+            } else {
+                assert_eq!(key, DataType::floating_point_element_order_key(value, false));
+            }
+        }
     }
 
     #[test]

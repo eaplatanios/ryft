@@ -29,14 +29,14 @@ use ryft_core::{
     DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation,
     GatherMode, GatherOperation, Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation,
     LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation,
-    MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized,
-    PowOperation, Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME,
-    REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReducePrecisionOperation, ReductionKind, RegionId,
-    RegionRef, RemOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RoundOperation,
-    RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
-    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
-    SinOperation, SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation,
-    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, Parameterized, PowOperation, Program,
+    ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode,
+    RaggedDotOperation, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
+    RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation,
+    SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
+    SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation, TanhOperation,
+    TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -10963,10 +10963,21 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// row-major device linearization, or, when the collective records explicit logical participant groups, those groups
 /// expanded inside every fixed coordinate of the mesh's other axes without reordering either the groups or their
 /// members. The emitted operation carries a module-unique channel id with a device-to-device channel type and
-/// `use_global_device_ids`, the standard SPMD emission for cross-partition collectives. `Sum`/`Mean` reduce with
-/// `add` (a `Mean` divides by the effective group size) and `Max` reduces with `maximum`, reusing the same scalar
-/// combiner regions as `stablehlo.reduce` lowering. A collective lowered outside any manual region, or naming an axis
-/// the innermost region does not bind as a manual mesh axis, is an error.
+/// `use_global_device_ids`, the standard SPMD emission for cross-partition collectives.
+///
+/// Each kind combines with the single StableHLO operation of its reduction (i.e., `add` for `Sum` and `Mean`,
+/// `multiply` for `Product`, `maximum` and `minimum` for `Max` and `Min`, and `or` and `and` for `Any` and `All`), and
+/// a `Mean` then divides the all-reduced sum by the effective group size. Unlike the `stablehlo.reduce` lowering, the
+/// combiner never needs a guard for an identity element because an all-reduce combines only its participants' values,
+/// and it must stay a single operation because XLA backends implement all-reduce only for the combiners that they
+/// recognize. Floating-point extrema therefore follow the backend's native `maximum` and `minimum`, as
+/// `jax.lax.pmax` and `jax.lax.pmin` do, so their NaN and signed-zero behavior is backend-defined. The combiner also
+/// accumulates in the input element type, without the `f32` accumulation that [`ReductionKind::Sum`] documents for
+/// narrower floating-point `reduce` inputs, so that, e.g., `bf16` gradient all-reduces keep their communication
+/// volume. A `LogSumExp` has no single combiner and is rejected, because the
+/// [`ParallelReduce`](ryft_core::ParallelReduce) capability composes it from a mesh maximum and a mesh sum instead. A
+/// collective lowered outside any manual region, or naming an axis the innermost region does not bind as a manual mesh
+/// axis, is an error.
 fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     operation: &ParallelReduceOperation,
     collective_state: &CollectiveLoweringState,
@@ -11004,8 +11015,54 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     };
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
 
-    let element_type = output_array_type.data_type();
-    let computation = build_reduce_body_region(operation.kind().reduction_kind(), element_type, context, location)?;
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(output_array_type.data_type()), context, location)?;
+    let mut computation = context.region();
+    let mut combiner_block =
+        computation.append_block(context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]))?;
+    let left = combiner_block.argument(0)?.as_ref();
+    let right = combiner_block.argument(1)?.as_ref();
+    let combined = match operation.kind() {
+        ReductionKind::Sum | ReductionKind::Mean => combiner_block
+            .append_operation(stable_hlo::add(left, right, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref(),
+        ReductionKind::Product => combiner_block
+            .append_operation(stable_hlo::multiply(left, right, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref(),
+        ReductionKind::Max => combiner_block
+            .append_operation(stable_hlo::maximum(left, right, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref(),
+        ReductionKind::Min => combiner_block
+            .append_operation(stable_hlo::minimum(left, right, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref(),
+        ReductionKind::Any => {
+            combiner_block.append_operation(stable_hlo::or(left, right, location)?)?.result(0).unwrap().as_ref()
+        }
+        ReductionKind::All => combiner_block
+            .append_operation(stable_hlo::and(left, right, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref(),
+        ReductionKind::LogSumExp => {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` with kind `{}` has no all-reduce combiner; stage it through the `ParallelReduce` \
+                     capability, which composes it from primitive mesh reductions",
+                    operation.name(),
+                    operation.kind(),
+                ),
+            }
+            .into());
+        }
+    };
+    combiner_block.append_operation(stable_hlo::r#return(&[combined], location)?)?;
     let result = block.append_operation(stable_hlo::all_reduce(
         &[input_value],
         stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
@@ -11016,7 +11073,7 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let reduced = result.result(0).expect("stablehlo.all_reduce should return one result").as_ref();
-    if !matches!(operation.kind(), ParallelReductionKind::Mean) {
+    if operation.kind() != ReductionKind::Mean {
         return Ok(reduced);
     }
     // `Mean` is the mean over the effective participant group: divide the all-reduced sum by the group size.

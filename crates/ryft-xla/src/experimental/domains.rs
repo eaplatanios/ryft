@@ -14637,7 +14637,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_collective_outside_a_mapping_context() {
-        use ryft_core::{ParallelReduceOperation, ParallelReductionKind};
+        use ryft_core::{ParallelReduceOperation, ReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -14651,7 +14651,7 @@ mod tests {
         // capability is not even implemented for `Array` (its dispatch domain carries no named-axis environment), so
         // this binds the operation directly and asserts the axis-resolution failure surfaced at compile time.
         let input = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let operation = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum);
+        let operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum);
         assert!(matches!(
             domain.bind(operation, Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })

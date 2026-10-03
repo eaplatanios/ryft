@@ -46,7 +46,7 @@ pub use assertions::{
 };
 pub use collectives::{
     ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelReduce,
-    ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation,
+    ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{
     COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,
@@ -122,7 +122,10 @@ pub use manipulation::{
     UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
-pub use reductions::{REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind};
+pub use reductions::{
+    ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
+    REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind,
+};
 pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
@@ -139,7 +142,7 @@ pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard,
     ReshardOperation,
 };
-pub use sorting::{ArgMax, ArgMin, SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
+pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::{

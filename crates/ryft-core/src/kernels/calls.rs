@@ -1087,6 +1087,8 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::RaggedDot(_)
                 | ArrayOperation::ScaledDot(_)
                 | ArrayOperation::Reduce(_)
+                | ArrayOperation::ArgMax(_)
+                | ArrayOperation::ArgMin(_)
                 | ArrayOperation::Cumulative(_)
                 | ArrayOperation::Sort(_)
                 | ArrayOperation::RngBitGenerator(_)

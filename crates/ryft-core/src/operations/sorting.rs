@@ -5,11 +5,12 @@
 //!
 //!   - **Sorting:** [`Sort`] stably sorts one or more same-shaped arrays along one axis in a [`SortDirection`],
 //!     by the lexicographic order of their leading key inputs, and co-permutes every other input as a passenger.
-//!   - **Ranking:** [`TopK`] selects the `k` largest elements along one axis together with their indices, while
-//!     [`ArgMax`] and [`ArgMin`] compute the index of the largest and smallest element. These are compositions rather
-//!     than primitives: each one sorts the ranked value together with an `i32` index [`iota`](IotaOperation) passenger
-//!     and slices the leading entries, and so every program transform supports them through the rules of
-//!     [`SortOperation`], [`Slice`], and [`Reshape`], and their indices are always `i32`.
+//!   - **Ranking:** [`TopK`] selects the `k` largest elements along one axis together with their indices. It is a
+//!     composition rather than a primitive. It sorts the ranked value together with an `i32` index
+//!     [`iota`](IotaOperation) passenger and slices the leading entries, and so every program transform supports
+//!     it through the rules of [`SortOperation`], [`Slice`], and [`Reshape`], and its indices are always `i32`.
+//!     The indices of the largest and smallest elements are reductions rather than rankings, and are supported
+//!     via [`ArgMax`](crate::ArgMax) and [`ArgMin`](crate::ArgMin), respectively.
 //!
 //! A [`SortOrdering`] selects how floating-point keys, including the real and imaginary parts of complex keys, compare.
 //! Under the default [`SortOrdering::Canonical`] ordering, `-0.0` and `+0.0` compare equal, every NaN compares equal
@@ -18,10 +19,8 @@
 //! Under [`SortOrdering::Total`], keys order by the IEEE 754 total order of StableHLO's
 //! [`TOTALORDER`](https://openxla.org/stablehlo/spec#compare) comparison (i.e., `-NaN < -∞ < … < -0.0 < +0.0
 //! < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total ordering, following JAX's
-//! [`lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), while [`ArgMax`] and [`ArgMin`] rank
-//! under the canonical ordering, so that an axis that contains a NaN of either sign reports its first NaN, following
-//! [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html). Every sort is stable, so
-//! elements that tie on every key keep their original relative order and ranking ties select the lowest index.
+//! [`lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html). Every sort is stable, so elements
+//! that tie on every key keep their original relative order and ranking ties select the lowest index.
 //!
 //! # Batching
 //!
@@ -58,14 +57,12 @@
 //! Ranking selects the leading entries of a stable sort, so ties select the lowest index:
 //!
 //! ```rust
-//! # use ryft_core::{Array, ArgMax, ArgMin, ProgramError, TopK};
+//! # use ryft_core::{Array, ProgramError, TopK};
 //! # fn main() -> Result<(), ProgramError> {
 //! let scores = Array::vector(vec![1.0, 3.0, 2.0, 3.0])?;
 //! let (values, indices) = scores.top_k(2, 0)?;
 //! assert_eq!(values, Array::vector(vec![3.0, 3.0])?);
 //! assert_eq!(indices, Array::vector(vec![1i32, 3])?);
-//! assert_eq!(scores.argmax(0)?, Array::scalar(1i32)?);
-//! assert_eq!(scores.argmin(0)?, Array::scalar(0i32)?);
 //! # Ok(())
 //! # }
 //! ```
@@ -75,7 +72,7 @@ use std::num::NonZeroUsize;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayType,
-    Complex, DataType, Dimension, Shape, ShardingDimension, i1, i2, i4, u1, u2, u4,
+    Complex, DataType, Dimension, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -87,7 +84,6 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual, Elementwis
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::comparisons::Compare;
 use crate::operations::constants::iota::{Iota, IotaOperation};
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
@@ -155,8 +151,8 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// (i.e., its keys). Elements are ordered lexicographically by the keys in input order (i.e., key 0 decides, ties on
 /// key 0 fall through to key 1, and so on), with every key compared in the same [`SortDirection`] and under the same
 /// [`SortOrdering`], and every other input is co-permuted as a passenger. The sort is always stable, so elements that
-/// are equal on every key keep their original relative order, which is what routes ranking ties (e.g., in [`ArgMax`])
-/// to the lowest index. An ascending sort under the default [`SortOrdering::Canonical`] ordering computes JAX's
+/// are equal on every key keep their original relative order, which is what routes ranking ties (e.g., in [`TopK`]) to
+/// the lowest index. An ascending sort under the default [`SortOrdering::Canonical`] ordering computes JAX's
 /// [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) with `num_keys = key_count`, and
 /// a descending one computes the stable descending sort of `jnp.sort(..., descending=True)`.
 ///
@@ -167,9 +163,8 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// reduction state, because permutations preserve their zero-filled replicas. Inputs must have matching manual
 /// variation, and [`Sort`] inserts the required transitions before binding.
 ///
-/// There is no user-provided comparator: the fixed lexicographic key ordering covers the ranking use cases (i.e.,
-/// [`TopK`], [`ArgMax`], and [`ArgMin`]) and multi-key sorts without carrying a comparator region through every
-/// program transform.
+/// There is no user-provided comparator: the fixed lexicographic key ordering covers ranking (e.g., [`TopK`]) and
+/// multi-key sorts without carrying a comparator region through every program transform.
 ///
 /// The permutation is piecewise constant in the keys, so every input, including each key, differentiates as a
 /// passenger: tangents ride a sort of their primal keys, and the transpose of that permutation sorts the output
@@ -634,22 +629,63 @@ impl Sort for Array {
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError> {
         // Type inference validates the inputs (e.g., their count, key data types, shapes, axis, sharding, and manual
-        // variation) exactly as it does for staged sorts. The keys are then ranked through an order-preserving encoding
+        // variation) exactly as it does for staged sorts. The keys are then converted to an order-preserving encoding
         // of each element and the resulting gather map moves whole element encodings, so non-key inputs of any element
         // data type (including the sub-byte ones without a scalar representation) sort without being decoded.
         let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         operation.infer_output_types(input_types.as_slice(), &[])?;
-        let key_ranks = inputs[..operation.key_count().get()]
-            .iter()
-            .map(|key| key.sort_key_ranks(ordering))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        let key_ranks = key_ranks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        // Every sort key contributes order-preserving `u64` keys for its elements in row-major order. Comparing these
+        // order keys compares the elements themselves (refer to `DataType::element_order_key` for the encoding), with
+        // floating-point elements canonicalized under the canonical ordering. Complex sort keys contribute two order
+        // key vectors (i.e., one for their real parts followed by one for their imaginary parts), which then compare
+        // lexicographically like two separate sort keys.
+        let canonicalize = ordering == SortOrdering::Canonical;
+        let mut order_keys = Vec::<Vec<u64>>::with_capacity(operation.key_count().get());
+        for key in &inputs[..operation.key_count().get()] {
+            let data_type = key.r#type().data_type();
+            let addressing = ArrayAddressing::new(key.r#type().into_owned())?;
+            let elements = (0..addressing.element_count())
+                .map(|index| &key.storage_bytes()[addressing.byte_range_for_flat_index(index)]);
+            match data_type {
+                DataType::C64 | DataType::C128 => {
+                    let parts = elements
+                        .map(|bytes| match data_type {
+                            DataType::C64 => {
+                                let value = Complex::<f32>::decode(bytes);
+                                (f64::from(value.re), f64::from(value.im))
+                            }
+                            _ => {
+                                let value = Complex::<f64>::decode(bytes);
+                                (value.re, value.im)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    order_keys.push(
+                        parts
+                            .iter()
+                            .map(|(real, _)| DataType::floating_point_element_order_key(*real, canonicalize))
+                            .collect(),
+                    );
+                    order_keys.push(
+                        parts
+                            .iter()
+                            .map(|(_, imaginary)| DataType::floating_point_element_order_key(*imaginary, canonicalize))
+                            .collect(),
+                    );
+                }
+                _ => {
+                    // Type inference rejects token and structural-zero keys, so every other key has element order keys.
+                    order_keys
+                        .push(elements.map(|bytes| data_type.element_order_key(bytes, canonicalize).unwrap()).collect())
+                }
+            }
+        }
+
+        let order_keys = order_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let shape = input_types[0].static_shape().unwrap();
-        let gather = sort_permutation(key_ranks.as_slice(), shape.dimensions(), operation.axis(), direction);
+        let gather = sort_permutation(order_keys.as_slice(), shape.dimensions(), operation.axis(), direction);
         inputs
             .iter()
             .zip(input_types)
@@ -681,85 +717,13 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl Array {
-    /// Returns the order-preserving `u64` ranks of the elements of this array, in row-major order, when it acts as a
-    /// key of a [`SortOperation`] that compares floating-point keys under `ordering`. Real keys produce a single rank
-    /// vector and complex keys produce two (i.e., one for their real parts followed by one for their imaginary parts),
-    /// which compare lexicographically. Booleans and unsigned integers rank by value, signed integers rank by their
-    /// sign-biased two's complement, and floating-point values rank by the IEEE 754 total order after the
-    /// canonicalization of [`SortOrdering::Canonical`], if applicable. Callers must have validated the key data type
-    /// through [`SortOperation`] type inference.
-    fn sort_key_ranks(&self, ordering: SortOrdering) -> Result<Vec<Vec<u64>>, ProgramError> {
-        /// Returns the IEEE 754 total-order rank of `value` after canonicalizing signed zeros and NaNs under the
-        /// canonical ordering.
-        fn floating_point_rank(value: f64, ordering: SortOrdering) -> u64 {
-            let value = match ordering {
-                SortOrdering::Canonical if value == 0.0 => 0.0,
-                SortOrdering::Canonical if value.is_nan() => f64::NAN,
-                _ => value,
-            };
-            let bits = value.to_bits();
-            if bits >> 63 == 1 { !bits } else { bits | (1 << 63) }
-        }
-
-        let data_type = self.r#type().data_type();
-        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let elements = (0..addressing.element_count())
-            .map(|index| &self.storage_bytes()[addressing.byte_range_for_flat_index(index)])
-            .collect::<Vec<_>>();
-        let parts = match data_type {
-            DataType::C64 => elements
-                .iter()
-                .map(|bytes| Complex::<f32>::decode(bytes))
-                .map(|value| (f64::from(value.re), f64::from(value.im)))
-                .collect::<Vec<_>>(),
-            DataType::C128 => elements
-                .iter()
-                .map(|bytes| Complex::<f64>::decode(bytes))
-                .map(|value| (value.re, value.im))
-                .collect(),
-            _ => {
-                return Ok(vec![
-                    elements
-                        .iter()
-                        .map(|bytes| match data_type {
-                            DataType::Boolean => u64::from(bool::decode(bytes)),
-                            DataType::I1 => (i1::decode(bytes).value() as u64) ^ (1 << 63),
-                            DataType::I2 => (i2::decode(bytes).value() as u64) ^ (1 << 63),
-                            DataType::I4 => (i4::decode(bytes).value() as u64) ^ (1 << 63),
-                            DataType::I8 => (i8::decode(bytes) as u64) ^ (1 << 63),
-                            DataType::I16 => (i16::decode(bytes) as u64) ^ (1 << 63),
-                            DataType::I32 => (i32::decode(bytes) as u64) ^ (1 << 63),
-                            DataType::I64 => (i64::decode(bytes) as u64) ^ (1 << 63),
-                            DataType::U1 => u64::from(u1::decode(bytes).value()),
-                            DataType::U2 => u64::from(u2::decode(bytes).value()),
-                            DataType::U4 => u64::from(u4::decode(bytes).value()),
-                            DataType::U8 => u64::from(u8::decode(bytes)),
-                            DataType::U16 => u64::from(u16::decode(bytes)),
-                            DataType::U32 => u64::from(u32::decode(bytes)),
-                            DataType::U64 => u64::decode(bytes),
-                            // Type inference rejects token and structural-zero keys, and complex keys are handled
-                            // above, so every remaining data type is a floating-point type.
-                            _ => floating_point_rank(Self::element_as_f64(data_type, bytes).unwrap(), ordering),
-                        })
-                        .collect(),
-                ]);
-            }
-        };
-        Ok(vec![
-            parts.iter().map(|(real, _)| floating_point_rank(*real, ordering)).collect(),
-            parts.iter().map(|(_, imaginary)| floating_point_rank(*imaginary, ordering)).collect(),
-        ])
-    }
-}
-
 /// Computes the flat gather map of a multi-key sort along `axis` of an array with the provided static `dimensions`:
 /// for every flat row-major output position, the returned vector holds the flat input position whose element the
-/// sorted output takes. `key_ranks` holds one order-preserving rank slice per key component (each with one rank per
+/// sorted output takes. `order_keys` holds one order-preserving key slice per key component (each with one key per
 /// element in row-major order). Elements are compared lexicographically across the key slices in order, the sort is
 /// stable (i.e., elements equal on every key keep their original relative order), and [`SortDirection::Descending`]
 /// reverses every key comparison.
-fn sort_permutation(key_ranks: &[&[u64]], dimensions: &[usize], axis: usize, direction: SortDirection) -> Vec<usize> {
+fn sort_permutation(order_keys: &[&[u64]], dimensions: &[usize], axis: usize, direction: SortDirection) -> Vec<usize> {
     let axis_size = dimensions[axis];
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let outer_count: usize = dimensions[..axis].iter().product();
@@ -771,14 +735,14 @@ fn sort_permutation(key_ranks: &[&[u64]], dimensions: &[usize], axis: usize, dir
             permutation.clear();
             permutation.extend(0..axis_size);
             permutation.sort_by(|&left, &right| {
-                key_ranks
+                order_keys
                     .iter()
-                    .map(|ranks| {
-                        let left_rank = ranks[base + left * inner_stride];
-                        let right_rank = ranks[base + right * inner_stride];
+                    .map(|keys| {
+                        let left_key = keys[base + left * inner_stride];
+                        let right_key = keys[base + right * inner_stride];
                         match direction {
-                            SortDirection::Ascending => left_rank.cmp(&right_rank),
-                            SortDirection::Descending => right_rank.cmp(&left_rank),
+                            SortDirection::Ascending => left_key.cmp(&right_key),
+                            SortDirection::Descending => right_key.cmp(&left_key),
                         }
                     })
                     .find(|ordering| ordering.is_ne())
@@ -862,9 +826,28 @@ where
 }
 
 /// Validates a [`top_k`](TopK::top_k) of `k` elements along `axis` of a value of type `value_type` and returns the
-/// normalized axis together with the static dimensions of that value.
+/// normalized axis together with the static dimensions of that value. Complex values are rejected, because complex
+/// numbers have no total order, and so are dynamic dimensions, because the index passenger and the slices need static
+/// extents.
 fn top_k_dimensions(value_type: &ArrayType, k: usize, axis: Axis) -> Result<(usize, Vec<usize>), ProgramError> {
-    let (axis, dimensions) = ranking_dimensions("top_k", value_type, axis)?;
+    let data_type = value_type.data_type();
+    if data_type.is_complex() {
+        return Err(TypeError::invalid(format!("`top_k` does not support data type `{data_type}`")).into());
+    }
+    let dimensions = value_type
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| {
+            dimension.value().ok_or_else(|| ProgramError::UnsupportedOperation {
+                message: "`top_k` does not support dynamic dimensions".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rank = dimensions.len();
+    let axis = axis
+        .normalize(rank)
+        .map_err(|_| TypeError::invalid(format!("`top_k` axis {axis} is out of bounds for rank {rank}")))?;
     if k > dimensions[axis] {
         return Err(ProgramError::InvalidArgument {
             message: format!("`top_k` `k` {k} exceeds size {} of axis {axis}", dimensions[axis]),
@@ -933,198 +916,6 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
     ))
 }
 
-/// Represents the ability to compute the index of the largest element of a value along one axis. Ties select the lowest
-/// index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index of
-/// its first NaN, and the indices are `i32`. Complex values and empty axes are rejected. These are the semantics of
-/// [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html).
-///
-/// [`ArgMax`] is not a primitive operation: [`Self::argmax`] stably sorts the value in descending order under
-/// [`SortOrdering::Canonical`] (which ties signed zeros and orders every NaN first) together with an `i32` index
-/// [`iota`](IotaOperation) passenger, slices the leading entry, and reshapes it to drop the reduced axis.
-///
-/// # Example
-///
-/// The following example finds the largest element of each row, where the first row's tie selects the lower index and
-/// the second row reports its NaN:
-///
-/// ```rust
-/// # use ryft_core::{Array, ArgMax, ProgramError};
-/// # fn main() -> Result<(), ProgramError> {
-/// let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 5.0, 4.0, f64::NAN, 2.0])?;
-/// assert_eq!(matrix.argmax(1)?, Array::vector(vec![1i32, 1])?);
-/// # Ok(())
-/// # }
-/// ```
-pub trait ArgMax: Sized {
-    /// Returns the indices of the largest elements of this value along `axis`, with that axis dropped from the result
-    /// shape.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis`: [`Axis`] along which the elements are ranked. Negative axes count from the end.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if the value has complex elements or dynamic dimensions, if `axis` is out of bounds
-    /// or empty, or if executing or staging the composition fails.
-    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
-}
-
-impl ArgMax for Array {
-    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
-        let (axis, dimensions) = extremal_index_dimensions("argmax", &self.r#type(), axis.into())?;
-        let indices = eager_index_passenger(self, axis)?;
-        extremal_index(vec![self.clone()], indices, dimensions.as_slice(), axis, SortDirection::Descending)
-    }
-}
-
-impl<V: Value<Type = ArrayType> + Sort + Slice + Reshape> ArgMax for V
-where
-    V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
-{
-    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
-        let (axis, dimensions) = extremal_index_dimensions("argmax", &self.r#type(), axis.into())?;
-        let indices = staged_index_passenger(self, axis)?;
-        extremal_index(vec![self.clone()], indices, dimensions.as_slice(), axis, SortDirection::Descending)
-    }
-}
-
-/// Represents the ability to compute the index of the smallest element of a value along one axis. Ties select the
-/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the
-/// index of its first NaN, and the indices are `i32`. Complex values and empty axes are rejected. These are the
-/// semantics of [`jnp.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmin.html).
-///
-/// [`ArgMin`] is not a primitive operation: [`Self::argmin`] stably sorts the value in ascending order under
-/// [`SortOrdering::Canonical`] (which ties signed zeros) together with an `i32` index [`iota`](IotaOperation)
-/// passenger, slices the leading entry, and reshapes it to drop the reduced axis. The canonical ordering places NaNs
-/// last, so floating-point values sort on the two keys `x == x` and `x`, where the first key is `false` exactly for
-/// NaNs and therefore orders them first.
-///
-/// # Example
-///
-/// The following example finds the smallest element of each row, where the first row's tie selects the lower index and
-/// the second row reports its NaN:
-///
-/// ```rust
-/// # use ryft_core::{Array, ArgMin, ProgramError};
-/// # fn main() -> Result<(), ProgramError> {
-/// let matrix = Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, f64::NAN, 2.0])?;
-/// assert_eq!(matrix.argmin(1)?, Array::vector(vec![1i32, 1])?);
-/// # Ok(())
-/// # }
-/// ```
-pub trait ArgMin: Sized {
-    /// Returns the indices of the smallest elements of this value along `axis`, with that axis dropped from the result
-    /// shape.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis`: [`Axis`] along which the elements are ranked. Negative axes count from the end.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if the value has complex elements or dynamic dimensions, if `axis` is out of bounds
-    /// or empty, or if executing or staging the composition fails.
-    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
-}
-
-impl ArgMin for Array {
-    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
-        let (axis, dimensions) = extremal_index_dimensions("argmin", &self.r#type(), axis.into())?;
-        let indices = eager_index_passenger(self, axis)?;
-        extremal_index(argmin_keys(self)?, indices, dimensions.as_slice(), axis, SortDirection::Ascending)
-    }
-}
-
-impl<V: Value<Type = ArrayType> + Compare + Sort + Slice + Reshape> ArgMin for V
-where
-    V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
-{
-    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
-        let (axis, dimensions) = extremal_index_dimensions("argmin", &self.r#type(), axis.into())?;
-        let indices = staged_index_passenger(self, axis)?;
-        extremal_index(argmin_keys(self)?, indices, dimensions.as_slice(), axis, SortDirection::Ascending)
-    }
-}
-
-/// Returns the sort keys that rank `value` for [`ArgMin`]: the value itself, preceded for floating-point values by the
-/// Boolean `value == value`, which is `false` exactly for NaNs and therefore sorts them first in ascending order.
-fn argmin_keys<V: Clone + Typed<Type = ArrayType> + Compare>(value: &V) -> Result<Vec<V>, ProgramError> {
-    if value.r#type().data_type().is_floating_point() {
-        Ok(vec![value.equal(value)?, value.clone()])
-    } else {
-        Ok(vec![value.clone()])
-    }
-}
-
-/// Validates an extremal-index ranking named `name` (i.e., `argmax` or `argmin`) along `axis` of a value of type
-/// `value_type` and returns the normalized axis together with the static dimensions of that value.
-fn extremal_index_dimensions(
-    name: &str,
-    value_type: &ArrayType,
-    axis: Axis,
-) -> Result<(usize, Vec<usize>), ProgramError> {
-    let (axis, dimensions) = ranking_dimensions(name, value_type, axis)?;
-    if dimensions[axis] == 0 {
-        return Err(ProgramError::InvalidArgument { message: format!("`{name}` axis {axis} is empty") });
-    }
-    Ok((axis, dimensions))
-}
-
-/// Computes the index of the extremal element along `axis`, which is shared by every [`ArgMax`] and [`ArgMin`]
-/// implementation: a stable canonical sort on `keys` with the prebuilt index passenger `indices`, sliced to the leading
-/// entry and reshaped to drop the reduced axis.
-fn extremal_index<V: Sort + Slice + Reshape>(
-    mut keys: Vec<V>,
-    indices: V,
-    dimensions: &[usize],
-    axis: usize,
-    direction: SortDirection,
-) -> Result<V, ProgramError> {
-    let key_count = keys.len();
-    keys.push(indices);
-    let sorted_indices = V::sort_with_ordering(keys.as_slice(), axis, key_count, direction, SortOrdering::Canonical)?
-        .pop()
-        .unwrap();
-    let start_indices = vec![0; dimensions.len()];
-    let mut limit_indices = dimensions.to_vec();
-    limit_indices[axis] = 1;
-    let strides = vec![1; dimensions.len()];
-    let leading = sorted_indices.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?;
-    let output_dimensions = dimensions
-        .iter()
-        .enumerate()
-        .filter_map(|(dimension, &size)| (dimension != axis).then_some(Dimension::Static(size)))
-        .collect::<Vec<_>>();
-    leading.reshape(Shape::new(output_dimensions))
-}
-
-/// Validates a ranking named `name` (i.e., `top_k`, `argmax`, or `argmin`) along `axis` of a value of type
-/// `value_type` and returns the normalized axis together with the static dimensions of that value. Rankings reject
-/// complex values, because complex numbers are unordered, and dynamic dimensions, because the index passenger and the
-/// slices need static extents.
-fn ranking_dimensions(name: &str, value_type: &ArrayType, axis: Axis) -> Result<(usize, Vec<usize>), ProgramError> {
-    let data_type = value_type.data_type();
-    if data_type.is_complex() {
-        return Err(TypeError::invalid(format!("`{name}` does not support data type `{data_type}`")).into());
-    }
-    let dimensions = value_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| {
-            dimension.value().ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: format!("`{name}` does not support dynamic dimensions"),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let rank = dimensions.len();
-    let axis = axis
-        .normalize(rank)
-        .map_err(|_| TypeError::invalid(format!("`{name}` axis {axis} is out of bounds for rank {rank}")))?;
-    Ok((axis, dimensions))
-}
-
 /// Returns the `i32` index passenger of a ranking of the eager [`Array`] `value` along `axis`, which holds the index of
 /// every element along that axis. The passenger keeps the sharding of `value`, including its varying manual axes,
 /// because eager arrays do not insert manual-variation transitions.
@@ -1169,7 +960,7 @@ mod tests {
 
     use crate::arrays::{
         ArrayOperation, DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis,
-        Sharding, StridedLayout,
+        Sharding, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
@@ -1956,118 +1747,6 @@ mod tests {
                     %7:f64[1, 2] = reshape [shape=[1, 2]] %5
                     %8:i32[1, 2] = reshape [shape=[1, 2]] %6
                 in (%7)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_argmax() {
-        // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
-        // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the `i32` result, which are the
-        // indices that `jnp.argmax` returns.
-        assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
-        assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
-        assert_eq!(Array::vector(vec![-0.0, 0.0]).unwrap().argmax(0), Ok(Array::scalar(0i32).unwrap()));
-        assert_eq!(Array::vector(vec![false, true, true]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
-        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
-        assert_eq!(matrix.argmax(0), Ok(Array::vector(vec![1i32, 0, 0]).unwrap()));
-        assert_eq!(matrix.argmax(1), Ok(Array::vector(vec![1i32, 0]).unwrap()));
-        assert_eq!(matrix.argmax(-1), matrix.argmax(1));
-
-        // Complex values and empty axes are rejected.
-        assert!(matches!(
-            Array::vector(vec![Complex::new(1.0f64, 0.0)]).unwrap().argmax(0),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`argmax` does not support data type `c128`",
-        ));
-        assert!(matches!(
-            Array::vector(Vec::<f64>::new()).unwrap().argmax(0),
-            Err(ProgramError::InvalidArgument { message }) if message == "`argmax` axis 0 is empty",
-        ));
-
-        // Eager arrays keep the manual variation of their input.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying = Array::from_elements(
-            ArrayType::new_static(DataType::I32, [2])
-                .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-                .unwrap(),
-            &[2i32, 1],
-        )
-        .unwrap();
-        assert_eq!(
-            varying.argmax(0),
-            Array::from_elements(
-                ArrayType::scalar(DataType::I32)
-                    .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap())
-                    .unwrap(),
-                &[0i32],
-            ),
-        );
-    }
-
-    #[test]
-    fn test_argmin() {
-        // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
-        // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the `i32` result, which are the
-        // indices that `jnp.argmin` returns.
-        assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
-        assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
-        assert_eq!(Array::vector(vec![0.0, -0.0]).unwrap().argmin(0), Ok(Array::scalar(0i32).unwrap()));
-        assert_eq!(Array::vector(vec![true, false]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
-        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
-        assert_eq!(matrix.argmin(0), Ok(Array::vector(vec![0i32, 1, 1]).unwrap()));
-        assert_eq!(matrix.argmin(1), Ok(Array::vector(vec![0i32, 1]).unwrap()));
-        assert_eq!(matrix.argmin(-1), matrix.argmin(1));
-
-        // Complex values and empty axes are rejected.
-        assert!(matches!(
-            Array::vector(vec![Complex::new(1.0f64, 0.0)]).unwrap().argmin(0),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`argmin` does not support data type `c128`",
-        ));
-        assert!(matches!(
-            Array::vector(Vec::<f64>::new()).unwrap().argmin(0),
-            Err(ProgramError::InvalidArgument { message }) if message == "`argmin` axis 0 is empty",
-        ));
-    }
-
-    #[test]
-    fn test_argmin_staging() {
-        // Floating-point values rank on the two keys `(x == x, x)`, so NaNs sort first, while other values rank on a
-        // single key.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| x.argmin(0),
-            ArrayType::new_static(DataType::F64, [4]),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_flat_program().to_string(),
-            indoc! {"
-                lambda %0:f64[4] .
-                let %1:i32[4] = iota [type=i32[4], dimension=0]
-                    %2:bool[4] = compare [direction=Equal] %0 %0
-                    %3:bool[4], %4:f64[4], %5:i32[4] = sort [axis=0, key_count=2, direction=ascending] %2 %0 %1
-                    %6:i32[1] = slice [start_indices=[0], limits=[1]] %5
-                    %7:i32[] = reshape [shape=[]] %6
-                in (%7)
-            "}
-            .trim_end(),
-        );
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| x.argmin(0),
-            ArrayType::new_static(DataType::I32, [4]),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_flat_program().to_string(),
-            indoc! {"
-                lambda %0:i32[4] .
-                let %1:i32[4] = iota [type=i32[4], dimension=0]
-                    %2:i32[4], %3:i32[4] = sort [axis=0, direction=ascending] %0 %1
-                    %4:i32[1] = slice [start_indices=[0], limits=[1]] %3
-                    %5:i32[] = reshape [shape=[]] %4
-                in (%5)
             "}
             .trim_end(),
         );
