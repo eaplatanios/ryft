@@ -34,34 +34,36 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Review this module.
-
 /// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RandomAlgorithm {
-    /// The ThreeFry-2x32 counter-based generator (Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"),
-    /// with a `ui64[2]` state holding `[key, counter]`.
+    /// The ThreeFry-2x32 counter-based generator, with a `ui64[2]` state holding `[key, counter]`, from
+    /// [Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"](https://dl.acm.org/doi/10.1145/2063384.2063405).
     ThreeFry,
 
-    /// The Philox-4x32 counter-based generator from the same paper, with a `ui64[3]` state holding `[key, counter]`
-    /// where the 128-bit counter is split into its low and high `u64` halves.
+    /// The Philox-4x32 counter-based generator from the same paper as [`Self::ThreeFry`], with a `ui64[3]` state
+    /// holding `[key, counter]` where the 128-bit counter is split into its low and high `u64` halves.
     Philox,
 }
 
 impl RandomAlgorithm {
-    /// Returns the state type consumed and produced by this algorithm: `ui64[2]` (holding `[key, counter]`) for
+    /// Returns the state type consumed and produced by this algorithm which is `ui64[2]` (holding `[key, counter]`) for
     /// [`ThreeFry`](Self::ThreeFry) and `ui64[3]` (holding `[key, counter]` with the 128-bit counter split into its
     /// low and high `u64` halves) for [`Philox`](Self::Philox).
+    #[inline]
     pub fn state_type(self) -> ArrayType {
-        let size = match self {
-            Self::ThreeFry => 2,
-            Self::Philox => 3,
-        };
-        ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]))
+        ArrayType::new(
+            DataType::U64,
+            Shape::new(vec![Dimension::Static(match self {
+                Self::ThreeFry => 2,
+                Self::Philox => 3,
+            })]),
+        )
     }
 }
 
 impl Display for RandomAlgorithm {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ThreeFry => formatter.write_str("three_fry"),
@@ -69,6 +71,8 @@ impl Display for RandomAlgorithm {
         }
     }
 }
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`RngBitGeneratorOperation`].
 pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
