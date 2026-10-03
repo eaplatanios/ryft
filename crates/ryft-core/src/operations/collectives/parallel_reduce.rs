@@ -26,8 +26,6 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Value};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Name of [`ParallelReduceOperation`]. The operation's [`ReductionKind`] is rendered as its `kind` attribute.
 pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 
@@ -37,21 +35,21 @@ pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 /// Refer to the documentation of [`ParallelReduce`] for more information. One payload represents three forms of the
 /// operation:
 ///
-///   - **Ordinary reductions**, created by [`new`](Self::new), name an axis that an enclosing `batch` level binds.
-///     Their output type is their input type. The `batch` level whose axis name matches reduces its mapped axis, and
-///     every other level forwards the reduction to its parent. A replicated input holds the same value for every batch
-///     item, so a mean, an extremum, or a Boolean reduction of it is the value itself, while a sum, a product, or a
-///     logarithmic sum of exponentials counts it once per item (e.g., yielding `n · v`, `vⁿ`, or `v + ln n` for an
-///     axis of size `n`).
-///   - **Grouped reductions**, created by [`grouped`](Self::grouped), reduce independently within each group of an
-///     equal-sized exact partition of the axis's participants and preserve the input's manual variation, because
+///   - **Ordinary Reductions:** Are created by [`new`](Self::new) and name an axis that an enclosing `batch` level
+///     binds. Their output type is their input type. The `batch` level whose axis name matches reduces its mapped axis,
+///     and every other level forwards the reduction to its parent. A replicated input holds the same value for every
+///     batch item, so a mean, an extremum, or a Boolean reduction of it is the value itself, while a sum, a product,
+///     or a logarithmic sum of exponentials counts it once per item (e.g., yielding `n · v`, `vⁿ`, or `v + ln(n)` for
+///     an axis of size `n`).
+///   - **Grouped Reductions:** Are created by [`grouped`](Self::grouped) and reduce independently within each group of
+///     an equal-sized exact partition of the axis's participants and preserve the input's manual variation, because
 ///     distinct groups can produce distinct results. A `batch` level that binds their axis rejects them.
-///   - **Mesh reductions**, created by [`with_mesh`](Self::with_mesh), reduce over a manual axis of that mesh inside a
-///     manual region (e.g., the body of a `shard_map` operation in the XLA backend). Their input must vary over the
-///     axis, and their output no longer does, because every device holds the full reduction. This is the analogue of
-///     JAX's `psum_invariant` primitive, and of `pmax` and `pmin` inside a `shard_map`. A cross-device reduction
-///     combines one value per device with a single associative operator, so mesh reductions support the sum, product,
-///     extremum, and Boolean kinds directly, while [`ParallelReduce::parallel_reduce`] composes a mean and a
+///   - **Mesh Reductions:** Are created by [`with_mesh`](Self::with_mesh) and reduce over a manual axis of that mesh
+///     inside a manual region (e.g., the body of a `shard_map` operation in the XLA backend). Their input must vary
+///     over the axis, and their output no longer does, because every device holds the full reduction. This is the Ryft
+///     analogue of JAX's `psum_invariant` primitive, and of `pmax` and `pmin` inside a `shard_map`. A cross-device
+///     reduction combines one value per device with a single associative operator, so mesh reductions support the sum,
+///     product, extremum, and Boolean kinds directly, while [`ParallelReduce::parallel_reduce`] composes a mean and a
 ///     logarithmic sum of exponentials from them. A mesh reduction accumulates in the element data type of its input,
 ///     as a cross-device all-reduce does, so unlike a [`ReductionKind::Sum`] across an array axis, it does not widen
 ///     floating-point inputs narrower than `f32` to `f32` (convert the input first where that precision matters). A
@@ -67,7 +65,7 @@ pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 /// type for a maximum) before the participants are combined, and each surviving ragged extent is the elementwise
 /// maximum across the participants. Participants whose local extents exclude a position contribute the identity, so
 /// with multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers
-/// holds the identity. A mean rejects ragged inputs, because its denominator has no single implied meaning: the
+/// holds the identity. A mean rejects ragged inputs, because its denominator has no single implied meaning as the
 /// participant count, the present-value count, and the logical-element count define different operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelReduceOperation {
@@ -86,6 +84,8 @@ pub struct ParallelReduceOperation {
     /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
     mesh: Option<LogicalMesh>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ParallelReduceOperation {
     /// Creates a new ordinary [`ParallelReduceOperation`] over `axis_name` with the provided `kind`.
