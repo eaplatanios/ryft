@@ -159,8 +159,6 @@ pub struct RngBitGeneratorOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
 impl<T: Type> RngBitGeneratorOperation<T> {
     /// Creates a new [`RngBitGeneratorOperation`] with the provided algorithm and declared bits output type.
     #[inline]
@@ -216,13 +214,13 @@ impl<T: Type> RngBitGeneratorOperation<T> {
         Ok(())
     }
 
-    /// Returns this payload with every declared output identity renamed according to `renaming`.
-    fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        Ok(Self::new(self.algorithm, self.output_type.rename_identities(renaming)?))
-    }
-
-    /// Renders this payload independently of its input contract.
-    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+    /// Renders this payload independently of its homogeneous or composite input contract. This is a separate function
+    /// rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads have
+    /// separate [`Operation`] implementations that must render identically, and both must forward their `indentation`
+    /// so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence over trait
+    /// functions during method resolution, so the `self.render(...)` calls in those implementations and in the
+    /// [`Display`] implementation resolve to this function rather than recursing into [`Operation::render`].
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("algorithm", self.algorithm)?;
             operation.field("output_type", &self.output_type)
@@ -233,7 +231,7 @@ impl<T: Type> RngBitGeneratorOperation<T> {
 impl<T: Type> Display for RngBitGeneratorOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render_operation(formatter, 0)
+        self.render(formatter, 0)
     }
 }
 
@@ -262,12 +260,12 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
 
     #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        self.renamed(renaming)
+        Ok(Self::new(self.algorithm, self.output_type.rename_identities(renaming)?))
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
+        self.render(formatter, indentation)
     }
 }
 
@@ -284,8 +282,8 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        // The state is followed by one first-class extent input per dynamic output axis, and each extent must define
-        // the dimension variable that the corresponding declared output axis refers to.
+        // The state is followed by one first-class extent input per dynamic output axis, and each extent
+        // must define the dimension variable that the corresponding declared output axis refers to.
         check_count!("region", region_interfaces, 0, TypeError);
         let dynamic_output_dimensions =
             self.output_type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
@@ -306,12 +304,12 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
 
     #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        self.renamed(renaming)
+        Ok(Self::new(self.algorithm, self.output_type.rename_identities(renaming)?))
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
+        self.render(formatter, indentation)
     }
 }
 
@@ -336,7 +334,6 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
 impl<C: Domain<Type = ArrayIrType, Value: DynamicRngBitGenerator>> InterpretableOperation<C>
     for RngBitGeneratorOperation<ArrayIrType>
 {
-    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -354,14 +351,18 @@ impl<C: Domain<Type = ArrayIrType, Value: DynamicRngBitGenerator>> Interpretable
 impl<T: Type, C: Context<Type = T, Operation: From<RngBitGeneratorOperation<T>>>> PartiallyEvaluatableOperation<C>
     for RngBitGeneratorOperation<T>
 where
-    RngBitGeneratorOperation<T>: Operation<Type = T>,
+    Self: Operation<Type = T>,
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Transpose>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for RngBitGeneratorOperation<ArrayType>
-where
-    C::Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
+impl<
+    C: Context<
+            Type = ArrayType,
+            Value: Transpose,
+            Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for RngBitGeneratorOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -406,15 +407,14 @@ where
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for RngBitGeneratorOperation<ArrayIrType>
 where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<RngBitGeneratorOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>
-        + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -425,6 +425,7 @@ where
         let Some((state, output_dimensions)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
+
         for output_dimension in output_dimensions {
             output_dimension.validate_replicated_dimension()?;
         }
@@ -487,18 +488,19 @@ impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type
 impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 /// Represents the ability to generate deterministic, uniformly distributed random bits from a counter-based generator
-/// state, which is the primitive underlying [`Random`]. Randomness is functional: the same state always produces the
-/// same bits and the same advanced state, and drawing again requires threading the advanced state or deriving fresh
-/// states with [`Random::split_key`].
+/// state, which is the primitive underlying [`Random`]. Randomness is _functional_. Specifically, the same state always
+/// produces the same bits and the same advanced state, and drawing again requires threading the advanced state or
+/// deriving fresh states with [`Random::split_key`].
 ///
-/// The state must have the [`RandomAlgorithm::state_type`] of the requested algorithm, and the output element type
-/// must be `u8`, `u16`, `u32`, or `u64`. Narrower outputs keep the low bits of one 32-bit word per element. The output
-/// must be statically shaped ([`DynamicRngBitGenerator`] supports dynamic shapes), and neither the state nor the
-/// output may be sharded, since every shard would otherwise draw the same bits. Derive per-shard states inside
-/// `shard_map` instead. Concrete [`Array`]s generate the bits immediately, bit-exactly with XLA's
-/// [`rng_bit_generator` expansion](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc), while
-/// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers, and
-/// so their derivative is a structural zero.
+/// The state must have the [`RandomAlgorithm::state_type`] of the requested algorithm, and the output element type must
+/// be `u8`, `u16`, `u32`, or `u64`. Narrower outputs keep the low bits of one 32-bit word per element. The output must
+/// be statically shaped (refer to [`DynamicRngBitGenerator`] for dynamic shape support), and neither the state nor the
+/// output may be sharded, since every shard would otherwise draw the same bits. For XLA's `shard_map` operation, for
+/// example, you must derive per-shard states inside that operation instead. Concrete [`Array`]s generate the bits
+/// immediately, bit-identical with XLA's
+/// [`rng_bit_generator`](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) expansion, while
+/// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers,
+/// and so their derivative is a structural zero.
 ///
 /// # Example
 ///
@@ -523,8 +525,8 @@ pub trait RngBitGenerator: Sized {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if this state does not have the state type of `algorithm`, if `output_type` is not a
-    /// statically shaped and unsharded unsigned-integer type, or if the context of the value fails to bind the
+    /// Returns a [`ProgramError`] if this state does not have the state type of `algorithm`, if `output_type` is not
+    /// a statically shaped and unsharded unsigned-integer type, or if the context of the value fails to bind the
     /// operation.
     fn rng_bit_generator(
         &self,
@@ -554,6 +556,7 @@ impl RngBitGenerator for Array {
             DataType::U16 => Array::from_fn_elements(output_type.clone(), |index| Ok(words[index] as u16)),
             _ => Array::from_elements(output_type.clone(), &words),
         };
+
         let state = self.elements::<u64>()?;
         let key = state[0];
         let (advanced_state, bits) = match algorithm {
@@ -580,13 +583,17 @@ impl RngBitGenerator for Array {
                 (vec![key, counter as u64, (counter >> 64) as u64], bits)
             }
         };
+
         Ok((Array::from_elements(self.r#type().into_owned(), &advanced_state)?, bits))
     }
 }
 
-impl<V: Value<Type = ArrayType>> RngBitGenerator for V
-where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
+impl<
+    V: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
+        >,
+> RngBitGenerator for V
 {
     fn rng_bit_generator(
         &self,
@@ -606,8 +613,8 @@ where
 }
 
 /// Represents the ability to generate random bits whose output shape may be dynamic, in the mixed [`ArrayIrValue`]
-/// family. [`Self::dynamic_rng_bit_generator`] follows the semantics of [`RngBitGenerator`], except that each dynamic
-/// axis of the declared output type takes its runtime extent from one first-class dimension value. Concrete
+/// family. [`Self::dynamic_rng_bit_generator`] follows the semantics of [`RngBitGenerator`], except that each
+/// dynamic axis of the declared output type takes its runtime extent from one first-class dimension value. Concrete
 /// [`ArrayIrValue`]s generate exactly the bits that [`RngBitGenerator`] generates for the resolved static shape, while
 /// context-carrying values bind an [`RngBitGeneratorOperation<ArrayIrType>`].
 ///
@@ -693,9 +700,12 @@ impl<A: Value<Type = ArrayType> + RngBitGenerator> DynamicRngBitGenerator for Ar
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicRngBitGenerator for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
+        >,
+> DynamicRngBitGenerator for V
 {
     fn dynamic_rng_bit_generator(
         &self,
@@ -715,6 +725,8 @@ where
         Ok((state, bits))
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 /// Represents the ability to draw random samples from a counter-based generator state. Every function selects the
 /// [`RandomAlgorithm`] from the state type (see [`RandomAlgorithm::from_state_type`]), threads the state functionally
