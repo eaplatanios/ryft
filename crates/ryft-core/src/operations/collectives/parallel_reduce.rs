@@ -85,8 +85,6 @@ pub struct ParallelReduceOperation {
     mesh: Option<LogicalMesh>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ParallelReduceOperation {
     /// Creates a new ordinary [`ParallelReduceOperation`] with the provided `kind` over `axis_name`.
     #[inline]
@@ -101,6 +99,7 @@ impl ParallelReduceOperation {
     ///
     /// Returns a [`TypeError`] if `axis_size` is zero or if `axis_index_groups` is empty, contains an empty group,
     /// contains groups of different sizes, or does not contain every participant in `0..axis_size` exactly once.
+    #[inline]
     pub fn grouped(
         kind: ReductionKind,
         axis_name: String,
@@ -140,8 +139,8 @@ impl ParallelReduceOperation {
         self.axis_size
     }
 
-    /// Returns the ordered participant groups of a grouped [`ParallelReduceOperation`], or [`None`] for an ungrouped
-    /// one.
+    /// Returns the ordered participant groups of a grouped [`ParallelReduceOperation`],
+    /// or [`None`] for an ungrouped one.
     #[inline]
     pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
         self.axis_index_groups.as_deref()
@@ -155,8 +154,9 @@ impl ParallelReduceOperation {
         self.mesh.as_ref()
     }
 
-    /// Returns the number of participants in each group of a grouped [`ParallelReduceOperation`], or [`None`] for an
-    /// ungrouped one, whose participant count is supplied by the enclosing binder.
+    // TODO(eaplatanios): Can we delete this function? I don't think it has any users.
+    /// Returns the number of participants in each group of a grouped [`ParallelReduceOperation`], or [`None`]
+    /// for an ungrouped one, whose participant count is supplied by the enclosing binder.
     #[inline]
     pub fn group_size(&self) -> Option<usize> {
         self.axis_index_groups.as_ref().and_then(|groups| groups.first()).map(Vec::len)
@@ -169,6 +169,8 @@ impl Display for ParallelReduceOperation {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for ParallelReduceOperation {
     type Type = ArrayType;
@@ -792,7 +794,6 @@ mod tests {
         assert_eq!(operation.axis_name(), "i");
         assert_eq!(operation.axis_size(), None);
         assert_eq!(operation.axis_index_groups(), None);
-        assert_eq!(operation.group_size(), None);
         assert_eq!(operation.mesh(), None);
         assert_eq!(operation.to_string(), "parallel_reduce [kind=sum, axis_name=\"i\"]");
 
@@ -803,7 +804,6 @@ mod tests {
         assert_eq!(grouped.name(), PARALLEL_REDUCE_OPERATION_NAME);
         assert_eq!(grouped.axis_size(), Some(4));
         assert_eq!(grouped.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
-        assert_eq!(grouped.group_size(), Some(2));
         assert_eq!(grouped.mesh(), None);
         assert_eq!(
             grouped.to_string(),
