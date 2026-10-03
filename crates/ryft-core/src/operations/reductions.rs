@@ -4141,12 +4141,11 @@ mod tests {
 
     #[test]
     fn test_argmax_type_inference() {
-        let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
         check_operation_type_inference!(
             operation = ArgMaxOperation::new(1, DataType::I32),
             cases = [
                 {
-                    input_types = [matrix.clone()],
+                    input_types = [ArrayType::new_static(DataType::F32, [2, 3])],
                     output_types = [ArrayType::new_static(DataType::I32, [2])],
                 },
                 {
@@ -4178,7 +4177,6 @@ mod tests {
             operation = ArgMaxOperation::new(0, DataType::U8),
             cases = [
                 {
-                    type = ArrayType,
                     input_types = [ArrayType::new_static(DataType::F32, [256])],
                     output_types = [ArrayType::scalar(DataType::U8)],
                 },
@@ -4188,35 +4186,49 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ArgMaxOperation::new(0, DataType::I8),
             cases = [{
-                type = ArrayType,
                 input_types = [ArrayType::new_static(DataType::F32, [129])],
                 error = "`argmax` index data type `i8` cannot represent index 128 of axis 0",
             }],
         );
+
         check_operation_type_inference!(
             operation = ArgMaxOperation::new(0, DataType::F32),
             cases = [{
-                type = ArrayType,
                 input_types = [ArrayType::new_static(DataType::F32, [3])],
                 error = "`argmax` requires an integer index data type but got `f32`",
             }],
         );
-        let bounded = DimensionVariable::new("length", DimensionBounds::new(1, Some(257)).unwrap());
-        let possibly_empty = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let bounded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded.clone())]));
+
+        let bounded_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "length",
+                DimensionBounds::new(1, Some(257)).unwrap(),
+            ))]),
+        );
+
         let unbounded_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::at_least(1)))]),
         );
+
+        let possibly_empty_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "length",
+                DimensionBounds::new(0, Some(4)).unwrap(),
+            ))]),
+        );
+
         check_operation_type_inference!(
             operation = ArgMaxOperation::new(0, DataType::U8),
             cases = [
                 {
-                    type = ArrayType,
-                    input_types = [bounded_type.clone()],
+                    input_types = [bounded_type],
                     output_types = [ArrayType::scalar(DataType::U8)],
                 },
                 {
@@ -4224,15 +4236,15 @@ mod tests {
                     error = "`argmax` index data type `u8` cannot represent index 9223372036854775806 of axis 0",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(possibly_empty)]))],
+                    input_types = [possibly_empty_type],
                     error = "`argmax` requires a non-empty axis but axis 0 has extent `length`",
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ArgMaxOperation::new(0, DataType::I64),
             cases = [{
-                type = ArrayType,
                 input_types = [unbounded_type],
                 output_types = [ArrayType::scalar(DataType::I64)],
             }],
@@ -4427,7 +4439,7 @@ mod tests {
                 .map(BatchedOutputs::into_parts),
             Ok((
                 vec![ArrayBatch::new(Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap()],
-                vec![length]
+                vec![length],
             )),
         );
     }
@@ -4454,6 +4466,16 @@ mod tests {
 
         // A function that uses the index as a coefficient differentiates as if the index were a constant, in both
         // forward and reverse mode (e.g., `sum(x) · argmax(x)` has the gradient `argmax(x)` everywhere).
+        assert_eq!(
+            differentiate_at(Array::vector(vec![1.0, 3.0, 2.0]).unwrap()).jvp(
+                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
+                |input| {
+                    let index = input.argmax(0)?.convert_element_type(DataType::F64)?;
+                    Ok(input.reduce_sum(&[0], None)? * index)
+                },
+            ),
+            Ok((Array::scalar(6.0).unwrap(), Array::scalar(3.0).unwrap())),
+        );
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0, 3.0, 2.0]).unwrap()).gradient(|input| {
                 let index = input.argmax(0)?.convert_element_type(DataType::F64)?;
@@ -4517,7 +4539,7 @@ mod tests {
     fn test_argmin_interpretation() {
         // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
         // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the result, which are the indices that
-        // JAX's `lax.argmin` returns.
+        // JAX's `jax.lax.argmin` returns.
         assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
         assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
         assert_eq!(Array::vector(vec![0.0, -0.0]).unwrap().argmin(0), Ok(Array::scalar(0i32).unwrap()));
@@ -4544,6 +4566,27 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`argmin` axis 2 is out of bounds for rank 2",
         ));
+    }
+
+    #[test]
+    fn test_argmin_interpretation_staging() {
+        // Context-carrying values bind an `ArgMinOperation` through their context, with the axis already normalized.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input.argmin_with_index_data_type(-2, DataType::I64)
+            },
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:i64[3] = argmin [axis=0, index_data_type=i64] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -4608,7 +4651,7 @@ mod tests {
                 .map(BatchedOutputs::into_parts),
             Ok((
                 vec![ArrayBatch::new(Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap()],
-                vec![length]
+                vec![length],
             )),
         );
     }
