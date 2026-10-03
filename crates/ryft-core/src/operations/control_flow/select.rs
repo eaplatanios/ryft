@@ -1,32 +1,32 @@
-//! Contains the `select` operation: [`SelectOperation`], which chooses each output element from one of two branch
-//! inputs according to the corresponding element of a Boolean condition input, together with the [`Select`] value
-//! capability that computes or stages it and its interpretation, partial-evaluation, batching, forward-mode
-//! differentiation, and transposition rules. Unlike [`ConditionOperation`](super::ConditionOperation), which executes
-//! only one of its attached branch [`Region`](crate::Region)s, `select` consumes two ordinary branch values that have
-//! both already been computed.
+//! Contains [`SelectOperation`], which chooses each output element from one of two branch inputs according to the
+//! corresponding element of a Boolean condition input, together with the [`Select`] value capability that computes
+//! or stages it and its interpretation, partial evaluation, batching, forward mode differentiation, and transposition
+//! rules. Unlike [`ConditionOperation`](crate::ConditionOperation), which executes only one of its attached branch
+//! [`Region`](crate::Region)s, `select` consumes two ordinary branch values that have both already been computed.
 //!
 //! `select(condition, on_true, on_false)` takes the `on_true` element wherever `condition` is `true` and the `on_false`
 //! element elsewhere. The shapes of all three inputs broadcast together, and the two branch [`DataType`]s promote to
 //! the output data type. The condition must be [`DataType::Boolean`] and it does not take part in that promotion
-//! because it is a mask rather than a value. This is the three-argument form of
-//! [JAX's `jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html), which is more permissive than
-//! `lax.select`, whose inputs must share one shape and data type. The output keeps the broadcast placement of its
-//! inputs and uses the dense row-major layout. Branches that carry pending reductions must carry identical reduction
-//! state, which the output inherits, while the condition must neither be unreduced nor vary over any of those reduction
-//! axes, because selection commutes with a pending sum only when every shard selects the same way.
+//! because it is a mask rather than a value. This is the three-argument form of JAX's
+//! [`jax.numpy.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html), which is more permissive than
+//! [`jax.lax.select`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.select.html), whose inputs must share one
+//! shape and data type. The output keeps the broadcast placement of its inputs and uses the dense row-major layout.
+//! Branches that carry pending reductions must carry identical reduction state, which the output inherits, while the
+//! condition must neither be unreduced nor vary over any of those reduction axes, because selection commutes with a
+//! pending sum only when every shard selects the same way.
 //!
-//! For a fixed condition, `select` is linear in its two branches. Forward-mode differentiation therefore selects the
-//! branch tangents under the primal condition and keeps a structural-zero output tangent when both branch tangents
-//! are structural zeros. Transposition requires a known condition and routes the output cotangent into the branch
-//! that each element selected (i.e., `select(condition, cotangent, 0)` for `on_true` and
-//! `select(condition, 0, cotangent)` for `on_false`), reducing broadcast axes and converting element types back to
-//! each linear branch's cotangent type. The Boolean condition has no tangent space, and a known branch receives no
-//! cotangent. Note that the unselected branch still receives a zero cotangent. A non-finite derivative inside that
-//! branch (e.g., of `sqrt` at zero) therefore turns its zero cotangent into `NaN`, so a branch that is only
-//! well-defined where it is selected should also be guarded on its own input. Refer to the
-//! [JAX FAQ](https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where) for more information.
-//! Batching follows the standard elementwise broadcasting rule. Backends lower `select` to their elementwise selection
-//! construct after broadcasting and converting its inputs (e.g.,
+//! For a fixed condition, `select` is linear in its two branches. Forward mode differentiation therefore selects the
+//! branch tangents under the primal condition and keeps a structural-zero output tangent when both branch tangents are
+//! structural zeros. Transposition requires a known condition and routes the output cotangent into the branch that each
+//! element selected (i.e., `select(condition, cotangent, 0)` for `on_true` and `select(condition, 0, cotangent)` for
+//! `on_false`), reducing broadcast axes and converting element types back to each linear branch's cotangent type. The
+//! Boolean condition has no tangent space, and a known branch receives no cotangent. Note that the unselected branch
+//! still receives a zero cotangent. A non-finite derivative inside that branch (e.g., of `sqrt` at zero) therefore
+//! turns its zero cotangent into `NaN`, so a branch that is only well-defined where it is selected should also be
+//! guarded on its own input. Refer to the related JAX
+//! [FAQ](https://docs.jax.dev/en/latest/faq.html#gradients-contain-nan-where-using-where) for more information on this
+//! topic. Batching follows the standard elementwise broadcasting rule. Backends lower `select` to their elementwise
+//! selection construct after broadcasting and converting its inputs (e.g.,
 //! [`stablehlo.select`](https://openxla.org/stablehlo/spec#select) in the XLA backend).
 //!
 //! # Example
@@ -67,8 +67,6 @@
 //! # }
 //! ```
 
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -103,14 +101,14 @@ pub const SELECT_OPERATION_NAME: &str = "select";
 #[derive(Clone, Debug)]
 pub struct SelectOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl<T: Type> Copy for SelectOperation<T> {}
-
 impl<T: Type> SelectOperation<T> {
     /// Creates a new [`SelectOperation`].
     pub const fn new() -> Self {
         Self(PhantomData)
     }
 }
+
+impl<T: Type> Copy for SelectOperation<T> {}
 
 impl<T: Type> Display for SelectOperation<T> {
     #[inline]
@@ -136,7 +134,8 @@ impl Operation for SelectOperation<DataType> {
         check_count!("input", input_types, 3, TypeError);
         if !input_types[0].is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{SELECT_OPERATION_NAME}` condition data type `{}` is not `{}`",
+                "`{}` condition data type `{}` is not `{}`",
+                SELECT_OPERATION_NAME,
                 input_types[0],
                 DataType::Boolean,
             )));
@@ -186,7 +185,8 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
         if !condition.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{SELECT_OPERATION_NAME}` condition data type `{}` is not `{}`",
+                "`{}` condition data type `{}` is not `{}`",
+                SELECT_OPERATION_NAME,
                 condition.data_type(),
                 DataType::Boolean,
             )));
@@ -201,12 +201,14 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
                 "`{SELECT_OPERATION_NAME}` branches must carry identical reduction state",
             )));
         }
+
         if let Some(sharding) = condition.sharding() {
             if !sharding.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{SELECT_OPERATION_NAME}` condition must not carry unreduced state",
                 )));
             }
+
             for axis in unreduced.union(&reduced) {
                 if sharding.varying_manual_axes().contains(axis)
                     || sharding
@@ -309,8 +311,8 @@ impl_differentiable_operation! {
     where
         T: Type,
         V::Type: DifferentiableType,
-        O: From<SelectOperation<V::Type>>
-            + From<ZeroLikeOperation<V::Type>>
+        O: From<ZeroLikeOperation<V::Type>>
+            + From<SelectOperation<V::Type>>
             + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
@@ -318,16 +320,17 @@ impl_differentiable_operation! {
             // The Boolean condition has no tangent space, and so it must be a known input. Each linear branch then
             // receives the output cotangent at the elements that the condition selected from it and zero elsewhere
             // (i.e., `select(condition, cotangent, 0)` for `on_true` and `select(condition, 0, cotangent)` for
-            // `on_false`), reduced over its broadcast axes and converted to its own cotangent type. A known branch, an
-            // unrequested cotangent, and a structural-zero output cotangent stage no work.
+            // `on_false`), reduced over its broadcast axes and converted to its own cotangent type. A known branch,
+            // an unrequested cotangent, and a structural-zero output cotangent stage no work.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 3, DifferentiationError);
             if inputs[0].is_unknown() {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "operation `{SELECT_OPERATION_NAME}` does not support transposition for input pattern \
+                        "operation `{}` does not support transposition for input pattern \
                          [condition = linear, on_true = {}, on_false = {}]",
+                        SELECT_OPERATION_NAME,
                         if inputs[1].is_unknown() { "linear" } else { "known" },
                         if inputs[2].is_unknown() { "linear" } else { "known" },
                     ),
@@ -473,12 +476,12 @@ impl Select for Array {
             let output_range = output_addressing.byte_range_for_flat_index(output_index);
             output_bytes[output_range].copy_from_slice(&source[source_range]);
         }
+
         Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
     }
 }
 
 impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
-    #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let condition = <Self as ValueProjection<ArrayType>>::projected(condition)?;
         let on_true = <Self as ValueProjection<ArrayType>>::projected(on_true)?;
@@ -487,15 +490,15 @@ impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
     }
 }
 
-// Context-carrying values (e.g., staged tracers, batching tracers, and differentiation tracers) select by binding a
-// `SelectOperation` through their own context after aligning the manual variation of all three inputs. The
+// Context-carrying values (e.g., staged tracers, batching tracers, and differentiation tracers) select by binding
+// a `SelectOperation` through their own context after aligning the manual variation of all three inputs. The
 // `From<SelectOperation<T>>` bound keeps this implementation disjoint from the eager value implementations above,
 // whose dispatch context operation is a `ConstantOperation`.
-impl<T: Type, V: Value<Type = T> + ManualVariationAlignment<T>> Select for V
-where
-    V::DispatchDomain: Context<Operation: From<SelectOperation<T>>>,
+impl<
+    T: Type,
+    V: Value<Type = T, DispatchDomain: Context<Operation: From<SelectOperation<T>>>> + ManualVariationAlignment<T>,
+> Select for V
 {
-    #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let inputs = V::align_manual_variation(&[condition.clone(), on_true.clone(), on_false.clone()])?;
         let mut outputs = condition.dispatch_domain().bind(SelectOperation::new(), Vec::new(), &inputs)?;
