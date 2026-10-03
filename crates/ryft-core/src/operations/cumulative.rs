@@ -853,16 +853,15 @@ impl Array {
 /// This is Ryft's port of the log-depth Blelloch construction that JAX's
 /// [`jax.lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements,
 /// and it exists here to support cumulative operations whose combining operators are non-linear and have no closed-form
-/// primitive derivatives. Specifically, the non-linear [`CumulativeKind`](crate::CumulativeKind)s define their forward
-/// mode differentiation rules by differentiating _through_ this decomposition rather than by carrying a bespoke
-/// gradient formula. It is also useful on its own for combining operators that no cumulative kind covers.
+/// primitive derivatives. Specifically, the non-linear [`CumulativeKind`]s define their forward mode differentiation
+/// rules by differentiating _through_ this decomposition rather than by carrying a bespoke gradient formula. It is also
+/// useful on its own for combining operators that no cumulative kind covers.
 ///
-/// For an operator that a cumulative kind does cover (e.g., a running sum or maximum), prefer the
-/// [`Cumulative`](crate::Cumulative) capability. It stages a single cumulative instruction instead of this
-/// construction, which keeps programs small and leaves each backend free to choose its own lowering (e.g., the XLA
-/// backend lowers cumulative sums to [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop)
-/// on GPUs). The two can also round floating-point results differently in their last bits, because they associate the
-/// combinations differently.
+/// For an operator that a cumulative kind does cover (e.g., a running sum or maximum), prefer the [`Cumulative`]
+/// capability. It stages a single cumulative instruction instead of this construction, which keeps programs small and
+/// leaves each backend free to choose its own lowering (e.g., the XLA backend lowers cumulative sums to
+/// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) on GPUs). The two can also round
+/// floating-point results differently in their last bits, because they associate the combinations differently.
 ///
 /// Like JAX's, the scan runs over a whole structure of arrays at once: `values` is any [`Parameterized`] structure
 /// of arrays (e.g., a single array, a tuple, a vector, or a derived structure), and `combine_fn` receives and returns

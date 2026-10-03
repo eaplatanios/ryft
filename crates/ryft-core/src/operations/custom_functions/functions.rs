@@ -2299,10 +2299,17 @@ where
         if !axis.is_replicated() {
             continue;
         }
+        // The leaf is broadcast by a batch of the complete input that returns only that leaf, so that its extent is
+        // inferred exactly as in the batches that it is compared with.
+        let input_value = I::from_parameters(structure.clone(), inputs.clone()).map_err(BatchingError::from)?;
+        let axes =
+            I::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone()).map_err(BatchingError::from)?;
         let broadcast: V = batch(
-            |value| Ok(value),
-            inputs[input].clone(),
-            BatchAxis::replicated(),
+            |tracers: I::To<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>| {
+                Ok(tracers.into_parameters().nth(input).unwrap())
+            },
+            input_value,
+            axes,
             BatchAxis::new(0),
             batch_axis.clone(),
         )?;
@@ -5232,8 +5239,7 @@ mod tests {
             vector(vec![6.0, 8.0, 13.0]),
             vector(vec![34.0, 39.0, 44.0]),
         ];
-        assert_eq!(
-            outputs, expected);
+        assert_eq!(outputs, expected);
         assert_eq!(output_axes, vec![mapped, replicated, mapped, mapped]);
         assert_eq!(batched(&plain_program.jvp().unwrap(), &axes, inputs).1, expected);
         assert_eq!(batched_jvp.to_string(),
@@ -5287,7 +5293,43 @@ mod tests {
         // Linearization stages a pushforward call, whose batching takes the same exact path when its residual primals
         // have the axes above, and structural batching when they are replicated (e.g., in a forward-mode Jacobian).
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.tangent().to_string(), "");
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
+                let %6:f64[], %7:f64[] = custom_function [name=\"pushforward(custom_function)\"] %3 %4 %5 %0 %1 %2 [
+                    primal={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
+                        let %6:f64[] = mul %1 %3
+                            %7:f64[] = mul %0 %4
+                            %8:f64[] = add %6 %7
+                            %9:f64[] = mul %2 %4
+                            %10:f64[] = mul %1 %5
+                            %11:f64[] = add %9 %10
+                        in (%8, %11)
+                    },
+                ]
+                in (%6, %7)
+            "}
+            .trim_end(),
+        );
+        let tangent = linearization.tangent();
+        let tangents = vec![vector(vec![1.0, 0.5, 0.25]), vector(vec![2.0, 3.0, 4.0]), scalar(6.0)];
+        let mut inputs = tangents.clone();
+        inputs.extend(primals.clone());
+        let (_, outputs, output_axes) =
+            batched(tangent, &[mapped, mapped, replicated, mapped, replicated, replicated], inputs);
+        assert_eq!(outputs, vec![vector(vec![6.0, 8.0, 13.0]), vector(vec![34.0, 39.0, 44.0])]);
+        assert_eq!(output_axes, vec![mapped; 2]);
+
+        // A forward-mode Jacobian at `(x, y, z) = (2, 4, 5)` batches the pushforward over the basis tangents with
+        // replicated primals, which applies the rule once and batches its derivative structurally.
+        let mut inputs = vec![vector(vec![1.0, 0.0, 0.0]), vector(vec![0.0, 1.0, 0.0]), vector(vec![0.0, 0.0, 1.0])];
+        inputs.extend([scalar(2.0), scalar(4.0), scalar(5.0)]);
+        let (_, outputs, output_axes) =
+            batched(tangent, &[mapped, mapped, mapped, replicated, replicated, replicated], inputs);
+        assert_eq!(outputs, vec![vector(vec![4.0, 2.0, 0.0]), vector(vec![0.0, 5.0, 4.0])]);
+        assert_eq!(output_axes, vec![mapped; 2]);
     }
 
     #[test]
@@ -5344,8 +5386,7 @@ mod tests {
         let function = custom_function(primal).with_batching(rule);
         let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type.clone()).unwrap();
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
-        assert_eq!(
-            output_axes, vec![BatchAxis::new(0); 2]);
+        assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
         assert_eq!(batched.interpret(inputs.clone()), outputs(vec![2.0, 4.0, 6.0]));
 
         let function = custom_function(primal).with_axis_dependent_batching(rule);
@@ -5437,6 +5478,55 @@ mod tests {
         let (batched, output_axes) = batched_jvp(program.into_flat_program());
         assert_eq!(output_axes, vec![mapped; 2]);
         assert_eq!(batched.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_check_batching_rule_consistency() {
+        // A rule that computes `2xy` when both inputs are mapped and `3xy` otherwise changes its batched output when the
+        // replicated `y` is broadcast, while a rule that computes `xy` for every axis pattern does not.
+        type Tracer = DomainTracer<ArrayContext>;
+        let scaled_product = |inconsistent: bool| {
+            custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+                move |_: BatchingLevelExtent<Tracer>,
+                      (x, y): (Tracer, Tracer),
+                      (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                    let product = x * y;
+                    let scale = match inconsistent && !x_axis.is_replicated() && !y_axis.is_replicated() {
+                        true => 2.0,
+                        false => 1.0,
+                    };
+                    let scale = product.context().lift(Array::scalar(scale)?)?;
+                    Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
+                },
+            )
+        };
+        let input = (Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), Array::scalar(4.0f64).unwrap());
+        let input_axes = (BatchAxis::new(0), BatchAxis::replicated());
+        let check = |inconsistent: bool| {
+            let function = scaled_product(inconsistent);
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                input.clone(),
+                input_axes,
+                None,
+                |expected: &Array, actual: &Array| expected == actual,
+            )
+        };
+        assert_eq!(check(false), Ok(()));
+        assert_eq!(check(true), Err(BatchingRuleConsistencyError::Inconsistent { input: 1, output: 0 }));
+
+        // Every input of a fully replicated batch is broadcast in turn, which requires an explicit extent.
+        let function = scaled_product(true);
+        assert_eq!(
+            check_batching_rule_consistency(
+                |inputs| function.call(inputs),
+                (Array::scalar(1.0f64).unwrap(), Array::scalar(4.0f64).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::replicated()),
+                3,
+                |expected: &Array, actual: &Array| expected == actual,
+            ),
+            Ok(()),
+        );
     }
 
     #[test]
