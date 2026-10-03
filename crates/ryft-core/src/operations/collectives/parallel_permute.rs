@@ -1,4 +1,3 @@
-use std::fmt::Display;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
@@ -8,28 +7,27 @@ use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver,
+    
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+    ProgramError, ProjectedValue, TypeError, Value,
     ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review from here onwards.
 
-use super::{linear_collective, linear_collective_output_type, resolve_named_axis_size, transpose_linear_collective};
+use super::{define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, resolve_named_axis_size};
 
-linear_collective! {
+/// Canonical operation name for [`ParallelPermuteOperation`].
+pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
+
+define_linear_collective_operation!(
     /// [`Operation`] that sends every participant's input to another participant along the named axis according to
     /// explicit `(source, target)` pairs — the analogue of
     /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
@@ -39,15 +37,15 @@ linear_collective! {
     /// reassembling it in target order from per-item slices, with zero slices at untargeted positions. Bounded ragged
     /// extents follow the same source-to-target routing as their packed values; untargeted participants receive zero
     /// extents together with their zero-filled values.
-    operation = ParallelPermuteOperation,
-    name = PARALLEL_PERMUTE_OPERATION_NAME = "parallel_permute",
-    accepts_unreduced = false,
+    ParallelPermuteOperation,
+    PARALLEL_PERMUTE_OPERATION_NAME,
     fields = {
         /// Pairs of `(source, target)` positions along the named axis: the value of participant `source` is sent to
         /// participant `target`.
         source_target_pairs: Vec<(usize, usize)>,
     },
-    infer = |operation, input_type, dimensions| {
+    check_array_types = [@no_unreduced],
+    infer_output_type = |operation, input_type, dimensions| {
         let mut seen_sources = std::collections::BTreeSet::new();
         let mut seen_targets = std::collections::BTreeSet::new();
         for (source, target) in &operation.source_target_pairs {
@@ -66,7 +64,7 @@ linear_collective! {
         }
         linear_collective_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
     },
-}
+);
 
 impl ParallelPermuteOperation {
     /// Returns the `(source, target)` pairs of participant positions along the named axis.
@@ -163,43 +161,15 @@ where
     }
 }
 
-linear_collective!(@differentiation ParallelPermuteOperation);
-
 // Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
 // `(target, source)`, so the input cotangent is the permutation with every pair inverted.
-impl<V, O> TransposableOperation<V, O> for ParallelPermuteOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelPermuteOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            let inverted_pairs =
-                self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
-            transpose_linear_collective(
-                context,
-                inputs,
-                outputs,
-                ParallelPermuteOperation::new(self.axis_name.clone(), self.axis_size, inverted_pairs),
-            )
-        };
-        let contributions = contributions?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
+impl_differentiable_linear_collective_operation! {
+    ParallelPermuteOperation,
+    transpose = |operation| -> ParallelPermuteOperation {
+        let inverted_pairs =
+            operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
+        ParallelPermuteOperation::new(operation.axis_name.clone(), operation.axis_size, inverted_pairs)
+    },
 }
 
 impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOperation<A> {

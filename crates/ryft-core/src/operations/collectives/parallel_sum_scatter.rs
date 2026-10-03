@@ -4,7 +4,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::fmt::Display;
 
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
@@ -18,13 +17,13 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
+use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
+use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -35,12 +34,10 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue,
     RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
 use super::{
@@ -48,8 +45,8 @@ use super::{
     divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    linear_collective, linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
-    transpose_linear_collective, validate_explicit_collective_output_extents,
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
+    validate_explicit_collective_output_extents,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary inputs preserve their variance metadata. An input that is
@@ -180,7 +177,10 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
     Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation)?.into()])
 }
 
-linear_collective! {
+/// Canonical operation name for [`ParallelSumScatterOperation`].
+pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
+
+define_linear_collective_operation!(
     /// [`Operation`] that sums every participant's input across the named axis and scatters the result: each
     /// participant receives its own chunk of the sum along `scatter_axis` — the analogue of
     /// [JAX's `psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) with
@@ -189,9 +189,8 @@ linear_collective! {
     /// The collective is linear and its transpose is [`AllGatherOperation`] over the same axis and dimension. A
     /// matching `batch` level consumes the mapped batch axis by summing over it and re-mapping the chunks of
     /// `scatter_axis` onto it, so batch item `i` receives chunk `i` of the sum.
-    operation = ParallelSumScatterOperation,
-    name = PARALLEL_SUM_SCATTER_OPERATION_NAME = "parallel_sum_scatter",
-    accepts_unreduced = true,
+    ParallelSumScatterOperation,
+    PARALLEL_SUM_SCATTER_OPERATION_NAME,
     fields = {
         /// Axis of the input along which the summed result is scattered across the participants.
         scatter_axis: usize,
@@ -199,7 +198,7 @@ linear_collective! {
         /// Shared rank and participant-group semantics.
         options: CollectiveOptions,
     },
-    infer = |operation, input_type, dimensions| {
+    infer_output_type = |operation, input_type, dimensions| {
         let effective_axis_size = operation.effective_axis_size()?;
         let output_type = match operation.options.mode {
             CollectiveMode::Untiled => {
@@ -246,7 +245,7 @@ linear_collective! {
         }?;
         parallel_sum_scatter_output_type(input_type, output_type, operation)
     },
-}
+);
 
 impl ParallelSumScatterOperation {
     /// Returns the axis of the input along which the summed result is scattered across the participants.
@@ -329,47 +328,19 @@ where
     }
 }
 
-linear_collective!(@differentiation ParallelSumScatterOperation);
-
 // Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
 // same mode, axis, and participant groups, so the input cotangent is an [`AllGatherOperation`] of the output cotangent.
-impl<V, O> TransposableOperation<V, O> for ParallelSumScatterOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<AllGatherOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            transpose_linear_collective(
-                context,
-                inputs,
-                outputs,
-                AllGatherOperation::new(
-                    self.axis_name.clone(),
-                    self.axis_size,
-                    self.scatter_axis,
-                    self.options.clone(),
-                    AllGatherOutputVariance::Varying,
-                ),
-            )
-        };
-        let contributions = contributions?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
+impl_differentiable_linear_collective_operation! {
+    ParallelSumScatterOperation,
+    transpose = |operation| -> AllGatherOperation {
+        AllGatherOperation::new(
+            operation.axis_name.clone(),
+            operation.axis_size,
+            operation.scatter_axis,
+            operation.options.clone(),
+            AllGatherOutputVariance::Varying,
+        )
+    },
 }
 
 impl_shape_changing_collective_member_operation!(
@@ -486,13 +457,7 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         jvp_shape_changing_collective_with_adjoint(
             self,
-            AllGatherOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.scatter_axis(),
-                self.options().clone(),
-                AllGatherOutputVariance::Varying,
-            ),
+            self.adjoint()?,
             context,
             inputs,
         )

@@ -4,7 +4,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::fmt::Display;
 
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
@@ -18,13 +17,13 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
+use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
+use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -34,21 +33,18 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue,
     RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
     collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    linear_collective, linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
-    require_collective_axis_extent, resolve_named_axis_size, transpose_linear_collective,
-    validate_explicit_collective_output_extents,
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
+    require_collective_axis_extent, resolve_named_axis_size, validate_explicit_collective_output_extents,
 };
 
 /// Infers the composite all-to-all contract.
@@ -192,7 +188,10 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
     )
 }
 
-linear_collective! {
+/// Canonical operation name for [`AllToAllOperation`].
+pub const ALL_TO_ALL_OPERATION_NAME: &str = "all_to_all";
+
+define_linear_collective_operation!(
     /// [`Operation`] that exchanges chunks between the participants along the named axis: every participant splits its
     /// input into `axis_size` chunks along `split_axis` and receives the participants' chunks concatenated along
     /// `concat_axis` — the analogue of
@@ -206,9 +205,8 @@ linear_collective! {
     /// A bounded ragged input is rejected even when its logical extents are available. One extent per item does not
     /// determine how each source partitions its live prefix among destinations; that requires the explicit input and
     /// output offsets and per-destination sizes of [`RaggedAllToAllOperation`](super::RaggedAllToAllOperation).
-    operation = AllToAllOperation,
-    name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
-    accepts_unreduced = false,
+    AllToAllOperation,
+    ALL_TO_ALL_OPERATION_NAME,
     fields = {
         /// Axis of the input that is split into one chunk per participant.
         split_axis: usize,
@@ -219,7 +217,8 @@ linear_collective! {
         /// Shared rank and participant-group semantics.
         options: CollectiveOptions,
     },
-    infer = |operation, input_type, dimensions| {
+    check_array_types = [@no_unreduced],
+    infer_output_type = |operation, input_type, dimensions| {
         let effective_axis_size = operation.effective_axis_size()?;
         let mut output_dimensions = dimensions;
         let rank = output_dimensions.len();
@@ -261,7 +260,7 @@ linear_collective! {
             linear_collective_output_type(ALL_TO_ALL_OPERATION_NAME, input_type, output_dimensions)
         }
     },
-}
+);
 
 impl AllToAllOperation {
     /// Returns the axis of the input that is split into one chunk per participant.
@@ -360,47 +359,19 @@ where
     }
 }
 
-linear_collective!(@differentiation AllToAllOperation);
-
 // Transpose rule for [`AllToAllOperation`]: the chunk exchange is its own adjoint with the split and concatenation
 // axes swapped.
-impl<V, O> TransposableOperation<V, O> for AllToAllOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<AllToAllOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            transpose_linear_collective(
-                context,
-                inputs,
-                outputs,
-                AllToAllOperation::new(
-                    self.axis_name.clone(),
-                    self.axis_size,
-                    self.concat_axis,
-                    self.split_axis,
-                    self.options.clone(),
-                ),
-            )
-        };
-        let contributions = contributions?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
+impl_differentiable_linear_collective_operation! {
+    AllToAllOperation,
+    transpose = |operation| -> AllToAllOperation {
+        AllToAllOperation::new(
+            operation.axis_name.clone(),
+            operation.axis_size,
+            operation.concat_axis,
+            operation.split_axis,
+            operation.options.clone(),
+        )
+    },
 }
 
 impl_shape_changing_collective_member_operation!(AllToAllOperation, infer_explicit_all_to_all_output_types);
@@ -525,13 +496,7 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         jvp_shape_changing_collective_with_adjoint(
             self,
-            AllToAllOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.concat_axis(),
-                self.split_axis(),
-                self.options().clone(),
-            ),
+            self.adjoint()?,
             context,
             inputs,
         )

@@ -58,11 +58,9 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::partial::PartialValue;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 pub mod all_gather;
 pub mod all_to_all;
@@ -331,35 +329,74 @@ fn linear_collective_output_type(
     Ok(output_type)
 }
 
-/// Implements the shared structure of the single-input linear collectives: the operation constant and struct with
-/// its accessors, the `Display`/`Operation` implementations (with payload-dependent output-shape inference provided as
-/// a closure over the input dimensions), degenerate interpretation, default partial evaluation, and the linear
-/// forward-mode rule (the tangent rides the same collective). The batching and transposition rules and the
-/// value-level staging capabilities are hand-written next to each macro invocation because each collective
-/// materializes the mapped batch axis, and exposes its named axis to users, differently.
-macro_rules! linear_collective {
-    // Public form: generates the operation constant and struct with its accessors, the `Display`/`Operation`
-    // implementations, degenerate interpretation, and default partial evaluation. `accepts_unreduced` states whether
-    // type inference accepts inputs with unreduced axes.
+/// Defines the structural implementations shared by the single-input linear collectives (e.g., `all_gather` and
+/// `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its
+/// `axis_name` and `axis_size` accessors, together with its [`Display`], [`Operation`](crate::Operation),
+/// [`InterpretableOperation`](crate::InterpretableOperation), and
+/// [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations:
+///
+///   - Type inference validates the shared input contract (a nonzero axis size and exactly one statically shaped input
+///     that satisfies the requested array-type checks) and then delegates the payload-dependent output type.
+///   - Interpretation outside any binder is the identity over a degenerate single-participant axis and an error over
+///     any larger axis, because the other participants do not exist per item.
+///   - Partial evaluation uses the default fold-or-residualize behavior of `Program::partially_evaluate`.
+///
+/// Batching rules and value-level capabilities are written next to each invocation, because every collective consumes
+/// the mapped batch axis, and exposes its named axis to users, differently.
+/// [`impl_differentiable_linear_collective_operation!`] generates the differentiation rules.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// /// Canonical operation name for [`AllToAllOperation`].
+/// pub const ALL_TO_ALL_OPERATION_NAME: &str = "all_to_all";
+///
+/// define_linear_collective_operation!(
+///     /// [`Operation`] that exchanges chunks between the participants along the named axis.
+///     AllToAllOperation,
+///     ALL_TO_ALL_OPERATION_NAME,
+///     fields = {
+///         /// Axis of the input that is split into one chunk per participant.
+///         split_axis: usize,
+///     },
+///     check_array_types = [@no_unreduced],
+///     infer_output_type = |operation, input_type, dimensions| {
+///         all_to_all_output_type(operation, input_type, dimensions)
+///     },
+/// );
+/// ```
+///
+/// # Parameters
+///
+///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
+///   - `$operation`: Identifier of the generated operation struct (e.g., `AllToAllOperation`).
+///   - `$name`: Identifier of an existing operation-name constant (e.g., `ALL_TO_ALL_OPERATION_NAME`).
+///   - `fields = { ... }`: Documented payload fields that follow the shared `axis_name` and `axis_size` fields, in the
+///     order in which the generated `new` function takes them and the operation renders them.
+///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types) selectors
+///     applied to the input type (e.g., `@no_unreduced` for collectives that cannot complete a pending cross-device
+///     sum as part of their exchange).
+///   - `infer_output_type`: Closure-like rule that returns the output type as a `Result<ArrayType, TypeError>`. It
+///     binds the operation, the validated input type, and the input's static dimensions to the provided names. The
+///     closure-like syntax only names these values; it does not create a runtime closure.
+macro_rules! define_linear_collective_operation {
+    // This branch accepts the public form and generates the operation struct together with its base implementations.
     (
-        $(#[$operation_documentation:meta])*
-        operation = $operation:ident,
-        name = $operation_name:ident = $name_literal:literal,
-        accepts_unreduced = $accepts_unreduced:literal,
+        $(#[$documentation:meta])*
+        $operation:ident,
+        $name:ident,
         fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
-        infer = |$infer_self:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
+        $(check_array_types = [$(@$array_type_check:ident),* $(,)?],)?
+        infer_output_type = |$operation_binding:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
     ) => {
-        /// Canonical operation name for the operation.
-        pub const $operation_name: &str = $name_literal;
-
-        $(#[$operation_documentation])*
+        $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
         pub struct $operation {
             /// Axis name referenced by this collective.
             axis_name: String,
 
-            /// Number of participants along the named axis, resolved from the active [`NamedAxes`] environment when
-            /// the operation is staged.
+            /// Number of participants along the named axis, resolved from the active
+            /// [`NamedAxes`](crate::NamedAxes) environment when the operation is staged.
             axis_size: usize,
 
             $($(#[$field_documentation])* $field: $field_type,)*
@@ -385,55 +422,47 @@ macro_rules! linear_collective {
             }
         }
 
-        impl Display for $operation {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.render(formatter, 0)
+        impl ::std::fmt::Display for $operation {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                $crate::Operation::render(self, formatter, 0)
             }
         }
 
-        impl Operation for $operation {
-            type Type = ArrayType;
+        impl $crate::Operation for $operation {
+            type Type = $crate::ArrayType;
 
             #[inline]
             fn name(&self) -> &'static str {
-                $operation_name
+                $name
             }
 
             fn infer_output_types(
                 &self,
-                input_types: &[ArrayType],
-                region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("region", region_interfaces, 0, TypeError);
+                input_types: &[$crate::ArrayType],
+                region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
+            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                $crate::check_count!("region", region_interfaces, 0, TypeError);
                 // A zero-participant collective is rejected before any extent arithmetic divides by its size.
                 if self.axis_size == 0 {
-                    return Err(TypeError::invalid(format!("`{}` axis size must be greater than zero", $name_literal)));
+                    return Err($crate::TypeError::invalid(format!("`{}` axis size must be greater than zero", $name)));
                 }
-
-                // Every linear collective has exactly one statically shaped input, which may carry unreduced axes only
-                // when the collective accepts them (e.g., a sum-scatter, which completes the pending reduction as part
-                // of its exchange).
-                check_count!("input", input_types, 1, TypeError);
-                let accepts_unreduced: bool = $accepts_unreduced;
-                if !accepts_unreduced && !input_types[0].unreduced_axes().is_empty() {
-                    return Err(TypeError::invalid(format!("`{}` does not support unreduced inputs", $name_literal)));
-                }
-
+                // Every linear collective has exactly one statically shaped input.
+                $crate::check_count!("input", input_types, 1, TypeError);
+                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 let Some(shape) = input_types[0].static_shape() else {
-                    return Err(TypeError::invalid(format!(
+                    return Err($crate::TypeError::invalid(format!(
                         "`{}` does not support dynamically shaped inputs",
-                        $name_literal,
+                        $name,
                     )));
                 };
-
                 let $dimensions = shape.dimensions().to_vec();
-                let $infer_self = self;
+                let $operation_binding = self;
                 let $input_type = &input_types[0];
                 Ok(vec![$infer?])
             }
 
-            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-                OperationFormatter::new(formatter, indentation, $operation_name)?.bracketed(|operation| {
+            fn render(&self, formatter: &mut ::std::fmt::Formatter<'_>, indentation: usize) -> ::std::fmt::Result {
+                $crate::OperationFormatter::new(formatter, indentation, $name)?.bracketed(|operation| {
                     operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
                     operation.field("axis_size", &self.axis_size)?;
                     $(operation.field(stringify!($field), format_args!("{:?}", &self.$field))?;)*
@@ -442,21 +471,21 @@ macro_rules! linear_collective {
             }
         }
 
-        impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for $operation {
-            fn interpret<D: InterpretationDriver<C>>(
+        impl<C: $crate::Domain<Type = $crate::ArrayType>> $crate::InterpretableOperation<C> for $operation {
+            fn interpret<D: $crate::InterpretationDriver<C>>(
                 &self,
                 _context: &C,
                 _driver: &D,
                 inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, ProgramError> {
+            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
                 // Outside any binder, only the degenerate single-participant axis has defined per-item semantics (the
                 // identity). Any larger axis is an error because the other participants do not exist per item.
-                check_count!("input", inputs, 1, ProgramError);
+                $crate::check_count!("input", inputs, 1, ProgramError);
                 if self.axis_size != 1 {
-                    return Err(ProgramError::UnsupportedOperation {
+                    return Err($crate::ProgramError::UnsupportedOperation {
                         message: format!(
                             "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                            $name_literal, self.axis_name, self.axis_size,
+                            $name, self.axis_name, self.axis_size,
                         ),
                     });
                 }
@@ -464,79 +493,137 @@ macro_rules! linear_collective {
             }
         }
 
-        // Partial evaluation defers to the default fold-or-residualize behavior of
-        // `Program::partially_evaluate`.
-        impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for $operation where
+        // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
+        impl<C: $crate::Context<Type = $crate::ArrayType>> $crate::PartiallyEvaluatableOperation<C> for $operation where
             C::Operation: From<$operation>
         {
         }
     };
+}
 
-    // Generates the linear forward-mode rule after the operation's batching implementation.
-    (@differentiation $operation:ident) => {
-        // Forward-mode rule: the collective is linear, so the tangent rides the same collective. Structural-zero
-        // tangents stay symbolic, retyped to the output tangent type (the collective changes shapes).
-        impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for $operation
+use define_linear_collective_operation;
+
+/// Implements the forward-mode differentiation (i.e., Jacobian-Vector Product, or JVP) and primitive transposition
+/// rules of a collective defined by [`define_linear_collective_operation!`]. Linear collectives need only declare their
+/// adjoint collective, and the macro generates the rest:
+///
+///   - The JVP stages the same collective on the input tangent, because the collective is linear. A structural-zero
+///     tangent stays symbolic, retyped to the output tangent type because the collective can change shapes.
+///   - Transposition stages the adjoint collective on the output cotangent. A known input and a structural-zero output
+///     cotangent contribute nothing, which leaves the input cotangent a structural zero.
+///   - A private `adjoint` function returns the adjoint collective, so that other rules can stage it as well (e.g., the
+///     explicit-extent forward-mode rules of the shape-changing collectives, which call it inside a linear call).
+///
+/// Reverse-mode differentiation needs no separate rule because it is derived by linearizing and then transposing the
+/// staged tangent program. The closure-like syntax only names the operation and the adjoint type, which the generated
+/// transposition bounds require; it does not allocate or dynamically dispatch a runtime closure. The body becomes the
+/// body of the generated `adjoint` function, so it may use `?` or return an error early for configurations that have
+/// no adjoint collective, and its final expression is the adjoint operation.
+///
+/// # Examples
+///
+/// The transpose of a permutation is the permutation with every pair inverted:
+///
+/// ```rust,ignore
+/// impl_differentiable_linear_collective_operation! {
+///     ParallelPermuteOperation,
+///     transpose = |operation| -> ParallelPermuteOperation {
+///         let pairs = operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect();
+///         ParallelPermuteOperation::new(operation.axis_name.clone(), operation.axis_size, pairs)
+///     },
+/// }
+/// ```
+///
+/// # Parameters
+///
+///   - `$operation`: Linear collective type for which the rules are generated.
+///   - `$operation_binding`: Name bound to the operation whose adjoint is being constructed.
+///   - `$adjoint`: Type of the adjoint collective that the transposition rule stages.
+///   - `$adjoint_body`: Block that evaluates to the adjoint collective, or returns a
+///     [`ProgramError`](crate::ProgramError) early.
+macro_rules! impl_differentiable_linear_collective_operation {
+    // This branch generates the adjoint function together with the JVP and transposition rules of one collective.
+    (
+        $operation:ident,
+        transpose = |$operation_binding:ident| -> $adjoint:ty $adjoint_body:block $(,)?
+    ) => {
+        impl $operation {
+            /// Returns the adjoint collective that transposition stages on the output cotangent.
+            fn adjoint(&self) -> Result<$adjoint, $crate::ProgramError> {
+                let $operation_binding = self;
+                Ok($adjoint_body)
+            }
+        }
+
+        impl<C: $crate::Context<Type = $crate::ArrayType>> $crate::DifferentiableOperation<C> for $operation
         where
             C::Operation: From<$operation>,
         {
-            fn jvp<D: DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(
+            fn jvp<D: $crate::DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(
                 &self,
                 context: &$crate::DifferentiationContext<C, P>,
                 _driver: &D,
-                inputs: &[DifferentiationDual<C::Value>],
-            ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-                check_count!("input", inputs, 1, ProgramError);
-                let mut primal_outputs =
+                inputs: &[$crate::DifferentiationDual<C::Value>],
+            ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
+                use $crate::{Context as _, DifferentiableType as _, Typed as _};
+
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                let mut primals =
                     context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
-                check_count!("output", primal_outputs, 1, ProgramError);
-                let primal = primal_outputs.remove(0);
+                $crate::check_count!("output", primals, 1, ProgramError);
+                let primal = primals.remove(0);
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                    MaybeZero::Value(tangent) => {
-                        let mut tangent_outputs =
+                    $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(primal.r#type().tangent()?),
+                    $crate::MaybeZero::Value(tangent) => {
+                        let mut tangents =
                             context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
-                        check_count!("output", tangent_outputs, 1, ProgramError);
-                        MaybeZero::Value(tangent_outputs.remove(0))
+                        $crate::check_count!("output", tangents, 1, ProgramError);
+                        $crate::MaybeZero::Value(tangents.remove(0))
                     }
                 };
-                Ok(vec![DifferentiationDual::new(primal, tangent)?])
+                Ok(vec![$crate::DifferentiationDual::new(primal, tangent)?])
+            }
+        }
+
+        impl<V, O> $crate::TransposableOperation<V, O> for $operation
+        where
+            V: $crate::Value<Type = $crate::ArrayType>,
+            O: $crate::Operation<Type = $crate::ArrayType>
+                + From<$crate::AddOperation<$crate::ArrayType>>
+                + From<$adjoint>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                context: &mut $crate::TranspositionContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
+                use $crate::Context as _;
+
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
+                // The adjoint is resolved first, so that a configuration without one is rejected regardless of the
+                // cotangent, and only a live output cotangent of an unknown input then stages it.
+                let adjoint = self.adjoint()?;
+                let $crate::MaybeZero::Value(cotangent) = &outputs[0] else {
+                    return Ok(());
+                };
+                if inputs[0].is_known() {
+                    return Ok(());
+                }
+                let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
+                $crate::check_count!("output", contributions, 1, ProgramError);
+                accumulators[0].accumulate(context, $crate::MaybeZero::Value(contributions.remove(0)))?;
+                Ok(())
             }
         }
     };
 }
 
-use linear_collective;
-
-/// Stages the adjoint collective of a linear collective on the output cotangent: a known input receives a structural
-/// zero, a zero output cotangent stays symbolic, and a live cotangent rides the provided adjoint operation.
-fn transpose_linear_collective<V, O, A>(
-    context: &mut TracingContext<V, O>,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    adjoint: A,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<A>,
-    A: Operation<Type = ArrayType>,
-{
-    check_count!("input", inputs, 1, ProgramError);
-    check_count!("output", outputs, 1, ProgramError);
-    if inputs[0].is_known() {
-        return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
-    }
-    match &outputs[0] {
-        MaybeZero::Value(cotangent) => {
-            let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
-            check_count!("output", contributions, 1, ProgramError);
-            Ok(vec![MaybeZero::Value(contributions.remove(0))])
-        }
-        MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
-    }
-}
-
-// TODO(eaplatanios): Review this module.
+use impl_differentiable_linear_collective_operation;
 
 /// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
 ///

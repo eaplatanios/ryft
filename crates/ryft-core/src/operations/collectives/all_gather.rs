@@ -4,8 +4,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::fmt::Display;
-
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayType,
@@ -19,13 +17,13 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
+use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
+use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -38,12 +36,10 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    MaybeZero, MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue,
     RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::{
@@ -51,8 +47,8 @@ use super::{
     collective_input_extents, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    linear_collective, linear_collective_output_type, multiplied_collective_extent, resolve_named_axis_size,
-    transpose_linear_collective, validate_explicit_collective_output_extents,
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, multiplied_collective_extent, resolve_named_axis_size,
+    validate_explicit_collective_output_extents,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -226,7 +222,10 @@ pub(crate) fn infer_explicit_all_gather_output_types(
     Ok(vec![all_gather_output_type(input_type, output_type, operation)?.into()])
 }
 
-linear_collective! {
+/// Canonical operation name for [`AllGatherOperation`].
+pub const ALL_GATHER_OPERATION_NAME: &str = "all_gather";
+
+define_linear_collective_operation!(
     /// [`Operation`] that concatenates every participant's input along `concat_axis` across the named axis, so every
     /// participant receives the full concatenation — the analogue of
     /// [JAX's `all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) with `tiled = True`
@@ -241,9 +240,8 @@ linear_collective! {
     /// an ordinary output axis and is added to each participant-varying extent array's `extent_axes` mapping. Tiled
     /// gathering of a ragged carrier is rejected because fusing the participant and concatenation axes can make live
     /// chunks non-prefix-shaped, which one [`RaggedAxis`] cannot represent faithfully.
-    operation = AllGatherOperation,
-    name = ALL_GATHER_OPERATION_NAME = "all_gather",
-    accepts_unreduced = false,
+    AllGatherOperation,
+    ALL_GATHER_OPERATION_NAME,
     fields = {
         /// Axis of the input along which the participants' values are concatenated.
         concat_axis: usize,
@@ -254,7 +252,8 @@ linear_collective! {
         /// Named-axis variance of the result.
         output_variance: AllGatherOutputVariance,
     },
-    infer = |operation, input_type, dimensions| {
+    check_array_types = [@no_unreduced],
+    infer_output_type = |operation, input_type, dimensions| {
         let effective_axis_size = operation.effective_axis_size()?;
         let output_type = match operation.options.mode {
             CollectiveMode::Untiled => input_type
@@ -276,7 +275,7 @@ linear_collective! {
         };
         all_gather_output_type(input_type, output_type, operation)
     },
-}
+);
 
 impl AllGatherOperation {
     /// Returns the axis of the input along which the participants' values are concatenated.
@@ -395,52 +394,27 @@ where
     }
 }
 
-linear_collective!(@differentiation AllGatherOperation);
-
 // Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
 // mode, axis, and participant groups, so the input cotangent is a [`ParallelSumScatterOperation`] of the output
 // cotangent. Invariant and reduced variance require the residual-aware composite adjoints because their pullbacks
 // depend on participant-indexed runtime geometry.
-impl<V, O> TransposableOperation<V, O> for AllGatherOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelSumScatterOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        if self.output_variance == AllGatherOutputVariance::Invariant {
+impl_differentiable_linear_collective_operation! {
+    AllGatherOperation,
+    transpose = |operation| -> ParallelSumScatterOperation {
+        if operation.output_variance == AllGatherOutputVariance::Invariant {
             return Err(ProgramError::UnsupportedOperation {
                 message: "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
                           slice; linearize so that the current participant can select its gathered chunk"
                     .to_string(),
-            }
-            .into());
+            });
         }
-        let contributions = transpose_linear_collective(
-            context,
-            inputs,
-            outputs,
-            ParallelSumScatterOperation::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                self.concat_axis,
-                self.options.clone(),
-            ),
-        )?;
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
+        ParallelSumScatterOperation::new(
+            operation.axis_name.clone(),
+            operation.axis_size,
+            operation.concat_axis,
+            operation.options.clone(),
+        )
+    },
 }
 
 impl_shape_changing_collective_member_operation!(AllGatherOperation, infer_explicit_all_gather_output_types);
@@ -693,12 +667,7 @@ where
         }
         jvp_shape_changing_collective_with_adjoint(
             self,
-            ParallelSumScatterOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.concat_axis(),
-                self.options().clone(),
-            ),
+            self.adjoint()?,
             context,
             inputs,
         )
