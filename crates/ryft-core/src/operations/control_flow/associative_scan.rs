@@ -1,11 +1,10 @@
-//! Parallel-prefix scans of arbitrary associative operators, built out of ordinary manipulation primitives. Refer to
-//! [`associative_scan`] for the construction and its semantics.
+//! Parallel-prefix scans of arbitrary associative operators, built out of ordinary manipulation primitives.
+//! Refer to [`associative_scan`] for the construction and its semantics.
 //!
-//! Unlike the control-flow [`ScanOperation`](crate::operations::control_flow::ScanOperation), which stages one
-//! region-carrying instruction that runs its body sequentially, [`associative_scan`] is a function rather than an
-//! operation. It stages the logarithmic-depth construction directly, so it has no transformation rules of its own and
-//! every transformation (e.g., batching, differentiation, or partial evaluation) applies the rules of the primitives
-//! it stages.
+//! Unlike the control-flow [`ScanOperation`](crate::ScanOperation), which stages one region-carrying instruction that
+//! runs its body sequentially, [`associative_scan`] is a function rather than an operation. It stages the
+//! logarithmic-depth construction directly, so it has no transformation rules of its own and every transformation
+//! (e.g., batching, differentiation, or partial evaluation) applies the rules of the primitives it stages.
 //!
 //! # Example
 //!
@@ -20,8 +19,6 @@
 //! # }
 //! ```
 
-// TODO(eaplatanios): Review this module.
-
 use crate::arrays::{ArrayType, DataType};
 use crate::axes::Axis;
 use crate::contexts::Context;
@@ -32,11 +29,23 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::padding::Pad;
 use crate::operations::manipulation::slicing::Slice;
 use crate::parameters::Parameterized;
-use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
+use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator `combine`,
 /// built out of ordinary manipulation primitives instead of out of one
 /// [`CumulativeOperation`](crate::operations::cumulative::CumulativeOperation).
+///
+/// Writing `a ⊕ b` for `combine(a, b)`, element `i` of a forward scan combines the input elements `0..=i` and element
+/// `i` of a reverse scan combines the input elements `i..` (still in the original output order), with the accumulated
+/// side always on the left. For example, over an input with four elements along `axis`:
+///
+/// ```text
+///     input    = [x0,                x1,           x2,           x3               ]
+///     forward  = [x0,                x0 ⊕ x1,      x0 ⊕ x1 ⊕ x2, x0 ⊕ x1 ⊕ x2 ⊕ x3]
+///     reverse  = [x3 ⊕ x2 ⊕ x1 ⊕ x0, x3 ⊕ x2 ⊕ x1, x3 ⊕ x2,      x3               ]
+/// ```
 ///
 /// This is Ryft's port of the log-depth Blelloch construction that JAX's
 /// [`lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements
@@ -67,6 +76,31 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 /// mirrors the same recursion around the end of the axis (the pairing simply starts one element in when the extent is
 /// odd) instead of reversing the arrays before and after a forward scan, which saves two array reversals per array and
 /// scan. Boolean arrays are interleaved with a disjunction rather than an addition, because Booleans have no addition.
+///
+/// For example, a forward scan over five elements reduces the pairs `(x0, x1)` and `(x2, x3)`, scans those two
+/// reductions recursively to obtain the results at the odd positions, extends each of them by the next input element to
+/// obtain the results at the remaining even positions (where position 0 is just `x0`), and interleaves the two:
+///
+/// ```text
+///     position             0     1        2             3                 4
+///     input                x0    x1       x2            x3                x4
+///     pairwise reductions        x0⊕x1                  x2⊕x3
+///     recursive scan             x0⊕x1                  x0⊕x1⊕x2⊕x3
+///     complement           x0             (x0⊕x1)⊕x2                      (x0⊕x1⊕x2⊕x3)⊕x4
+///     result               x0    x0⊕x1    x0⊕x1⊕x2      x0⊕x1⊕x2⊕x3       x0⊕x1⊕x2⊕x3⊕x4
+/// ```
+///
+/// A reverse scan over the same five elements leaves `x0` unpaired instead, combines each pair with its later element
+/// on the left, and appends `x4` at the end of the complement:
+///
+/// ```text
+///     position             0                  1              2            3        4
+///     input                x0                 x1             x2           x3       x4
+///     pairwise reductions                     x2⊕x1                       x4⊕x3
+///     recursive scan                          x4⊕x3⊕x2⊕x1                 x4⊕x3
+///     complement           (x4⊕x3⊕x2⊕x1)⊕x0                  (x4⊕x3)⊕x2            x4
+///     result               x4⊕x3⊕x2⊕x1⊕x0     x4⊕x3⊕x2⊕x1    x4⊕x3⊕x2     x4⊕x3    x4
+/// ```
 ///
 /// The scanned axis of every array must have a static extent, because the construction slices it at staging-time
 /// positions, while every other axis can be dynamic (it is kept whole). A scanned axis shorter than two elements leaves
@@ -162,8 +196,20 @@ pub fn associative_scan<
     Ok(Values::from_parameters(structure, scanned)?)
 }
 
-/// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose (static) extent
-/// along `axis` is `extent`.
+/// Scans the flat arrays of a [`Parameterized`] structure using the construction that the documentation of
+/// [`associative_scan`] describes and illustrates. [`associative_scan`] validates `axis` and the scanned extents,
+/// flattens its structure into `values`, wraps its combining operator so that it operates on flat arrays too, and
+/// opens the provenance scopes that attribute the staged instructions before calling this function. Each call performs
+/// one level of the recursion: it reduces adjacent pairs, scans those reductions by calling itself over half the
+/// extent, completes the remaining positions, and interleaves the two halves using [`scan_interleave`].
+///
+/// # Parameters
+///
+///   - `values`: Flat arrays to scan, in the order of the flattened structure.
+///   - `extent`: Static extent along `axis` that every array in `values` shares.
+///   - `axis`: Scanned axis, already normalized against the rank of every array in `values`.
+///   - `reverse`: Whether to accumulate from the end of `axis` toward its start.
+///   - `combine`: Flattened combining operator, which receives and returns one array per array in `values`.
 fn associative_scan_impl<
     V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
@@ -186,8 +232,14 @@ fn associative_scan_impl<
         true => extent % 2,
         false => 0,
     };
-    let earlier = scan_slice(values, axis, pair_offset, extent - 1, 2)?;
-    let later = scan_slice(values, axis, pair_offset + 1, extent, 2)?;
+    let earlier = values
+        .iter()
+        .map(|value| value.slice_axis(axis, pair_offset, extent - 1, 2))
+        .collect::<Result<Vec<_>, _>>()?;
+    let later = values
+        .iter()
+        .map(|value| value.slice_axis(axis, pair_offset + 1, extent, 2))
+        .collect::<Result<Vec<_>, _>>()?;
     let reduced = match reverse {
         true => combine(&later, &earlier)?,
         false => combine(&earlier, &later)?,
@@ -207,15 +259,24 @@ fn associative_scan_impl<
     };
     let complement = match reverse {
         true => {
-            let last = scan_slice(values, axis, extent - 1, extent, 1)?;
+            let last = values
+                .iter()
+                .map(|value| value.slice_axis(axis, extent - 1, extent, 1))
+                .collect::<Result<Vec<_>, _>>()?;
             match complement_count {
                 0 => last,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, axis, 1, half, 1)?,
+                        0 => aligned
+                            .iter()
+                            .map(|value| value.slice_axis(axis, 1, half, 1))
+                            .collect::<Result<Vec<_>, _>>()?,
                         _ => aligned.clone(),
                     };
-                    let inputs = scan_slice(values, axis, 1 - pair_offset, extent - 1, 2)?;
+                    let inputs = values
+                        .iter()
+                        .map(|value| value.slice_axis(axis, 1 - pair_offset, extent - 1, 2))
+                        .collect::<Result<Vec<_>, _>>()?;
                     combine(&trimmed, &inputs)?
                         .iter()
                         .zip(&last)
@@ -225,15 +286,21 @@ fn associative_scan_impl<
             }
         }
         false => {
-            let first = scan_slice(values, axis, 0, 1, 1)?;
+            let first = values.iter().map(|value| value.slice_axis(axis, 0, 1, 1)).collect::<Result<Vec<_>, _>>()?;
             match complement_count {
                 0 => first,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, axis, 0, half - 1, 1)?,
+                        0 => aligned
+                            .iter()
+                            .map(|value| value.slice_axis(axis, 0, half - 1, 1))
+                            .collect::<Result<Vec<_>, _>>()?,
                         _ => aligned.clone(),
                     };
-                    let inputs = scan_slice(values, axis, 2, extent, 2)?;
+                    let inputs = values
+                        .iter()
+                        .map(|value| value.slice_axis(axis, 2, extent, 2))
+                        .collect::<Result<Vec<_>, _>>()?;
                     first
                         .iter()
                         .zip(&combine(&trimmed, &inputs)?)
@@ -252,18 +319,6 @@ fn associative_scan_impl<
     }
 }
 
-/// Returns the elements of each array in `values` at positions `start`, `start + stride`, ... below `limit` along
-/// `axis`, keeping every other axis whole (including a dynamic one) through [`Slice::slice_axis`].
-fn scan_slice<V: Typed<Type = ArrayType> + Slice>(
-    values: &[V],
-    axis: usize,
-    start: usize,
-    limit: usize,
-    stride: usize,
-) -> Result<Vec<V>, ProgramError> {
-    values.iter().map(|value| value.slice_axis(axis, start, limit, stride)).collect()
-}
-
 /// Returns each array of `left` interleaved along `axis` with the corresponding array of `right`, starting with the
 /// `left` one. Each `left` array must hold either as many elements along `axis` as its `right` counterpart or exactly
 /// one more.
@@ -271,7 +326,19 @@ fn scan_slice<V: Typed<Type = ArrayType> + Slice>(
 /// Both arrays are dilated into the output extent with interior padding (writing zeros into the positions that the
 /// other array occupies) and then combined with an addition, or with a disjunction for Boolean arrays, which have no
 /// addition. The combination is exact because the two dilated arrays have disjoint support and zero (i.e., `false`)
-/// is the identity of both combiners.
+/// is the identity of both combiners. For example, interleaving three elements with two along `axis` pads `left` only
+/// in its interior and pads `right` in its interior and with one zero at each end:
+///
+/// ```text
+///     left           = [a0,     a1,     a2]
+///     right          = [    b0,     b1    ]
+///     dilated left   = [a0, 0,  a1, 0,  a2]    (interior padding 1)
+///     dilated right  = [0,  b0, 0,  b1, 0 ]    (interior padding 1, low padding 1, high padding 1)
+///     result         = [a0, b0, a1, b1, a2]
+/// ```
+///
+/// When both sides hold the same number of elements, `left` instead gets one zero of high padding and `right` one zero
+/// of low padding, so that `[a0, a1]` and `[b0, b1]` interleave into `[a0, b0, a1, b1]`.
 fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Pad>(
     left: &[V],
     right: &[V],
@@ -320,7 +387,7 @@ mod tests {
     use crate::operations::comparisons::{Compare, ComparisonDirection};
     use crate::operations::control_flow::select::Select;
     use crate::partial::PartialValue;
-    use crate::programs::ProgramRenderingMode;
+    use crate::programs::{ProgramRenderingMode, Typed};
     use crate::tracing::TracingContext;
 
     use super::*;
