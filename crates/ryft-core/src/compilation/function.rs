@@ -979,6 +979,9 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat argument
     /// list in the `[captures..., public inputs...]` order every execution expects.
     pub fn arguments_with_captures(&self, inputs: Vec<D::Value>) -> Vec<D::Value> {
+        if self.state.captures.is_empty() {
+            return inputs;
+        }
         let mut arguments = self.state.captures.to_vec();
         arguments.extend(inputs);
         arguments
@@ -1327,13 +1330,15 @@ where
         let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let (dispatch_key, effective_input_types) =
             self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
-        JitCacheStatisticsState::add_duration(
-            &self.state.statistics.input_abstractification_duration_ns,
-            abstractification_start.elapsed(),
-        );
         let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
+        // One clock read both ends input abstractification (including key construction) and starts the dispatch
+        // lookup, which keeps the timing of every cached call to three clock reads.
         let dispatch_start = Instant::now();
+        JitCacheStatisticsState::add_duration(
+            &self.state.statistics.input_abstractification_duration_ns,
+            dispatch_start.duration_since(abstractification_start),
+        );
         let entry = self.state.specializations.try_entry(key);
         JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_start.elapsed());
         let producer = match entry {

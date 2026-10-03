@@ -430,7 +430,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         for (input, r#type) in inputs.iter().zip(types) {
             if input.r#type().data_type() != r#type.data_type()
                 || input.r#type().shape() != r#type.shape()
-                || input.mesh() != *mesh
+                || input.mesh() != mesh
                 || input.addressable_shards().count() != 1
                 || !ArrayAddressing::new(input.r#type().into_owned())
                     .map_err(|error| DistributedKernelError::invalid(error.to_string()))?

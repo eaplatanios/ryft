@@ -2270,7 +2270,7 @@ mod tests {
         let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
+            Err(ProgramError::MalformedProgram("`condition` interpretation requires a predicate input".to_string())),
         );
     }
 

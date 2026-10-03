@@ -678,6 +678,13 @@ pub struct LoadedExecutable<'c> {
     /// the [`KeyValueStore`](crate::KeyValueStore) that is associated with that [`Client`].
     client: *mut crate::clients::ffi::PJRT_Client,
 
+    /// Addressable device count and output count of this [`LoadedExecutable`], which are fixed once it is loaded and
+    /// which [`Self::execute`] needs on every call. They are queried once on first use, because querying the output
+    /// count goes through [`Self::executable`], which creates (and later destroys) a fresh PJRT executable wrapper
+    /// that recomputes the output dimensions of the program. Only successful queries are cached, so a failed query
+    /// is retried by the next execution instead of failing every later one.
+    execution_counts: OnceLock<(usize, usize)>,
+
     /// [`PhantomData`] used to track the lifetime of the [`Client`] that owns this [`LoadedExecutable`].
     owner: PhantomData<&'c ()>,
 }
@@ -695,7 +702,7 @@ impl<'c> LoadedExecutable<'c> {
         } else if client.is_null() {
             Err(Error::invalid_argument("the provided PJRT client handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, client, owner: PhantomData })
+            Ok(Self { handle, api, client, execution_counts: OnceLock::new(), owner: PhantomData })
         }
     }
 
@@ -849,13 +856,16 @@ impl<'c> LoadedExecutable<'c> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
         let mut inputs = inputs;
-
-        let device_count = if device.is_some() { 1 } else { self.addressable_devices()?.len() };
+        let (addressable_device_count, output_count) = match self.execution_counts.get() {
+            Some(counts) => *counts,
+            None => {
+                let counts = (self.addressable_devices()?.len(), self.executable()?.output_count()?);
+                *self.execution_counts.get_or_init(|| counts)
+            }
+        };
+        let device_count = if device.is_some() { 1 } else { addressable_device_count };
         let input_count = inputs.first().map(|inputs| inputs.inputs.len()).unwrap_or(0);
-        let input_is_donatable = inputs
-            .first()
-            .map(|inputs| inputs.inputs.iter().map(|input| input.donatable).collect::<Vec<bool>>())
-            .unwrap_or_default();
+        let first_device_inputs = inputs.first().map(|inputs| inputs.inputs).unwrap_or_default();
         let send_callback_count = inputs.first().map(|inputs| inputs.send_callbacks.len()).unwrap_or(0);
         let receive_callback_count = inputs.first().map(|inputs| inputs.receive_callbacks.len()).unwrap_or(0);
 
@@ -875,7 +885,7 @@ impl<'c> LoadedExecutable<'c> {
             }
 
             for (input_index, input) in device_inputs.inputs.iter().enumerate() {
-                if input.donatable != input_is_donatable[input_index] {
+                if input.donatable != first_device_inputs[input_index].donatable {
                     return Err(Error::invalid_argument(format!(
                         "input {input_index} is not marked consistently across all devices \
                             as donatable or non-donatable",
@@ -909,25 +919,35 @@ impl<'c> LoadedExecutable<'c> {
         // underlying memory will be freed. Furthermore, after the call to `PJRT_LoadedExecutable_Execute` and assuming
         // that everything went well, we move ownership of the callbacks to the corresponding `Event::on_ready`
         // callbacks so that the underlying memory will be freed once execution completes.
-        let mut send_callbacks = unsafe {
-            inputs
-                .iter_mut()
-                .map(|i| i.send_callbacks.drain(..).map(|c| c.to_c_api()).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
+
+        // Executions without send or receive callbacks (the common case) skip building these per-device containers.
+        let mut send_callback_infos = if send_callback_count == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                inputs
+                    .iter_mut()
+                    .map(|i| i.send_callbacks.drain(..).map(|c| c.to_c_api()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            }
         };
-        let mut send_callback_pointers = send_callbacks.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut send_callbacks = send_callbacks
+        let mut send_callback_ptrs = send_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
+        let mut send_callbacks = send_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut SendCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         // We handle receive callbacks in exactly the same way as send callbacks.
-        let mut receive_callbacks = inputs
-            .iter_mut()
-            .map(|i| i.receive_callbacks.drain(..).map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let mut receive_callback_pointers = receive_callbacks.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut receive_callbacks = receive_callbacks
+        let mut receive_callback_infos = if receive_callback_count == 0 {
+            Vec::new()
+        } else {
+            inputs
+                .iter_mut()
+                .map(|i| i.receive_callbacks.drain(..).map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let mut receive_callback_ptrs = receive_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
+        let mut receive_callbacks = receive_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut ReceiveCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
@@ -939,17 +959,19 @@ impl<'c> LoadedExecutable<'c> {
         let hlo_output_callback_count = hlo_output_callbacks.len();
         let mut hlo_output_callback_infos =
             hlo_output_callbacks.into_iter().map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>();
-        let hlo_output_callbacks = Arc::new(Mutex::new(
-            hlo_output_callback_infos
-                .iter()
-                .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
-                .collect::<Vec<_>>(),
-        ));
+        let hlo_output_callbacks = (hlo_output_callback_count > 0).then(|| {
+            Arc::new(Mutex::new(
+                hlo_output_callback_infos
+                    .iter()
+                    .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
+                    .collect::<Vec<_>>(),
+            ))
+        });
 
-        let non_donatable_input_indices = input_is_donatable
-            .into_iter()
+        let non_donatable_input_indices = first_device_inputs
+            .iter()
             .enumerate()
-            .filter_map(|(index, donatable)| if donatable { None } else { Some(index as i64) })
+            .filter_map(|(index, input)| if input.donatable { None } else { Some(index as i64) })
             .collect::<Vec<_>>();
 
         let call_location = call_location
@@ -968,8 +990,8 @@ impl<'c> LoadedExecutable<'c> {
         });
 
         let mut options = ffi::PJRT_ExecuteOptions::new(
-            send_callback_pointers.as_mut_ptr(),
-            receive_callback_pointers.as_mut_ptr(),
+            send_callback_ptrs.as_mut_ptr(),
+            receive_callback_ptrs.as_mut_ptr(),
             send_callback_count,
             receive_callback_count,
             launch_id as i32,
@@ -987,18 +1009,20 @@ impl<'c> LoadedExecutable<'c> {
         );
 
         // We prepare the input buffer handles array. This is an array of `Buffer` handle arrays where the outer
-        // dimension corresponds to devices and the inner dimension corresponds to program inputs.
-        let inputs = inputs
+        // dimension corresponds to devices and the inner dimension corresponds to program inputs. The handles of
+        // all devices share one flat allocation.
+        let input_handles = inputs
             .iter()
-            .map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }).collect::<Vec<_>>())
+            .flat_map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }))
             .collect::<Vec<_>>();
-        let input_pointers = inputs.iter().map(|inputs| inputs.as_ptr()).collect::<Vec<_>>();
+        let input_pointers = (0..device_count)
+            .map(|device_index| unsafe { input_handles.as_ptr().add(device_index * input_count) })
+            .collect::<Vec<_>>();
 
         // We pre-allocate the backing arrays for the output `Buffer` and `Event` handles. The output buffer handles
         // array is an array of `Buffer` handles arrays where the outer dimension corresponds to devices and the inner
-        // dimension corresponds to program outputs. The `Event` handles array contains an `Event` for each
-        // `Device`, which can be used to track when the computation for this program is completed on each `Device`.
-        let output_count = self.executable()?.output_count()?;
+        // dimension corresponds to program outputs. The `Event` handles array contains an `Event` for each `Device`,
+        // which can be used to track when the computation for this program is completed on each `Device`.
         let mut output_buffers: Vec<*mut crate::buffers::ffi::PJRT_Buffer> =
             vec![std::ptr::null_mut(); device_count * output_count];
         let output_buffer_pointers = (0..device_count)
@@ -1026,14 +1050,14 @@ impl<'c> LoadedExecutable<'c> {
         let mut completion_events = Vec::with_capacity(device_count);
         for device_index in 0..device_count {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
-            let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
-            let receive_callbacks = std::mem::take(&mut receive_callbacks[device_index]);
-            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callback_count > 0 {
+            let send_callbacks = send_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
+            let receive_callbacks = receive_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
+            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callbacks.is_some() {
                 // Move the owned callback allocations into the event completion handler so that they
                 // are released *only after* the runtime signals the device execution is done. HLO output
                 // callbacks are shared across all devices and so each device holds one clone of the `Arc`,
                 // releasing the callbacks only after the last device execution is done.
-                let hlo_output_callbacks = Arc::clone(&hlo_output_callbacks);
+                let hlo_output_callbacks = hlo_output_callbacks.clone();
                 done_event.on_ready(move |_| {
                     drop(send_callbacks);
                     drop(receive_callbacks);
@@ -1258,10 +1282,15 @@ impl ExecutionFenceState {
 /// https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h) into a single all-of/first-error future that is
 /// then shared by every output array of the launch. XLA futures are multi-consumer values backed by shared state;
 /// this fence recreates that shared observation over PJRT C API events.
+///
+/// Note that, executions whose events have all completed successfully by the time the fence is created (as small CPU
+/// programs typically have once [`LoadedExecutable::execute`] returns) need no shared state at all. Such fences are
+/// trivially ready, allocate nothing, and register no native callbacks.
 #[derive(Clone)]
 pub struct ExecutionFence {
-    /// Shared per-execution events and joined completion state.
-    state: Arc<ExecutionFenceState>,
+    /// Shared per-execution events and joined completion state, or [`None`] for an execution that had already
+    /// completed successfully when this fence was created.
+    state: Option<Arc<ExecutionFenceState>>,
 }
 
 impl ExecutionFence {
@@ -1269,6 +1298,10 @@ impl ExecutionFence {
     /// failures wait for native completion before publishing an error. A plugin missing both native completion
     /// functions leaves the fence pending because device completion cannot be established safely.
     pub fn new(events: Vec<Event<()>>) -> Self {
+        if events.iter().all(|event| event.ready().unwrap_or(false) && event.ready_error().is_none()) {
+            return Self { state: None };
+        }
+
         let event_count = events.len();
         let state = Arc::new(ExecutionFenceState {
             events: Mutex::new(Vec::new()),
@@ -1309,7 +1342,7 @@ impl ExecutionFence {
             drop(std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned")));
         }
 
-        Self { state }
+        Self { state: Some(state) }
     }
 
     /// Returns `true` once every participating [`Event`] is completed, while preserving any asynchronous execution
@@ -1318,7 +1351,11 @@ impl ExecutionFence {
     /// only ever contends with short state transitions.
     #[inline]
     pub fn is_ready(&self) -> Result<bool, Error> {
-        self.state
+        let Some(state) = &self.state else {
+            return Ok(true);
+        };
+
+        state
             .completion
             .lock()
             .expect("execution fence completion mutex poisoned")
@@ -1329,10 +1366,13 @@ impl ExecutionFence {
 
     /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
     pub fn block_until_ready(&self) -> Result<(), Error> {
-        let mut completion = self.state.completion.lock().expect("execution fence completion mutex poisoned");
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+
+        let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
         while completion.result.is_none() {
-            completion =
-                self.state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
+            completion = state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
         }
         completion.result.clone().unwrap()
     }
@@ -1344,8 +1384,12 @@ impl ExecutionFence {
     /// [`ExecutionFence`] handle. The callback must therefore own its captured state for the full asynchronous
     /// lifetime and be safe to send between threads.
     pub fn on_ready(&self, callback: impl FnOnce(Result<(), Error>) + Send + 'static) {
+        let Some(state) = &self.state else {
+            return callback(Ok(()));
+        };
+
         let callback = {
-            let mut completion = self.state.completion.lock().expect("execution fence completion mutex poisoned");
+            let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
             if let Some(result) = &completion.result {
                 Some((Box::new(callback) as ExecutionFenceCallback, result.clone()))
             } else {
@@ -1353,6 +1397,7 @@ impl ExecutionFence {
                 None
             }
         };
+
         if let Some((callback, result)) = callback {
             callback(result);
         }
@@ -3557,6 +3602,46 @@ mod tests {
     }
 
     #[test]
+    fn test_loaded_executable_execute_retries_failed_execution_count_queries() {
+        let client = test_cpu_client();
+        let executable = client.compile(&test_program(false, false), &test_compilation_options()).unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let bytes = [1i32, 2i32].iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+        let buffer = Arc::new(client.buffer(bytes.as_slice(), BufferType::I32, [2, 1], None, device, None).unwrap());
+        let inputs = [
+            ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
+            ExecutionInput { buffer, donatable: false },
+        ];
+
+        // Alias the executable through an API table whose addressable-device query is missing, so that the first
+        // execution fails to query its counts. The alias is never dropped because it does not own the handle.
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_LoadedExecutable_AddressableDevices = None;
+        let failing_api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let mut alias = ManuallyDrop::new(LoadedExecutable {
+            handle: executable.handle,
+            api: failing_api,
+            client: executable.client,
+            execution_counts: OnceLock::new(),
+            owner: PhantomData,
+        });
+        assert!(matches!(
+            alias.execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None),
+            Err(Error::MissingFunction { .. }),
+        ));
+        assert_eq!(alias.execution_counts.get(), None);
+
+        // Failed queries are not cached, so a later execution retries them and caches the successful result.
+        alias.api = executable.api;
+        let execution = alias
+            .execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None)
+            .unwrap();
+        assert_eq!(execution.block_until_ready().unwrap().len(), 1);
+        assert_eq!(alias.execution_counts.get(), Some(&(1, 1)));
+        drop(table);
+    }
+
+    #[test]
     fn test_loaded_executable_execute_with_native_token() {
         let client = test_cpu_client();
         let program = Program::Mlir {
@@ -3928,6 +4013,32 @@ mod tests {
         let recorder = Arc::clone(&delivered);
         fence.on_ready(move |result| recorder.lock().unwrap().push(result));
         assert_eq!(*delivered.lock().unwrap(), vec![Ok(())]);
+    }
+
+    #[test]
+    fn test_execution_fence_of_completed_events_is_immediately_terminal() {
+        // Executions whose events all completed successfully before the fence was created need no shared state.
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(None).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        assert!(fence.state.is_none());
+        assert_eq!(fence.is_ready(), Ok(true));
+        assert_eq!(fence.clone().block_until_ready(), Ok(()));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&delivered);
+        fence.on_ready(move |result| recorder.lock().unwrap().push(result));
+        assert_eq!(*delivered.lock().unwrap(), vec![Ok(())]);
+
+        // One pending event keeps the whole fence pending, even when the other events already completed.
+        let (completed_event, completed_promise) = client.event(()).unwrap();
+        let (pending_event, pending_promise) = client.event(()).unwrap();
+        completed_promise.set(None).unwrap();
+        let fence = ExecutionFence::new(vec![completed_event, pending_event]);
+        assert!(fence.state.is_some());
+        assert_eq!(fence.is_ready(), Ok(false));
+        pending_promise.set(None).unwrap();
+        assert_eq!(fence.block_until_ready(), Ok(()));
     }
 
     #[test]

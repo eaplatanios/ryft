@@ -86,6 +86,11 @@ path = "src/bin/compilation_benchmark.rs"
 required-features = ["performance-benchmarking"]
 
 [[bin]]
+name = "dispatch_benchmark"
+path = "src/bin/dispatch_benchmark.rs"
+required-features = ["performance-benchmarking"]
+
+[[bin]]
 name = "rematerialization_benchmark"
 path = "src/bin/rematerialization_benchmark.rs"
 required-features = ["performance-benchmarking"]

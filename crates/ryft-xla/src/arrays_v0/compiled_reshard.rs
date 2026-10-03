@@ -94,7 +94,7 @@ pub(crate) fn reshard_with_donation<'o>(
     }
 
     let src_mesh = source.mesh();
-    if &src_mesh == dst_mesh {
+    if src_mesh == dst_mesh {
         try_same_mesh(source, engine, dst_mesh, dst_sharding, donate)
     } else if source.sharding().is_replicated() {
         try_replicated_cross_mesh(source, engine, dst_mesh, dst_sharding)

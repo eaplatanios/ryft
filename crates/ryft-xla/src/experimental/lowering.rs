@@ -8493,7 +8493,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     // region selects per state element between the body's candidate update and the carried (incoming-state)
     // predicate, then recomputes the predicate on the updated state for the next iteration. The condition is
     // therefore evaluated exactly once per iteration (plus once before the loop to seed the initial predicate),
-    // never twice. A batched-predicate loop is always pure (`WhileOperation::new` rejects effects in a
+    // never twice. A batched-predicate loop is always pure (the while signature validation rejects effects in a
     // batched-predicate loop, since observable effects cannot be masked for finished items), so predicate threading
     // and token threading never coexist.
     let condition_output_types = condition.output_types();
@@ -8504,14 +8504,16 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     // predicate carried through the loop state. This preserves exactly-once condition effects and lets the body
     // return their updated tokens. Batched predicates already use the same carried-predicate shape for masking.
     let condition_effects = condition.effects().classes();
-    let threaded_predicate = batched_predicate || !condition_effects.is_empty();
+    let iteration_bound = while_op.iteration_bound();
+    // Bounded loops also thread pure predicates so reaching the bound skips the condition computation entirely,
+    // including any nested pure loop that would otherwise diverge on the final state.
+    let threaded_predicate = batched_predicate || !condition_effects.is_empty() || iteration_bound.is_some();
     let predicate_dimensions = (0..predicate_type.rank()).collect::<Vec<_>>();
     let predicate_offset = if threaded_predicate { 1 } else { 0 };
     // A semantic iteration bound is enforced by threading an internal `i64` iteration counter through the
     // `stablehlo.while` state (element 0, starting at zero and incremented once per body run) and conjoining
     // `counter < bound` into the lowered condition. The counter is internal extra state: the operation's outputs
     // remain exactly the original state elements. Unbounded loops emit no counter machinery at all.
-    let iteration_bound = while_op.iteration_bound();
     let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
     // Carry one trailing token for each ordered class used by either nested program. Each class advances independently
     // through the body; a body that is pure for one active class returns that class's entry token unchanged.
@@ -8574,7 +8576,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         let mut condition_block_ref = condition_block.as_ref();
         // A threaded predicate is read from the loop state. Batched predicates are reduced with Boolean `or`, so the
         // loop continues while any mapped item remains active; effectful scalar predicates are already scalar. Pure
-        // scalar predicates retain the smaller representation and are evaluated directly in this region.
+        // unbounded scalar predicates retain the smaller representation and are evaluated directly in this region.
         let loop_predicate = if threaded_predicate {
             let carried_predicate = condition_block_ref
                 .argument(predicate_index)
@@ -8701,9 +8703,9 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 .zip(state_types.iter())
                 .map(|((candidate, carried), state_type)| {
                     // A first-class dimension carry is loop-invariant under a batched predicate (the contract
-                    // documented on `WhileTypeSemantics`), so masking it is the identity and the body's candidate
-                    // result is threaded on directly. This matches eager interpretation, whose `mask_select` returns
-                    // equal dimension carries unchanged.
+                    // documented on `WhileType`), so masking it is the identity and the body's candidate result is
+                    // threaded on directly. This matches eager interpretation, whose `mask_select` returns equal
+                    // dimension carries unchanged.
                     if matches!(state_type, ArrayIrType::Dimension(_)) {
                         return Ok(candidate);
                     }
@@ -8713,18 +8715,76 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                     let element_mask = if state_type.shape() == predicate_type.shape() {
                         carried_predicate
                     } else {
-                        let mask_type = lower_tensor_type(
-                            &ArrayType::new(DataType::Boolean, state_type.shape().clone()),
-                            context,
-                            location,
-                        )?;
-                        let broadcast = body_block_ref.append_operation(stable_hlo::broadcast(
-                            carried_predicate,
-                            mask_type,
-                            predicate_dimensions.as_slice(),
-                            location,
-                        )?)?;
-                        broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+                        let mask_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
+                        if state_type.static_shape().is_some() {
+                            let broadcast = body_block_ref.append_operation(stable_hlo::broadcast(
+                                carried_predicate,
+                                lower_tensor_type(&mask_type, context, location)?,
+                                predicate_dimensions.as_slice(),
+                                location,
+                            )?)?;
+                            broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+                        } else if let Ok(physical_type) = physical_bound_type(&mask_type) {
+                            // Broadcast bounded storage, then restore every logical extent from the carry. A
+                            // predicate cannot supply the dynamic sizes of trailing state axes, and native bounded
+                            // broadcast results admit at most one dynamic axis.
+                            let predicate = lower_physical_bound_value(
+                                carried_predicate,
+                                &predicate_type,
+                                0.0,
+                                &mut body_block_ref,
+                                context,
+                                location,
+                            )?;
+                            let broadcast = body_block_ref.append_operation(stable_hlo::broadcast(
+                                predicate,
+                                lower_tensor_type(&physical_type, context, location)?,
+                                predicate_dimensions.as_slice(),
+                                location,
+                            )?)?;
+                            let sources = (0..state_type.rank()).map(|axis| (*carried, axis)).collect::<Vec<_>>();
+                            lower_restore_dynamic_dimensions(
+                                broadcast.result(0).unwrap().as_ref(),
+                                &mask_type,
+                                &sources,
+                                &mut body_block_ref,
+                                context,
+                                location,
+                            )?
+                        } else {
+                            let extents = (0..state_type.rank())
+                                .map(|axis| {
+                                    lower_runtime_dimension_size_i64(
+                                        *carried,
+                                        axis,
+                                        &mut body_block_ref,
+                                        context,
+                                        location,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let shape =
+                                composite::lower_explicit_shape(&extents, &mut body_block_ref, context, location)?;
+                            let broadcast = body_block_ref.append_operation(stable_hlo::dynamic_broadcast(
+                                carried_predicate,
+                                shape,
+                                predicate_dimensions.as_slice(),
+                                None,
+                                None,
+                                location,
+                            )?)?;
+                            let result = broadcast.result(0).unwrap().as_ref();
+                            let expected_type = lower_tensor_type(&mask_type, context, location)?;
+                            if result.r#type()? == expected_type.as_ref() {
+                                result
+                            } else {
+                                body_block_ref
+                                    .append_operation(tensor::cast(result, expected_type, location)?)?
+                                    .result(0)
+                                    .unwrap()
+                                    .as_ref()
+                            }
+                        }
                     };
                     let select = body_block_ref.append_operation(stable_hlo::select(
                         element_mask,
@@ -8739,37 +8799,103 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         } else {
             body_outputs
         };
-        // Recompute a threaded predicate after the body. An effectful scalar condition shares the body's token set,
-        // so its effects become the tokens returned as the next loop state. Batched conditions are required to be
-        // pure, but follow the same value path.
+        let next_counter = if iteration_bound.is_some() {
+            let counter = body_block_ref.argument(0).expect("bounded while state should include the counter").as_ref();
+            let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
+            let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, one, location)?)?;
+            Some(next_counter.result(0).expect("stablehlo.add should return one result").as_ref())
+        } else {
+            None
+        };
+        // Recompute a threaded predicate after the body. At the semantic bound, the condition must not run again:
+        // eager interpretation checks the bound before evaluating it. An extra evaluation could cause observable
+        // effects or diverge even when the condition is pure.
+        // The guarded branch returns the predicate and every active token, forwarding the incoming tokens unchanged
+        // when the bound is reached. The carried predicate is immaterial then because the counter ends the loop.
         let next_predicate = if threaded_predicate {
-            let next_predicate = lower_nested_program_inline(
-                condition,
-                next_state_values.as_slice(),
-                &mut body_block_ref,
-                context,
-                location,
-                captured_values,
-                &RematerializationOptimizationBarrier::None,
-                nested_functions,
-                collective_state,
-                &mut body_effect_tokens,
-            )?;
-            if next_predicate.len() != 1 {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!("{} condition lowered to {} outputs", WHILE_OPERATION_NAME, next_predicate.len(),),
-                });
+            if let Some(bound) = iteration_bound {
+                let bound_constant = lower_static_index_constants(&[bound], &mut body_block_ref, context, location)?[0];
+                let evaluate_condition = lower_compare_to_mlir(
+                    ComparisonDirection::LessThan,
+                    next_counter.unwrap(),
+                    bound_constant,
+                    &mut body_block_ref,
+                    location,
+                )?;
+                let condition_region = lower_control_flow_region(
+                    condition,
+                    next_state_values.as_slice(),
+                    context,
+                    location,
+                    captured_values,
+                    nested_functions,
+                    collective_state,
+                    body_effect_tokens,
+                    threaded_effects,
+                )?;
+                let mut finished_region = context.region();
+                let finished_block = context.block_with_no_arguments();
+                {
+                    let mut finished_block_ref = finished_block.as_ref();
+                    let mut finished_outputs = vec![
+                        body_block_ref
+                            .argument(predicate_index)
+                            .expect("predicate-threaded while state should include the carried predicate")
+                            .as_ref(),
+                    ];
+                    for effect in token_threaded_effects(threaded_effects) {
+                        finished_outputs.push(
+                            body_effect_tokens
+                                .get(effect)
+                                .expect("token-threaded while bodies receive every active effect token"),
+                        );
+                    }
+                    finished_block_ref
+                        .append_operation(stable_hlo::r#return(finished_outputs.as_slice(), location)?)?;
+                }
+                finished_region.append_block(finished_block)?;
+                let guarded_condition = body_block_ref.append_operation(stable_hlo::r#if(
+                    evaluate_condition,
+                    condition_region.into(),
+                    finished_region.into(),
+                    location,
+                )?)?;
+                for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
+                    body_effect_tokens.set(
+                        effect,
+                        guarded_condition
+                            .result(1 + token_offset)
+                            .expect("a guarded while condition returns every active effect token")
+                            .as_ref(),
+                    );
+                }
+                Some(guarded_condition.result(0).expect("a guarded while condition returns its predicate").as_ref())
+            } else {
+                let next_predicate = lower_nested_program_inline(
+                    condition,
+                    next_state_values.as_slice(),
+                    &mut body_block_ref,
+                    context,
+                    location,
+                    captured_values,
+                    &RematerializationOptimizationBarrier::None,
+                    nested_functions,
+                    collective_state,
+                    &mut body_effect_tokens,
+                )?;
+                if next_predicate.len() != 1 {
+                    return Err(LoweringError::UnsupportedOp {
+                        op: format!("{} condition lowered to {} outputs", WHILE_OPERATION_NAME, next_predicate.len(),),
+                    });
+                }
+                Some(next_predicate[0])
             }
-            Some(next_predicate[0])
         } else {
             None
         };
         let mut next_state = Vec::with_capacity(lowered_state_types.len());
-        if iteration_bound.is_some() {
-            let counter = body_block_ref.argument(0).expect("bounded while state should include the counter").as_ref();
-            let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
-            let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, one, location)?)?;
-            next_state.push(next_counter.result(0).expect("stablehlo.add should return one result").as_ref());
+        if let Some(next_counter) = next_counter {
+            next_state.push(next_counter);
         }
         next_state.extend(next_state_values);
         if let Some(next_predicate) = next_predicate {
@@ -21793,6 +21919,8 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("@ryft.print").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("@ryft.assert").count(), 2, "{stablehlo}");
+        // The second condition site is guarded so reaching the semantic bound never executes its effects.
+        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         let condition_region = stablehlo.split_once("cond {").unwrap().1.split_once("} do {").unwrap().0;
         assert!(!condition_region.contains("@ryft.print"), "{stablehlo}");
         assert!(!condition_region.contains("@ryft.assert"), "{stablehlo}");
@@ -21909,6 +22037,11 @@ mod tests {
         assert!(stablehlo.contains("stablehlo.and"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.add"), "{stablehlo}");
         assert!(stablehlo.contains("tensor<i64>"), "{stablehlo}");
+        // Even a pure scalar condition is carried and recomputed only below the bound. The condition region reads
+        // its carried predicate, while the body guards the next condition evaluation with a nested branch.
+        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
+        let condition = stablehlo.split_once("cond {").unwrap().1.split_once("} do {").unwrap().0;
+        assert_eq!(condition.matches("stablehlo.compare").count(), 1, "{stablehlo}");
     }
 
     #[test]
@@ -21977,11 +22110,90 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_broadcasts_while_masks_over_dynamic_state_axes() {
+        for upper_bound in [Some(5), None] {
+            let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
+            let state_type = ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![
+                    Dimension::Static(2),
+                    dynamic_dimension("rows", upper_bound),
+                    dynamic_dimension("columns", upper_bound),
+                ]),
+            );
+            let condition = {
+                let mut builder = CompositeXlaProgramBuilder::new();
+                let predicate = builder.add_input(predicate_type.clone().into());
+                builder.add_input(state_type.clone().into());
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                        vec![predicate],
+                        vec![Placeholder, Placeholder],
+                        vec![Placeholder],
+                    )
+                    .unwrap()
+            };
+            let body = {
+                let mut builder = CompositeXlaProgramBuilder::new();
+                let predicate = builder.add_input(predicate_type.clone().into());
+                let state = builder.add_input(state_type.clone().into());
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                        vec![predicate, state],
+                        vec![Placeholder, Placeholder],
+                        vec![Placeholder, Placeholder],
+                    )
+                    .unwrap()
+            };
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let condition = builder.import_region(condition.entry_region_ref());
+            let body = builder.import_region(body.entry_region_ref());
+            let predicate = builder.add_input(predicate_type.clone().into());
+            let state = builder.add_input(state_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                    vec![condition, body],
+                    vec![predicate, state],
+                    None,
+                )
+                .unwrap()[1];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![predicate_type, state_type.clone()],
+                &vec![state_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(module.contains("stablehlo.select"), "{module}");
+            if upper_bound.is_some() {
+                // Both dynamic mask axes inherit their actual extents from the state, rather than its capacity.
+                let body = module.split_once("} do {").unwrap().1;
+                assert_eq!(body.matches("stablehlo.set_dimension_size").count(), 2, "{module}");
+                assert!(!body.contains("stablehlo.dynamic_broadcast_in_dim"), "{module}");
+            } else {
+                assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1, "{module}");
+            }
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_passes_loop_invariant_dimension_through_masked_batched_predicate_while() {
-        // A batched-predicate loop may also carry a first-class dimension, which the relaxed `WhileTypeSemantics`
-        // contract requires to be loop-invariant. Masking a loop-invariant carry is the identity, so the lowering
-        // threads the body's dimension result on directly: only the array carry gets a `stablehlo.select`, while the
-        // condition region still `or`-reduces the per-item predicate into the scalar continuation decision.
+        // A batched-predicate loop may also carry a first-class dimension, which the relaxed `WhileType` contract
+        // requires to be loop-invariant. Masking a loop-invariant carry is the identity, so the lowering threads the
+        // body's dimension result on directly: only the array carry gets a `stablehlo.select`, while the condition
+        // region still `or`-reduces the per-item predicate into the scalar continuation decision.
         use ryft_core::{CompareOperation, OneLikeOperation, ZeroLikeOperation};
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
@@ -25415,6 +25627,129 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_bounded_while_condition_effects_stop_at_bound_on_cpu() {
+        use std::sync::Arc;
+
+        use ryft_core::{CompareOperation, OneLikeOperation, PrintOperation, ZeroLikeOperation};
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+        use ryft_pjrt::{
+            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+            load_cpu_plugin,
+        };
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::tests::{values_from_bytes, values_to_bytes};
+
+        // A false entry predicate runs the condition once, natural termination runs it once more than the body,
+        // and truncation at the bound runs it only before each permitted body execution.
+        let state_type = ArrayType::scalar(DataType::F64);
+        let condition = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let state = builder.add_input(state_type.clone().into());
+            let state =
+                builder.add_instruction(PrintOperation::new("condition"), Vec::new(), vec![state], None).unwrap()[0];
+            let zero = builder
+                .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
+                .unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![state, zero],
+                    None,
+                )
+                .unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+        }
+        .unwrap();
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let state = builder.add_input(state_type.clone().into());
+            let one = builder
+                .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
+                .unwrap()[0];
+            let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
+            let next = builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![next], None).unwrap()[0];
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+        }
+        .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let state = builder.add_input(state_type.clone().into());
+        let output = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+                vec![condition_region, body_region],
+                vec![state],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![state_type.clone()];
+        let output_types = vec![state_type.clone()];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let options = CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: std::collections::HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        };
+        let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        for (input, expected, expected_lines) in [
+            (-1.0, -1.0, vec!["condition: -1.0"]),
+            (1.0, 0.0, vec!["condition: 1.0", "body: 0.0", "condition: 0.0"]),
+            (5.0, 3.0, vec!["condition: 5.0", "body: 4.0", "condition: 4.0", "body: 3.0"]),
+        ] {
+            let input_bytes = values_to_bytes::<f64>(&[input]);
+            let (output, lines) = with_captured_prints(|| {
+                let inputs = ExecutionDeviceInputs {
+                    inputs: &[ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(input_bytes.as_slice(), BufferType::F64, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    }],
+                    ..Default::default()
+                };
+                let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
+                let mut outputs = execution.block_until_ready().unwrap().remove(0);
+                assert_eq!(outputs.outputs.len(), 1);
+                let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f64>(output_bytes.as_slice())
+            });
+            assert_eq!(output, vec![expected]);
+            assert_eq!(lines, expected_lines);
+        }
     }
 
     // ---------------------------------------------------------------------------

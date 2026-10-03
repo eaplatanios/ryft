@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use ryft_core::{ArrayType, DeviceMesh, Dimension, Shape, Sharding, Typed, check_sharding};
-use ryft_pjrt::{Buffer, DeviceId};
+use ryft_pjrt::DeviceId;
 
 use crate::arrays_v0::compiled_reshard;
 use crate::arrays_v0::error::ArrayError;
@@ -48,7 +45,7 @@ impl<'o> Array<'o> {
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
     pub fn to_placement(&self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
-        if self.mesh() == target_mesh && self.sharding() == &target_sharding {
+        if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self.clone());
         }
         self.run_placement_dispatch(engine, target_mesh, target_sharding, false)
@@ -73,7 +70,7 @@ impl<'o> Array<'o> {
     ///   - `target`: Resolved into a destination [`DeviceMesh`] + [`Sharding`].
     pub fn into_placement(self, engine: &XlaDomain<'o>, target: DevicePutTarget) -> Result<Self, ArrayError> {
         let (target_mesh, target_sharding) = target.resolve(self.sharding().rank())?;
-        if self.mesh() == target_mesh && self.sharding() == &target_sharding {
+        if self.mesh() == &target_mesh && self.sharding() == &target_sharding {
             return Ok(self);
         }
         self.run_placement_dispatch(engine, target_mesh, target_sharding, true)
@@ -160,7 +157,7 @@ impl<'o> Array<'o> {
         addressable_device_ids: &[DeviceId],
     ) -> Result<ExecuteArguments<'o>, ArrayError> {
         let donation_flags = vec![false; arrays.len()];
-        ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids, donation_flags.as_slice())
+        ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
 
     /// Same as [`Array::into_execute_arguments`] but with explicit per-input donation requests.
@@ -173,17 +170,6 @@ impl<'o> Array<'o> {
         addressable_device_ids: &[DeviceId],
         donation_flags: &[bool],
     ) -> Result<ExecuteArguments<'o>, ArrayError> {
-        ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids, donation_flags)
-    }
-
-    pub(crate) fn into_addressable_buffers_by_device(self) -> HashMap<DeviceId, Arc<Buffer<'o>>> {
-        self.shards()
-            .iter()
-            .filter_map(|shard| {
-                let (descriptor, buffer) = shard.clone().into_parts();
-                let device_id = descriptor.device().id();
-                buffer.map(|buffer| (device_id, buffer))
-            })
-            .collect()
+        ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags)
     }
 }

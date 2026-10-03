@@ -64,7 +64,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         _donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let current_mesh = self.mesh();
+        let current_mesh = self.mesh().clone();
         let current_sharding = self.sharding().clone();
         if let Some(src) = src {
             let (expected_mesh, expected_sharding) = src.resolve(current_sharding.rank())?;

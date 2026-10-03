@@ -236,8 +236,8 @@ pub(crate) mod tests {
         ConstantOperation, ConvertElementTypeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation,
         DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
         PadOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation,
-        ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation, SubOperation, TransposeOperation,
-        UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
+        ReshapeOperation, ReshardOperation, SelectOperation, SliceOperation, StopGradientOperation, SubOperation,
+        TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -272,18 +272,18 @@ pub(crate) mod tests {
     /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
     /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
     /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
-    /// division, subtraction, exponentiation, and selection. These dependencies apply to the operation family even
-    /// when a particular scalar test emits none of those operations. Tests of `jvp_for_transpose` additionally
-    /// use the scalar and weighted cube fixtures, the rule-marker fixtures for nested rule selection, conditional
-    /// regions, and a retained linear call. All regions use the fixed `Array` value
-    /// family, so no value type parameter is needed.
+    /// division, subtraction, exponentiation, and selection. Mapped conditional predicates require gradient barriers
+    /// on inactive branch inputs. These dependencies apply to the operation family even when a particular scalar test
+    /// emits none of those operations. Tests of `jvp_for_transpose` additionally use the scalar and weighted cube
+    /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and a retained linear call.
+    /// All regions use the fixed `Array` value family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
     pub(crate) enum TestArrayOperation {
         Constant(ConstantOperation<Array>),
         Zero(ZeroOperation<ArrayType>),
-        One(OneOperation<ArrayType>),
         ZeroLike(ZeroLikeOperation<ArrayType>),
+        One(OneOperation<ArrayType>),
         OneLike(OneLikeOperation<ArrayType>),
         Neg(NegOperation<ArrayType>),
         Add(AddOperation<ArrayType>),
@@ -291,10 +291,6 @@ pub(crate) mod tests {
         Mul(MulOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
         Exp(ExpOperation<ArrayType>),
-        CustomCube(CustomCubeOperation),
-        CustomWeightedCube(CustomWeightedCubeOperation),
-        RuleMarker(RuleMarkerOperation),
-        NestedRule(NestedRuleOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),
@@ -308,9 +304,14 @@ pub(crate) mod tests {
         Compare(CompareOperation<ArrayType>),
         Select(SelectOperation<ArrayType>),
         Condition(ConditionOperation<Array>),
+        StopGradient(StopGradientOperation<ArrayType>),
         LinearCall(LinearCallOperation<ArrayType>),
         CustomFunction(CustomFunctionOperation<Array, TestArrayOperation>),
         CustomFunctionTranspose(CustomFunctionTransposeOperation<Array, TestArrayOperation>),
+        CustomCube(CustomCubeOperation),
+        CustomWeightedCube(CustomWeightedCubeOperation),
+        RuleMarker(RuleMarkerOperation),
+        NestedRule(NestedRuleOperation),
     }
 
     // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation

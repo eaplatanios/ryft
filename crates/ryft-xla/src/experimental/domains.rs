@@ -1,5 +1,6 @@
 //! XLA staging, compilation, and execution through the shared compilation-domain interfaces.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -41,7 +42,7 @@ use super::lowering::{
 };
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
-use crate::arrays::ArrayTypeExtension;
+use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
 use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
 use crate::arrays_v0::{
     BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
@@ -155,7 +156,7 @@ struct PreparedXlaExecution<'c> {
     inputs: Vec<Array<'c>>,
 
     /// Addressable devices in executable order.
-    addressable_device_ids: Vec<DeviceId>,
+    addressable_device_ids: Arc<[DeviceId]>,
 
     /// Effective physical donation request for every input.
     donation_flags: Vec<bool>,
@@ -170,9 +171,9 @@ struct PreparedXlaExecution<'c> {
 impl<'c> PreparedXlaExecution<'c> {
     /// Consumes the materialized arrays into device-major PJRT arguments.
     fn into_arguments(self) -> Result<(ExecuteArguments<'c>, <ArrayType as Type>::Refinements, usize), ArrayError> {
-        let arguments = Array::into_execute_arguments_with_donation(
+        let arguments = ExecuteArguments::from_arrays_with_donation(
             self.inputs,
-            self.addressable_device_ids.as_slice(),
+            self.addressable_device_ids,
             self.donation_flags.as_slice(),
         )?;
         Ok((arguments, self.input_refinements, self.physical_output_count))
@@ -1425,35 +1426,47 @@ impl<'c> XlaDomain<'c> {
 
         // Applications go through the session's eager dispatch cache, which maps the operation, its attached regions,
         // and its inputs directly to a compiled program, so a repeated application skips tracing, lowering, and
-        // compilation-key construction and only revalidates its input placement.
-        let key = XlaEagerDispatchKey {
-            operation: operation.clone(),
-            regions: driver.regions().map(RegionRef::structure).collect(),
-            inputs: inputs
-                .iter()
-                .map(|input| match input {
-                    ArrayIrValue::Array(array) => XlaEagerDispatchInput::Array(array.r#type().into_owned()),
-                    ArrayIrValue::Dimension(dimension) => XlaEagerDispatchInput::Dimension(dimension.clone()),
-                    ArrayIrValue::Reference(_) => {
-                        unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
-                    }
-                })
-                .collect(),
-            mesh: self.mesh.clone().or_else(|| array_inputs.first().map(Array::mesh)),
-            compilation_options: XlaCompilationOptionsIdentity(Arc::clone(&self.compilation_options)),
+        // compilation-key construction and only revalidates its input placement. Hits are looked up through a
+        // borrowed query, and the owned key is only built on a miss.
+        let regions = driver.regions().map(RegionRef::structure).collect::<Vec<_>>();
+        let query = XlaEagerDispatchQuery {
+            operation: &operation,
+            regions: regions.as_slice(),
+            inputs,
+            mesh: self.mesh.as_ref().or_else(|| array_inputs.first().map(Array::mesh)),
+            compilation_options: &self.compilation_options,
         };
-        let entry = self
-            .session
-            .eager_dispatch_cache
-            .try_entry(key)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let compiled = match entry {
-            SpecializationCacheEntry::Occupied(compiled) => {
+        let compiled = match self.session.eager_dispatch_cache.get(&query as &dyn XlaEagerDispatchKeyView) {
+            Some(compiled) => {
                 self.validate_eager_placement(array_inputs.as_slice())?;
                 compiled
             }
-            SpecializationCacheEntry::Vacant(producer) => {
-                producer.insert(self.compile_eager_operation(operation, driver, inputs, array_inputs.as_slice())?)
+            None => {
+                // The query borrows `regions`, so the key takes them only after its last use of the query.
+                let key = XlaEagerDispatchKey {
+                    operation: operation.clone(),
+                    inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
+                    mesh: query.mesh.cloned(),
+                    compilation_options: Arc::clone(&self.compilation_options),
+                    regions: regions.into(),
+                };
+                let entry = self
+                    .session
+                    .eager_dispatch_cache
+                    .try_entry(key)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                match entry {
+                    SpecializationCacheEntry::Occupied(compiled) => {
+                        self.validate_eager_placement(array_inputs.as_slice())?;
+                        compiled
+                    }
+                    SpecializationCacheEntry::Vacant(producer) => producer.insert(self.compile_eager_operation(
+                        operation,
+                        driver,
+                        inputs,
+                        array_inputs.as_slice(),
+                    )?),
+                }
             }
         };
 
@@ -1543,13 +1556,20 @@ impl<'c> XlaDomain<'c> {
                 )));
             }
         }
-        let first_device_ids = inputs[0].mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
+        // Arrays produced by the same program (or cloned from one array) share their mesh allocation, so pointer
+        // equality settles the common case without comparing devices.
+        let first_mesh = inputs[0].mesh();
+        let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(Device::id).collect::<Vec<_>>();
         for (index, input) in inputs.iter().enumerate().skip(1) {
-            let device_ids = input.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
-            if device_ids != first_device_ids {
+            let mesh = input.mesh();
+            if !std::ptr::eq(mesh, first_mesh)
+                && !mesh.devices().iter().map(Device::id).eq(first_mesh.devices().iter().map(Device::id))
+            {
                 return Err(invalid_argument(format!(
-                    "received incompatible devices for eager xla execution: input #{index} is placed on devices \
-                     {device_ids:?} but input #0 is placed on devices {first_device_ids:?}",
+                    "received incompatible devices for eager xla execution: input #{index} is placed on devices {:?} \
+                     but input #0 is placed on devices {:?}",
+                    device_ids(mesh),
+                    device_ids(first_mesh),
                 )));
             }
         }
@@ -1567,7 +1587,7 @@ impl<'c> XlaDomain<'c> {
             return Ok(mesh.clone());
         }
         if let Some(input) = inputs.first() {
-            return Ok(input.mesh());
+            return Ok(input.mesh().clone());
         }
         let invalid_argument = |message: String| ProgramError::InvalidArgument { message };
         let devices = self.client().addressable_devices().map_err(|error| invalid_argument(error.to_string()))?;
@@ -1881,7 +1901,10 @@ const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// traced afresh on every call still hit the cache when they trace to the same regions. Instruction provenance is not
 /// part of region structure, so applications that differ only in provenance share one compiled program, whose debug
 /// locations are those of the first application.
-#[derive(Clone, PartialEq, Eq, Hash)]
+///
+/// Keys are compared and hashed through [`XlaEagerDispatchKeyView`], which they share with the borrowed
+/// [`XlaEagerDispatchQuery`] that eager dispatch looks hits up with.
+#[derive(Clone)]
 struct XlaEagerDispatchKey {
     /// Applied operation, compared and hashed with all of its attributes.
     operation: XlaOperation,
@@ -1897,12 +1920,15 @@ struct XlaEagerDispatchKey {
     /// a domain without a mesh, whose mesh is then determined by the operation and the session's client.
     mesh: Option<DeviceMesh>,
 
-    /// Compilation options of the dispatching domain, compared by identity.
-    compilation_options: XlaCompilationOptionsIdentity,
+    /// Compilation options of the dispatching domain, compared and hashed by the address of their shared allocation.
+    /// Domains created through [`XlaSession::domain`] share one default allocation, so they share eager dispatch cache
+    /// entries, while each [`XlaDomain::with_compilation_options`] call creates a distinct identity. Options that are
+    /// equal but separately allocated therefore only miss each other's entries.
+    compilation_options: Arc<CompilationOptions>,
 }
 
 /// One input of an [`XlaEagerDispatchKey`].
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 enum XlaEagerDispatchInput {
     /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
     Array(ArrayType),
@@ -1911,24 +1937,168 @@ enum XlaEagerDispatchInput {
     Dimension(DimensionValue),
 }
 
-/// Compilation options of an [`XlaDomain`], compared and hashed by the address of their shared allocation. Domains
-/// created through [`XlaSession::domain`] share one default allocation, so they share eager dispatch cache entries,
-/// while each [`XlaDomain::with_compilation_options`] call creates a distinct identity. Options that are equal but
-/// separately allocated therefore only miss each other's entries.
-#[derive(Clone)]
-struct XlaCompilationOptionsIdentity(Arc<CompilationOptions>);
+/// Borrowed form of one [`XlaEagerDispatchInput`], which owned keys and borrowed queries compare and hash alike.
+#[derive(PartialEq, Eq, Hash)]
+enum XlaEagerDispatchInputRef<'a> {
+    /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
+    Array(Cow<'a, ArrayType>),
 
-impl PartialEq for XlaCompilationOptionsIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+    /// Dimension input, keyed by its [`DimensionValue`] (including its extent).
+    Dimension(&'a DimensionValue),
+}
+
+impl XlaEagerDispatchInputRef<'_> {
+    /// Returns the owned [`XlaEagerDispatchInput`] that this reference borrows from or describes.
+    fn into_owned(self) -> XlaEagerDispatchInput {
+        match self {
+            Self::Array(r#type) => XlaEagerDispatchInput::Array(r#type.into_owned()),
+            Self::Dimension(dimension) => XlaEagerDispatchInput::Dimension(dimension.clone()),
+        }
     }
 }
 
-impl Eq for XlaCompilationOptionsIdentity {}
+/// Common view of an owned [`XlaEagerDispatchKey`] and a borrowed [`XlaEagerDispatchQuery`]. Both forms are compared
+/// and hashed through `dyn XlaEagerDispatchKeyView`, so that equal keys and queries hash alike and an owned key can be
+/// [borrowed](std::borrow::Borrow) as a view for lookups in the eager dispatch cache.
+trait XlaEagerDispatchKeyView {
+    /// Returns the applied operation.
+    fn operation(&self) -> &XlaOperation;
 
-impl Hash for XlaCompilationOptionsIdentity {
+    /// Returns the structures of the regions attached to the application, in operation-defined order.
+    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>];
+
+    /// Returns the number of inputs of the application.
+    fn input_count(&self) -> usize;
+
+    /// Returns the input at `index`, which must be smaller than [`Self::input_count`].
+    fn input(&self, index: usize) -> XlaEagerDispatchInputRef<'_>;
+
+    /// Returns the mesh that the eager lowering compiles against, if it is not derived from the operation alone.
+    fn mesh(&self) -> Option<&DeviceMesh>;
+
+    /// Returns the compilation options of the dispatching domain, which are compared by identity.
+    fn compilation_options(&self) -> &Arc<CompilationOptions>;
+}
+
+impl XlaEagerDispatchKeyView for XlaEagerDispatchKey {
+    fn operation(&self) -> &XlaOperation {
+        &self.operation
+    }
+
+    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>] {
+        &self.regions
+    }
+
+    fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    fn input(&self, index: usize) -> XlaEagerDispatchInputRef<'_> {
+        match &self.inputs[index] {
+            XlaEagerDispatchInput::Array(r#type) => XlaEagerDispatchInputRef::Array(Cow::Borrowed(r#type)),
+            XlaEagerDispatchInput::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension),
+        }
+    }
+
+    fn mesh(&self) -> Option<&DeviceMesh> {
+        self.mesh.as_ref()
+    }
+
+    fn compilation_options(&self) -> &Arc<CompilationOptions> {
+        &self.compilation_options
+    }
+}
+
+impl PartialEq for dyn XlaEagerDispatchKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation() == other.operation()
+            && self.regions() == other.regions()
+            && self.input_count() == other.input_count()
+            && (0..self.input_count()).all(|index| self.input(index) == other.input(index))
+            && self.mesh() == other.mesh()
+            && Arc::ptr_eq(self.compilation_options(), other.compilation_options())
+    }
+}
+
+impl Eq for dyn XlaEagerDispatchKeyView + '_ {}
+
+impl Hash for dyn XlaEagerDispatchKeyView + '_ {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
+        self.operation().hash(state);
+        self.regions().hash(state);
+        self.input_count().hash(state);
+        (0..self.input_count()).for_each(|index| self.input(index).hash(state));
+        self.mesh().hash(state);
+        Arc::as_ptr(self.compilation_options()).hash(state);
+    }
+}
+
+impl PartialEq for XlaEagerDispatchKey {
+    fn eq(&self, other: &Self) -> bool {
+        (self as &dyn XlaEagerDispatchKeyView) == (other as &dyn XlaEagerDispatchKeyView)
+    }
+}
+
+impl Eq for XlaEagerDispatchKey {}
+
+impl Hash for XlaEagerDispatchKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as &dyn XlaEagerDispatchKeyView).hash(state);
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn XlaEagerDispatchKeyView + 'a> for XlaEagerDispatchKey {
+    fn borrow(&self) -> &(dyn XlaEagerDispatchKeyView + 'a) {
+        self
+    }
+}
+
+/// Borrowed [`XlaEagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
+/// building an owned key.
+struct XlaEagerDispatchQuery<'a, 'c> {
+    /// Applied operation.
+    operation: &'a XlaOperation,
+
+    /// Structures of the regions attached to the application, in operation-defined order.
+    regions: &'a [RegionStructure<XlaConstant, XlaOperation>],
+
+    /// Inputs of the application, which contain no references.
+    inputs: &'a [ArrayIrValue<Array<'c>>],
+
+    /// Mesh that the eager lowering compiles against (refer to [`XlaEagerDispatchKey`] for more information).
+    mesh: Option<&'a DeviceMesh>,
+
+    /// Compilation options of the dispatching domain.
+    compilation_options: &'a Arc<CompilationOptions>,
+}
+
+impl XlaEagerDispatchKeyView for XlaEagerDispatchQuery<'_, '_> {
+    fn operation(&self) -> &XlaOperation {
+        self.operation
+    }
+
+    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>] {
+        self.regions
+    }
+
+    fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    fn input(&self, index: usize) -> XlaEagerDispatchInputRef<'_> {
+        match &self.inputs[index] {
+            ArrayIrValue::Array(array) => XlaEagerDispatchInputRef::Array(array.r#type()),
+            ArrayIrValue::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension),
+            ArrayIrValue::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
+        }
+    }
+
+    fn mesh(&self) -> Option<&DeviceMesh> {
+        self.mesh
+    }
+
+    fn compilation_options(&self) -> &Arc<CompilationOptions> {
+        self.compilation_options
     }
 }
 
@@ -3070,6 +3240,100 @@ pub struct XlaCompiledProgram<'c> {
     xla_flags: Arc<str>,
     compilation_duration: Option<Duration>,
     analysis: Arc<OnceLock<Result<XlaCompilationAnalysis, String>>>,
+
+    /// Value-independent execution metadata, computed once when the program is compiled or loaded.
+    plan: Arc<XlaExecutionPlan>,
+}
+
+/// Execution metadata of an [`XlaCompiledProgram`] that does not depend on the values that it is called with. It is
+/// computed once when the program is compiled or loaded, so that each execution only reads it instead of re-deriving
+/// physical types, device assignments, donation requests, and output placements, and instead of querying PJRT.
+struct XlaExecutionPlan {
+    /// Logical input index of each physical array input, excluding hidden extent scalars and tokens.
+    physical_input_logical_indices: Vec<usize>,
+
+    /// Physical array input types, including hidden extent scalars.
+    physical_input_types: Vec<ArrayType>,
+
+    /// Physical donation request of each physical array input when the caller overrides no donation.
+    default_donation_flags: Vec<bool>,
+
+    /// Identifiers of the executable's addressable devices, in execution order.
+    addressable_device_ids: Arc<[DeviceId]>,
+
+    /// Whether every logical input type has a static shape. Refining such inputs reduces to comparing types.
+    static_inputs: bool,
+
+    /// Whether any physical array input has the zero-space data type and thus needs a materialized carrier.
+    zero_space_inputs: bool,
+
+    /// Placement of every logical output, present when every output has a static type and every output without a
+    /// physical result is zero-space. The outputs of such programs are built directly from the returned buffers.
+    output_layouts: Option<Vec<ArrayOutputLayout>>,
+}
+
+impl XlaExecutionPlan {
+    /// Computes the execution plan of a program with the provided metadata, loaded as `executable`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        executable: &LoadedExecutable<'_>,
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        signature: &XlaExecutableSignature,
+        donation_flags: &[bool],
+        capture_count: usize,
+        mesh: &DeviceMesh,
+    ) -> Result<Self, XlaDomainError> {
+        let physical_input_logical_indices = signature.project_inputs(&(0..input_types.len()).collect::<Vec<_>>());
+        let physical_input_types = signature.physical_input_types(input_types);
+        let logical_donation_flags =
+            std::iter::repeat_n(false, capture_count).chain(donation_flags.iter().copied()).collect::<Vec<_>>();
+        let mut default_donation_flags = signature.project_inputs(logical_donation_flags.as_slice());
+        default_donation_flags.extend(std::iter::repeat_n(false, signature.input_dimensions().len()));
+        for (donation, input_type) in default_donation_flags.iter_mut().zip(physical_input_types.iter()) {
+            if input_type.data_type().is_zero() {
+                *donation = false;
+            }
+        }
+        let addressable_device_ids = executable
+            .addressable_devices()?
+            .iter()
+            .map(|device| device.id().map_err(XlaDomainError::from))
+            .collect::<Result<Arc<[_]>, _>>()?;
+        let static_inputs = input_types.iter().all(|input_type| input_type.static_shape().is_some());
+        let zero_space_inputs = physical_input_types.iter().any(|input_type| input_type.data_type().is_zero());
+        let static_outputs = signature.output_dimensions().is_empty()
+            && output_types.iter().zip(signature.output_mapping()).all(|(output_type, physical_index)| {
+                output_type.static_shape().is_some() && (physical_index.is_some() || output_type.data_type().is_zero())
+            });
+        let output_layouts = if static_outputs {
+            let mesh = Arc::new(mesh.clone());
+            Some(
+                output_types
+                    .iter()
+                    .map(|output_type| {
+                        let output_type = match output_type.sharding() {
+                            Some(_) => output_type.clone(),
+                            None => output_type.replicated(mesh.as_ref()).map_err(ArrayError::from)?,
+                        };
+                        Ok(ArrayOutputLayout::new(output_type, Arc::clone(&mesh), &addressable_device_ids)
+                            .map_err(ArrayError::from)?)
+                    })
+                    .collect::<Result<Vec<_>, XlaDomainError>>()?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            physical_input_logical_indices,
+            physical_input_types,
+            default_donation_flags,
+            addressable_device_ids,
+            static_inputs,
+            zero_space_inputs,
+            output_layouts,
+        })
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -3322,7 +3586,11 @@ impl<'c> XlaDomain<'c> {
             fence.clone(),
             0..program.output_types.len(),
         )?;
-        validate_compiled_output_refinements(program, &input_refinements, program.output_types.as_ref(), &outputs)?;
+        // Static outputs cannot disagree with the input refinements, so only builds with debug assertions re-validate
+        // them.
+        if program.plan.output_layouts.is_none() || cfg!(debug_assertions) {
+            validate_compiled_output_refinements(program, &input_refinements, program.output_types.as_ref(), &outputs)?;
+        }
         if physical_outputs.iter().any(Option::is_some) {
             return Err(
                 ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
@@ -3357,62 +3625,96 @@ impl<'c> XlaDomain<'c> {
                 ),
             });
         }
-        let actual_input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let refinement_input_types = program
-            .input_types
-            .iter()
-            .zip(actual_input_types.iter())
-            .map(|(declared, actual)| {
-                // Sharding is normalized separately at the executable boundary. Preserve every other observed type
-                // component so refinement still rejects a wrong data type, layout, memory space, rank, or extent.
-                actual.clone().with_sharding(declared.sharding().cloned()).map_err(ArrayError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let input_refinements =
-            <ArrayType as Type>::Refinements::establish(program.input_types.iter(), refinement_input_types.iter())
-                .map_err(ProgramError::from)?;
-        let physical_input_types = program.signature.physical_input_types(&program.input_types);
-        let inputs = materialize_bounded_dynamic_inputs(
-            self,
-            &program.signature,
-            &program.input_types,
-            actual_input_types.as_slice(),
-            inputs,
-        )?
-        .inputs;
-        let inputs = materialize_zero_space_carriers(self, physical_input_types.as_slice(), inputs)?;
-        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
-        let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
-            .chain(program.donation_flags.iter().copied())
-            .collect::<Vec<_>>();
-        for &(logical_input_index, donation) in donation_overrides {
-            let flag = logical_donation_flags.get_mut(logical_input_index).ok_or_else(|| {
-                XlaDomainError::InvalidCompilationOptions {
-                    reason: format!("donation override input {logical_input_index} is out of range"),
-                }
-            })?;
-            *flag = donation;
-        }
-        let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
-        donation_flags.extend(std::iter::repeat_n(false, program.signature.input_dimensions().len()));
-        for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types.iter()) {
-            if input_type.data_type().is_zero() {
-                *donation = false;
+        let plan = program.plan.as_ref();
+
+        // Static input types establish no refinements, so refining them reduces to comparing every component except
+        // the sharding, which is normalized separately at the executable boundary. Inputs that differ, as well as
+        // dynamic input types, take the general path below, which also produces the precise diagnostic.
+        let static_inputs_match = plan.static_inputs
+            && program.input_types.iter().zip(inputs.iter()).all(|(declared, input)| {
+                let actual = input.r#type();
+                declared.data_type() == actual.data_type()
+                    && declared.shape() == actual.shape()
+                    && declared.layout() == actual.layout()
+                    && declared.memory() == actual.memory()
+            });
+        let (input_refinements, actual_input_types) = if static_inputs_match {
+            (<ArrayType as Type>::Refinements::default(), None)
+        } else {
+            let actual_input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let refinement_input_types = program
+                .input_types
+                .iter()
+                .zip(actual_input_types.iter())
+                .map(|(declared, actual)| {
+                    // Preserve every observed type component except the sharding, so that refinement still rejects a
+                    // wrong data type, layout, memory space, rank, or extent.
+                    actual.clone().with_sharding(declared.sharding().cloned()).map_err(ArrayError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input_refinements =
+                <ArrayType as Type>::Refinements::establish(program.input_types.iter(), refinement_input_types.iter())
+                    .map_err(ProgramError::from)?;
+            (input_refinements, Some(actual_input_types))
+        };
+
+        // Without hidden extent scalars, physical inputs are a projection of the logical inputs (which is the identity
+        // for most programs); bounded-dynamic inputs are padded to their physical bounds instead.
+        let inputs = if program.signature.input_dimensions().is_empty() {
+            if plan.physical_input_logical_indices.iter().copied().eq(0..inputs.len()) {
+                inputs
+            } else {
+                plan.physical_input_logical_indices.iter().map(|&index| inputs[index].clone()).collect()
             }
-        }
-        let physical_output_count = program.signature.array_output_count();
-        let addressable_device_ids = program
-            .executable
-            .addressable_devices()?
-            .iter()
-            .map(|device| device.id().map_err(XlaDomainError::from))
-            .collect::<Result<Vec<_>, _>>()?;
+        } else {
+            let actual_input_types = match actual_input_types {
+                Some(actual_input_types) => actual_input_types,
+                None => inputs.iter().map(|input| input.r#type().into_owned()).collect(),
+            };
+            materialize_bounded_dynamic_inputs(
+                self,
+                &program.signature,
+                &program.input_types,
+                actual_input_types.as_slice(),
+                inputs,
+            )?
+            .inputs
+        };
+        let inputs = if plan.zero_space_inputs {
+            materialize_zero_space_carriers(self, plan.physical_input_types.as_slice(), inputs)?
+        } else {
+            inputs
+        };
+        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        let donation_flags = if donation_overrides.is_empty() {
+            plan.default_donation_flags.clone()
+        } else {
+            let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
+                .chain(program.donation_flags.iter().copied())
+                .collect::<Vec<_>>();
+            for &(logical_input_index, donation) in donation_overrides {
+                let flag = logical_donation_flags.get_mut(logical_input_index).ok_or_else(|| {
+                    XlaDomainError::InvalidCompilationOptions {
+                        reason: format!("donation override input {logical_input_index} is out of range"),
+                    }
+                })?;
+                *flag = donation;
+            }
+            let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
+            donation_flags.extend(std::iter::repeat_n(false, program.signature.input_dimensions().len()));
+            for (donation, input_type) in donation_flags.iter_mut().zip(plan.physical_input_types.iter()) {
+                if input_type.data_type().is_zero() {
+                    *donation = false;
+                }
+            }
+            donation_flags
+        };
         Ok(PreparedXlaExecution {
             inputs,
-            addressable_device_ids,
+            addressable_device_ids: Arc::clone(&plan.addressable_device_ids),
             donation_flags,
             input_refinements,
-            physical_output_count,
+            physical_output_count: program.signature.array_output_count(),
         })
     }
 }
@@ -3632,13 +3934,17 @@ impl<'c> XlaDomain<'c> {
             }
             .into());
         }
-        for (declared, actual) in executable.input_types().iter().zip(request.inputs().iter().map(Typed::r#type)) {
-            validate_xla_input_type(
-                <&ArrayType>::try_from(declared).map_err(ProgramError::from)?,
-                <&ArrayType>::try_from(actual.as_ref()).map_err(ProgramError::from)?,
-            )?;
+        for (declared, input) in executable.input_types().iter().zip(request.inputs()) {
+            let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
+            // Array inputs borrow their types, while the composite type of other inputs is built only to report them.
+            match input {
+                ArrayIrValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
+                input => validate_xla_input_type(
+                    declared,
+                    <&ArrayType>::try_from(input.r#type().as_ref()).map_err(ProgramError::from)?,
+                )?,
+            }
         }
-        let output_types = executable.compiled_program().output_types().to_vec();
         let arguments = request
             .into_arguments()
             .into_iter()
@@ -3650,7 +3956,7 @@ impl<'c> XlaDomain<'c> {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
-        validate_runtime_outputs(&output_types, &outputs)?;
+        validate_runtime_outputs(executable.compiled_program().output_types(), &outputs)?;
         let output = Request::reconstruct(&executable, outputs.into_iter().map(ArrayIrValue::Array).collect())?;
         Ok((output, fence))
     }
@@ -3818,7 +4124,7 @@ impl<'c> XlaDomain<'c> {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
                     let snapshot = observations[guard_indices[&reference.id()]].snapshot().clone();
-                    if snapshot.mesh() != program.mesh {
+                    if snapshot.mesh() != &program.mesh {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
                             reason: format!(
                                 "external state input {logical_input_index} reference mesh does not match the compiled \
@@ -4475,6 +4781,15 @@ impl<'c> XlaDomain<'c> {
         let compilation_start = Instant::now();
         let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
         let compilation_duration = compilation_start.elapsed();
+        let plan = XlaExecutionPlan::new(
+            &executable,
+            &program.input_types,
+            &program.output_types,
+            &program.signature,
+            &program.donation_flags,
+            program.capture_count,
+            &program.mesh,
+        )?;
         Ok(XlaCompiledProgram {
             executable: Arc::new(executable),
             input_types: Arc::clone(&program.input_types),
@@ -4496,6 +4811,7 @@ impl<'c> XlaDomain<'c> {
             xla_flags: Arc::clone(&program.xla_flags),
             compilation_duration: Some(compilation_duration),
             analysis: Arc::new(OnceLock::new()),
+            plan: Arc::new(plan),
         })
     }
 
@@ -4821,6 +5137,15 @@ impl<'c> XlaDomain<'c> {
             return Ok(None);
         }
         let compilation_duration = metadata.compilation_duration_nanoseconds.map(Duration::from_nanos);
+        let plan = XlaExecutionPlan::new(
+            &executable,
+            &input_types,
+            &output_types,
+            &signature,
+            &donation_flags,
+            capture_count,
+            &mesh,
+        )?;
         Ok(Some(XlaCompiledProgram {
             executable: Arc::new(executable),
             input_types: input_types.into(),
@@ -4842,6 +5167,7 @@ impl<'c> XlaDomain<'c> {
             xla_flags: metadata.xla_flags.into(),
             compilation_duration,
             analysis: Arc::new(OnceLock::new()),
+            plan: Arc::new(plan),
         }))
     }
 }
@@ -4897,6 +5223,10 @@ fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result
 }
 
 pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
+    // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
+    if declared == actual {
+        return Ok(());
+    }
     let declared_without_sharding =
         declared.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
     let actual_without_sharding =
@@ -4932,7 +5262,7 @@ pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
     }
     for (declared, actual) in declared.iter().zip(outputs.iter().map(Typed::r#type)) {
-        if !declared.is_refined_by(actual.as_ref()) {
+        if declared != actual.as_ref() && !declared.is_refined_by(actual.as_ref()) {
             return Err(ProgramError::InvalidArgument {
                 message: format!("runtime output type {actual} does not refine declared type {declared}"),
             }
@@ -5731,7 +6061,7 @@ fn upload_bounded_input_host_copy<'c>(
         pending.physical_type.data_type(),
     )?;
     report.host_padding_payload_allocations += padding_payload_allocations;
-    let physical = Array::from_host_buffer(domain, pending.physical_type, input.mesh(), padded_bytes)?;
+    let physical = Array::from_host_buffer(domain, pending.physical_type, input.mesh().clone(), padded_bytes)?;
     report.host_to_device_shard_uploads += physical.shards().iter().filter(|shard| shard.buffer().is_some()).count();
     Ok(PendingBoundedInputPublication {
         physical_input_index: pending.physical_input_index,
@@ -6072,7 +6402,7 @@ fn materialize_zero_space_carriers<'c>(
                 .element_count()
                 .map_err(Error::from)?
                 .expect("physical bounded input types should only have static shapes");
-            Ok(Array::from_host_buffer(domain, carrier_type, input.mesh(), vec![0u8; element_count])?)
+            Ok(Array::from_host_buffer(domain, carrier_type, input.mesh().clone(), vec![0u8; element_count])?)
         })
         .collect()
 }
@@ -6085,6 +6415,27 @@ fn reconstruct_compiled_outputs<'c>(
     fence: ryft_pjrt::ExecutionFence,
     logical_indices: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<Array<'c>>, XlaDomainError> {
+    // Programs with only static outputs build each output directly from its planned layout, without querying the
+    // returned buffers or re-deriving their placement.
+    if let Some(layouts) = &program.plan.output_layouts {
+        return logical_indices
+            .into_iter()
+            .map(|logical_index| {
+                let buffers = match program.signature.output_mapping()[logical_index] {
+                    Some(physical_index) => {
+                        physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "physical output {physical_index} for logical output {logical_index} is missing or \
+                                 was claimed twice",
+                            ))
+                        })?
+                    }
+                    None => Vec::new(),
+                };
+                Ok(Array::from_execution_output(domain, &layouts[logical_index], buffers, fence.clone()))
+            })
+            .collect();
+    }
     let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
     let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh).map_err(ArrayError::from)?;
     let mut output_extents = BTreeMap::new();
@@ -6319,7 +6670,7 @@ impl<'c> XlaDomain<'c> {
         };
         let (mut device_outputs, fence) = program
             .executable
-            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, Some(file!()), None, None)?
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, None, None, None)?
             .into_parts();
         if program.signature.requires_cuda_kernel_runtime() {
             let session = &self.session;
@@ -8836,7 +9187,7 @@ mod tests {
                 assert_eq!(outputs.len(), 2);
                 for output in &outputs {
                     assert_eq!(output.data_type(), DataType::F64);
-                    assert_eq!(output.mesh(), mesh);
+                    assert_eq!(output.mesh(), &mesh);
                 }
                 assert_eq!(outputs[0].shape().as_slice(), static_dimensions_or_panic(&output_type).as_slice());
                 assert_eq!(read_f64s(&client, &outputs[0]), expected, "{name}, n={size}");
@@ -9025,7 +9376,7 @@ mod tests {
             assert_eq!(outputs.len(), 2);
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);
-                assert_eq!(output.mesh(), mesh);
+                assert_eq!(output.mesh(), &mesh);
             }
             assert_eq!(outputs[0].shape().as_slice(), static_dimensions_or_panic(&output_type).as_slice());
             assert_eq!(read_f64s(&client, &outputs[0]), expected, "n={size}");
@@ -9146,7 +9497,7 @@ mod tests {
             assert_eq!(outputs.len(), 3, "n={size}");
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);
-                assert_eq!(output.mesh(), mesh);
+                assert_eq!(output.mesh(), &mesh);
             }
             assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}");
             assert_eq!(outputs[1].shape().as_slice(), &[size, 4], "n={size}");
@@ -9348,7 +9699,7 @@ mod tests {
             assert_eq!(outputs.len(), 2, "n={size}, row={row}");
             for output in &outputs {
                 assert_eq!(output.data_type(), DataType::F64);
-                assert_eq!(output.mesh(), mesh);
+                assert_eq!(output.mesh(), &mesh);
             }
             assert_eq!(outputs[0].shape().as_slice(), &[size, 4], "n={size}, row={row}");
             assert_eq!(outputs[1].shape().as_slice(), gradient_shape, "n={size}, row={row}");
@@ -10551,6 +10902,7 @@ mod tests {
         assert_eq!(executable_options.partition_count, 1);
         assert!(!executable_options.use_spmd_partitioning);
         assert!(!executable_options.use_shardy_partitioner);
+        assert!(compiled.compiled_program().plan.output_layouts.is_none());
 
         for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
             let actual_type =
@@ -10610,6 +10962,77 @@ mod tests {
             "invalid compilation options: bounded-dynamic multi-device programs currently require fully replicated \
              shardings because Shardy rejects dynamic tensors",
         );
+    }
+
+    #[test]
+    fn test_static_program_outputs_take_their_planned_layouts_on_multiple_cpu_devices() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            input_type.clone(),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
+        assert!(compiled.compiled_program().plan.output_layouts.is_some());
+
+        // Outputs are built from the program's planned layouts, which place every shard like the validating
+        // constructors do and are shared by the outputs of every execution.
+        let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
+        let input = Array::from_host_buffer(
+            &domain,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes(values.as_slice()).as_slice(),
+        )
+        .unwrap();
+        let call = || {
+            let output = ryft_core::compilation::call_function(
+                &domain,
+                compiled.executable_function(),
+                ArrayIrValue::Array(input.clone()),
+            )
+            .unwrap();
+            let ArrayIrValue::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output
+        };
+        let output = call();
+        let other_output = call();
+        output.block_until_ready().unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(
+            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+            input.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            other_output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+        );
+        let shards = output
+            .shards()
+            .iter()
+            .map(|shard| {
+                values_from_bytes::<f32>(
+                    shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap().as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shards, vec![vec![0.0, 2.0], vec![4.0, 6.0], vec![8.0, 10.0], vec![12.0, 14.0]]);
     }
 
     #[test]
@@ -14430,6 +14853,58 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_dispatch_query_compares_and_hashes_like_its_key() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let operation = XlaOperation::Array(AddOperation::new().into());
+        let inputs = [
+            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        ];
+        let query = XlaEagerDispatchQuery {
+            operation: &operation,
+            regions: &[],
+            inputs: &inputs,
+            mesh: Some(&mesh),
+            compilation_options: &domain.compilation_options,
+        };
+        let key = XlaEagerDispatchKey {
+            operation: operation.clone(),
+            inputs: (0..inputs.len()).map(|index| query.input(index).into_owned()).collect(),
+            mesh: Some(mesh.clone()),
+            compilation_options: Arc::clone(&domain.compilation_options),
+            regions: Arc::new([]),
+        };
+        let hash = |view: &dyn XlaEagerDispatchKeyView| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            view.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        // Owned keys borrow as views that equal, and hash like, the queries that they were built from.
+        let borrowed_key: &dyn XlaEagerDispatchKeyView = std::borrow::Borrow::borrow(&key);
+        assert!(borrowed_key == &query as &dyn XlaEagerDispatchKeyView);
+        assert_eq!(hash(borrowed_key), hash(&query));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        assert_eq!(hasher.finish(), hash(&query));
+
+        // Compilation options are compared by identity, and every other component by value.
+        let other_options = Arc::new(domain.compilation_options.as_ref().clone());
+        let other_options_query = XlaEagerDispatchQuery { compilation_options: &other_options, ..query };
+        assert!(borrowed_key != &other_options_query as &dyn XlaEagerDispatchKeyView);
+        let other_inputs = [inputs[0].clone(), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
+        let other_inputs_query = XlaEagerDispatchQuery { inputs: &other_inputs, ..query };
+        assert!(borrowed_key != &other_inputs_query as &dyn XlaEagerDispatchKeyView);
+        let meshless_query = XlaEagerDispatchQuery { mesh: None, ..query };
+        assert!(borrowed_key != &meshless_query as &dyn XlaEagerDispatchKeyView);
+    }
+
+    #[test]
     fn test_eager_dispatch_cache_does_not_retain_failures() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -14490,76 +14965,6 @@ mod tests {
         assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (0, 0));
         domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
         assert_eq!(domain.eager_dispatch_statistics().misses, 2);
-    }
-
-    // TODO(eaplatanios): Temporary profiling harness for `.tasks/plan_execute_path_overhead.md`; delete it once that
-    //  plan's measurements are recorded.
-    #[test]
-    #[ignore = "profiling harness"]
-    fn test_profile_eager_dispatch_loop() {
-        use std::time::{Duration, Instant};
-
-        use crate::jit::{JittedXlaFunction, XlaCompileTracer, jitted};
-
-        let case = std::env::var("RYFT_PROFILE_CASE").unwrap_or_else(|_| "eager".to_string());
-        let seconds = std::env::var("RYFT_PROFILE_SECONDS").map(|value| value.parse().unwrap()).unwrap_or(10u64);
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaSession::new(&client).domain();
-        let input = f32_vector(&domain, &mesh, &[1.0; 8]);
-        let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
-            |_, value: XlaCompileTracer<'_>| ryft_core::Add::add(&value, &value).unwrap(),
-            &domain,
-            mesh.clone(),
-        );
-        let array_type = ArrayIrType::Array(input.r#type().into_owned());
-        let mut builder = XlaProgramBuilder::new();
-        let left = builder.add_input(array_type.clone());
-        let right = builder.add_input(array_type);
-        let operation = XlaOperation::Array(AddOperation::new().into());
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap().to_vec();
-        let program: FlatXlaProgram = builder.build(outputs, vec![Placeholder; 2], vec![Placeholder; 1]).unwrap();
-        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let buffer = Arc::clone(input.addressable_shards().next().unwrap().buffer().unwrap());
-        let execution_inputs = [
-            ryft_pjrt::ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
-            ryft_pjrt::ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
-        ];
-
-        let mut step: Box<dyn FnMut()> = match case.as_str() {
-            "eager" => Box::new(|| {
-                ryft_core::Add::add(&input, &input).unwrap();
-            }),
-            "jit" => Box::new(|| {
-                function.call((), input.clone()).unwrap();
-            }),
-            "execute" => Box::new(|| {
-                domain.execute_xla_program(&compiled, vec![input.clone(), input.clone()]).unwrap();
-            }),
-            "pjrt" => Box::new(|| {
-                let inputs = vec![ryft_pjrt::ExecutionDeviceInputs::from(&execution_inputs[..])];
-                compiled.executable.execute(inputs, Vec::new(), 0, None, None, None, None).unwrap();
-            }),
-            _ => panic!("unknown profiling case `{case}`"),
-        };
-        for _ in 0..1000 {
-            step();
-        }
-        let deadline = Instant::now() + Duration::from_secs(seconds);
-        let start = Instant::now();
-        let mut count = 0u64;
-        while Instant::now() < deadline {
-            for _ in 0..100 {
-                step();
-            }
-            count += 100;
-        }
-        let mean = start.elapsed().as_secs_f64() * 1e6 / count as f64;
-        println!("profile {case}: {mean:.2} us/op over {count} operations");
     }
 
     /// Measures eager dispatch overhead for `.tasks/plan_eager_dispatch_front_cache.md`. Compares repeated eager `add`

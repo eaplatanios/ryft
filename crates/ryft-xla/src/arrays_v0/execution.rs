@@ -6,7 +6,7 @@ use super::*;
 
 pub struct ExecuteArguments<'o> {
     /// Addressable devices in the same order as [`Self::inputs_by_device`].
-    addressable_device_ids: Vec<DeviceId>,
+    addressable_device_ids: Arc<[DeviceId]>,
 
     /// Execution inputs grouped by addressable device.
     inputs_by_device: Vec<Vec<ExecutionInput<'o>>>,
@@ -15,7 +15,7 @@ pub struct ExecuteArguments<'o> {
 impl<'o> ExecuteArguments<'o> {
     /// Returns addressable device IDs corresponding to [`Self::inputs_by_device`].
     pub fn addressable_device_ids(&self) -> &[DeviceId] {
-        self.addressable_device_ids.as_slice()
+        &self.addressable_device_ids
     }
 
     /// Returns execution inputs grouped by device.
@@ -43,7 +43,7 @@ impl<'o> ExecuteArguments<'o> {
     /// to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub(crate) fn from_arrays_with_donation(
         arrays: Vec<Array<'o>>,
-        addressable_device_ids: &[DeviceId],
+        addressable_device_ids: Arc<[DeviceId]>,
         donation_flags: &[bool],
     ) -> Result<Self, ArrayError> {
         if donation_flags.len() != arrays.len() {
@@ -52,41 +52,41 @@ impl<'o> ExecuteArguments<'o> {
                 actual_count: donation_flags.len(),
             });
         }
-
-        let mut seen_devices = HashSet::with_capacity(addressable_device_ids.len());
-        for &device_id in addressable_device_ids {
-            if !seen_devices.insert(device_id) {
+        for (position, &device_id) in addressable_device_ids.iter().enumerate() {
+            if addressable_device_ids[..position].contains(&device_id) {
                 return Err(ArrayError::DuplicateExecutionDeviceId { device_id });
             }
         }
 
-        let donation_flags = arrays
-            .iter()
-            .zip(donation_flags)
-            .map(|(array, requested)| *requested && array.has_unique_shard_buffers())
-            .collect::<Vec<_>>();
-        let mut buffers_by_array =
-            arrays.into_iter().map(Array::into_addressable_buffers_by_device).collect::<Vec<_>>();
-
-        let mut inputs_by_device = Vec::with_capacity(addressable_device_ids.len());
-        for &device_id in addressable_device_ids {
-            let mut device_inputs = Vec::with_capacity(buffers_by_array.len());
-            for (array_index, array_buffers_by_device) in buffers_by_array.iter_mut().enumerate() {
-                let buffer = array_buffers_by_device
-                    .remove(&device_id)
+        // Every array must have exactly one buffer on each addressable device and none elsewhere. Its shards are
+        // looked up by device in constant time, and counting its buffers detects buffers on other devices.
+        let mut inputs_by_device = (0..addressable_device_ids.len())
+            .map(|_| Vec::with_capacity(arrays.len()))
+            .collect::<Vec<Vec<ExecutionInput<'o>>>>();
+        for (array_index, (array, requested)) in arrays.iter().zip(donation_flags).enumerate() {
+            let donatable = *requested && array.has_unique_shard_buffers();
+            for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
+                let buffer = array
+                    .device_shard(device_id)
+                    .and_then(ArrayShard::buffer)
                     .ok_or(ArrayError::MissingArrayShardForDevice { array_index, device_id })?;
-                device_inputs.push(ExecutionInput { buffer, donatable: donation_flags[array_index] });
+                device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
             }
-            inputs_by_device.push(device_inputs);
-        }
-
-        for (array_index, array_buffers_by_device) in buffers_by_array.iter().enumerate() {
-            if let Some(device_id) = array_buffers_by_device.keys().next().copied() {
+            if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len() {
+                let device_id = array
+                    .shards()
+                    .iter()
+                    .filter(|shard| shard.buffer().is_some())
+                    .map(|shard| shard.device().id())
+                    .find(|device_id| !addressable_device_ids.contains(device_id))
+                    .unwrap();
                 return Err(ArrayError::UnexpectedArrayShardDevice { array_index, device_id });
             }
         }
 
-        Ok(Self { addressable_device_ids: addressable_device_ids.to_vec(), inputs_by_device })
+        // Dropping the consumed arrays leaves the execution inputs as the only owners of donated buffers.
+        drop(arrays);
+        Ok(Self { addressable_device_ids, inputs_by_device })
     }
 }
 
