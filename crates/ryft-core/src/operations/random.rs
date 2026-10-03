@@ -72,7 +72,7 @@ impl Display for RandomAlgorithm {
     }
 }
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`RngBitGeneratorOperation`].
 pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
