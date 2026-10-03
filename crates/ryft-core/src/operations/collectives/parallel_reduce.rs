@@ -162,8 +162,6 @@ impl Display for ParallelReduceOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Operation for ParallelReduceOperation {
     type Type = ArrayType;
 
@@ -212,43 +210,50 @@ impl Operation for ParallelReduceOperation {
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` over a manual mesh axis must not use axis index groups",
                     )));
                 }
+
                 // A cross-device reduction combines one value per device with a single associative operator. A mean
                 // also divides by the participant count, and a stable logarithmic sum of exponentials also shifts by
                 // the maximum, so the `ParallelReduce` capability stages both from the primitive kinds instead.
                 if matches!(self.kind, ReductionKind::Mean | ReductionKind::LogSumExp) {
                     return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_REDUCE_OPERATION_NAME}` with kind `{}` over a manual mesh axis must be composed \
+                        "`{}` with kind `{}` over a manual mesh axis must be composed \
                          from primitive mesh reductions (e.g., through the `ParallelReduce` capability)",
-                        self.kind,
+                        PARALLEL_REDUCE_OPERATION_NAME, self.kind,
                     )));
                 }
+
                 if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
                     )));
                 }
+
                 let Some(sharding) = input.sharding() else {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` input must carry a mesh containing manual axis \
                          `{axis_name}`",
                     )));
                 };
+
                 if sharding.mesh() != mesh {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` input mesh does not match the operation mesh",
                     )));
                 }
+
                 if sharding.unreduced_axes().contains(axis_name) || sharding.reduced_axes().contains(axis_name) {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` axis `{axis_name}` must not carry reduction state",
                     )));
                 }
+
                 if !sharding.varying_manual_axes().contains(axis_name) {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` input must vary over manual axis `{axis_name}`; pass an \
                          invariant value through `parallel_vary` first so that every copy is counted",
                     )));
                 }
+
                 let mut axes = sharding.varying_manual_axes().clone();
                 axes.remove(axis_name);
                 let sharding = sharding
@@ -265,7 +270,6 @@ impl Operation for ParallelReduceOperation {
         Ok(vec![output])
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("kind", self.kind)?;
@@ -294,8 +298,8 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelReduceOp
     ) -> Result<Vec<C::Value>, ProgramError> {
         // The other participants of the named axis exist only inside an enclosing binder: a `batch` level consumes the
         // reduction through the batching rule, and a backend that owns a manual region lowers it to a cross-device
-        // reduction. There is therefore no per-item value to produce, and partial evaluation residualizes the operation
-        // through the deferral of unsupported operations in its default rule.
+        // reduction. There is therefore no per-item value to produce, and partial evaluation residualizes the
+        // operation through the deferral of unsupported operations in its default rule.
         check_count!("input", inputs, 1, ProgramError);
         let message = match &self.mesh {
             None => {
@@ -369,9 +373,9 @@ impl<
 
         // A replicated input holds the same value for every batch item. The idempotent kinds (i.e., a mean, an
         // extremum, or a Boolean reduction) of identical values are that value, so such an input passes through
-        // unchanged. Every other kind counts the value once per item (e.g., a sum yields `n · v`, a product `vⁿ`, and a
-        // logarithmic sum of exponentials `v + ln n`), so the input is first materialized across the mapped extent and
-        // then reduced.
+        // unchanged. Every other kind counts the value once per item (e.g., a sum yields `n · v`, a product `vⁿ`,
+        // and a logarithmic sum of exponentials `v + ln n`), so the input is first materialized across the mapped
+        // extent and then reduced.
         let idempotent = matches!(
             self.kind,
             ReductionKind::Mean | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All,
@@ -472,6 +476,7 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
+
             match &outputs[0] {
                 MaybeZero::Value(_) if !accumulators[0].is_needed() => Ok(()),
                 MaybeZero::Value(cotangent) if operation.mesh.is_some() => {
@@ -500,10 +505,14 @@ impl_differentiable_operation! {
 /// at staging time, so an unbound name fails fast rather than silently acting as identity. A name bound by an enclosing
 /// `batch` level stages an ordinary [`ParallelReduceOperation`], which that level collapses by reducing its mapped
 /// batch axis. A value that is the same for every batch item is counted once per item by a sum, so summing a constant
-/// `c` over an axis of size `n` yields `n · c`, exactly as `jax.lax.psum` does. A name bound to a device mesh axis by a
-/// manual region (e.g., the body of a `shard_map` operation in the XLA backend) stays in the staged body program and
-/// lowers to a cross-device `all_reduce` over that mesh axis. For sums, means, maxima, and minima, this is the analogue
-/// of JAX's `jax.lax.psum`, `jax.lax.pmean`, `jax.lax.pmax`, and `jax.lax.pmin`, respectively, while JAX has no
+/// `c` over an axis of size `n` yields `n · c`, exactly as JAX's
+/// [`jax.lax.psum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum.html) does. A name bound to a device mesh
+/// axis by a manual region (e.g., the body of a `shard_map` operation in the XLA backend) stays in the staged body
+/// program and lowers to a cross-device `all_reduce` over that mesh axis. For sums, means, maxima, and minima, this is
+/// the Ryft analogue of JAX's [`jax.lax.psum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum.html),
+/// [`jax.lax.pmean`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmean.html),
+/// [`jax.lax.pmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmax.html),
+/// and [`jax.lax.pmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmin.html), respectively, while JAX has no
 /// counterpart for the other kinds. Refer to [`ReductionKind`] for the semantics and supported data types of each
 /// kind. Integer means truncate toward zero in the input's own type, whereas JAX's `pmean` promotes them to a
 /// floating-point type through its division, so a fractional mean requires converting the input first.
@@ -516,16 +525,16 @@ impl_differentiable_operation! {
 /// it counts that shard once per device, which is why the operation only accepts varying inputs: an invariant value is
 /// first passed through [`parallel_vary`](ParallelVary::parallel_vary), which makes the multiplication by the device
 /// count an explicit, differentiable step rather than an accident. [`parallel_reduce`](Self::parallel_reduce) inserts
-/// that step itself, so summing an invariant constant `c` over an axis of size `n` yields `n · c` here as well. The sum
-/// and the variation transition are adjoints of each other, which is what makes gradients through a manual region
-/// correct without any bookkeeping at the region boundary: the transpose of the mesh-form sum is a
-/// [`ParallelVaryOperation`], because the cotangent of a shared total is the same value handed to every device, and the
-/// transpose of a [`ParallelVaryOperation`] is the mesh-form sum. A mean over a manual axis is the mesh-form sum
-/// divided by the axis size, as `jax.lax.pmean` is `psum(x) / n`. A logarithmic sum of exponentials over a manual axis
-/// is composed from a mesh-form maximum and a mesh-form sum with the same guarded shift as the corresponding
+/// that step itself, so summing an invariant constant `c` over an axis of size `n` yields `n · c` here as well.
+/// The sum and the variation transition are adjoints of each other, which is what makes gradients through a manual
+/// region correct without any bookkeeping at the region boundary: the transpose of the mesh-form sum is a
+/// [`ParallelVaryOperation`], because the cotangent of a shared total is the same value handed to every device,
+/// and the transpose of a [`ParallelVaryOperation`] is the mesh-form sum. A mean over a manual axis is the mesh-form
+/// sum divided by the axis size, as `jax.lax.pmean` is `psum(x) / n`. A logarithmic sum of exponentials over a manual
+/// axis is composed of a mesh-form maximum and a mesh-form sum with the same guarded shift as the corresponding
 /// single-device reduction (refer to [`ReductionKind::LogSumExp`]), which keeps it numerically stable for large,
-/// infinite, and NaN inputs, and differentiable, because the shift is computed under `stop_gradient`. The other kinds
-/// are not differentiable.
+/// infinite, and NaN inputs, and differentiable, because the shift is computed under a [`stop_gradient`](StopGradient).
+/// The other kinds are not differentiable.
 ///
 /// Participant subgroups retain the ordinary collective contract: the staged operation carries no mesh and preserves
 /// the input variation, because distinct groups can produce distinct results.
@@ -538,8 +547,8 @@ impl_differentiable_operation! {
 /// ```rust
 /// # use indoc::indoc;
 /// # use ryft_core::{
-/// #     Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, NamedAxis, Operation,
-/// #     ParallelReduce, ReductionKind, Sharding, TracingContext,
+/// #     Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, NamedAxis, ParallelReduce,
+/// #     ReductionKind, Sharding, TracingContext,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual)?])?;
@@ -564,8 +573,14 @@ impl_differentiable_operation! {
 /// let transposed = program.transpose_with_respect_to(&[0], &[])?;
 /// assert_eq!(transposed.input_types(), vec![invariant]);
 /// assert_eq!(transposed.output_types(), vec![varying]);
-/// let operations = transposed.instructions().iter().map(|instruction| instruction.operation().name());
-/// assert_eq!(operations.collect::<Vec<_>>(), ["parallel_vary"]);
+/// assert_eq!(
+///     transposed.to_string(),
+///     indoc! {"
+///         lambda %0:f32[][sharding={mesh<['x'=2:manual]>, []}] .
+///         let %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+///             parallel_vary [axis_name=\"x\"] %0
+///         in (%1)"},
+/// );
 /// # Ok(())
 /// # }
 /// ```
@@ -612,14 +627,29 @@ pub trait ParallelReduce: Sized {
 }
 
 // Any context-carrying value reduces by validating the axis name against the active `NamedAxes` environment and binding
-// a `ParallelReduceOperation` through its own context: a staged tracer records the operation, a batching tracer
-// resolves the named axis against the batching context stack, and a JVP dual forwards to the primal-side resolution.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType> + ParallelVary> ParallelReduce for V
-where
-    V: Add + Sub + Exp + Log + Compare + Select + ZeroLike + Real + Complex + StopGradient,
-    V::DispatchDomain: Context + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation:
-        From<ParallelReduceOperation> + From<ConstantOperation<Array>> + From<DivOperation<ArrayType>>,
+// a `ParallelReduceOperation` through its own context (i.e., a staged tracer records the operation, a batching tracer
+// resolves the named axis against the batching context stack, and a JVP dual forwards to the primal-side resolution).
+impl<
+    V: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<
+                Operation: From<ConstantOperation<Array>>
+                               + From<DivOperation<ArrayType>>
+                               + From<ParallelReduceOperation>,
+            > + NamedAxes,
+        > + ManualVariationAlignment<ArrayType>
+        + ZeroLike
+        + Add
+        + Sub
+        + Exp
+        + Log
+        + Real
+        + Complex
+        + Compare
+        + Select
+        + ParallelVary
+        + StopGradient,
+> ParallelReduce for V
 {
     fn parallel_reduce(&self, kind: ReductionKind, axis_name: &str) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
@@ -633,8 +663,8 @@ where
             return Ok(outputs.remove(0));
         };
 
-        // Reducing an invariant value counts its shard once per device, so the value is first made varying, which
-        // records that multiplication as an explicit, differentiable step.
+        // Reducing an invariant value counts its shard once per device, so the value is first made varying,
+        // which records that multiplication as an explicit, differentiable step.
         let mut input = self.clone();
         if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
             input = input.parallel_vary(axis_name)?;
@@ -649,12 +679,12 @@ where
                 // A stable logarithmic sum of exponentials shifts every exponent by the maximum before exponentiating,
                 // exactly as the single-device reduction documented on `ReductionKind::LogSumExp` does, so that large
                 // finite inputs cannot overflow. Complex inputs are shifted by the maximum of their real components,
-                // which are the only components that affect magnitudes. A non-finite maximum (i.e., all `-∞`, any
-                // `+∞`, or a NaN) is replaced by zero, so that `-∞ - -∞ = NaN` cannot arise and infinities and NaNs
-                // propagate through the exponentials as usual. The shift cancels mathematically and so contributes no
-                // derivative: the maximum reads its input under `stop_gradient` because a mesh maximum has no
-                // derivative rule, and the shift itself is also wrapped in `stop_gradient` so that its tangent stays a
-                // structural zero instead of being staged from the selected zero.
+                // which are the only components that affect magnitudes. A non-finite maximum (i.e., all `-∞`, any `+∞`,
+                // or a NaN) is replaced by zero, so that `-∞ - -∞ = NaN` cannot arise and infinities and NaNs propagate
+                // through the exponentials as usual. The shift cancels mathematically and so contributes no derivative:
+                // the maximum reads its input under `stop_gradient` because a mesh maximum has no derivative rule, and
+                // the shift itself is also wrapped in `stop_gradient` so that its tangent stays a structural zero
+                // instead of being staged from the selected zero.
                 let complex = input.r#type().data_type().is_complex();
                 let magnitudes = input.stop_gradient()?;
                 let magnitudes = if complex { magnitudes.real()? } else { magnitudes };
@@ -706,6 +736,8 @@ where
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Binds `operation` to `input` in `context` and returns its single output. The forward-mode and transposition rules
 /// use this to repeat a [`ParallelReduceOperation`] on a primal, a tangent, or an output cotangent.
