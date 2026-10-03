@@ -758,23 +758,21 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to select the `k` largest elements of a value along one axis together with their indices.
 /// Values rank by the IEEE 754 total order of [`SortOrdering::Total`] (i.e., `+NaN` ranks above `+∞`, `+0.0` ranks
-/// above `-0.0`, and `-NaN` ranks below `-∞`), ties select the lowest index first, and the indices are `i32`. Complex
-/// values are rejected, because they have no total order. These are the semantics of [JAX's
-/// `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), generalized from the trailing axis to
-/// any axis.
+/// above `-0.0`, and `-NaN` ranks below `-∞`), ties select the lowest index first, and the indices are `i32`.
+/// Complex values are rejected, because they have no total order. These are the semantics of JAX's
+/// [`jax.lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html),
+/// generalized from the trailing axis to any axis.
 ///
-/// [`TopK`] is not a primitive operation: [`Self::top_k`] stably sorts the value in descending order together with an
+/// [`TopK`] is not a primitive operation. [`Self::top_k`] stably sorts the value in descending order together with an
 /// `i32` index [`iota`](IotaOperation) passenger and slices the leading `k` entries of both sorted outputs, so every
 /// program transform supports it through the rules of [`SortOperation`] and [`Slice`]. This staged form is the
-/// sort-plus-slice idiom that XLA's top-k rewriter replaces with its fast top-k implementation. That rewriter only
-/// accepts `iota` or `broadcast(iota)` index passengers, while the StableHLO-to-HLO import turns the index iota of an
-/// input with leading size-1 dimensions (e.g., `f32[1, 32000]`) into `reshape(iota)`. Therefore, when the ranked axis
-/// is the trailing axis, the leading size-1 dimensions are reshaped away before the composition and reinserted
-/// afterward, which leaves the values and indices unchanged.
+/// sort-plus-slice idiom that the XLA backend's top-k rewriter replaces with its fast top-k implementation. That
+/// rewriter only accepts `iota` or `broadcast(iota)` index passengers, while the StableHLO-to-HLO import turns the
+/// index iota of an input with leading size-1 dimensions (e.g., `f32[1, 32000]`) into `reshape(iota)`. Therefore,
+/// when the ranked axis is the trailing axis, the leading size-1 dimensions are reshaped away before the composition
+/// and reinserted afterward, which leaves the values and indices unchanged.
 ///
 /// # Example
 ///
@@ -806,6 +804,8 @@ pub trait TopK: Sized {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl TopK for Array {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
         let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
@@ -816,9 +816,12 @@ impl TopK for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Sort + Slice + Reshape> TopK for V
-where
-    V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>>
+        + Sort
+        + Slice
+        + Reshape,
+> TopK for V
 {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
         let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
