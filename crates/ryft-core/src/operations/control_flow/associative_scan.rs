@@ -89,17 +89,17 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 /// the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
 /// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including those that `combine`
 /// stages) fails.
-pub fn associative_scan<V, Values: Parameterized<V>, A: Into<Axis>, F>(
+pub fn associative_scan<
+    V: Value<Type = ArrayType, DispatchDomain: Context + Zero<V>> + Add + Or + Concatenate + Pad + Slice,
+    Values: Parameterized<V>,
+    A: Into<Axis>,
+    F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
+>(
     values: &Values,
     axis: A,
     reverse: bool,
     combine: &F,
-) -> Result<Values, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
-    V::DispatchDomain: Context + Zero<V>,
-    F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
-{
+) -> Result<Values, ProgramError> {
     let structure = values.parameter_structure();
     let arrays = values.parameters().cloned().collect::<Vec<_>>();
     let Some(first) = arrays.first() else {
@@ -156,7 +156,7 @@ where
     let domain = first.dispatch_domain();
     let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
         domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
-            associative_scan_recursively(&arrays, extent, axis, reverse, &flat_combine)
+            associative_scan_impl(&arrays, extent, axis, reverse, &flat_combine)
         })
     })?;
     Ok(Values::from_parameters(structure, scanned)?)
@@ -164,18 +164,16 @@ where
 
 /// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose (static) extent
 /// along `axis` is `extent`.
-fn associative_scan_recursively<V, F>(
+fn associative_scan_impl<
+    V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice,
+    F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
+>(
     values: &[V],
     extent: usize,
     axis: usize,
     reverse: bool,
     combine: &F,
-) -> Result<Vec<V>, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
-    V::DispatchDomain: Zero<V>,
-    F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
-{
+) -> Result<Vec<V>, ProgramError> {
     if extent < 2 {
         return Ok(values.to_vec());
     }
@@ -197,7 +195,7 @@ where
 
     // Scanning the pairwise reductions yields every other output element: the odd positions of a forward scan, and the
     // positions congruent to `pair_offset` of a reverse one.
-    let aligned = associative_scan_recursively(&reduced, half, axis, reverse, combine)?;
+    let aligned = associative_scan_impl(&reduced, half, axis, reverse, combine)?;
 
     // Each complementary position extends the aligned result just before it in scan order by its own input element,
     // except for the position at the scan's own start, which is just the input element there. An even extent has one
@@ -274,17 +272,13 @@ fn scan_slice<V: Typed<Type = ArrayType> + Slice>(
 /// other array occupies) and then combined with an addition, or with a disjunction for Boolean arrays, which have no
 /// addition. The combination is exact because the two dilated arrays have disjoint support and zero (i.e., `false`)
 /// is the identity of both combiners.
-fn scan_interleave<V>(
+fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Pad>(
     left: &[V],
     right: &[V],
     axis: usize,
     left_count: usize,
     right_count: usize,
-) -> Result<Vec<V>, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + Or + Pad,
-    V::DispatchDomain: Zero<V>,
-{
+) -> Result<Vec<V>, ProgramError> {
     if left_count != right_count && left_count != right_count + 1 {
         return Err(TypeError::invalid(format!(
             "`associative_scan` cannot interleave {left_count} elements with {right_count} elements"
