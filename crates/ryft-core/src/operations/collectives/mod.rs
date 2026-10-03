@@ -234,7 +234,7 @@ impl Debug for CollectiveOptions {
 ///
 /// Returns a [`TypeError`] that names `operation_name` and describes the first violated requirement, checking the
 /// requirements above in order and the groups and their participants in order.
-pub(super) fn effective_collective_axis_size(
+fn effective_collective_axis_size(
     operation_name: &str,
     axis_size: usize,
     groups: Option<&[Vec<usize>]>,
@@ -298,7 +298,7 @@ pub(super) fn effective_collective_axis_size(
 /// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake
 /// the resolved size into their operation payloads at staging time, because their output shapes and payload validation
 /// depend on it while [`Operation::infer_output_types`] only sees input types.
-pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
+fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
     match context
         .named_axis(axis_name)
         .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?
@@ -316,22 +316,22 @@ pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str
     }
 }
 
-// TODO(eaplatanios): Review form here onwards.
-
-/// Builds a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
+/// Infers a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
 /// sharding through with the same per-dimension placement (the dimension count never changes).
-fn linear_collective_output_type(
+fn infer_linear_collective_operation_output_type(
     operation_name: &'static str,
     input_type: &ArrayType,
     output_dimensions: Vec<usize>,
 ) -> Result<ArrayType, TypeError> {
     let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
+    let output_shape = Shape::new(output_sizes);
     let sharding = input_type.resized_sharding(output_sizes.as_slice(), operation_name)?;
-    let mut output_type =
-        ArrayType::new(input_type.data_type(), Shape::new(output_sizes)).with_memory(input_type.memory());
+    let mut output_type = ArrayType::new(input_type.data_type(), output_shape).with_memory(input_type.memory());
     output_type.sharding = sharding;
     Ok(output_type)
 }
+
+// TODO(eaplatanios): Review form here onwards.
 
 /// Defines the structural implementations shared by the single-input linear collectives (e.g., `all_gather` and
 /// `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its

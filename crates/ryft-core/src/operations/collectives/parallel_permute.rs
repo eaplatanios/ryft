@@ -9,6 +9,10 @@ use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, Batch
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::collectives::parallel_vary::ParallelVary;
+use crate::operations::collectives::{
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation,
+    infer_linear_collective_operation_output_type, resolve_named_axis_size,
+};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
@@ -16,11 +20,6 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::programs::{Operation, ProgramError, ProjectedValue, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review from here onwards.
-
-use super::{
-    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type,
-    resolve_named_axis_size,
-};
 
 /// Canonical operation name for [`ParallelPermuteOperation`].
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
@@ -81,7 +80,7 @@ define_linear_collective_operation!(
                 operation.axis_name,
             )));
         }
-        linear_collective_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
+        infer_linear_collective_operation_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
     },
     interpret<C> where C::Value: ZeroLike {
         |operation, input| {

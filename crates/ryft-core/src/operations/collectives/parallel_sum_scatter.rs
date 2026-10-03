@@ -44,7 +44,7 @@ use super::{
     explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
     impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
+    infer_linear_collective_operation_output_type, require_collective_axis_extent, resolve_named_axis_size,
     validate_explicit_collective_output_extents,
 };
 
@@ -235,7 +235,7 @@ define_linear_collective_operation!(
                     )));
                 }
                 *dimension /= effective_axis_size;
-                linear_collective_output_type(
+                infer_linear_collective_operation_output_type(
                     PARALLEL_SUM_SCATTER_OPERATION_NAME,
                     input_type,
                     output_dimensions,

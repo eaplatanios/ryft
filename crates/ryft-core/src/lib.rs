@@ -150,7 +150,7 @@ pub use operations::{
     TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, Tolerance, TopK, TransferToMemory,
     TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
     UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation,
-    WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
+    WhilePredicate, WhileType, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
     WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
     ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
     check_batching_rule_consistency, custom_function, transpose_primal_condition,
@@ -210,7 +210,6 @@ pub use tracing::{
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use core::hash::Hash;
     use std::any::TypeId;
     use std::borrow::Cow;
     use std::convert::Infallible;
