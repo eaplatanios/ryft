@@ -1,7 +1,9 @@
-//! Operations that combine array elements along selected axes. Every reduction is defined by the [`ReduceOperation`]
-//! type together with the [`Reduce`] value capability trait, whose functions apply it to eager [`Array`]s and traced
-//! values alike, so the same code executes immediately or records into a program depending on the value it runs on. A
-//! [`ReductionKind`] selects the computation:
+//! Operations that reduce array elements along selected axes, either by combining them or by locating an extremal one.
+//! Each reduction is defined by an [`Operation`] type together with a value capability trait, whose functions apply it
+//! to eager [`Array`]s and traced values alike, so the same code executes immediately or records into a program
+//! depending on the value it runs on. Combining reductions share the [`ReduceOperation`] type and the [`Reduce`]
+//! capability, with a [`ReductionKind`] selecting the combiner, while index reductions have their own operation types,
+//! because they produce integer indices along exactly one axis. The reductions fall into the following groups:
 //!
 //!   - **Numeric Reductions:** [`Sum`](ReductionKind::Sum) adds and [`Product`](ReductionKind::Product) multiplies
 //!     the reduced elements. [`Mean`](ReductionKind::Mean) divides their sum by the number of reduced elements.
@@ -12,30 +14,40 @@
 //!     without overflowing for large finite inputs.
 //!   - **Boolean Reductions:** [`Any`](ReductionKind::Any) and [`All`](ReductionKind::All) compute the disjunction and
 //!     conjunction of Boolean elements.
+//!   - **Index Reductions:** [`ArgMax`] and [`ArgMin`] (i.e., [`ArgMaxOperation`] and [`ArgMinOperation`]) compute
+//!     the index of the largest and smallest element along one non-empty axis as an integer of a configurable data
+//!     type. An axis that contains a NaN of either sign reports the index of its first NaN, and ties (including ties
+//!     between `-0.0` and `+0.0`) select the lowest index. These are the semantics of JAX's
+//!     [`lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html) and
+//!     [`lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html).
 //!
 //! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
 //! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, products, extrema, and Boolean reductions start from
 //! their combiner identity (e.g., `0` for sums and `1` for products), so an empty axis produces that identity. Bounded
 //! ragged-axis reductions support sums, products, and logarithmic sums of exponentials; padding is replaced by zero,
 //! one, or negative infinity (with a zero imaginary component for complex inputs), respectively. Other kinds reject
-//! ragged reduced axes. Narrow floating-point sums, products, means, and logarithmic sums of exponentials compute in
-//! `f32` before converting the output back to the input data type. Empty floating-point and complex means compute NaNs
-//! before output conversion.
+//! ragged reduced axes, except that index reductions replace padding by the lowest value of the input data type for
+//! [`ArgMax`] and by the highest one for [`ArgMin`], which a live element always beats or ties with a lower index.
+//! Narrow floating-point sums, products, means, and logarithmic sums of exponentials compute in `f32` before converting
+//! the output back to the input data type. Empty floating-point and complex means compute NaNs before output
+//! conversion.
 //!
 //! Floating-point and complex sums and means are linear: their transposes broadcast the cotangent over the reduced
 //! axes, dividing it by the number of reduced elements for means. Extrema route the tangent through selected elements,
 //! splitting it evenly between ties. Products use the product rule without dividing by input elements, including at
 //! zeros. Products, extrema, and logarithmic sums are differentiable but nonlinear. Products and logarithmic sums
-//! currently require statically shaped inputs for differentiation. Boolean reductions are not differentiable.
+//! currently require statically shaped inputs for differentiation. Boolean reductions are not differentiable, and
+//! index reductions produce integers whose tangents are structural zeros.
 //!
 //! # Example
 //!
 //! ```rust
-//! # use ryft_core::{Array, ProgramError, Reduce, ReductionKind};
+//! # use ryft_core::{Array, ArgMax, ProgramError, Reduce, ReductionKind};
 //! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
 //! let output = input.reduce(&[1], ReductionKind::Sum)?;
 //! assert_eq!(output.elements::<f32>()?, vec![6.0, 15.0]);
+//! assert_eq!(input.argmax(1)?, Array::vector(vec![2i32, 2])?);
 //! # Ok(())
 //! # }
 //! ```
@@ -54,6 +66,7 @@ use crate::arrays::{
     ShardingDimension, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
     f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
+use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -65,7 +78,10 @@ use crate::differentiation::{
     jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::macros::{
+    check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_non_differentiable_operation,
+    impl_non_transposable_operation,
+};
 use crate::operations::arithmetic::{Add, Div, DivOperation, Mul, MulOperation, Sub};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
@@ -181,6 +197,79 @@ impl ReductionKind {
             Self::Any => "any",
             Self::All => "all",
         }
+    }
+
+    /// Validates that a reduction of this kind supports elements of `data_type`, as documented on each kind, reporting
+    /// a violation as an error that names `operation_name` (e.g., `reduce` or `parallel_reduce`). Reductions over
+    /// different axes, such as an array axis or the participants of a named axis, share these requirements.
+    pub(crate) fn validate_data_type(self, operation_name: &str, data_type: DataType) -> Result<(), TypeError> {
+        if self == Self::LogSumExp {
+            // Logarithmic sums are built from exponentials and logarithms, so they require the floating-point and
+            // complex domain documented on `ReductionKind::LogSumExp`, restricted to formats that represent the
+            // negative infinity that the maximum-shifted evaluation starts from.
+            if !data_type.is_floating_point() && !data_type.is_complex() {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` with kind `{self}` requires floating-point or complex inputs but got \
+                     `{data_type}`",
+                )));
+            }
+
+            if !matches!(
+                data_type,
+                DataType::BF16
+                    | DataType::F16
+                    | DataType::F32
+                    | DataType::F64
+                    | DataType::F8E3M4
+                    | DataType::F8E4M3
+                    | DataType::F8E5M2
+                    | DataType::C64
+                    | DataType::C128,
+            ) {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` with kind `{self}` requires a floating-point format that represents negative \
+                     infinity but got `{data_type}`",
+                )));
+            }
+            return Ok(());
+        }
+
+        let (requirement, supports_kind) = if matches!(self, Self::Any | Self::All) {
+            ("Boolean", data_type.is_boolean())
+        } else if matches!(self, Self::Max | Self::Min) {
+            ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
+        } else if self == Self::Product {
+            // A structural zero cannot represent the multiplicative identity of an empty product.
+            ("numeric", data_type.is_numeric())
+        } else {
+            ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
+        };
+
+        if !supports_kind {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` with kind `{self}` requires {requirement} inputs but got `{data_type}`",
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates that a reduction of this kind can reduce `input_type` while it carries unreduced axes (i.e., while a
+    /// cross-device sum over those mesh axes is still pending), reporting a violation as an error that names
+    /// `operation_name`. Only a sum and a floating-point mean commute with that pending sum. A product, a logarithmic
+    /// sum of exponentials, an extremum, or a truncating integer mean of partial contributions differs from the same
+    /// reduction of their total.
+    pub(crate) fn validate_unreduced_axes(self, operation_name: &str, input_type: &ArrayType) -> Result<(), TypeError> {
+        let data_type = input_type.data_type();
+        if (matches!(self, Self::Product | Self::Max | Self::Min | Self::LogSumExp)
+            || (self == Self::Mean && data_type.is_integer()))
+            && input_type.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
+        {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` with kind `{self}` cannot reduce inputs with unreduced axes",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -466,13 +555,7 @@ where
             .map(|ragged_axis| ragged_axis.dimension().clone())
             .collect::<Vec<_>>();
 
-        let masked = match self.kind {
-            ReductionKind::Product => P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::One)?,
-            ReductionKind::LogSumExp => {
-                P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::LowestReal)?
-            }
-            _ => P::mask_reduction_input(context, input, reduced_axes, self.kind)?,
-        };
+        let masked = P::mask_reduction_input(context, input, reduced_axes, self.kind)?;
 
         // Ragged axes outside the reduced axes survive onto the output.
         let remaining_ragged_axes = masked
@@ -1351,66 +1434,10 @@ impl ArrayType {
             reduce_mask[*axis] = true;
         }
 
-        let data_type = self.data_type();
-
         // Validate axes before the element domain so malformed geometry retains diagnostic precedence.
-        if kind == ReductionKind::LogSumExp {
-            // Logarithmic sums are built from exponentials and logarithms, so they require the floating-point and
-            // complex domain documented on `ReductionKind::LogSumExp`, restricted to formats that represent the
-            // negative infinity that the maximum-shifted evaluation starts from.
-            if !data_type.is_floating_point() && !data_type.is_complex() {
-                return Err(TypeError::invalid(format!(
-                    "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires floating-point or complex inputs but got \
-                     `{data_type}`",
-                )));
-            }
-
-            if !matches!(
-                data_type,
-                DataType::BF16
-                    | DataType::F16
-                    | DataType::F32
-                    | DataType::F64
-                    | DataType::F8E3M4
-                    | DataType::F8E4M3
-                    | DataType::F8E5M2
-                    | DataType::C64
-                    | DataType::C128,
-            ) {
-                return Err(TypeError::invalid(format!(
-                    "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires a floating-point format that represents \
-                     negative infinity but got `{data_type}`",
-                )));
-            }
-        } else {
-            let (requirement, supports_kind) = if matches!(kind, ReductionKind::Any | ReductionKind::All) {
-                ("Boolean", data_type.is_boolean())
-            } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
-                ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
-            } else if kind == ReductionKind::Product {
-                // A structural zero cannot represent the multiplicative identity of an empty product.
-                ("numeric", data_type.is_numeric())
-            } else {
-                ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
-            };
-
-            if !supports_kind {
-                return Err(TypeError::invalid(format!(
-                    "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires {requirement} inputs but got `{data_type}`",
-                )));
-            }
-        }
-
-        if !axes.is_empty()
-            && (matches!(
-                kind,
-                ReductionKind::Product | ReductionKind::Max | ReductionKind::Min | ReductionKind::LogSumExp
-            ) || (kind == ReductionKind::Mean && data_type.is_integer()))
-            && self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
-        {
-            return Err(TypeError::invalid(format!(
-                "`{REDUCE_OPERATION_NAME}` with kind `{kind}` cannot reduce inputs with unreduced axes",
-            )));
+        kind.validate_data_type(REDUCE_OPERATION_NAME, self.data_type())?;
+        if !axes.is_empty() {
+            kind.validate_unreduced_axes(REDUCE_OPERATION_NAME, self)?;
         }
 
         // With no removed axes, the original layout and all other metadata remain valid.
@@ -1449,7 +1476,7 @@ impl ArrayType {
             })
             .transpose()?;
 
-        Self::new(data_type, Shape::new(dimensions))
+        Self::new(self.data_type(), Shape::new(dimensions))
             .with_memory(self.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError::invalid(error.to_string()))
@@ -1691,6 +1718,585 @@ macro_rules! impl_element_divide_by_count_for_complex {
 impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
 
+// TODO(eaplatanios): Review from here onwards.
+
+/// Canonical operation name for [`ArgMaxOperation`].
+pub const ARG_MAX_OPERATION_NAME: &str = "argmax";
+
+/// [`Operation`] that computes the index of the largest element of its input along one axis, dropping that axis from
+/// the output shape and producing indices of a configurable integer data type. Refer to the documentation of
+/// [`ArgMax`] for its semantics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArgMaxOperation {
+    /// Refer to the documentation of [`Self::axis`].
+    axis: usize,
+
+    /// Refer to the documentation of [`Self::index_data_type`].
+    index_data_type: DataType,
+}
+
+impl ArgMaxOperation {
+    /// Creates a new [`ArgMaxOperation`] that reduces `axis` and produces indices of `index_data_type`. Type inference
+    /// requires `index_data_type` to be an integer data type that can represent every index along `axis`.
+    #[inline]
+    pub fn new(axis: usize, index_data_type: DataType) -> Self {
+        Self { axis, index_data_type }
+    }
+
+    /// Creates the [`ArgMaxOperation`] that the [`ArgMax`] capability functions execute or stage for an input of type
+    /// `input_type`, normalizing the possibly negative `axis` against the rank of that type.
+    fn from_arguments(input_type: &ArrayType, axis: Axis, index_data_type: DataType) -> Result<Self, ProgramError> {
+        let rank = input_type.rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!("`{ARG_MAX_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
+        })?;
+        Ok(Self::new(axis, index_data_type))
+    }
+
+    /// Returns the axis along which this [`ArgMaxOperation`] searches for the largest element.
+    #[inline]
+    pub fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Returns the integer [`DataType`] of the indices that this [`ArgMaxOperation`] produces.
+    #[inline]
+    pub fn index_data_type(&self) -> DataType {
+        self.index_data_type
+    }
+}
+
+impl Display for ArgMaxOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ArgMaxOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        ARG_MAX_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(vec![input_types[0].extremal_index(ARG_MAX_OPERATION_NAME, self.axis, self.index_data_type)?])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, ARG_MAX_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis", self.axis)?;
+            operation.field("index_data_type", self.index_data_type)
+        })
+    }
+}
+
+impl<D: Domain<Type = ArrayType, Value: ArgMax>> InterpretableOperation<D> for ArgMaxOperation {
+    #[inline]
+    fn interpret<I: InterpretationDriver<D>>(
+        &self,
+        _context: &D,
+        _driver: &I,
+        inputs: &[D::Value],
+    ) -> Result<Vec<D::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].argmax_with_index_data_type(self.axis, self.index_data_type)?])
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>> PartiallyEvaluatableOperation<C>
+    for ArgMaxOperation
+{
+}
+
+impl<C: Context<Type = ArrayType, Value: ArgMax>, P: RaggedArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ArgMaxOperation
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Padding along a bounded ragged reduced axis is replaced by the lowest value of the input data type, which
+        // can never be strictly larger than a live element. Padding follows the live elements of every batch item, so
+        // a live element that equals the lowest value still wins the tie by its lower index.
+        batch_extremal_index(context, inputs, self.axis, RaggedMaskIdentity::Lowest, |axis| {
+            Self::new(axis, self.index_data_type)
+        })
+    }
+}
+
+impl_non_differentiable_operation!(ArgMaxOperation);
+impl_non_transposable_operation!(ArgMaxOperation);
+
+/// Represents the ability to compute the index of the largest element of a value along one axis. Ties select the
+/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index
+/// of its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point values
+/// are supported, while complex values are rejected, because complex numbers have no order. The reduced axis must be
+/// non-empty, and the integer index data type must be able to represent every index along it (i.e., its static extent
+/// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry is
+/// dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with unreduced
+/// axes are rejected. These are the semantics of
+/// [JAX's `lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html), except that JAX silently
+/// wraps indices that its index data type cannot represent.
+///
+/// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMaxOperation`]
+/// through their own context. The indices are integers, and so their derivative is a structural zero.
+///
+/// # Example
+///
+/// The following example finds the largest element of each row, where the first row's tie selects the lower index and
+/// the second row reports its NaN:
+///
+/// ```rust
+/// # use ryft_core::{Array, ArgMax, DataType, ProgramError};
+/// # fn main() -> Result<(), ProgramError> {
+/// let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 5.0, 4.0, f64::NAN, 2.0])?;
+/// assert_eq!(matrix.argmax(1)?, Array::vector(vec![1i32, 1])?);
+/// assert_eq!(matrix.argmax_with_index_data_type(-1, DataType::U8)?, Array::vector(vec![1u8, 1])?);
+/// # Ok(())
+/// # }
+/// ```
+pub trait ArgMax: Sized {
+    /// Returns the `i32` indices of the largest elements of this value along `axis`, with that axis dropped from the
+    /// result shape. Refer to [`Self::argmax_with_index_data_type`] for the semantics of `axis` and for the errors that
+    /// this function may return.
+    #[inline]
+    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        self.argmax_with_index_data_type(axis, DataType::I32)
+    }
+
+    /// Returns the indices of the largest elements of this value along `axis` as `index_data_type` values, with that
+    /// axis dropped from the result shape.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: [`Axis`] along which the elements are compared. Negative axes count from the end.
+    ///   - `index_data_type`: Integer [`DataType`] of the returned indices, which must be able to represent every index
+    ///     along `axis`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `axis` is out of bounds or may be empty, if the value has complex, token, or
+    /// structural-zero elements or unreduced axes, if `index_data_type` is not an integer data type or cannot represent
+    /// every index along `axis`, or if the context of the value fails to bind the operation.
+    fn argmax_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl ArgMax for Array {
+    fn argmax_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let operation = ArgMaxOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
+        let mut output_types = operation.infer_output_types(&[self.r#type().into_owned()], &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        self.extremal_index_elements(output_types.remove(0), operation.axis(), true)
+    }
+}
+
+// Any context-carrying value computes the index by binding an `ArgMaxOperation` through its context. The
+// `From<ArgMaxOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>> ArgMax
+    for V
+{
+    fn argmax_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let operation = ArgMaxOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+/// Canonical operation name for [`ArgMinOperation`].
+pub const ARG_MIN_OPERATION_NAME: &str = "argmin";
+
+/// [`Operation`] that computes the index of the smallest element of its input along one axis, dropping that axis from
+/// the output shape and producing indices of a configurable integer data type. Refer to the documentation of
+/// [`ArgMin`] for its semantics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArgMinOperation {
+    /// Refer to the documentation of [`Self::axis`].
+    axis: usize,
+
+    /// Refer to the documentation of [`Self::index_data_type`].
+    index_data_type: DataType,
+}
+
+impl ArgMinOperation {
+    /// Creates a new [`ArgMinOperation`] that reduces `axis` and produces indices of `index_data_type`. Type inference
+    /// requires `index_data_type` to be an integer data type that can represent every index along `axis`.
+    #[inline]
+    pub fn new(axis: usize, index_data_type: DataType) -> Self {
+        Self { axis, index_data_type }
+    }
+
+    /// Creates the [`ArgMinOperation`] that the [`ArgMin`] capability functions execute or stage for an input of type
+    /// `input_type`, normalizing the possibly negative `axis` against the rank of that type.
+    fn from_arguments(input_type: &ArrayType, axis: Axis, index_data_type: DataType) -> Result<Self, ProgramError> {
+        let rank = input_type.rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!("`{ARG_MIN_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
+        })?;
+        Ok(Self::new(axis, index_data_type))
+    }
+
+    /// Returns the axis along which this [`ArgMinOperation`] searches for the smallest element.
+    #[inline]
+    pub fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Returns the integer [`DataType`] of the indices that this [`ArgMinOperation`] produces.
+    #[inline]
+    pub fn index_data_type(&self) -> DataType {
+        self.index_data_type
+    }
+}
+
+impl Display for ArgMinOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ArgMinOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        ARG_MIN_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        Ok(vec![input_types[0].extremal_index(ARG_MIN_OPERATION_NAME, self.axis, self.index_data_type)?])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, ARG_MIN_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis", self.axis)?;
+            operation.field("index_data_type", self.index_data_type)
+        })
+    }
+}
+
+impl<D: Domain<Type = ArrayType, Value: ArgMin>> InterpretableOperation<D> for ArgMinOperation {
+    #[inline]
+    fn interpret<I: InterpretationDriver<D>>(
+        &self,
+        _context: &D,
+        _driver: &I,
+        inputs: &[D::Value],
+    ) -> Result<Vec<D::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].argmin_with_index_data_type(self.axis, self.index_data_type)?])
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ArgMinOperation>>> PartiallyEvaluatableOperation<C>
+    for ArgMinOperation
+{
+}
+
+impl<C: Context<Type = ArrayType, Value: ArgMin>, P: RaggedArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ArgMinOperation
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Padding along a bounded ragged reduced axis is replaced by the highest value of the input data type, which
+        // can never be strictly smaller than a live element. Padding follows the live elements of every batch item, so
+        // a live element that equals the highest value still wins the tie by its lower index.
+        batch_extremal_index(context, inputs, self.axis, RaggedMaskIdentity::Highest, |axis| {
+            Self::new(axis, self.index_data_type)
+        })
+    }
+}
+
+impl_non_differentiable_operation!(ArgMinOperation);
+impl_non_transposable_operation!(ArgMinOperation);
+
+/// Represents the ability to compute the index of the smallest element of a value along one axis. Ties select the
+/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index
+/// of its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point values
+/// are supported, while complex values are rejected, because complex numbers have no order. The reduced axis must be
+/// non-empty, and the integer index data type must be able to represent every index along it (i.e., its static extent
+/// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry is
+/// dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with unreduced
+/// axes are rejected. These are the semantics of
+/// [JAX's `lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html), except that JAX silently
+/// wraps indices that its index data type cannot represent.
+///
+/// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMinOperation`]
+/// through their own context. The indices are integers, and so their derivative is a structural zero.
+///
+/// # Example
+///
+/// The following example finds the smallest element of each row, where the first row's tie selects the lower index and
+/// the second row reports its NaN:
+///
+/// ```rust
+/// # use ryft_core::{Array, ArgMin, DataType, ProgramError};
+/// # fn main() -> Result<(), ProgramError> {
+/// let matrix = Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, f64::NAN, 2.0])?;
+/// assert_eq!(matrix.argmin(1)?, Array::vector(vec![1i32, 1])?);
+/// assert_eq!(matrix.argmin_with_index_data_type(-1, DataType::I64)?, Array::vector(vec![1i64, 1])?);
+/// # Ok(())
+/// # }
+/// ```
+pub trait ArgMin: Sized {
+    /// Returns the `i32` indices of the smallest elements of this value along `axis`, with that axis dropped from the
+    /// result shape. Refer to [`Self::argmin_with_index_data_type`] for the semantics of `axis` and for the errors that
+    /// this function may return.
+    #[inline]
+    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        self.argmin_with_index_data_type(axis, DataType::I32)
+    }
+
+    /// Returns the indices of the smallest elements of this value along `axis` as `index_data_type` values, with that
+    /// axis dropped from the result shape.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: [`Axis`] along which the elements are compared. Negative axes count from the end.
+    ///   - `index_data_type`: Integer [`DataType`] of the returned indices, which must be able to represent every index
+    ///     along `axis`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `axis` is out of bounds or may be empty, if the value has complex, token, or
+    /// structural-zero elements or unreduced axes, if `index_data_type` is not an integer data type or cannot represent
+    /// every index along `axis`, or if the context of the value fails to bind the operation.
+    fn argmin_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl ArgMin for Array {
+    fn argmin_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let operation = ArgMinOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
+        let mut output_types = operation.infer_output_types(&[self.r#type().into_owned()], &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        self.extremal_index_elements(output_types.remove(0), operation.axis(), false)
+    }
+}
+
+// Any context-carrying value computes the index by binding an `ArgMinOperation` through its context. The
+// `From<ArgMinOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>> ArgMin
+    for V
+{
+    fn argmin_with_index_data_type<A: Into<Axis>>(
+        &self,
+        axis: A,
+        index_data_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let operation = ArgMinOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl ArrayType {
+    /// Returns the output [`ArrayType`] of the extremal-index reduction named `operation_name` (i.e., `argmax` or
+    /// `argmin`) of `self` along `axis` with `index_data_type` indices, after validating that:
+    ///
+    ///   - `axis` is within `0..self.rank()`,
+    ///   - the element data type of `self` is Boolean, integer, or floating point, since complex numbers have no order,
+    ///   - `index_data_type` is an integer data type,
+    ///   - the reduced dimension is non-empty (i.e., its static extent or the lower bound of its dynamic extent is at
+    ///     least one), since an empty axis has no extremal element,
+    ///   - `index_data_type` can represent every index along `axis` (i.e., up to its static extent or the upper bound of
+    ///     its dynamic extent minus one), and
+    ///   - `self` has no unreduced mesh axes, since the extremum of partial contributions differs from the extremum of
+    ///     their total.
+    ///
+    /// The output is the type of a maximum reduction of `self` along `axis` (refer to the documentation of
+    /// `ArrayType::reduce`), with the element data type replaced by `index_data_type`.
+    fn extremal_index(&self, operation_name: &str, axis: usize, index_data_type: DataType) -> Result<Self, TypeError> {
+        let rank = self.rank();
+        if axis >= rank {
+            return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
+        }
+        let data_type = self.data_type();
+        if !data_type.is_boolean() && !data_type.is_integer() && !data_type.is_floating_point() {
+            return Err(TypeError::invalid(format!("`{operation_name}` does not support data type `{data_type}`")));
+        }
+        if !index_data_type.is_integer() {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` requires an integer index data type but got `{index_data_type}`",
+            )));
+        }
+        let dimension = self.dimension(axis);
+        let (lower, upper) = dimension.bounds().representable_extent_range().map_err(|error| {
+            TypeError::invalid(format!("`{operation_name}` cannot represent the extent of axis {axis}: {error}"))
+        })?;
+        if lower == 0 {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` requires a non-empty axis but axis {axis} has extent `{dimension}`",
+            )));
+        }
+
+        // Signed indices reserve their top bit for the sign, so a `b`-bit index represents `0..2^(b - 1)` when signed
+        // and `0..2^b` when unsigned.
+        let index_bits = index_data_type.bit_width() - usize::from(index_data_type.is_signed());
+        let maximum_index = (1u128 << index_bits) - 1;
+        if (upper - 1) as u128 > maximum_index {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` index data type `{index_data_type}` cannot represent index {} of axis {axis}",
+                upper - 1,
+            )));
+        }
+        if self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty()) {
+            return Err(TypeError::invalid(format!("`{operation_name}` cannot reduce inputs with unreduced axes")));
+        }
+        Ok(self.reduce(&[axis], ReductionKind::Max)?.with_data_type(index_data_type))
+    }
+}
+
+impl Array {
+    /// Computes the index of the largest element along `axis` when `maximize` is `true`, or of the smallest one
+    /// otherwise, for every output position, encoding the indices as `output_type` elements. Callers must have
+    /// validated the input and derived `output_type` through the type inference of [`ArgMaxOperation`] or
+    /// [`ArgMinOperation`], which guarantees a non-empty reduced axis, an ordered element data type, and indices that
+    /// `output_type` can represent.
+    fn extremal_index_elements(
+        &self,
+        output_type: ArrayType,
+        axis: usize,
+        maximize: bool,
+    ) -> Result<Self, ProgramError> {
+        let data_type = self.r#type().data_type();
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+
+        // Every element is compared through `(is NaN, order key)`, using the canonical order key from
+        // `DataType::element_order_key` (which ties signed zeros and orders every NaN like the same positive NaN).
+        // A NaN therefore beats every ordered element for both directions, which is why the minimizing key inverts the
+        // NaN flag, and only a strictly better key replaces the best so far, which makes the lowest index win ties.
+        let mut indices = Vec::with_capacity(output_addressing.element_count());
+        let mut output_index = vec![0usize; output_type.rank()];
+        let mut input_index = vec![0usize; input_shape.rank()];
+        for _ in 0..output_addressing.element_count() {
+            input_index[..axis].copy_from_slice(&output_index[..axis]);
+            input_index[axis + 1..].copy_from_slice(&output_index[axis..]);
+            let mut best = None::<(usize, (bool, u64))>;
+            for position in 0..input_shape[axis] {
+                input_index[axis] = position;
+                let bytes = &self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)];
+                let order_key = data_type.element_order_key(bytes, true).unwrap();
+                let is_nan = data_type.is_floating_point() && data_type.element_as_f64(bytes).unwrap().is_nan();
+                let key = if maximize { (is_nan, order_key) } else { (!is_nan, order_key) };
+                if best.is_none_or(|(_, best_key)| if maximize { key > best_key } else { key < best_key }) {
+                    best = Some((position, key));
+                }
+            }
+            indices.push(best.unwrap().0);
+            output_addressing.advance_index(&mut output_index);
+        }
+
+        let index_data_type = output_type.data_type();
+        dispatch_on_array_element_type!(index_data_type, |Element| {
+            Self::from_fn_elements(output_type, |index| Element::from_unsigned(indices[index] as u64))
+        })
+    }
+}
+
+/// Batches the extremal-index reduction that `operation` creates for a given reduced axis (i.e., an [`ArgMaxOperation`]
+/// or an [`ArgMinOperation`]) of the single input in `inputs` along the per-item axis `axis`. The reduced axis is
+/// expressed in the per-item coordinate system, so it shifts past the inserted batch axis, and the output batch axis
+/// moves down by one when the reduced axis precedes it, because the output drops that axis. Padding along a bounded
+/// ragged reduced axis is replaced by `identity` before the reduction, which consumes that axis and is reported as the
+/// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item whose ragged
+/// extent along the reduced axis is zero has no live elements and produces index zero.
+fn batch_extremal_index<
+    C: Context<Type = ArrayType>,
+    P: RaggedArrayExtentBatchingPolicy<C>,
+    O: InterpretableOperation<C> + Operation<Type = ArrayType>,
+>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+    inputs: &[ArrayBatch<C::Value>],
+    axis: usize,
+    identity: RaggedMaskIdentity,
+    operation: impl Fn(usize) -> O,
+) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+    check_count!("input", inputs, 1, ProgramError);
+    let Some(batch_axis) = inputs[0].batch_axis_position() else {
+        return Ok(operation(axis).interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+    };
+    let lifted_axis = if axis < batch_axis { axis } else { axis + 1 };
+    let output_axis = if axis < batch_axis { batch_axis - 1 } else { batch_axis };
+
+    // The consumed extents are collected from the unmasked input, because masking rewrites the payload while leaving
+    // in place the ragged metadata that the validation boundary is told about.
+    let input = &inputs[0];
+    let consumed_ragged_dimensions = input
+        .ragged_axes()
+        .iter()
+        .filter(|ragged_axis| ragged_axis.axis() == lifted_axis)
+        .map(|ragged_axis| ragged_axis.dimension().clone())
+        .collect::<Vec<_>>();
+    let masked = P::mask_identity_input(context, input, &[lifted_axis], identity)?;
+    let remaining_ragged_axes = masked
+        .ragged_axes()
+        .iter()
+        .cloned()
+        .filter_map(|ragged_axis| ragged_axis.reduced(&[lifted_axis]))
+        .collect::<Vec<_>>();
+    let output_batch_axis = BatchAxis::from_position(output_axis);
+    let mut outputs = operation(lifted_axis).interpret_with_batch_axes(
+        context,
+        std::slice::from_ref(&masked),
+        std::slice::from_ref(&output_batch_axis),
+    )?;
+    check_count!("output", outputs, 1, ProgramError);
+    let output =
+        ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?.with_ragged_axes(remaining_ragged_axes)?;
+    Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1712,7 +2318,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed, ValueProjection};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
 
@@ -2102,9 +2708,7 @@ mod tests {
                 &[input],
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 \
-                          with `LowestReal`"
-                    .to_string(),
+                message: "static array batching cannot mask bounded ragged axes".to_string(),
             }),
         );
 
@@ -2168,6 +2772,57 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_reduce_batching_extremum_and_boolean_reduced_ragged_axis() {
+        // Extrema and Boolean reductions write their own identity over the padding of a reduced ragged axis, so that
+        // the padding (here, values that would otherwise win) never reaches the result, and consume its extent.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let ragged = |values: Array| {
+            ArrayBatch::new(values, BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(vec![1i32, 2]).unwrap(),
+                    length.clone(),
+                    vec![0],
+                )])
+                .unwrap()
+        };
+        for (kind, input, expected) in [
+            (
+                ReductionKind::Max,
+                Array::matrix(2, 3, vec![-5.0f32, 100.0, 100.0, -3.0, -4.0, 100.0]).unwrap(),
+                Array::vector(vec![-5.0f32, -3.0]).unwrap(),
+            ),
+            (
+                ReductionKind::Min,
+                Array::matrix(2, 3, vec![5.0f32, -100.0, -100.0, 3.0, 4.0, -100.0]).unwrap(),
+                Array::vector(vec![5.0f32, 3.0]).unwrap(),
+            ),
+            (
+                ReductionKind::Any,
+                Array::matrix(2, 3, vec![false, true, true, false, true, true]).unwrap(),
+                Array::vector(vec![false, true]).unwrap(),
+            ),
+            (
+                ReductionKind::All,
+                Array::matrix(2, 3, vec![true, false, false, true, true, false]).unwrap(),
+                Array::vector(vec![true, true]).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                ReduceOperation::new(vec![0], kind)
+                    .batch(&context, &EmptyRegionDriver, &[ragged(input)])
+                    .map(BatchedOutputs::into_parts),
+                Ok((vec![ArrayBatch::new(expected, BatchAxis::new(0)).unwrap()], vec![length.clone()])),
+            );
+        }
     }
 
     #[test]
@@ -3464,5 +4119,528 @@ mod tests {
         // Reducing no axes leaves the pending sum untouched, and so even extrema accept unreduced inputs.
         assert_eq!(input.reduce(&[], ReductionKind::Product), Ok(input.clone()));
         assert_eq!(input.reduce(&[], ReductionKind::Max), Ok(input.clone()));
+    }
+
+    #[test]
+    fn test_argmax() {
+        let operation = ArgMaxOperation::new(1, DataType::I32);
+        assert_eq!(operation.name(), ARG_MAX_OPERATION_NAME);
+        assert_eq!(operation.axis(), 1);
+        assert_eq!(operation.index_data_type(), DataType::I32);
+        assert_eq!(operation.to_string(), "argmax [axis=1, index_data_type=i32]");
+        assert_eq!(ArgMaxOperation::new(0, DataType::U8).to_string(), "argmax [axis=0, index_data_type=u8]");
+    }
+
+    #[test]
+    fn test_argmax_type_inference() {
+        let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(1, DataType::I32),
+            cases = [
+                {
+                    input_types = [matrix.clone()],
+                    output_types = [ArrayType::new_static(DataType::I32, [2])],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::Boolean, [2, 3])],
+                    output_types = [ArrayType::new_static(DataType::I32, [2])],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::C64, [2, 3])],
+                    error = "`argmax` does not support data type `c64`",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::Token, [2, 3])],
+                    error = "`argmax` does not support data type `token`",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2, 0])],
+                    error = "`argmax` requires a non-empty axis but axis 1 has extent `0`",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [3])],
+                    error = "`argmax` axis 1 is out of bounds for rank 1",
+                },
+            ],
+        );
+
+        // The index data type must be an integer data type that can represent every index along the reduced axis,
+        // including the indices of the largest extent that a dynamic axis admits.
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(0, DataType::U8),
+            cases = [
+                {
+                    type = ArrayType,
+                    input_types = [ArrayType::new_static(DataType::F32, [256])],
+                    output_types = [ArrayType::scalar(DataType::U8)],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [257])],
+                    error = "`argmax` index data type `u8` cannot represent index 256 of axis 0",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(0, DataType::I8),
+            cases = [{
+                type = ArrayType,
+                input_types = [ArrayType::new_static(DataType::F32, [129])],
+                error = "`argmax` index data type `i8` cannot represent index 128 of axis 0",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(0, DataType::F32),
+            cases = [{
+                type = ArrayType,
+                input_types = [ArrayType::new_static(DataType::F32, [3])],
+                error = "`argmax` requires an integer index data type but got `f32`",
+            }],
+        );
+        let bounded = DimensionVariable::new("length", DimensionBounds::new(1, Some(257)).unwrap());
+        let possibly_empty = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let bounded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(bounded.clone())]));
+        let unbounded_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::at_least(1)))]),
+        );
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(0, DataType::U8),
+            cases = [
+                {
+                    type = ArrayType,
+                    input_types = [bounded_type.clone()],
+                    output_types = [ArrayType::scalar(DataType::U8)],
+                },
+                {
+                    input_types = [unbounded_type.clone()],
+                    error = "`argmax` index data type `u8` cannot represent index 9223372036854775806 of axis 0",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(possibly_empty)]))],
+                    error = "`argmax` requires a non-empty axis but axis 0 has extent `length`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(0, DataType::I64),
+            cases = [{
+                type = ArrayType,
+                input_types = [unbounded_type],
+                output_types = [ArrayType::scalar(DataType::I64)],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_argmax_type_inference_sharding() {
+        // An explicitly sharded reduced axis is dropped from the output sharding, leaving the cross-shard combination
+        // to the backend partitioner, while the remaining entries, the reduced axes, and the varying manual axes carry
+        // through. Inputs with unreduced axes are rejected.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap()
+                .with_varying_manual_axes(["m"])
+                .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4, 6]).with_sharding(sharding).unwrap();
+        let output_type = ArrayType::new_static(DataType::I32, [4])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["m"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let unreduced_type = ArrayType::new_static(DataType::F32, [4, 6])
+            .with_sharding(Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["y"]).unwrap())
+            .unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F32, [4, 6])
+            .with_sharding(Sharding::replicated(mesh.clone(), 2).with_reduced_axes(["y"]).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = ArgMaxOperation::new(1, DataType::I32),
+            cases = [
+                {
+                    input_types = [input_type],
+                    output_types = [output_type],
+                },
+                {
+                    input_types = [reduced_type],
+                    output_types = [ArrayType::new_static(DataType::I32, [4])
+                        .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["y"]).unwrap())
+                        .unwrap()],
+                },
+                {
+                    input_types = [unreduced_type],
+                    error = "`argmax` cannot reduce inputs with unreduced axes",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmax_interpretation() {
+        // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
+        // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the result, which are the indices that
+        // JAX's `lax.argmax` returns.
+        assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![-0.0, 0.0]).unwrap().argmax(0), Ok(Array::scalar(0i32).unwrap()));
+        assert_eq!(
+            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY]).unwrap().argmax(0),
+            Ok(Array::scalar(0i32).unwrap()),
+        );
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
+        assert_eq!(matrix.argmax(0), Ok(Array::vector(vec![1i32, 0, 0]).unwrap()));
+        assert_eq!(matrix.argmax(1), Ok(Array::vector(vec![1i32, 0]).unwrap()));
+        assert_eq!(matrix.argmax(-1), matrix.argmax(1));
+
+        // Booleans and integers order by value, exactly even for 64-bit integers that `f64` cannot represent.
+        assert_eq!(Array::vector(vec![false, true, true]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![-3i8, 7, -128]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(
+            Array::vector(vec![u64::MAX - 1, u64::MAX, u64::MAX - 2]).unwrap().argmax(0),
+            Ok(Array::scalar(1i32).unwrap()),
+        );
+
+        // Sub-byte inputs decode through arbitrary physical layouts, and the index data type is configurable.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::I4, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1]))),
+            &[i4::new(-2).unwrap(), i4::new(7).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(input.argmax_with_index_data_type(0, DataType::U8), Ok(Array::scalar(1u8).unwrap()));
+        assert_eq!(input.argmax_with_index_data_type(-1, DataType::I64), Ok(Array::scalar(1i64).unwrap()));
+
+        // The capability normalizes negative axes and reports out-of-bounds axes in the caller's terms.
+        assert!(matches!(
+            matrix.argmax(-3),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`argmax` axis -3 is out of bounds for rank 2",
+        ));
+        assert!(matches!(
+            Array::vector(Vec::<f64>::new()).unwrap().argmax(0),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`argmax` requires a non-empty axis but axis 0 has extent `0`",
+        ));
+    }
+
+    #[test]
+    fn test_argmax_interpretation_staging() {
+        // Context-carrying values bind an `ArgMaxOperation` through their context, with the axis already normalized.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input.argmax_with_index_data_type(-1, DataType::U16)
+            },
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:u16[2] = argmax [axis=1, index_data_type=u16] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_argmax_partial_evaluation() {
+        let input = Array::vector(vec![1.0, 3.0, 2.0]).unwrap();
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ArgMaxOperation::new(0, DataType::I32),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, Array::scalar(1i32).unwrap())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, Array::scalar(1i32).unwrap())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmax_batching() {
+        // The reduced axis lifts past the mapped axis, and the output batch axis moves down when the reduced axis
+        // precedes it, while replicated inputs reduce once for every batch item.
+        check_operation_batching!(
+            @exact,
+            operation = ArgMaxOperation::new(0, DataType::I32),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![1i32, 0]).unwrap())],
+                },
+                {
+                    inputs = [(@mapped(axis = 1), Array::matrix(3, 2, vec![1.0, 4.0, 5.0, 0.0, 3.0, 2.0]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![1i32, 0]).unwrap())],
+                },
+                {
+                    inputs = [(@replicated, Array::vector(vec![1.0, 5.0, 3.0]).unwrap())],
+                    outputs = [(@replicated, Array::scalar(1i32).unwrap())],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmax_batching_ragged() {
+        // The lowest value replaces the padding of a reduced ragged axis (here, values that would otherwise win), so
+        // that a live element always wins, and the rule consumes the ragged extent.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayBatch::new(
+            Array::matrix(2, 3, vec![f32::NEG_INFINITY, 100.0, 100.0, -3.0, -1.0, 100.0]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
+        .unwrap();
+        assert_eq!(
+            ArgMaxOperation::new(0, DataType::I32)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(BatchedOutputs::into_parts),
+            Ok((
+                vec![ArrayBatch::new(Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap()],
+                vec![length]
+            )),
+        );
+    }
+
+    #[test]
+    fn test_argmax_differentiation() {
+        // The integer indices have a structural-zero tangent even when the input tangent is nonzero.
+        let outputs = ArgMaxOperation::new(0, DataType::I32)
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(
+                    Array::vector(vec![1.0, 3.0, 2.0]).unwrap(),
+                    Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(1i32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
+
+        // A function that uses the index as a coefficient differentiates as if the index were a constant, in both
+        // forward and reverse mode (e.g., `sum(x) · argmax(x)` has the gradient `argmax(x)` everywhere).
+        assert_eq!(
+            differentiate_at(Array::vector(vec![1.0, 3.0, 2.0]).unwrap()).gradient(|input| {
+                let index = input.argmax(0)?.convert_element_type(DataType::F64)?;
+                Ok(input.reduce_sum(&[0], None)? * index)
+            }),
+            Ok(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_argmax_transposition() {
+        // Program transposition elides the zero-space cotangents of integer outputs, so check the primitive's rejection
+        // directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            ArgMaxOperation::new(0, DataType::I32).transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(ArrayType::new_static(DataType::F64, [3]))],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `argmax` is not transposable",
+        ));
+    }
+
+    #[test]
+    fn test_argmin() {
+        let operation = ArgMinOperation::new(1, DataType::I32);
+        assert_eq!(operation.name(), ARG_MIN_OPERATION_NAME);
+        assert_eq!(operation.axis(), 1);
+        assert_eq!(operation.index_data_type(), DataType::I32);
+        assert_eq!(operation.to_string(), "argmin [axis=1, index_data_type=i32]");
+        assert_eq!(ArgMinOperation::new(0, DataType::I64).to_string(), "argmin [axis=0, index_data_type=i64]");
+    }
+
+    #[test]
+    fn test_argmin_type_inference() {
+        // `argmin` shares the type rule of `argmax`, whose tests cover its edge cases, and names itself in errors.
+        check_operation_type_inference!(
+            operation = ArgMinOperation::new(1, DataType::I32),
+            cases = [
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2, 3])],
+                    output_types = [ArrayType::new_static(DataType::I32, [2])],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::C128, [2, 3])],
+                    error = "`argmin` does not support data type `c128`",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2, 0])],
+                    error = "`argmin` requires a non-empty axis but axis 1 has extent `0`",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmin_interpretation() {
+        // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
+        // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the result, which are the indices that
+        // JAX's `lax.argmin` returns.
+        assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![0.0, -0.0]).unwrap().argmin(0), Ok(Array::scalar(0i32).unwrap()));
+        assert_eq!(
+            Array::vector(vec![f64::INFINITY, f64::INFINITY]).unwrap().argmin(0),
+            Ok(Array::scalar(0i32).unwrap()),
+        );
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
+        assert_eq!(matrix.argmin(0), Ok(Array::vector(vec![0i32, 1, 1]).unwrap()));
+        assert_eq!(matrix.argmin(1), Ok(Array::vector(vec![0i32, 1]).unwrap()));
+        assert_eq!(matrix.argmin(-1), matrix.argmin(1));
+
+        // Booleans and integers order by value, exactly even for 64-bit integers that `f64` cannot represent.
+        assert_eq!(Array::vector(vec![true, false]).unwrap().argmin(0), Ok(Array::scalar(1i32).unwrap()));
+        assert_eq!(Array::vector(vec![-3i8, 7, -128]).unwrap().argmin(0), Ok(Array::scalar(2i32).unwrap()));
+        assert_eq!(
+            Array::vector(vec![i64::MIN + 1, i64::MIN, i64::MIN + 2])
+                .unwrap()
+                .argmin_with_index_data_type(0, DataType::U8),
+            Ok(Array::scalar(1u8).unwrap()),
+        );
+        assert!(matches!(
+            matrix.argmin(2),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`argmin` axis 2 is out of bounds for rank 2",
+        ));
+    }
+
+    #[test]
+    fn test_argmin_partial_evaluation() {
+        let input = Array::vector(vec![2.0, 1.0, 3.0]).unwrap();
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ArgMinOperation::new(0, DataType::I32),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, Array::scalar(1i32).unwrap())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, Array::scalar(1i32).unwrap())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmin_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ArgMinOperation::new(0, DataType::I32),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![0i32, 1]).unwrap())],
+                },
+                {
+                    inputs = [(@mapped(axis = 1), Array::matrix(3, 2, vec![1.0, 4.0, 5.0, 0.0, 3.0, 2.0]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![0i32, 1]).unwrap())],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_argmin_batching_ragged() {
+        // The highest value replaces the padding of a reduced ragged axis (here, values that would otherwise win), so
+        // that a live element always wins, and the rule consumes the ragged extent.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayBatch::new(
+            Array::matrix(2, 3, vec![f32::INFINITY, -100.0, -100.0, 3.0, 1.0, -100.0]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
+        .unwrap();
+        assert_eq!(
+            ArgMinOperation::new(0, DataType::I32)
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(BatchedOutputs::into_parts),
+            Ok((
+                vec![ArrayBatch::new(Array::vector(vec![0i32, 1]).unwrap(), BatchAxis::new(0)).unwrap()],
+                vec![length]
+            )),
+        );
+    }
+
+    #[test]
+    fn test_argmin_differentiation() {
+        // The integer indices have a structural-zero tangent even when the input tangent is nonzero.
+        let outputs = ArgMinOperation::new(0, DataType::I32)
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(
+                    Array::vector(vec![2.0, 1.0, 3.0]).unwrap(),
+                    Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(1i32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
+    }
+
+    #[test]
+    fn test_argmin_transposition() {
+        // Program transposition elides the zero-space cotangents of integer outputs, so check the primitive's rejection
+        // directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            ArgMinOperation::new(0, DataType::I32).transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(ArrayType::new_static(DataType::F64, [3]))],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `argmin` is not transposable",
+        ));
     }
 }

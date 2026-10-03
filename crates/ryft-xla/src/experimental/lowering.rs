@@ -4996,6 +4996,146 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
     Ok(canonical)
 }
 
+/// Lowers an [`ArgMaxOperation`](ryft_core::ArgMaxOperation) (when `maximize` is `true`) or an
+/// [`ArgMinOperation`](ryft_core::ArgMinOperation) along `axis` to a variadic `stablehlo.reduce` over the input and a
+/// `stablehlo.iota` of its indices along `axis`, returning the reduced indices. The reduction starts from the extremum
+/// identity of the input data type (i.e., the lowest value for `argmax` and the highest one for `argmin`) paired with
+/// index zero, and its comparator (refer to [`build_extremal_index_body_region`]) is commutative and associative, so
+/// that the result does not depend on the order in which XLA combines elements. Narrow floating-point inputs compare in
+/// `f32`, into which they convert exactly (including their NaNs and signed zeros), and signed one-bit inputs and indices
+/// use a signed byte carrier, because StableHLO treats `i1` as a predicate.
+///
+/// Bounded-dynamic inputs are supported as well: XLA's bounded-dynamic legalizer pads every input of a variadic
+/// `stablehlo.reduce` along a dynamic reduced axis with that input's own initial value, so padded positions hold the
+/// extremum identity paired with index zero. Such a pair never strictly beats a live element, and it ties with live
+/// elements only when every live element equals the identity, in which case index zero is the correct result. Dynamic
+/// axes that are not reduced pass through the reduction unchanged.
+fn lower_extremal_index_to_mlir<'b, 'c: 'b, 't: 'c>(
+    maximize: bool,
+    axis: usize,
+    input_value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let (value, value_data_type) = match input_type.data_type() {
+        DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
+        data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
+            let working_type =
+                lower_tensor_type(&ArrayType::new(DataType::F32, input_type.shape().clone()), context, location)?;
+            let converted = block.append_operation(stable_hlo::convert(input_value, working_type, location)?)?;
+            (converted.result(0).expect("stablehlo.convert should return one result").as_ref(), DataType::F32)
+        }
+        data_type => (input_value, data_type),
+    };
+    let index_data_type = match output_type.data_type() {
+        DataType::I1 => DataType::I8,
+        data_type => data_type,
+    };
+
+    // `stablehlo.reduce` requires its inputs to share one shape, so the index iota takes the bounded-dynamic type of
+    // the input: it is built at the physical bound of every dynamic axis and then receives the runtime extents of the
+    // input. Statically shaped inputs need no refinement.
+    let index_type = ArrayType::new(index_data_type, input_type.shape().clone());
+    let physical_index_tensor_type = lower_tensor_type(&physical_bound_type(&index_type)?, context, location)?;
+    let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
+    let indices = indices.result(0).expect("stablehlo.iota should return one result").as_ref();
+    let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();
+    let indices = lower_restore_dynamic_dimensions(indices, &index_type, &extent_sources, block, context, location)?;
+    let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
+    let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
+    let scalar_index_type = ArrayType::scalar(index_data_type);
+    let scalar_index_tensor_type = lower_tensor_type(&scalar_index_type, context, location)?;
+    let index_identity =
+        lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
+    let body = build_extremal_index_body_region(maximize, value_data_type, index_data_type, context, location)?;
+    let reduced = block.append_operation(stable_hlo::reduce(
+        &[value, indices],
+        &[value_identity, index_identity],
+        &[axis],
+        body,
+        location,
+    )?)?;
+    let reduced_indices = reduced.result(1).expect("stablehlo.reduce should return one result per input").as_ref();
+    if index_data_type == output_type.data_type() {
+        return Ok(reduced_indices);
+    }
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let converted = block.append_operation(stable_hlo::convert(reduced_indices, output_tensor_type, location)?)?;
+    Ok(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
+}
+
+/// Builds the comparator region of [`lower_extremal_index_to_mlir`], which combines two `(value, index)` pairs by
+/// picking the left pair when its value is strictly better than the right one, or equivalent to it with a lower index.
+/// For `argmax` (when `maximize` is `true`), a value is strictly better when it is greater, and for `argmin` when it is
+/// smaller, comparing floating-point values with `FLOAT` semantics (so that `-0.0` and `+0.0` are equivalent).
+/// A floating-point NaN is also strictly better than every ordered value for both directions, and two NaNs are
+/// equivalent. Unlike JAX's comparator, which picks the left pair whenever its value is a NaN, this one is commutative
+/// and associative, so every combination order selects the first NaN and the lowest index among ties.
+fn build_extremal_index_body_region<'c, 't>(
+    maximize: bool,
+    value_data_type: DataType,
+    index_data_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+    let value_tensor_type = lower_tensor_type(&ArrayType::scalar(value_data_type), context, location)?;
+    let index_tensor_type = lower_tensor_type(&ArrayType::scalar(index_data_type), context, location)?;
+    let block = context.block(&[
+        (value_tensor_type, location),
+        (index_tensor_type, location),
+        (value_tensor_type, location),
+        (index_tensor_type, location),
+    ]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let left_value = block_ref.argument(0)?.as_ref();
+    let left_index = block_ref.argument(1)?.as_ref();
+    let right_value = block_ref.argument(2)?.as_ref();
+    let right_index = block_ref.argument(3)?.as_ref();
+    let direction = if maximize { ComparisonDirection::GreaterThan } else { ComparisonDirection::LessThan };
+    let mut better = lower_compare_to_mlir(direction, left_value, right_value, &mut block_ref, location)?;
+    let mut equivalent =
+        lower_compare_to_mlir(ComparisonDirection::Equal, left_value, right_value, &mut block_ref, location)?;
+    if value_data_type.is_floating_point() {
+        let left_is_nan =
+            lower_compare_to_mlir(ComparisonDirection::NotEqual, left_value, left_value, &mut block_ref, location)?;
+        let right_is_nan =
+            lower_compare_to_mlir(ComparisonDirection::NotEqual, right_value, right_value, &mut block_ref, location)?;
+        let right_is_ordered =
+            lower_compare_to_mlir(ComparisonDirection::Equal, right_value, right_value, &mut block_ref, location)?;
+        let nan_beats_ordered =
+            block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_ordered, location)?)?;
+        let nan_beats_ordered = nan_beats_ordered.result(0).expect("stablehlo.and should return one result").as_ref();
+        let both_nan = block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_nan, location)?)?;
+        let both_nan = both_nan.result(0).expect("stablehlo.and should return one result").as_ref();
+        better = block_ref
+            .append_operation(stable_hlo::or(better, nan_beats_ordered, location)?)?
+            .result(0)
+            .expect("stablehlo.or should return one result")
+            .as_ref();
+        equivalent = block_ref
+            .append_operation(stable_hlo::or(equivalent, both_nan, location)?)?
+            .result(0)
+            .expect("stablehlo.or should return one result")
+            .as_ref();
+    }
+    let lower_index =
+        lower_compare_to_mlir(ComparisonDirection::LessThan, left_index, right_index, &mut block_ref, location)?;
+    let tie = block_ref.append_operation(stable_hlo::and(equivalent, lower_index, location)?)?;
+    let tie = tie.result(0).expect("stablehlo.and should return one result").as_ref();
+    let pick_left = block_ref.append_operation(stable_hlo::or(better, tie, location)?)?;
+    let pick_left = pick_left.result(0).expect("stablehlo.or should return one result").as_ref();
+    let value = block_ref.append_operation(stable_hlo::select(pick_left, left_value, right_value, location)?)?;
+    let value = value.result(0).expect("stablehlo.select should return one result").as_ref();
+    let index = block_ref.append_operation(stable_hlo::select(pick_left, left_index, right_index, location)?)?;
+    let index = index.result(0).expect("stablehlo.select should return one result").as_ref();
+    block_ref.append_operation(stable_hlo::r#return(&[value, index], location)?)?;
+    Ok(region)
+}
+
 /// Returns backend-local input types for a named decomposition after boundary validation and differentiation.
 ///
 /// Private decomposition functions contain local array computations and have no manual-axis binders. Manual variation
@@ -6015,6 +6155,34 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer.location,
                 )?;
                 Ok(vec![value])
+            }
+            ArrayOperation::ArgMax(operation) => {
+                check_count!("input", lowerer.input_types, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
+                Ok(vec![lower_extremal_index_to_mlir(
+                    true,
+                    operation.axis(),
+                    input_values[0],
+                    &lowerer.input_types[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?])
+            }
+            ArrayOperation::ArgMin(operation) => {
+                check_count!("input", lowerer.input_types, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
+                Ok(vec![lower_extremal_index_to_mlir(
+                    false,
+                    operation.axis(),
+                    input_values[0],
+                    &lowerer.input_types[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?])
             }
             ArrayOperation::Sort(operation) => lower_sort_to_mlir(
                 operation,
@@ -22419,6 +22587,62 @@ mod tests {
                       stablehlo.return %25 : tensor<i1>
                     }) : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
                     return %0 : tensor<4xcomplex<f32>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_argmax_with_variadic_reduce() {
+        use ryft_core::ArgMaxOperation;
+
+        // An argmax lowers to a variadic `stablehlo.reduce` over the input and an index iota, starting from the lowest
+        // value paired with index zero. Its comparator picks the left pair when its value is greater or a NaN facing an
+        // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
+        // left index is lower.
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let outputs = builder
+            .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let module =
+            to_mlir_module_for_program(&program, &[], &[input_type], &[output_type], "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xi32> {
+                    %0 = stablehlo.iota dim = 1 : tensor<2x3xi32>
+                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %1:2 = stablehlo.reduce(%arg0 init: %cst), (%0 init: %c) across dimensions = [1] : (tensor<2x3xf32>, tensor<2x3xi32>, tensor<f32>, tensor<i32>) -> (tensor<2xf32>, tensor<2xi32>)
+                     reducer(%arg1: tensor<f32>, %arg3: tensor<f32>) (%arg2: tensor<i32>, %arg4: tensor<i32>)  {
+                      %2 = stablehlo.compare GT, %arg1, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %3 = stablehlo.compare EQ, %arg1, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %5 = stablehlo.compare NE, %arg3, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %6 = stablehlo.compare EQ, %arg3, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %7 = stablehlo.and %4, %6 : tensor<i1>
+                      %8 = stablehlo.and %4, %5 : tensor<i1>
+                      %9 = stablehlo.or %2, %7 : tensor<i1>
+                      %10 = stablehlo.or %3, %8 : tensor<i1>
+                      %11 = stablehlo.compare LT, %arg2, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                      %12 = stablehlo.and %10, %11 : tensor<i1>
+                      %13 = stablehlo.or %9, %12 : tensor<i1>
+                      %14 = stablehlo.select %13, %arg1, %arg3 : tensor<i1>, tensor<f32>
+                      %15 = stablehlo.select %13, %arg2, %arg4 : tensor<i1>, tensor<i32>
+                      stablehlo.return %14, %15 : tensor<f32>, tensor<i32>
+                    }
+                    return %1#1 : tensor<2xi32>
                   }
                 }
             "#},

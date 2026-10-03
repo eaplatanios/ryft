@@ -8350,7 +8350,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
-                ParallelReduceOperation::new("items".to_string(), ReductionKind::Sum),
+                ParallelReduceOperation::new(ReductionKind::Sum, "items".to_string()),
                 Vec::new(),
                 vec![input],
                 None,

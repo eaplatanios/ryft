@@ -2275,7 +2275,7 @@ mod tests {
         }
     }
 
-    /// Executes `local.parallel_reduce("x", kind)` inside a `shard_map` over the manual axis `"x"` of four CPU devices,
+    /// Executes `local.parallel_reduce(kind, "x")` inside a `shard_map` over the manual axis `"x"` of four CPU devices,
     /// on the global vector of `4 · shard_size` elements of `data_type` whose device shards hold the raw `shards`, and
     /// returns the raw bytes of every device's output shard in device order.
     fn execute_parallel_reduce_on_cpu(
@@ -2302,7 +2302,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", kind).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce(kind, "x").unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4117,7 +4117,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -4314,7 +4314,7 @@ mod tests {
                                     local_x
                                         .reduce(&[0], ReductionKind::Sum)
                                         .unwrap()
-                                        .parallel_reduce("x", ReductionKind::LogSumExp)
+                                        .parallel_reduce(ReductionKind::LogSumExp, "x")
                                         .unwrap()
                                 },
                                 x,
@@ -4425,7 +4425,7 @@ mod tests {
                                         (shared.clone() * shared * weights)
                                             .reduce(&[0], ReductionKind::Sum)
                                             .unwrap()
-                                            .parallel_reduce("x", ReductionKind::Sum)
+                                            .parallel_reduce(ReductionKind::Sum, "x")
                                             .unwrap()
                                     },
                                     (shared, weights),
@@ -4449,7 +4449,7 @@ mod tests {
                                         (varying.clone() * varying)
                                             .reduce(&[0], ReductionKind::Sum)
                                             .unwrap()
-                                            .parallel_reduce("x", ReductionKind::Sum)
+                                            .parallel_reduce(ReductionKind::Sum, "x")
                                             .unwrap()
                                     },
                                     varying,
@@ -4480,7 +4480,7 @@ mod tests {
                                                 (shared.clone() * shared * weights)
                                                     .reduce(&[0], ReductionKind::Sum)
                                                     .unwrap()
-                                                    .parallel_reduce("x", ReductionKind::Sum)
+                                                    .parallel_reduce(ReductionKind::Sum, "x")
                                                     .unwrap()
                                             },
                                             (shared, weights),
@@ -4569,7 +4569,7 @@ mod tests {
                             |input: ShardMapTracer| {
                                 let constant: ShardMapTracer =
                                     input.dispatch_domain().fill(&input.r#type(), 3.0_f32).unwrap();
-                                constant.parallel_reduce("x", ReductionKind::Sum).unwrap()
+                                constant.parallel_reduce(ReductionKind::Sum, "x").unwrap()
                             },
                             inputs[0].clone(),
                             mesh.clone(),
@@ -4760,7 +4760,7 @@ mod tests {
                     let gradient = pullback.apply(inputs[2].clone().into_value()).unwrap();
                     let maxima = shard_map::<_, _, (ArrayType, ArrayType), _>(
                         |input: ShardMapTracer| {
-                            let maximum = input.parallel_reduce("x", ReductionKind::Max).unwrap();
+                            let maximum = input.parallel_reduce(ReductionKind::Max, "x").unwrap();
                             let varying = maximum.parallel_vary("x").unwrap();
                             (maximum, varying)
                         },
@@ -5216,7 +5216,7 @@ mod tests {
                                             (shared.clone() * shared * weights.clone() * weights)
                                                 .reduce(&[0], ReductionKind::Sum)
                                                 .unwrap()
-                                                .parallel_reduce("y", ReductionKind::Sum)
+                                                .parallel_reduce(ReductionKind::Sum, "y")
                                                 .unwrap()
                                         },
                                         inputs,
@@ -5226,7 +5226,7 @@ mod tests {
                                         vec!["y".to_string()],
                                     )
                                     .unwrap()
-                                    .parallel_reduce("x", ReductionKind::Sum)
+                                    .parallel_reduce(ReductionKind::Sum, "x")
                                     .unwrap()
                                 },
                                 (shared, weights),
@@ -5360,7 +5360,7 @@ mod tests {
                                     (shared.clone() * shared * weights)
                                         .reduce(&[0, 1], ReductionKind::Sum)
                                         .unwrap()
-                                        .parallel_reduce("x", ReductionKind::Sum)
+                                        .parallel_reduce(ReductionKind::Sum, "x")
                                         .unwrap()
                                 },
                                 (shared, weights),
@@ -5587,7 +5587,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Mean).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce(ReductionKind::Mean, "x").unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -5638,8 +5638,8 @@ mod tests {
                         |local_x: ShardMapTracer| {
                             local_x
                                 .parallel_reduce_with_axis_index_groups(
-                                    "x",
                                     ReductionKind::Mean,
+                                    "x",
                                     vec![vec![0, 2], vec![3, 1]],
                                 )
                                 .unwrap()
@@ -5683,7 +5683,7 @@ mod tests {
                             let context = local_x.dispatch_domain();
                             let summed: ShardMapTracer = Batch::batch(
                                 &context,
-                                |item| item.parallel_reduce("x", ReductionKind::Sum),
+                                |item| item.parallel_reduce(ReductionKind::Sum, "x"),
                                 local_x,
                                 BatchAxis::new(0),
                                 BatchAxis::new(0),
@@ -5751,7 +5751,7 @@ mod tests {
                                 let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
-                                        ParallelReduceOperation::new("x".to_string(), ReductionKind::Sum),
+                                        ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()),
                                         Vec::new(),
                                         vec![input],
                                         None,
@@ -5830,7 +5830,7 @@ mod tests {
                         let context = local_x.value().context().clone();
                         let mut outputs = context
                             .stage_operation(
-                                ParallelReduceOperation::new("x".to_string(), ReductionKind::LogSumExp),
+                                ParallelReduceOperation::new(ReductionKind::LogSumExp, "x".to_string()),
                                 Vec::new(),
                                 &[local_x.into_value()],
                             )
@@ -5870,7 +5870,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     let first = shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -5878,7 +5878,7 @@ mod tests {
                     )
                     .expect("first shard_map should trace");
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ReductionKind::Sum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
                         first,
                         mesh.clone(),
                         sharding.clone(),
@@ -6126,7 +6126,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            let error = local_x.parallel_reduce("y", ReductionKind::Sum).unwrap_err();
+                            let error = local_x.parallel_reduce(ReductionKind::Sum, "y").unwrap_err();
                             assert_eq!(
                                 error,
                                 ProgramError::Axis(AxisError::UnboundAxisName { name: "y".to_string() }),

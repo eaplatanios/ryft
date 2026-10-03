@@ -683,9 +683,52 @@ impl Sort for Array {
             }
         }
 
-        let order_keys = order_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let shape = input_types[0].static_shape().unwrap();
-        let gather = sort_permutation(order_keys.as_slice(), shape.dimensions(), operation.axis(), direction);
+        // The sort permutes every slice along the sorted axis independently. In row-major order, the elements of one
+        // such slice are `inner_stride` apart (i.e., the product of the dimensions after the axis), and the slices are
+        // identified by an `outer` index over the dimensions before the axis and an `inner` offset within one stride.
+        // The `gather` map records, for every flat output position, the flat input position whose element the sorted
+        // output takes, and so it starts as the identity, which positions outside the sorted axis never leave.
+        let dimensions = input_types[0].static_shape().unwrap().dimensions().to_vec();
+        let axis = operation.axis();
+        let axis_size = dimensions[axis];
+        let inner_stride = dimensions[axis + 1..].iter().product::<usize>();
+        let outer_count = dimensions[..axis].iter().product::<usize>();
+        let mut gather = (0..dimensions.iter().product()).collect::<Vec<usize>>();
+        let mut permutation = Vec::with_capacity(axis_size);
+        for outer in 0..outer_count {
+            for inner in 0..inner_stride {
+                // `base` is the flat position of the first element of this slice, so its element at position `i`
+                // along the sorted axis lives at `base + i * inner_stride`.
+                let base = outer * axis_size * inner_stride + inner;
+
+                // Sorting the positions `0..axis_size` of the slice by their keys yields the permutation that maps
+                // every sorted position to the original position whose element it takes. The keys compare
+                // lexicographically (i.e., the first key component that differs decides), descending sorts reverse
+                // every comparison, and `sort_by` is stable, so elements that tie on every key keep their order.
+                permutation.clear();
+                permutation.extend(0..axis_size);
+                permutation.sort_by(|&left, &right| {
+                    order_keys
+                        .iter()
+                        .map(|keys| {
+                            let left_key = keys[base + left * inner_stride];
+                            let right_key = keys[base + right * inner_stride];
+                            match direction {
+                                SortDirection::Ascending => left_key.cmp(&right_key),
+                                SortDirection::Descending => right_key.cmp(&left_key),
+                            }
+                        })
+                        .find(|ordering| ordering.is_ne())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (target_position, &source_position) in permutation.iter().enumerate() {
+                    gather[base + target_position * inner_stride] = base + source_position * inner_stride;
+                }
+            }
+        }
+
+        // Applying the gather map moves whole element encodings, so every input is permuted the same way without being
+        // decoded.
         inputs
             .iter()
             .zip(input_types)
@@ -716,45 +759,6 @@ impl<
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Computes the flat gather map of a multi-key sort along `axis` of an array with the provided static `dimensions`:
-/// for every flat row-major output position, the returned vector holds the flat input position whose element the
-/// sorted output takes. `order_keys` holds one order-preserving key slice per key component (each with one key per
-/// element in row-major order). Elements are compared lexicographically across the key slices in order, the sort is
-/// stable (i.e., elements equal on every key keep their original relative order), and [`SortDirection::Descending`]
-/// reverses every key comparison.
-fn sort_permutation(order_keys: &[&[u64]], dimensions: &[usize], axis: usize, direction: SortDirection) -> Vec<usize> {
-    let axis_size = dimensions[axis];
-    let inner_stride: usize = dimensions[axis + 1..].iter().product();
-    let outer_count: usize = dimensions[..axis].iter().product();
-    let mut gather = (0..dimensions.iter().product()).collect::<Vec<_>>();
-    let mut permutation = Vec::with_capacity(axis_size);
-    for outer in 0..outer_count {
-        for inner in 0..inner_stride {
-            let base = outer * axis_size * inner_stride + inner;
-            permutation.clear();
-            permutation.extend(0..axis_size);
-            permutation.sort_by(|&left, &right| {
-                order_keys
-                    .iter()
-                    .map(|keys| {
-                        let left_key = keys[base + left * inner_stride];
-                        let right_key = keys[base + right * inner_stride];
-                        match direction {
-                            SortDirection::Ascending => left_key.cmp(&right_key),
-                            SortDirection::Descending => right_key.cmp(&left_key),
-                        }
-                    })
-                    .find(|ordering| ordering.is_ne())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for (target_position, &source_position) in permutation.iter().enumerate() {
-                gather[base + target_position * inner_stride] = base + source_position * inner_stride;
-            }
-        }
-    }
-    gather
-}
 
 /// Represents the ability to select the `k` largest elements of a value along one axis together with their indices.
 /// Values rank by the IEEE 754 total order of [`SortOrdering::Total`] (i.e., `+NaN` ranks above `+∞`, `+0.0` ranks

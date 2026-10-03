@@ -2596,6 +2596,70 @@ mod tests {
         assert_eq!(read_i32s(&device.argmin(0).unwrap()), vec![0]);
     }
 
+    /// Argmax and argmin agree between the XLA-backed eager array backend and the reference array backend across input
+    /// data types (including narrow floating-point inputs, which the lowering compares in `f32`, and signed one-bit
+    /// inputs, which it compares in a signed byte carrier), reduced axes, and index data types. Both backends receive
+    /// the same host bytes, and the expected indices are the ones that JAX's `lax.argmax` and `lax.argmin` return.
+    #[test]
+    fn test_eager_argmax_and_argmin_parity_with_reference_backend() {
+        use ryft_core::{ArgMax, ArgMin};
+
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let nan = bf16::NAN;
+        let cases = [
+            (
+                DataType::BF16,
+                values_to_bytes(&[bf16::ONE, nan, bf16::from_f32(3.0), bf16::NEG_ZERO, bf16::ZERO, bf16::NEG_ONE]),
+                1,
+                DataType::U8,
+                vec![1i64, 0],
+                vec![1i64, 2],
+            ),
+            (DataType::I8, values_to_bytes(&[-3i8, 7, -128, 5, 5, 1]), 0, DataType::I64, vec![1, 0, 1], vec![0, 1, 0]),
+            (
+                DataType::U64,
+                values_to_bytes(&[u64::MAX - 1, u64::MAX, 0, u64::MAX, u64::MAX, 1]),
+                1,
+                DataType::I32,
+                vec![1, 0],
+                vec![2, 2],
+            ),
+            (DataType::Boolean, vec![0, 1, 1, 0, 0, 0], 1, DataType::I32, vec![1, 0], vec![0, 0]),
+            // The set bit of a signed one-bit integer encodes `-1`, so the rows are `[0, -1, 0]` and `[-1, -1, 0]`.
+            (DataType::I1, vec![0, 1, 0, 1, 1, 0], 1, DataType::I32, vec![0, 2], vec![1, 0]),
+        ];
+        for (data_type, bytes, axis, index_data_type, expected_argmax, expected_argmin) in cases {
+            let device =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2, 3]), mesh.clone(), &bytes)
+                    .unwrap();
+            let reference = CpuArray::new(ArrayType::new_static(data_type, [2, 3]), bytes).unwrap();
+            for (device_output, reference_output, expected) in [
+                (
+                    device.argmax_with_index_data_type(axis, index_data_type).unwrap(),
+                    reference.argmax_with_index_data_type(axis, index_data_type).unwrap(),
+                    expected_argmax,
+                ),
+                (
+                    device.argmin_with_index_data_type(axis, index_data_type).unwrap(),
+                    reference.argmin_with_index_data_type(axis, index_data_type).unwrap(),
+                    expected_argmin,
+                ),
+            ] {
+                assert_eq!(
+                    reference_output.to_f64s(),
+                    expected.into_iter().map(|index| index as f64).collect::<Vec<_>>(),
+                    "{data_type}",
+                );
+                assert_eq!(
+                    shard_host_bytes(device_output.addressable_shards().next().unwrap()).unwrap(),
+                    reference_output.storage_bytes(),
+                    "{data_type}",
+                );
+            }
+        }
+    }
+
     /// A two-key lexicographic sort agrees between the XLA-backed eager array backend and the reference array
     /// backend: duplicates in the `i32` primary key fall through to the `f32` secondary key (compared with
     /// `TOTALORDER` semantics), full ties keep their original order (the sort is stable), and the passenger

@@ -112,7 +112,7 @@ bonus first-class kind (so RMSNorm's `mean(x^2)` needs no helper).
 | `lax.reduce_max` / `reduce_min` | softmax numerical stability | ✅ | `ReductionKind::Max` / `Min` |
 | `any` / `all` | mask diagnostics | ✅ | `ReductionKind::Any` / `All` |
 | `lax.reduce_prod` | (not used by Gemma 4) | ❌ | no `Prod` kind; not needed |
-| `argmax` / `argmin` | sampling, top-1 accuracy | ✅ | `ArgMax::argmax(axis)` / `ArgMin::argmin(axis)` in `operations/sorting.rs`, composed from `Sort` |
+| `argmax` / `argmin` | sampling, top-1 accuracy | ✅ | `ArgMax::argmax(axis)` / `ArgMin::argmin(axis)` in `operations/reductions.rs`, backed by the `ArgMaxOperation` / `ArgMinOperation` primitives |
 | cumulative ops (`cumsum`) | (not used by Gemma 4 training) | ❌ | absent; not needed |
 | `logsumexp` / `softmax` (composite) | cross-entropy; standalone softmax | ⚠️ | still model-level compositions (`reduce_max` + `sub` + `exp` + `reduce` + `log`); the fused attention op embeds its own softmax, so only the LM-head loss needs the composition |
 

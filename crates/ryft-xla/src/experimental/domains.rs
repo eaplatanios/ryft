@@ -5034,6 +5034,11 @@ fn array_data_dependent_padding_discipline(
     match operation {
         ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
         ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
+        // XLA pads every input of the variadic reduction that these lower to with that input's own initial value along
+        // a dynamic reduced axis (i.e., the extremum identity paired with index zero), which never beats a live element
+        // and ties only when every live element equals the identity, where index zero is correct. Dynamic axes that
+        // are not reduced pass through. `data_derived_padding_fixture` executes both configurations.
+        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => XlaMasked,
         // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update lanes;
         // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
         // Other window shapes, modes, and combiners retain their independent admission requirements.
@@ -6262,25 +6267,26 @@ mod tests {
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation, Atan2Operation,
-        BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
-        ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomFunctionJvpRule, CustomFunctionOperation,
-        Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
-        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation,
-        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-        SelectOperation, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext,
-        StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
+        ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation,
+        Atan2Operation, BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference,
+        CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
+        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
+        CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
+        DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation,
+        DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
+        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
+        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext, StaticShape, SubOperation,
+        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6582,6 +6588,20 @@ mod tests {
         values_from_bytes::<f64>(bytes.as_slice())
     }
 
+    fn read_i32s(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<i32>(bytes.as_slice())
+    }
+
     fn read_u64s(client: &Client<'_>, array: &Array<'_>) -> Vec<u64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let bytes = array
@@ -6724,6 +6744,23 @@ mod tests {
         let cumulative_sum = builder
             .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![matrix], None)
             .unwrap()[0];
+
+        // Index reductions over the data-derived axis would select a physical suffix lane if its padding were not
+        // masked, because the suffix lanes of the increasing iota are larger than every live lane and those of its
+        // negation are smaller. The matrix covers both a reduced data-derived axis and a data-derived axis that the
+        // reduction keeps.
+        let argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let argmin = builder
+            .add_instruction(ArgMinOperation::new(0, DataType::I32), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let row_argmax = builder
+            .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let column_argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![
@@ -6740,23 +6777,13 @@ mod tests {
                     log_sum_exp,
                     cumulative_sum,
                     product,
+                    argmax,
+                    argmin,
+                    row_argmax,
+                    column_argmax,
                 ],
                 vec![Placeholder],
-                vec![
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                    Placeholder,
-                ],
+                vec![Placeholder; 17],
             )
             .unwrap()
     }
@@ -10604,6 +10631,12 @@ mod tests {
         for direction in [SortDirection::Ascending, SortDirection::Descending] {
             assert_eq!(sort_data_dependent_padding_discipline(direction), XlaMasked);
         }
+        for operation in [
+            ArrayOperation::ArgMax(ArgMaxOperation::new(0, DataType::I32)),
+            ArrayOperation::ArgMin(ArgMinOperation::new(0, DataType::I32)),
+        ] {
+            assert_eq!(array_data_dependent_padding_discipline(&operation), XlaMasked);
+        }
         for kind in [
             ScatterReductionKind::Overwrite,
             ScatterReductionKind::Add,
@@ -10740,6 +10773,10 @@ mod tests {
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
         assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
         assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
+        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
 
         // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
         // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
@@ -10755,6 +10792,14 @@ mod tests {
         assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
         assert_eq!(read_f32s(&client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
 
+        // With a single live lane, every physical suffix lane of the data-derived axis is padding, which index
+        // reductions must still never select.
+        let single = execute(1);
+        assert_eq!(read_i32s(&client, &single[13]), vec![0]);
+        assert_eq!(read_i32s(&client, &single[14]), vec![0]);
+        assert_eq!(read_i32s(&client, &single[15]), vec![3]);
+        assert_eq!(read_i32s(&client, &single[16]), vec![0, 0, 0, 0]);
+
         let at_bound = execute(4);
         assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
@@ -10768,6 +10813,10 @@ mod tests {
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
         assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
         assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
 
         // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
         // padded row silently participating at the smaller size.
@@ -10931,6 +10980,10 @@ mod tests {
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
         assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
         assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_i32s(&client, &small[13]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[14]), vec![1]);
+        assert_eq!(read_i32s(&client, &small[15]), vec![3, 3]);
+        assert_eq!(read_i32s(&client, &small[16]), vec![1, 1, 1, 1]);
 
         let at_bound = execute(4);
         assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
@@ -10944,6 +10997,10 @@ mod tests {
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
         assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
         assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_i32s(&client, &at_bound[13]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[14]), vec![3]);
+        assert_eq!(read_i32s(&client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_i32s(&client, &at_bound[16]), vec![3, 3, 3, 3]);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -14651,7 +14708,7 @@ mod tests {
         // capability is not even implemented for `Array` (its dispatch domain carries no named-axis environment), so
         // this binds the operation directly and asserts the axis-resolution failure surfaced at compile time.
         let input = f32_vector(&client, &mesh, &[1.0, 2.0]);
-        let operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum);
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
         assert!(matches!(
             domain.bind(operation, Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })

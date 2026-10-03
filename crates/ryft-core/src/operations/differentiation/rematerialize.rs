@@ -1493,7 +1493,7 @@ mod tests {
         let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = body.add_input(varying_type.clone());
         let y = body.add_input(invariant_type.clone());
-        let sum = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh);
+        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh);
         let sum = body.add_instruction(sum, Vec::new(), vec![x], None).unwrap()[0];
         let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![sum, y], None).unwrap()[0];
         let body = body

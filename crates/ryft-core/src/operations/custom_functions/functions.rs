@@ -3810,7 +3810,7 @@ mod tests {
             Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
         );
 
-        let function = custom_function(|x: Tracer| x.parallel_reduce("items", ReductionKind::Sum));
+        let function = custom_function(|x: Tracer| x.parallel_reduce(ReductionKind::Sum, "items"));
         assert_eq!(
             batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
             Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
