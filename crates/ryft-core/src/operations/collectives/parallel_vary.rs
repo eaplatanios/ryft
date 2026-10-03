@@ -11,8 +11,9 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::collectives::parallel_reduce::{ParallelReduceOperation, ParallelReductionKind};
+use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
+use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed,
@@ -232,7 +233,7 @@ impl_differentiable_operation! {
                 };
 
                 let mut contributions = context.bind(
-                    ParallelReduceOperation::new(operation.axis_name.clone(), ParallelReductionKind::Sum)
+                    ParallelReduceOperation::new(operation.axis_name.clone(), ReductionKind::Sum)
                         .with_mesh(mesh),
                     Vec::new(),
                     std::slice::from_ref(cotangent),

@@ -2071,7 +2071,7 @@ mod tests {
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, differentiate_at,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
-    use crate::operations::collectives::parallel_reduce::{ParallelReduce, ParallelReductionKind};
+    use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
     use crate::operations::custom_functions::rules::CustomRuleSource;
@@ -3810,7 +3810,7 @@ mod tests {
             Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
         );
 
-        let function = custom_function(|x: Tracer| x.parallel_reduce("items", ParallelReductionKind::Sum));
+        let function = custom_function(|x: Tracer| x.parallel_reduce("items", ReductionKind::Sum));
         assert_eq!(
             batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
             Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
