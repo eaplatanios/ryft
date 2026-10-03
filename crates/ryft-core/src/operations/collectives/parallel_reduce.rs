@@ -445,13 +445,19 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            let primal = stage_parallel_reduce(context.primal(), operation, inputs[0].primal())?;
+            let mut primals =
+                context.primal().bind(operation.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
+            check_count!("output", primals, 1, ProgramError);
+            let primal = primals.remove(0);
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(r#type) => {
                     MaybeZero::Zero(operation.infer_output_types(std::slice::from_ref(r#type), &[])?.remove(0))
                 }
                 MaybeZero::Value(tangent) => {
-                    MaybeZero::Value(stage_parallel_reduce(context.tangent(), operation, tangent)?)
+                    let mut tangents =
+                        context.tangent().bind(operation.clone(), Vec::new(), std::slice::from_ref(tangent))?;
+                    check_count!("output", tangents, 1, ProgramError);
+                    MaybeZero::Value(tangents.remove(0))
                 }
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -490,8 +496,10 @@ impl_differentiable_operation! {
                     Ok(())
                 }
                 MaybeZero::Value(cotangent) => {
-                    let contribution = stage_parallel_reduce(&**context, operation, cotangent)?;
-                    accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
+                    let mut contributions =
+                        context.bind(operation.clone(), Vec::new(), std::slice::from_ref(cotangent))?;
+                    check_count!("output", contributions, 1, ProgramError);
+                    accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
                     Ok(())
                 }
                 MaybeZero::Zero(_) => Ok(()),
@@ -735,20 +743,6 @@ impl<
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Binds `operation` to `input` in `context` and returns its single output. The forward-mode and transposition rules
-/// use this to repeat a [`ParallelReduceOperation`] on a primal, a tangent, or an output cotangent.
-fn stage_parallel_reduce<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>>(
-    context: &C,
-    operation: &ParallelReduceOperation,
-    input: &C::Value,
-) -> Result<C::Value, ProgramError> {
-    let mut outputs = context.bind(operation.clone(), Vec::new(), std::slice::from_ref(input))?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 #[cfg(test)]
