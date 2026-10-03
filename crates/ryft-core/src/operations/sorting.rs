@@ -810,8 +810,6 @@ pub trait TopK: Sized {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshape> TopK for V {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
         // Complex values have no total order, and the index passenger and the slices below need static extents,
@@ -871,12 +869,12 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshap
         // The `i32` index passenger holds the index of every element along the ranked axis, and it is built through the
         // `Iota` capability of the dispatch domain of the value, which materializes it for eager arrays and stages an
         // `IotaOperation` for context-carrying values. The passenger shares the sharding of the value, including its
-        // varying manual axes. An iota holds the same elements on every device, so typing it as varying is always
-        // valid (i.e., it is what a `parallel_vary` of the invariant iota produces, and an integer iota has no
-        // cotangent for that transition to affect), and it lets values that insert no variation transitions (e.g.,
-        // eager arrays) sort it together with the value. A stable descending sort under the total ordering then moves
-        // the largest elements to the front of the axis, with ties keeping their original order (and so the lowest
-        // index first), and carries the passenger along, so that it holds the original index of every sorted element.
+        // varying manual axes. An iota holds the same elements on every device, so typing it as varying is always valid
+        // (i.e., it is what a `parallel_vary` of the invariant iota produces, and an integer iota has no cotangent for
+        // that transition to affect), and it lets values that insert no variation transitions (e.g., eager arrays) sort
+        // it together with the value. A stable descending sort under the total ordering then moves the largest elements
+        // to the front of the axis, with ties keeping their original order (and so the lowest index first), and carries
+        // the passenger along, so that it holds the original index of every sorted element.
         let index_type = ArrayType::new(DataType::I32, value_type.shape().clone())
             .with_sharding(value_type.sharding().cloned())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
