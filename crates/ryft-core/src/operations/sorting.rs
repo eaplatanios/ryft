@@ -1020,7 +1020,6 @@ mod tests {
             operation = SortOperation::new(0, SortDirection::Ascending).with_ordering(SortOrdering::Total),
             cases = [
                 {
-                    type = ArrayType,
                     input_types = [complex.clone()],
                     error = "`sort` does not support key data type `c64` under the `total` ordering",
                 },
@@ -1037,7 +1036,6 @@ mod tests {
             operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(NonZeroUsize::new(2).unwrap()),
             cases = [
                 {
-                    type = ArrayType,
                     input_types = [vector.clone()],
                     error = "`sort` `key_count` 2 exceeds input count 1",
                 },
@@ -1060,7 +1058,6 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let operation = SortOperation::new(0, SortDirection::Ascending);
         let vector = ArrayType::new_static(DataType::F64, [4]);
         let invariant = vector.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         let varying = vector
@@ -1081,10 +1078,9 @@ mod tests {
         // Inputs must share their manual variation, and reduced passengers keep their reduction state, while reduced
         // keys, unreduced inputs, and sharded sort axes are rejected.
         check_operation_type_inference!(
-            operation = operation,
+            operation = SortOperation::new(0, SortDirection::Ascending),
             cases = [
                 {
-                    type = ArrayType,
                     input_types = [varying.clone(), invariant.clone()],
                     error = "`sort` inputs must have matching varying manual axes; insert `parallel_vary` on the \
                              inputs that lack an axis, as `align_manual_variation` does",
@@ -1176,6 +1172,10 @@ mod tests {
 
         // The eager implementation validates its inputs through type inference.
         assert!(matches!(
+            Array::sort(&[], 0, SortDirection::Ascending),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. })) if message == "`sort` needs at least one input",
+        ));
+        assert!(matches!(
             Array::sort_with_key_count(&inputs[..1], 0, 2, SortDirection::Ascending),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`sort` `key_count` 2 exceeds input count 1",
@@ -1190,8 +1190,8 @@ mod tests {
     fn test_sort_interpretation_ordering() {
         // The canonical ordering treats `-0.0` and `+0.0` as equal and every NaN as equal and greater than `+∞`, so
         // stability keeps those ties in input order, which the index passenger shows. The total ordering separates
-        // signed zeros and orders NaNs by sign. The expected permutations are those of JAX's `lax.sort` and
-        // `lax.top_k`, respectively.
+        // signed zeros and orders NaNs by sign. The expected permutations are those of JAX's `jax.lax.sort` and
+        // `jax.lax.top_k`, respectively.
         let negative_nan = -f64::NAN;
         let keys = Array::vector(vec![f64::NAN, 0.0, -0.0, negative_nan, f64::NEG_INFINITY, 1.0]).unwrap();
         let indices = Array::vector(vec![0i32, 1, 2, 3, 4, 5]).unwrap();
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_manual_variation() {
+    fn test_sort_interpretation_manual_variation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type = ArrayType::new_static(DataType::I32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
@@ -1474,7 +1474,8 @@ mod tests {
                 ],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[3], %5:f64[3] .
-                    let %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3], %10:f64[3], %11:f64[3] = sort [axis=0, key_count=2, direction=ascending] %0 %1 %2 %3 %4 %5
+                    let %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3], %10:f64[3], %11:f64[3] = \
+                        sort [axis=0, key_count=2, direction=ascending] %0 %1 %2 %3 %4 %5
                     in (%6, %7, %8, %9, %10, %11)
                 "},
             }],
@@ -1508,18 +1509,19 @@ mod tests {
     #[test]
     fn test_sort_differentiation_reverse_mode() {
         // Reverse mode transposes the permutation of the passengers, so the gradient of the sum of the two smallest
-        // sorted values selects their original positions, for keys of either ordering and multi-key sorts alike.
+        // sorted values selects their original positions, for keys of either ordering and multi-key sorts alike, which
+        // finite differences independently confirm.
         check_gradient!(
-            |input| Ok(Sort::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending)?
+            |input| Sort::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending)?
                 .remove(0)
                 .slice(&[0], &[2], &[1])?
-                .reduce_sum(&[0], None)?),
+                .reduce_sum(&[0], None),
             at = Array::vector(vec![3.0, 1.0, 2.0]).unwrap(),
             step = 1e-3,
             tolerance = 1e-6,
         );
         check_gradient!(
-            |input| Ok(Sort::sort_with_ordering(
+            |input| Sort::sort_with_ordering(
                 &[input.clone(), input.clone() * input],
                 1,
                 1,
@@ -1528,8 +1530,22 @@ mod tests {
             )?
             .remove(1)
             .slice(&[0, 0], &[2, 1], &[1, 1])?
-            .reduce_sum(&[0, 1], None)?),
+            .reduce_sum(&[0, 1], None),
             at = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, -1.0, 4.0, 0.5]).unwrap(),
+            step = 1e-3,
+            tolerance = 1e-6,
+        );
+        check_gradient!(
+            |input| Sort::sort_with_key_count(
+                &[input.clone(), input.clone() * input.clone(), input.clone() + input.clone() + input],
+                0,
+                2,
+                SortDirection::Ascending,
+            )?
+            .remove(2)
+            .slice(&[0], &[2], &[1])?
+            .reduce_sum(&[0], None),
+            at = Array::vector(vec![3.0, 1.0, 2.0]).unwrap(),
             step = 1e-3,
             tolerance = 1e-6,
         );
@@ -1589,7 +1605,7 @@ mod tests {
     fn test_top_k() {
         // Ties select the lowest index first because the descending ranking sort is stable, and values rank by the
         // total order, so `+NaN` ranks first, `+0.0` ranks above `-0.0`, and `-NaN` ranks last, which are the
-        // indices that JAX's `lax.top_k` returns.
+        // indices that JAX's `jax.lax.top_k` returns.
         let input = Array::vector(vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]).unwrap();
         assert_eq!(
             input.top_k(3, 0),
@@ -1701,6 +1717,7 @@ mod tests {
             .trim_end(),
         );
     }
+
     #[test]
     fn test_top_k_manual_variation() {
         // The index passenger shares the varying manual axes of the ranked value, so eager arrays (which insert no

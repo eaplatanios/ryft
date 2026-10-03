@@ -1741,21 +1741,22 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     ///     analogue of JAX's `custom_vmap_jvp`. Differentiating a batched call differentiates the rule's program, and
     ///     differentiating an unbatched call stages a derived call whose batching applies the derivative of the rule,
     ///     including when a forward-mode Jacobian batches it or when a linearized pushforward is batched. The derived
-    ///     rule applies the rule with the inputs that are mapped on both their primal and tangent side mapped
-    ///     (broadcasting the replicated side of a pair with one mapped side), so the batched derivative has the batch
-    ///     axes of the batched call. This deliberately differs from JAX when an input is mapped on only one of its two
-    ///     sides while another input is mapped on both: JAX then applies the rule with the primal-side axes and batches
-    ///     the tangents separately, which yields the outer product of the two batches, of which only the diagonal
-    ///     holds the per-item tangents. For a rule whose result depends on its input axes, the broadcast inputs also
-    ///     change the rule's result (e.g., the primal outputs of the batched derivative can differ from those of the
-    ///     batched call), whereas JAX's diagonal reflects the primal-side axes. When no input is mapped on both sides
-    ///     (e.g., in a forward-mode Jacobian, whose primals are replicated), it applies the rule with every input
-    ///     replicated and batches the rule's derivative structurally, so the rule must also accept calls without mapped
-    ///     inputs. Linearization computes the outputs with the call itself and recomputes the primal inside the staged
-    ///     pushforward, because the call is opaque to partial evaluation, which is only valid for a primal without
-    ///     effects: a primal with effects (e.g., one that updates or reads references) is linearized inline, so that
-    ///     its effects run once, and batching that linearization's pushforward batches it structurally. Reverse mode
-    ///     inlines the derivative of the primal instead, because derived calls are not transposable.
+    ///     rule computes the primal outputs with the rule applied at the batch axes of the primal inputs, exactly as
+    ///     batching the call does, and the tangents with the derivative of that application, after aligning each
+    ///     tangent to its primal (broadcasting or moving it), so the batched derivative has the batch axes of the
+    ///     batched call. A replicated primal whose tangent is mapped is the exception: the rule cannot perturb a shared
+    ///     input differently for each batch item, so the tangents come from a second application of the rule with that
+    ///     primal broadcast. When another input is mapped, this deliberately differs from JAX, which applies the rule
+    ///     with the primal-side axes and batches such tangents separately, which yields the outer product of the two
+    ///     batches, of which only the diagonal holds the per-item tangents. A rule whose result depends on its input
+    ///     axes therefore gets tangents from the broadcast application, whereas JAX's diagonal reflects the primal-side
+    ///     axes. When every primal is replicated (e.g., in a forward-mode Jacobian), it applies the rule with every
+    ///     input replicated and batches the rule's derivative structurally, so the rule must also accept calls without
+    ///     mapped inputs. Linearization computes the outputs with the call itself and recomputes the primal inside the
+    ///     staged pushforward, because the call is opaque to partial evaluation, which is only valid for a primal
+    ///     without effects: a primal with effects (e.g., one that updates or reads references) is linearized inline, so
+    ///     that its effects run once, and batching that linearization's pushforward batches it structurally. Reverse
+    ///     mode inlines the derivative of the primal instead, because derived calls are not transposable.
     ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse-mode rules): differentiating a batched call traces the
     ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that the
     ///     rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
@@ -4246,12 +4247,9 @@ mod tests {
 
     #[test]
     fn test_custom_function_with_batching_differentiate_then_batch_flag_sensitive_rule() {
-        // The rule computes `2xy` when both inputs are mapped and `3xy` otherwise. For a mapped `x` and a replicated
-        // `y` whose tangent is mapped, the derived rule broadcasts `y` and applies the rule with both inputs mapped, so
-        // the batched derivative returns `2xy` and `2(ẋy + xẏ)`, while batching the call alone returns `3xy`. JAX
-        // returns `3xy` and the outer product of the flags' two input sets, whose diagonal is `3(ẋy + xẏ)` (i.e.,
-        // `[18, 24, 39]` here). The two coincide for rules that do not depend on the flags (e.g., in
-        // `test_custom_function_with_batching_differentiate_then_batch_mixed_axes`).
+        // The rule computes `2xy` when both inputs are mapped and `3xy` otherwise. The primal outputs of a batched
+        // derivative always come from the rule applied at the primal inputs' batch axes, so they are those of the
+        // batched call in both cases below.
         type Tracer = DomainTracer<ArrayContext>;
         let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
             |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
@@ -4265,45 +4263,59 @@ mod tests {
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
         let program = program.into_flat_program();
+        let batched = |program: &FlatProgram<ArrayContext>, axes: &[BatchAxis], inputs: Vec<Array>| {
+            let (batched, output_axes) = program
+                .batched(3, ShardingDimension::Replicated, axes, ProgramBatchingOutputAxesPolicy::Natural)
+                .unwrap()
+                .into_parts();
+            (batched.interpret(inputs).unwrap(), output_axes)
+        };
+        let jvp = program.jvp().unwrap();
+        let mapped = BatchAxis::new(0);
+        let replicated = BatchAxis::replicated();
+
+        // For a mapped `x` and a replicated `y` whose tangent is mapped, the batched call returns `3xy`. The rule cannot
+        // perturb the shared `y` differently for each batch item, so the tangent comes from the rule applied with `y`
+        // broadcast, which is `2(ẋy + xẏ)`. JAX instead returns the outer product of the two batches, whose diagonal
+        // is `3(ẋy + xẏ)` (i.e., `[18, 24, 39]` here). The two coincide for rules that do not depend on their input
+        // axes (e.g., in `test_custom_function_with_batching_differentiate_then_batch_mixed_axes`).
         let x = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
         let y = Array::scalar(4.0f64).unwrap();
+        let primal = Array::vector(vec![12.0f64, 24.0, 36.0]).unwrap();
         assert_eq!(
-            program
-                .batched(
-                    3,
-                    ShardingDimension::Replicated,
-                    &[BatchAxis::new(0), BatchAxis::replicated()],
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )
-                .unwrap()
-                .into_parts()
-                .0
-                .interpret(vec![x.clone(), y.clone()]),
-            Ok(vec![Array::vector(vec![12.0f64, 24.0, 36.0]).unwrap()]),
+            batched(&program, &[mapped, replicated], vec![x.clone(), y.clone()]),
+            (vec![primal.clone()], vec![mapped]),
         );
-        let (batched, output_axes) = program
-            .jvp()
-            .unwrap()
-            .batched(
-                3,
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::new(0)],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
         assert_eq!(
-            batched.interpret(vec![
-                x,
-                y,
-                Array::vector(vec![1.0f64, 0.5, 0.25]).unwrap(),
-                Array::vector(vec![2.0f64, 3.0, 4.0]).unwrap(),
-            ]),
-            Ok(vec![
-                Array::vector(vec![8.0f64, 16.0, 24.0]).unwrap(),
-                Array::vector(vec![12.0f64, 16.0, 26.0]).unwrap(),
-            ]),
+            batched(
+                &jvp,
+                &[mapped, replicated, mapped, mapped],
+                vec![
+                    x,
+                    y,
+                    Array::vector(vec![1.0f64, 0.5, 0.25]).unwrap(),
+                    Array::vector(vec![2.0f64, 3.0, 4.0]).unwrap(),
+                ],
+            ),
+            (vec![primal, Array::vector(vec![12.0f64, 16.0, 26.0]).unwrap()], vec![mapped; 2]),
+        );
+
+        // For mapped primals with replicated tangents, the rule is applied once, with both inputs mapped, so the
+        // batched call and the batched derivative return `2xy`, and the derivative returns `2(ẋy + xẏ)`.
+        let x = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
+        let y = Array::vector(vec![4.0f64, 5.0, 6.0]).unwrap();
+        let primal = Array::vector(vec![8.0f64, 20.0, 36.0]).unwrap();
+        assert_eq!(
+            batched(&program, &[mapped, mapped], vec![x.clone(), y.clone()]),
+            (vec![primal.clone()], vec![mapped]),
+        );
+        assert_eq!(
+            batched(
+                &jvp,
+                &[mapped, mapped, replicated, replicated],
+                vec![x, y, Array::scalar(1.0f64).unwrap(), Array::scalar(2.0f64).unwrap()],
+            ),
+            (vec![primal, Array::vector(vec![12.0f64, 18.0, 24.0]).unwrap()], vec![mapped; 2]),
         );
     }
 

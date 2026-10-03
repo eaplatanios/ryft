@@ -1577,18 +1577,21 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
     /// higher orders recurse through each call's own region, and its batching rule applies the JVP of the source's
     /// batching rule. Calls whose primal regions differ therefore share one derived definition.
     ///
-    /// The derived batching rule classifies each primal input with an active tangent by which of the two values are
-    /// mapped:
+    /// The derived batching rule always computes the derived call's primal outputs with the source rule applied at the
+    /// batch axes of the primal inputs, which is exactly how batching the source call computes them, so a rule whose
+    /// result depends on its input axes gives a derivative whose primal outputs are those of the batched call. Its
+    /// tangents are computed in one of two modes:
     ///
-    ///   - **Structural:** when no input that the source rule could map is mapped on both sides (e.g., the replicated
-    ///     primals and mapped tangents of a forward-mode Jacobian), the source rule is applied with every input
-    ///     replicated, and the JVP of its program is batched structurally over the given batch axes. This falls back to
-    ///     the rule mode below when the rule maps an output of that application, because batching such an output
-    ///     structurally again would add a second batch axis.
+    ///   - **Structural:** when every primal input is replicated, and so is every output of the rule applied to them
+    ///     (e.g., the replicated primals and mapped tangents of a forward-mode Jacobian), the JVP of the rule's program
+    ///     is batched structurally over the given batch axes.
     ///   - **Rule:** otherwise, each primal and tangent pair with a mapped side is aligned to one axis (i.e., its
     ///     replicated side is broadcast, and a tangent mapped along another axis than its primal is moved), and the JVP
-    ///     of the source rule applied at the aligned batch axes is the batched program. Inputs without a tangent keep
-    ///     their batch axes.
+    ///     of the source rule applied at the aligned batch axes computes the tangents. Inputs without a tangent keep
+    ///     their batch axes. Alignment changes the rule's input axes only for a replicated primal whose tangent is
+    ///     mapped, because the rule cannot apply per-item perturbations of a shared input otherwise; only then is the
+    ///     rule applied twice (i.e., once at the primal axes for the primal outputs and once at the aligned axes for
+    ///     the tangents).
     ///
     /// Derived definitions are owned by the source's registration, like its specializations: every request for the
     /// same key returns the same derived definition while the registration's caches are alive, and a fresh one
@@ -2541,46 +2544,51 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
             input_axes,
         };
         let program_types = key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>();
+        let tangents_only = self.key.kind == CustomRuleDerivationKind::Pushforward;
 
-        // Structural mode: no input that the source rule could map is mapped on both sides.
-        let rule_can_map = (0..primal_count).any(|primal| {
-            !primal_axes[primal].is_replicated()
-                && primal_tangents[primal].is_none_or(|tangent: usize| !tangent_axes[tangent].is_replicated())
-        });
-        if !rule_can_map {
-            let rule = self.source.batching_rule_specialization(rule_key(
-                key.unbatched_input_types[..primal_count].to_vec(),
-                vec![BatchAxis::replicated(); primal_count],
-            ))?;
-            if rule.output_axes.iter().all(BatchAxis::is_replicated) {
-                let jvp = self.jvp_program(name, differentiator.as_ref(), &rule.program, &jvp_input_indices)?;
-                let mut input_axes = vec![BatchAxis::replicated(); boundary_input_count];
-                input_axes.extend_from_slice(&key.input_axes);
-                let (batched, output_axes) = batcher(
-                    &key.level,
-                    &jvp,
-                    &input_axes,
-                    &vec![None; jvp.output_types().len()],
-                    CustomRuleBatchedOutputs::Values,
-                )
-                .map_err(ProgramError::from)?;
+        // The source rule applied at the primal inputs' own batch axes is the batched primal of the source call, so it
+        // computes the derived call's primal outputs in every mode.
+        let primal_rule = self
+            .source
+            .batching_rule_specialization(rule_key(key.input_types[..primal_count].to_vec(), primal_axes.to_vec()))?;
 
-                // The batched program consumes the level's boundary inputs before the JVP program's own copy of them.
-                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
-                    |values: Vec<CustomRuleTracer<V, O>>| {
-                        let context = values[0].context().clone();
-                        let mut inputs = values[..boundary_input_count].to_vec();
-                        inputs.extend(values);
-                        Ok(batched.interpret_in_context(&context, inputs)?)
-                    },
-                    program_types,
-                    self.source.definition.named_axes.clone(),
-                )?;
-                return Ok(Arc::new(CustomRuleSpecialization { program, output_axes }));
-            }
+        // Structural mode: every primal input is replicated, and so is every output of the rule applied to them.
+        if primal_axes.iter().chain(&primal_rule.output_axes).all(BatchAxis::is_replicated) {
+            let jvp = self.jvp_program(
+                name,
+                differentiator.as_ref(),
+                &primal_rule.program,
+                &jvp_input_indices,
+                tangents_only,
+            )?;
+            let mut input_axes = vec![BatchAxis::replicated(); boundary_input_count];
+            input_axes.extend_from_slice(&key.input_axes);
+            let (batched, output_axes) = batcher(
+                &key.level,
+                &jvp,
+                &input_axes,
+                &vec![None; jvp.output_types().len()],
+                CustomRuleBatchedOutputs::Values,
+            )
+            .map_err(ProgramError::from)?;
+
+            // The batched program consumes the level's boundary inputs before the JVP program's own copy of them.
+            let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+                |values: Vec<CustomRuleTracer<V, O>>| {
+                    let context = values[0].context().clone();
+                    let mut inputs = values[..boundary_input_count].to_vec();
+                    inputs.extend(values);
+                    Ok(batched.interpret_in_context(&context, inputs)?)
+                },
+                program_types,
+                self.source.definition.named_axes.clone(),
+            )?;
+            return Ok(Arc::new(CustomRuleSpecialization { program, output_axes }));
         }
 
-        // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis.
+        // Rule mode: align each primal and tangent pair with a mapped side to one axis, preferring the primal's axis. Only
+        // a replicated primal whose tangent is mapped is broadcast, in which case the rule applied at the aligned axes
+        // computes the tangents, while the primal outputs still come from the rule applied at the primal axes.
         let mut aligned_axes = key.input_axes.clone();
         for (tangent, &primal) in tangent_primal_indices.iter().enumerate() {
             let axis = if primal_axes[primal].is_replicated() { tangent_axes[tangent] } else { primal_axes[primal] };
@@ -2624,19 +2632,30 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                 Some(alignment)
             }
         };
-        let rule = self.source.batching_rule_specialization(rule_key(
-            aligned_types[..primal_count].to_vec(),
-            aligned_axes[..primal_count].to_vec(),
-        ))?;
-        let jvp = self.jvp_program(name, differentiator.as_ref(), &rule.program, &jvp_input_indices)?;
+        let broadcasts_primals = aligned_axes[..primal_count] != *primal_axes;
+        let rule = match broadcasts_primals {
+            true => self.source.batching_rule_specialization(rule_key(
+                aligned_types[..primal_count].to_vec(),
+                aligned_axes[..primal_count].to_vec(),
+            ))?,
+            false => primal_rule.clone(),
+        };
+        let separate_primal = broadcasts_primals && !tangents_only;
+        let jvp = self.jvp_program(
+            name,
+            differentiator.as_ref(),
+            &rule.program,
+            &jvp_input_indices,
+            tangents_only || separate_primal,
+        )?;
         let tangent_output_axes = rule
             .output_axes
             .iter()
             .zip(&self.key.output_tangent_mask)
             .filter_map(|(axis, live)| live.then_some(*axis));
-        let output_axes = match self.key.kind {
-            CustomRuleDerivationKind::Jvp => rule.output_axes.iter().copied().chain(tangent_output_axes).collect(),
-            CustomRuleDerivationKind::Pushforward => tangent_output_axes.collect(),
+        let output_axes = match tangents_only {
+            true => tangent_output_axes.collect(),
+            false => primal_rule.output_axes.iter().copied().chain(tangent_output_axes).collect(),
         };
         let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
             |values: Vec<CustomRuleTracer<V, O>>| {
@@ -2651,9 +2670,15 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                         inputs[index] = value;
                     }
                 }
+                let mut outputs = Vec::new();
+                if separate_primal {
+                    let primal_inputs = boundary_inputs.iter().chain(&values[boundary_input_count..][..primal_count]);
+                    outputs = primal_rule.program.interpret_in_context(&context, primal_inputs.cloned().collect())?;
+                }
                 let mut jvp_inputs = boundary_inputs.to_vec();
                 jvp_inputs.extend(inputs);
-                Ok(jvp.interpret_in_context(&context, jvp_inputs)?)
+                outputs.extend(jvp.interpret_in_context(&context, jvp_inputs)?);
+                Ok(outputs)
             },
             program_types,
             self.source.definition.named_axes.clone(),
@@ -2662,7 +2687,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
     }
 
     /// Returns the Jacobian-Vector Product (JVP) program of the source rule's batched `program` with respect to
-    /// `input_indices`, restricted to its tangent outputs for pushforward derivations, after validating that its live
+    /// `input_indices`, restricted to its tangent outputs when `tangents_only` is set, after validating that its live
     /// tangent outputs are those of the derived calls.
     ///
     /// # Parameters
@@ -2671,12 +2696,15 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
     ///   - `differentiator`: Differentiator of the source definition.
     ///   - `program`: Batched program of the source rule.
     ///   - `input_indices`: Indices of the program inputs whose tangents are active.
+    ///   - `tangents_only`: Whether the returned program returns only the tangent outputs (e.g., for pushforward
+    ///     derivations, or when another program computes the primal outputs).
     fn jvp_program(
         &self,
         name: &str,
         differentiator: &CustomRuleDifferentiator<V, O>,
         program: &Program<V, O, Vec<V>, Vec<V>>,
         input_indices: &[usize],
+        tangents_only: bool,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let output_tangent_mask = program.entry_region_ref().tangent_output_mask(input_indices)?;
         if output_tangent_mask != self.key.output_tangent_mask {
@@ -2688,14 +2716,12 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
             .into());
         }
         let jvp = differentiator(program, input_indices)?;
-        match self.key.kind {
-            CustomRuleDerivationKind::Jvp => Ok(jvp),
-            CustomRuleDerivationKind::Pushforward => {
-                let inputs = jvp.input_ids();
-                let tangent_outputs = &jvp.output_ids()[program.output_types().len()..];
-                Ok(jvp.filtered(&inputs, tangent_outputs, &inputs)?.0)
-            }
+        if !tangents_only {
+            return Ok(jvp);
         }
+        let inputs = jvp.input_ids();
+        let tangent_outputs = &jvp.output_ids()[program.output_types().len()..];
+        Ok(jvp.filtered(&inputs, tangent_outputs, &inputs)?.0)
     }
 }
 
