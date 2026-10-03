@@ -1927,13 +1927,11 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ArgMinOperation`].
 pub const ARG_MIN_OPERATION_NAME: &str = "argmin";
 
-/// [`Operation`] that computes the index of the smallest element of its input along one axis, dropping that axis from
-/// the output shape and producing indices of a configurable integer data type. Refer to the documentation of
+/// [`Operation`] that computes the index of the smallest element of its input along one axis, dropping that axis
+/// from the output shape and producing indices of a configurable integer data type. Refer to the documentation of
 /// [`ArgMin`] for its semantics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArgMinOperation {
@@ -2038,8 +2036,8 @@ impl<C: Context<Type = ArrayType, Value: ArgMin>, P: RaggedArrayExtentBatchingPo
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // Padding along a bounded ragged reduced axis is replaced by the highest value of the input data type, which
-        // can never be strictly smaller than a live element. Padding follows the live elements of every batch item, so
-        // a live element that equals the highest value still wins the tie by its lower index.
+        // can never be strictly smaller than a live element. Padding follows the live elements of every batch item,
+        // so a live element that equals the highest value still wins the tie by its lower index.
         batch_index_reduction(context, inputs, self.axis, RaggedMaskIdentity::Highest, |axis| {
             Self::new(axis, self.index_data_type)
         })
@@ -2050,15 +2048,15 @@ impl_non_differentiable_operation!(ArgMinOperation);
 impl_non_transposable_operation!(ArgMinOperation);
 
 /// Represents the ability to compute the index of the smallest element of a value along one axis. Ties select the
-/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index
-/// of its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point values
-/// are supported, while complex values are rejected, because complex numbers have no order. The reduced axis must be
-/// non-empty, and the integer index data type must be able to represent every index along it (i.e., its static extent
-/// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry is
-/// dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with unreduced
-/// axes are rejected. These are the semantics of JAX's
-/// [`jax.lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html), except that JAX silently
-/// wraps indices that its index data type cannot represent.
+/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the
+/// index of its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point
+/// values are supported, while complex values are rejected, because complex numbers have no order. The reduced axis
+/// must be non-empty, and the integer index data type must be able to represent every index along it (i.e., its static
+/// extent or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding
+/// entry is dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with
+/// unreduced axes are rejected. These are the semantics of JAX's
+/// [`jax.lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html),
+/// except that JAX silently wraps indices that its index data type cannot represent.
 ///
 /// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMinOperation`]
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
@@ -2139,35 +2137,38 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 }
 
 impl ArrayType {
-    /// Returns the output [`ArrayType`] of the index reduction named `operation_name` (i.e., `argmax` or `argmin`) of
-    /// `self` along `axis` with `index_data_type` indices, after validating that:
+    /// Returns the output [`ArrayType`] of the index reduction named `operation_name` (i.e., `argmax` or `argmin`)
+    /// of `self` along `axis` with `index_data_type` indices, after validating that:
     ///
     ///   - `axis` is within `0..self.rank()`,
     ///   - the element data type of `self` is Boolean, integer, or floating point, since complex numbers have no order,
     ///   - `index_data_type` is an integer data type,
     ///   - the reduced dimension is non-empty (i.e., its static extent or the lower bound of its dynamic extent is at
     ///     least one), since an empty axis has no extremal element,
-    ///   - `index_data_type` can represent every index along `axis` (i.e., up to its static extent or the upper bound of
-    ///     its dynamic extent minus one), and
-    ///   - `self` has no unreduced mesh axes, since the extremum of partial contributions differs from the extremum of
-    ///     their total.
+    ///   - `index_data_type` can represent every index along `axis` (i.e., up to its static extent or the upper bound
+    ///     of its dynamic extent minus one), and
+    ///   - `self` has no unreduced mesh axes, since the extremum of partial contributions differs from the extremum
+    ///     of their total.
     ///
     /// The output is the type of a maximum reduction of `self` along `axis` (refer to the documentation of
-    /// `ArrayType::reduce`), with the element data type replaced by `index_data_type`.
+    /// [`ArrayType::reduce`]), with the element data type replaced by `index_data_type`.
     fn index_reduction(&self, operation_name: &str, axis: usize, index_data_type: DataType) -> Result<Self, TypeError> {
         let rank = self.rank();
         if axis >= rank {
             return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
         }
+
         let data_type = self.data_type();
         if !data_type.is_boolean() && !data_type.is_integer() && !data_type.is_floating_point() {
             return Err(TypeError::invalid(format!("`{operation_name}` does not support data type `{data_type}`")));
         }
+
         if !index_data_type.is_integer() {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` requires an integer index data type but got `{index_data_type}`",
             )));
         }
+
         let dimension = self.dimension(axis);
         let (lower, upper) = dimension.bounds().representable_extent_range().map_err(|error| {
             TypeError::invalid(format!("`{operation_name}` cannot represent the extent of axis {axis}: {error}"))
@@ -2178,19 +2179,24 @@ impl ArrayType {
             )));
         }
 
-        // Signed indices reserve their top bit for the sign, so a `b`-bit index represents `0..2^(b - 1)` when signed
-        // and `0..2^b` when unsigned.
+        // Signed indices reserve their top bit for the sign, so a `b`-bit index represents `0..2^(b - 1)`
+        // when signed and `0..2^b` when unsigned.
         let index_bits = index_data_type.bit_width() - usize::from(index_data_type.is_signed());
         let maximum_index = (1u128 << index_bits) - 1;
         if (upper - 1) as u128 > maximum_index {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` index data type `{index_data_type}` cannot represent index {} of axis {axis}",
+                "`{}` index data type `{}` cannot represent index {} of axis {}",
+                operation_name,
+                index_data_type,
                 upper - 1,
+                axis,
             )));
         }
+
         if self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty()) {
             return Err(TypeError::invalid(format!("`{operation_name}` cannot reduce inputs with unreduced axes")));
         }
+
         Ok(self.reduce(&[axis], ReductionKind::Max)?.with_data_type(index_data_type))
     }
 }
@@ -2199,8 +2205,8 @@ impl Array {
     /// Computes the index of the largest element along `axis` when `maximize` is `true`, or of the smallest one
     /// otherwise, for every output position, encoding the indices as `output_type` elements. Callers must have
     /// validated the input and derived `output_type` through the type inference of [`ArgMaxOperation`] or
-    /// [`ArgMinOperation`], which guarantees a non-empty reduced axis, an ordered element data type, and indices that
-    /// `output_type` can represent.
+    /// [`ArgMinOperation`], which guarantees a non-empty reduced axis, an ordered element data type, and
+    /// indices that `output_type` can represent.
     fn index_reduction_elements(
         &self,
         output_type: ArrayType,
@@ -2244,28 +2250,30 @@ impl Array {
     }
 }
 
-/// Batches the index reduction that `operation` creates for a given reduced axis (i.e., an [`ArgMaxOperation`] or an
+/// Batches the index reduction that `operation_fn` creates for a given reduced axis (i.e., an [`ArgMaxOperation`] or an
 /// [`ArgMinOperation`]) of the single input in `inputs` along the per-item axis `axis`. The reduced axis is expressed
 /// in the per-item coordinate system, so it shifts past the inserted batch axis, and the output batch axis moves down
 /// by one when the reduced axis precedes it, because the output drops that axis. Padding along a bounded ragged reduced
 /// axis is replaced by `identity` before the reduction, which consumes that axis and is reported as the
-/// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item whose ragged
-/// extent along the reduced axis is zero has no live elements and produces index zero.
+/// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item
+/// whose ragged extent along the reduced axis is zero has no live elements and produces index zero.
 fn batch_index_reduction<
     C: Context<Type = ArrayType>,
     P: RaggedArrayExtentBatchingPolicy<C>,
     O: InterpretableOperation<C> + Operation<Type = ArrayType>,
+    F: Fn(usize) -> O,
 >(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     inputs: &[ArrayBatch<C::Value>],
     axis: usize,
     identity: RaggedMaskIdentity,
-    operation: impl Fn(usize) -> O,
+    operation_fn: F,
 ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
     check_count!("input", inputs, 1, ProgramError);
     let Some(batch_axis) = inputs[0].batch_axis_position() else {
-        return Ok(operation(axis).interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        return Ok(operation_fn(axis).interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
     };
+
     let lifted_axis = if axis < batch_axis { axis } else { axis + 1 };
     let output_axis = if axis < batch_axis { batch_axis - 1 } else { batch_axis };
 
@@ -2286,7 +2294,7 @@ fn batch_index_reduction<
         .filter_map(|ragged_axis| ragged_axis.reduced(&[lifted_axis]))
         .collect::<Vec<_>>();
     let output_batch_axis = BatchAxis::from_position(output_axis);
-    let mut outputs = operation(lifted_axis).interpret_with_batch_axes(
+    let mut outputs = operation_fn(lifted_axis).interpret_with_batch_axes(
         context,
         std::slice::from_ref(&masked),
         std::slice::from_ref(&output_batch_axis),
