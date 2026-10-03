@@ -10,10 +10,11 @@
 //!
 //! [`SpecializationCache`] owns retained artifacts, in-flight markers, and private atomic counters.
 //! [`SpecializationCacheEntry`] and [`SpecializationCacheProducer`] model the entry-production protocol, while
-//! [`SpecializationCacheStatistics`] is an ordinary value snapshot of the live counters. Refer to the
-//! [`SpecializationCache`] documentation for more information on these relationships.
-//! [`TransformCache`](crate::programs::transforms::TransformCache) lets a typed transform descriptor select this same
-//! cache without wrapping or changing its entry protocol.
+//! [`SpecializationCache::get`] offers a read-only lookup by a borrowed form of the key for hot paths that should
+//! not build an owned key on every hit. [`SpecializationCacheStatistics`] is an ordinary value snapshot of the live
+//! counters. Refer to the [`SpecializationCache`] documentation for more information on these relationships.
+//! [`TransformCache`](crate::TransformCache) lets a typed transform descriptor select this same cache without
+//! wrapping or changing its entry protocol.
 //!
 //! # Reuse Contract
 //!
@@ -65,6 +66,7 @@
 //! `Artifact` are, with no `unsafe impl` anywhere. Thread-confined consumers whose artifacts are not `Send` still
 //! work single-threaded; they simply do not get `Send`.
 
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -346,8 +348,11 @@ pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
 ///
 /// [`Self::try_entry`] represents the low-level entry API for this cache. An occupied entry returns a cloned artifact.
 /// A vacant entry returns a thread-affine producer that authorizes publication. [`Self::get_or_try_insert_with`] wraps
-/// that protocol when callers do not need to separate entry resolution from production. Statistics are exposed as
-/// ordinary value snapshots, while private atomics accumulate events without participating in cache correctness.
+/// that protocol when callers do not need to separate entry resolution from production. [`Self::get`] is the read-only
+/// lookup that precedes this protocol on hot paths: it accepts any borrowed form of the key, so a hit never builds an
+/// owned key, and a miss continues through [`Self::try_entry`] with the owned key, which counts the miss and authorizes
+/// production. Statistics are exposed as ordinary value snapshots, while private atomics accumulate events without
+/// participating in cache correctness.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct SpecializationCache<Key, Artifact> {
     /// Retained artifacts in Least-Recently-Used (LRU) order.
@@ -399,6 +404,22 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
             .iter()
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// Returns a clone of the artifact retained for a key equal to `key`, refreshing its recency and counting a hit,
+    /// or [`None`] without counting anything. `key` may be any borrowed form of `Key` (e.g., a view over the caller's
+    /// arguments), which lets hot paths look up an artifact without first building an owned key. Its [`Hash`] and
+    /// [`Eq`] implementations must agree with those of `Key`, as for [`HashMap`](std::collections::HashMap) lookups.
+    /// On a miss, callers continue with [`Self::try_entry`] using the owned key, which counts the miss.
+    pub fn get<K: Eq + Hash + ?Sized>(&self, key: &K) -> Option<Artifact>
+    where
+        Key: Borrow<K>,
+    {
+        let artifact = self.entries.lock().expect("specialization cache mutex is poisoned").get(key).cloned();
+        if artifact.is_some() {
+            self.statistics.increment_hits();
+        }
+        artifact
     }
 
     /// Returns the cache entry for `key`, containing either the retained artifact or a [`SpecializationCacheProducer`]
@@ -606,6 +627,26 @@ mod tests {
         // Zero capacity is clamped to one so that a producer's work is never discarded immediately.
         let clamped_cache = SpecializationCache::<u32, &'static str>::new(0);
         assert_eq!(clamped_cache.capacity(), 1);
+    }
+
+    #[test]
+    fn test_specialization_cache_get() {
+        let cache = SpecializationCache::<String, &'static str>::new(2);
+        expect_vacant_producer(cache.try_entry("one".to_string())).insert("first");
+        expect_vacant_producer(cache.try_entry("two".to_string())).insert("second");
+        assert_eq!(cache.keys(), vec!["two".to_string(), "one".to_string()]);
+
+        // Borrowed lookups hit equal owned keys, refresh their recency, and count only hits.
+        assert_eq!(cache.get("one"), Some("first"));
+        assert_eq!(cache.keys(), vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(cache.get("three"), None);
+        assert_eq!(cache.statistics().hits, 1);
+        assert_eq!(cache.statistics().misses, 2);
+
+        // A borrowed miss leaves the entry protocol to `try_entry`, which counts the miss and produces normally.
+        expect_vacant_producer(cache.try_entry("three".to_string())).insert("third");
+        assert_eq!(cache.get("three"), Some("third"));
+        assert_eq!(cache.statistics().misses, 3);
     }
 
     #[test]
