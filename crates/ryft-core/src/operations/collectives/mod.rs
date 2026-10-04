@@ -1005,8 +1005,7 @@ fn infer_array_ir_shape_changing_collective_output_type(
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
-// TODO(eaplatanios): Review form here onwards.
-
+// TODO(eaplatanios): Review this.
 /// Representation boundary used only by shape-changing collective batching rules.
 ///
 /// The collective kernels own every formula. This trait exposes only the extent representation and the alignment and
@@ -1063,9 +1062,8 @@ trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
     ) -> Result<C::Value, BatchingError>;
 }
 
-impl<C> CollectiveArrayExtentBatchingPolicy<C> for StaticArrayExtentBatchingPolicy
-where
-    C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>,
+impl<C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>> CollectiveArrayExtentBatchingPolicy<C>
+    for StaticArrayExtentBatchingPolicy
 {
     type ShapeExtent = usize;
 
@@ -1129,24 +1127,25 @@ where
     }
 }
 
-impl<C> CollectiveArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
-where
+impl<
     C: Context<
             Type = ArrayIrType,
+            Value: Assert
+                       + DimensionSize
+                       + DynamicBroadcast
+                       + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+                       + ValueProjection<
+                DimensionType,
+                Projected: Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
+            >,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: Assert
-        + DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
+> CollectiveArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 {
     type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
 
@@ -1222,7 +1221,6 @@ where
         if !batch.batch_axis().is_replicated() {
             return batch.move_axis(0);
         }
-
         let input_type = batch.unbatched_type();
         let input_extent_dimensions =
             input_extents.iter().map(|extent| extent.r#type().to_dimension()).collect::<Vec<_>>();
@@ -1260,8 +1258,6 @@ where
         Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(outputs.remove(0))?)
     }
 }
-
-// TODO(eaplatanios): Review up to here.
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {
     /// Forwards a linear collective over an axis that the active batching level does not bind to the parent context.
