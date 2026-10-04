@@ -1,5 +1,3 @@
-use std::fmt::Display;
-
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
@@ -43,6 +41,8 @@ use crate::programs::{
     RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
+use ryft::PARALLEL_VARY_OPERATION_NAME;
+use std::fmt::Display;
 
 /// Canonical operation name for [`ParallelSumScatterOperation`].
 pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
@@ -184,7 +184,72 @@ impl ParallelSumScatterOperation {
                 )?
             }
         };
-        finalize_parallel_sum_scatter_output_type(input_type, output_type, self, apply_mesh_axis_semantics)
+        self.finalize_output_type(input_type, output_type, apply_mesh_axis_semantics)
+    }
+
+    /// Validates the element data type and the manual variation of a sum-scatter input, and applies the reduction-state
+    /// transition to the shape-only `output_type` shared by the static and explicit-extent inference paths. Ordinary
+    /// inputs preserve their variance metadata. An input that is unreduced over the scattered manual axis is the
+    /// cotangent of a reduced all-gather result, so the sum-scatter consumes that pending reduction and returns a value
+    /// that varies over the manual axis. A matching local batch passes `apply_mesh_axis_semantics = false` because it
+    /// does not perform a mesh exchange, even when it shadows a mesh axis with the same name; it preserves pending mesh
+    /// sums and variance.
+    fn finalize_output_type(
+        &self,
+        input_type: &ArrayType,
+        output_type: ArrayType,
+        apply_mesh_axis_semantics: bool,
+    ) -> Result<ArrayType, TypeError> {
+        let data_type = input_type.data_type();
+        if !data_type.is_numeric() && data_type != DataType::Zero {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` requires numeric inputs but got `{data_type}`",
+            )));
+        }
+
+        // A matching batch performs only local array arithmetic. It neither consumes nor introduces mesh-axis
+        // reduction or variation state, including when its axis name shadows an enclosing mesh axis.
+        if !apply_mesh_axis_semantics {
+            return Ok(output_type);
+        }
+
+        if input_type.unreduced_axes().is_empty() {
+            // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant
+            // over that axis would yield an output whose type wrongly claims that it is invariant.
+            if let Some(sharding) = input_type.sharding()
+                && sharding.mesh().axis_type(self.axis_name()) == Some(MeshAxisType::Manual)
+                && !sharding.varying_manual_axes().contains(self.axis_name())
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{}` input must vary over manual axis `{}`; pass an invariant \
+                     value through `{}` first so that every copy is counted",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                    self.axis_name(),
+                    PARALLEL_VARY_OPERATION_NAME,
+                )));
+            }
+            return Ok(output_type);
+        }
+
+        if input_type.unreduced_axes().len() != 1 || !input_type.unreduced_axes().contains(self.axis_name()) {
+            return Err(TypeError::invalid(format!(
+                "`{}` only supports an unreduced input over its own axis `{}`",
+                PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                self.axis_name(),
+            )));
+        }
+
+        // Unreduced axes require a sharding, and the shape-only output type preserves the input sharding.
+        let input_sharding = input_type.sharding().unwrap();
+        let mut varying_axes = input_sharding.varying_manual_axes().clone();
+        varying_axes.insert(self.axis_name().to_string());
+        let output_sharding = output_type.sharding().unwrap().clone();
+        Ok(output_type.with_sharding(
+            output_sharding
+                .with_unreduced_axes(Vec::<String>::new())
+                .and_then(|sharding| sharding.with_varying_manual_axes(varying_axes))
+                .map_err(|error| TypeError::invalid(error.to_string()))?,
+        )?)
     }
 
     /// Returns the adjoint collective that transposition stages on the output cotangent.
@@ -782,64 +847,6 @@ where
     }
 }
 
-/// Validates the element data type and the manual variation of a sum-scatter input, and applies the reduction-state
-/// transition to the shape-only `output_type` shared by the static and explicit-extent inference paths. Ordinary inputs
-/// preserve their variance metadata. An input that is unreduced over the scattered manual axis is the cotangent of a
-/// reduced all-gather result, so the sum-scatter consumes that pending reduction and returns a value that varies over
-/// the manual axis. A matching local batch passes `apply_mesh_axis_semantics = false` because it does not perform a
-/// mesh exchange, even when it shadows a mesh axis with the same name; it preserves pending mesh sums and variance.
-fn finalize_parallel_sum_scatter_output_type(
-    input_type: &ArrayType,
-    mut output_type: ArrayType,
-    operation: &ParallelSumScatterOperation,
-    apply_mesh_axis_semantics: bool,
-) -> Result<ArrayType, TypeError> {
-    let data_type = input_type.data_type();
-    if !data_type.is_numeric() && data_type != DataType::Zero {
-        return Err(TypeError::invalid(format!(
-            "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` requires numeric inputs but got `{data_type}`",
-        )));
-    }
-    // A matching batch performs only local array arithmetic. It neither consumes nor introduces mesh-axis
-    // reduction or variation state, including when its axis name shadows an enclosing mesh axis.
-    if !apply_mesh_axis_semantics {
-        return Ok(output_type);
-    }
-    if input_type.unreduced_axes().is_empty() {
-        // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant over
-        // that axis would yield an output whose type wrongly claims that it is invariant.
-        if let Some(sharding) = input_type.sharding()
-            && sharding.mesh().axis_type(operation.axis_name()) == Some(MeshAxisType::Manual)
-            && !sharding.varying_manual_axes().contains(operation.axis_name())
-        {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` input must vary over manual axis `{}`; pass an invariant \
-                 value through `parallel_vary` first so that every copy is counted",
-                operation.axis_name(),
-            )));
-        }
-        return Ok(output_type);
-    }
-    if input_type.unreduced_axes().len() != 1 || !input_type.unreduced_axes().contains(operation.axis_name()) {
-        return Err(TypeError::invalid(format!(
-            "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` only supports an unreduced input over its own axis `{}`",
-            operation.axis_name(),
-        )));
-    }
-    // Unreduced axes require a sharding, and the shape-only output type preserves the input sharding.
-    let input_sharding = input_type.sharding().unwrap();
-    let mut varying_axes = input_sharding.varying_manual_axes().clone();
-    varying_axes.insert(operation.axis_name().to_string());
-    let output_sharding = output_type.sharding().unwrap().clone();
-    output_type.sharding = Some(
-        output_sharding
-            .with_unreduced_axes(Vec::<String>::new())
-            .and_then(|sharding| sharding.with_varying_manual_axes(varying_axes))
-            .map_err(|error| TypeError::invalid(error.to_string()))?,
-    );
-    Ok(output_type)
-}
-
 /// Infers the output type of a sum-scatter in the composite array/dimension family, whose array input is followed by
 /// one explicit extent per output axis. It applies the same contract as static type inference, checking the extents
 /// that are statically known and leaving dynamic extents to the runtime assertions that the capability stages.
@@ -890,10 +897,7 @@ fn infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
             |_| Ok(()),
         )?;
         let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
-        return Ok(vec![
-            finalize_parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?
-                .into(),
-        ]);
+        return Ok(vec![operation.finalize_output_type(input_type, output_type, apply_mesh_axis_semantics)?.into()]);
     }
     if operation.scatter_axis >= input_type.rank() {
         return Err(TypeError::invalid(format!(
@@ -954,10 +958,7 @@ fn infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
     if output_type.shape() == input_type.shape() {
         output_type = output_type.with_layout(input_type.layout().cloned());
     }
-    Ok(vec![
-        finalize_parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?
-            .into(),
-    ])
+    Ok(vec![operation.finalize_output_type(input_type, output_type, apply_mesh_axis_semantics)?.into()])
 }
 
 /// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
