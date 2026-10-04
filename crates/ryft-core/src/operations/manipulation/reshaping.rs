@@ -576,7 +576,7 @@ impl Reshape for Array {
         if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
             // Both shapes enumerate exactly the same contiguous encodings. Retyping can share storage; later
             // mutation detaches it through the array's existing copy-on-write boundary.
-            return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
+            return Ok(Self::new_unchecked(output_type, self.shared_storage_bytes().clone()));
         }
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         for index in 0..input_addressing.element_count() {
@@ -3267,7 +3267,7 @@ mod tests {
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(Arc::ptr_eq(matrix.shared_storage(), reshaped.shared_storage()));
+        assert!(Arc::ptr_eq(matrix.shared_storage_bytes(), reshaped.shared_storage_bytes()));
 
         // Storage sharing preserves value semantics: changing a reshaped copy must detach its payload.
         let mut changed = reshaped.clone();

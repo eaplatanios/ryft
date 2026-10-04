@@ -2121,7 +2121,7 @@ impl Array {
 
         // No update can address an element of an empty input, even in clipping mode.
         if output_addressing.element_count() == 0 {
-            return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
+            return Ok(Self::new_unchecked(output_type, self.shared_storage_bytes().clone()));
         }
 
         let indices_shape = indices.r#type().static_shape().unwrap();
@@ -2132,7 +2132,7 @@ impl Array {
         // The caller has already validated all inputs and placement. With no updates, retain the input payload
         // before requesting mutable storage, which would otherwise copy the entire shared buffer.
         if updates_addressing.element_count() == 0 {
-            return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
+            return Ok(Self::new_unchecked(output_type, self.shared_storage_bytes().clone()));
         }
 
         let input_rank = input_shape.rank();
@@ -2156,7 +2156,7 @@ impl Array {
             input_window_size[input_axis] = updates_shape[dimensions.update_window_dimensions()[window]];
         }
 
-        let mut output = Self::new_unchecked(output_type, self.shared_storage().clone());
+        let mut output = Self::new_unchecked(output_type, self.shared_storage_bytes().clone());
         let output_bytes = output.storage_bytes_mut();
         let mut update_index = vec![0usize; updates_rank];
         let mut indices_index = vec![0usize; indices_rank];
@@ -3634,7 +3634,7 @@ mod tests {
         let output = input
             .scatter(&indices, &updates, &dimensions, ScatterReductionKind::Add, &ScatterOptions::new())
             .unwrap();
-        assert!(std::sync::Arc::ptr_eq(input.shared_storage(), output.shared_storage()));
+        assert!(std::sync::Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
         assert_eq!(output, input);
         assert_eq!(
             input.scatter(

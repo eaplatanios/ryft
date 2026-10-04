@@ -378,7 +378,7 @@ impl Reshard for Array {
         let input_type = self.r#type().into_owned();
         let mut output_types = ReshardOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        Ok(Self::new_unchecked(output_types.remove(0), self.shared_storage().clone()))
+        Ok(Self::new_unchecked(output_types.remove(0), self.shared_storage_bytes().clone()))
     }
 }
 

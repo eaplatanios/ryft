@@ -1243,7 +1243,7 @@ impl UpdateSlice for Array {
         // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
         let output_type = self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
         let output = self.clone().replace_block(update, start_indices);
-        Ok(Self::new_unchecked(output_type, output.shared_storage().clone()))
+        Ok(Self::new_unchecked(output_type, output.shared_storage_bytes().clone()))
     }
 }
 
@@ -3966,7 +3966,7 @@ impl DynamicUpdateSlice for Array {
 
         // Type inference preserves the input's shape, element type, memory, and physical layout; only sharding
         // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
-        Ok(Self::new_unchecked(output_type, output.shared_storage().clone()))
+        Ok(Self::new_unchecked(output_type, output.shared_storage_bytes().clone()))
     }
 }
 

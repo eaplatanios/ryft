@@ -1796,7 +1796,7 @@ mod tests {
         let output = input.transpose([0]).unwrap();
         assert_eq!(output.r#type(), input.r#type());
         assert_eq!(output.storage_bytes(), input.storage_bytes());
-        assert!(Arc::ptr_eq(output.shared_storage(), input.shared_storage()));
+        assert!(Arc::ptr_eq(output.shared_storage_bytes(), input.shared_storage_bytes()));
     }
 
     #[test]

@@ -2029,7 +2029,7 @@ mod tests {
         // Same-type conversion shares the original bytes, preserving NaN payloads and every unoccupied layout byte.
         let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]).unwrap();
         let unchanged = nan.convert_element_type(DataType::F32).unwrap();
-        assert!(Arc::ptr_eq(nan.shared_storage(), unchanged.shared_storage()));
+        assert!(Arc::ptr_eq(nan.shared_storage_bytes(), unchanged.shared_storage_bytes()));
         assert_eq!(unchanged.storage_bytes(), nan.storage_bytes());
     }
 
@@ -2079,7 +2079,7 @@ mod tests {
         // Identity reinterpretation returns the input unchanged, including for Boolean elements.
         let input = Array::scalar(true).unwrap();
         let output = input.bitcast_element_type(DataType::Boolean).unwrap();
-        assert!(Arc::ptr_eq(input.shared_storage(), output.shared_storage()));
+        assert!(Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
         assert_eq!(output, input);
     }
 

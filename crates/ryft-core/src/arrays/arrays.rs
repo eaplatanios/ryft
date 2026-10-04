@@ -43,14 +43,15 @@ use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, T
 /// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
 /// dynamically shaped array value cannot be built. Reference kernels may therefore assume static geometry and read
 /// extents directly off the stored type instead of resolving first-class dimension extent. [`Program`](crate::Program)s
-/// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
-/// each dynamic axis is carried by an explicit dimension input.
+/// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where each
+/// dynamic axis is carried by an explicit dimension input.
 ///
 /// Host concretization through [`Concretizable`] requires rank zero. Integer scalars can be extracted into any Rust
 /// integer or Ryft sub-byte integer type when the value fits; [`Concretizable<i128>`] preserves every supported integer
 /// value, including [`u64::MAX`]. Boolean, floating-point, and complex extraction requires the matching element type
 /// and preserves its exact encoding, including signed zeros and NaN payloads. Incompatible shapes, element types, and
-/// out-of-range integers return [`ProgramError::Concretization`]. Use [`Array::converted_to`] for numerical conversions.
+/// out-of-range integers return [`ProgramError::Concretization`]. Use [`Array::converted_to`] for numerical
+/// conversions.
 ///
 /// # Warning
 ///
@@ -157,31 +158,13 @@ impl Array {
     /// already uphold the storage invariants by construction and would otherwise pay for a second full traversal per
     /// operation. Taking the payload as an [`Arc`] also lets kernels that only retype a value (such as a memory
     /// transfer or a reshard kernel) share the original payload instead of copying it.
+    #[inline]
     pub(crate) fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
         Self { r#type, bytes }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the complete immutable physical storage, including layout holes and tile padding.
-    pub fn storage_bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    /// Returns the shared handle to this array's physical storage, so that a kernel which only retypes a value can
-    /// hand the same payload to [`Array::new_unchecked`] instead of copying it.
-    pub(crate) fn shared_storage(&self) -> &Arc<Vec<u8>> {
-        &self.bytes
-    }
-
-    /// Returns the complete physical storage for in-place mutation, copying the payload first when it is shared with
-    /// another array. Kernels that build a result by mutating a buffer they own (or one they just cloned from an
-    /// input) use this to avoid a second allocation.
-    pub(crate) fn storage_bytes_mut(&mut self) -> &mut [u8] {
-        Arc::make_mut(&mut self.bytes).as_mut_slice()
-    }
-
     /// Decodes this array as typed elements in logical row-major order.
+    #[inline]
     pub fn elements<T: ArrayElement>(&self) -> Result<Vec<T>, ProgramError> {
         decode_elements(&self.r#type, self.bytes.as_slice())
     }
@@ -220,18 +203,40 @@ impl Array {
     }
 
     /// Returns the concatenated logical element encodings in row-major order, omitting layout holes and tile padding.
+    #[inline]
     pub fn logical_bytes(&self) -> Vec<u8> {
         decode_logical_bytes(&self.r#type, self.bytes.as_slice()).unwrap()
     }
 
+    /// Returns the complete immutable physical storage, including layout holes and tile padding.
+    #[inline]
+    pub fn storage_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    /// Returns the complete physical storage for in-place mutation, copying the payload first when it is shared with
+    /// another array. Kernels that build a result by mutating a buffer they own (or one they just cloned from an
+    /// input) use this to avoid a second allocation.
+    #[inline]
+    pub(crate) fn storage_bytes_mut(&mut self) -> &mut [u8] {
+        Arc::make_mut(&mut self.bytes).as_mut_slice()
+    }
+
+    /// Returns the shared handle to this array's physical storage, so that a kernel which only retypes a value can
+    /// hand the same payload to [`Array::new_unchecked`] instead of copying it.
+    #[inline]
+    pub(crate) fn shared_storage_bytes(&self) -> &Arc<Vec<u8>> {
+        &self.bytes
+    }
+
     /// Applies a typed elementwise function to this array in logical row-major order, producing a new array of
-    /// `output_type`. Both arrays use their sealed codecs one element at a time, so the only payload allocation is the
-    /// result buffer, and the output layout may differ from the input layout.
+    /// `output_type`. Both arrays use their sealed codecs one element at a time, so the only payload allocation
+    /// is the result buffer, and the output layout may differ from the input layout.
     ///
     /// # Parameters
     ///
-    ///   - `output_type`: Static array type of the result. Its [`DataType`] must be represented by `Output` and its
-    ///     logical element count must equal this array's (elementwise kernels typically preserve the shape).
+    ///   - `output_type`: Static array type of the result. Its [`DataType`] must be represented by `Output` and
+    ///     its logical element count must equal this array's (elementwise kernels typically preserve the shape).
     ///   - `function`: Elementwise function applied to each decoded `Input` element.
     ///
     /// # Errors
@@ -353,14 +358,15 @@ impl Array {
             let output = function(left, right)?;
             output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(output_index)]);
         }
+
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
     /// Creates a new array holding this array's elements converted into `data_type`, preserving shape, sharding, and
-    /// memory space. Tiled layouts are preserved; byte-stride layouts are cleared when element storage width changes.
-    /// This is the foundational cast of the reference backend: the
-    /// [`ConvertElementType`](crate::operations::ConvertElementType) capability delegates to it, and so does every
-    /// kernel that promotes mixed-type inputs through [`Array::promoted_to`].
+    /// memory space. Tiled layouts are preserved while byte-stride layouts are cleared when element storage width
+    /// changes. This is the foundational cast of the reference backend: the
+    /// [`ConvertElementType`](crate::ConvertElementType) capability delegates to it, and
+    /// so does every kernel that promotes mixed-type inputs through [`Array::promoted_to`].
     ///
     /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
     /// (including rounding, truncation, saturation, and exceptional-value handling) are documented on that trait.
@@ -374,7 +380,7 @@ impl Array {
     /// # Errors
     ///
     /// Returns an error if either data type is [`DataType::Token`] or exactly one is [`DataType::Zero`]. Numerical
-    /// conversion maps zero to NaN for `f8e8m0fnu`; finite-only microscaling formats map NaN to their positive maximum
+    /// conversion maps zero to NaN for `f8e8m0fnu`. Finite-only microscaling formats map NaN to their positive maximum
     /// and saturate infinities to their signed finite limits. Explicit checked element constructors retain their own
     /// representability checks.
     pub fn converted_to(&self, data_type: DataType) -> Result<Self, ProgramError> {
@@ -389,10 +395,11 @@ impl Array {
             return Err(TypeError::invalid("cannot convert values to or from the `zero` data type").into());
         }
         let output_type = self.r#type.with_element_type(data_type);
+
         // The nested dispatch selects the concrete source and destination element types, which monomorphizes
-        // `convert_to` into the pair's direct conversion (refer to the documentation of
-        // `ArrayElement::convert_to`). Should a measured hot pair ever justify a bespoke kernel, it can be matched
-        // here ahead of the generic path without changing the element interchange contract.
+        // `convert_to` into the pair's direct conversion (refer to the documentation of `ArrayElement::convert_to`).
+        // Should a measured hot pair ever justify a bespoke kernel, it can be matched here ahead of the generic path
+        // without changing the element interchange contract.
         dispatch_on_array_element_type!(source_data_type, |Input| {
             dispatch_on_array_element_type!(data_type, |Output| {
                 self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
@@ -400,10 +407,11 @@ impl Array {
         })
     }
 
-    /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data
-    /// type so that already-promoted inputs keep their exact physical storage and layout. Kernels that promote
-    /// mixed-type inputs to a common element data type (which each kernel computes from its own type-inference
-    /// contract) use this to convert only the mismatched inputs.
+    /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data type
+    /// so that already-promoted inputs keep their exact physical storage and layout. Kernels that promote mixed-type
+    /// inputs to a common element data type (which each kernel computes from its own type-inference contract) use this
+    /// to convert only the mismatched inputs.
+    #[inline]
     pub fn promoted_to(&self, data_type: DataType) -> Result<Cow<'_, Self>, ProgramError> {
         if self.r#type.data_type() == data_type {
             Ok(Cow::Borrowed(self))
@@ -411,6 +419,8 @@ impl Array {
             Ok(Cow::Owned(self.converted_to(data_type)?))
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Broadcasts the types of the provided arrays together (including element data type promotion) and promotes
     /// every array to the broadcast element data type, borrowing the ones that already have it. This is the shared

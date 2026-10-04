@@ -1363,7 +1363,7 @@ impl Reduce for Array {
             .infer_output_types(&[self.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
         let output = self.reduce(axes, ReductionKind::Sum)?;
-        Ok(Self::new_unchecked(output_types.remove(0), output.shared_storage().clone()))
+        Ok(Self::new_unchecked(output_types.remove(0), output.shared_storage_bytes().clone()))
     }
 }
 

@@ -308,7 +308,7 @@ impl TransferToMemory for Array {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
         // Reference array storage stays host-resident. Updating only placement metadata retains exact physical bytes,
         // layout and sharding while making interpreted output types agree with staged output types.
-        Ok(Self::new_unchecked(self.r#type().into_owned().with_memory(destination), self.shared_storage().clone()))
+        Ok(Self::new_unchecked(self.r#type().into_owned().with_memory(destination), self.shared_storage_bytes().clone()))
     }
 }
 
@@ -426,7 +426,7 @@ mod tests {
                     let output = input.transfer_to_memory(destination).unwrap();
                     assert_eq!(output.r#type().as_ref(), &input.r#type().clone().into_owned().with_memory(destination));
                     assert_eq!(output.elements::<Element>().unwrap(), vec![element]);
-                    assert!(Arc::ptr_eq(input.shared_storage(), output.shared_storage()));
+                    assert!(Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
                 }
             });
         }
@@ -444,7 +444,7 @@ mod tests {
         let transferred = column_major.transfer_to_memory(PINNED_HOST).unwrap();
         assert_eq!(transferred.r#type().as_ref(), &column_major.r#type().into_owned().with_memory(PINNED_HOST));
         assert_eq!(transferred.elements::<i32>().unwrap(), vec![1, 2, 3, 4]);
-        assert!(Arc::ptr_eq(column_major.shared_storage(), transferred.shared_storage()));
+        assert!(Arc::ptr_eq(column_major.shared_storage_bytes(), transferred.shared_storage_bytes()));
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded_type =
@@ -452,7 +452,7 @@ mod tests {
         let sharded = Array::from_elements(sharded_type.clone(), &[1i32, 2]).unwrap();
         let transferred = sharded.transfer_to_memory(PINNED_HOST).unwrap();
         assert_eq!(transferred.r#type().as_ref(), &sharded_type.with_memory(PINNED_HOST));
-        assert!(Arc::ptr_eq(sharded.shared_storage(), transferred.shared_storage()));
+        assert!(Arc::ptr_eq(sharded.shared_storage_bytes(), transferred.shared_storage_bytes()));
 
         // Tracing carries the same placement in the result type and stages one transfer.
         let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
