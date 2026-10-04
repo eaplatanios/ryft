@@ -388,13 +388,17 @@ where
                 (operation, output_batch_axis)
             });
         }
+
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
+
         let input_type = input.unbatched_type();
-        let dimensions = input_type
-            .static_shape()
-            .ok_or_else(|| TypeError::invalid("`parallel_sum_scatter` does not support dynamically shaped inputs"))?;
+        let dimensions = input_type.static_shape().ok_or_else(|| {
+            TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
+            ))
+        })?;
         let output_type = self.infer_static_output_type(&input_type, dimensions.dimensions().to_vec(), false)?;
         let output_extents = output_type
             .shape()
