@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt::Display;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
@@ -7,134 +8,90 @@ use crate::arrays::{
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::macros::check_count;
-use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
-use crate::operations::collectives::{
-    define_linear_collective_operation, impl_differentiable_linear_collective_operation, resolve_named_axis_size,
+use crate::differentiation::{
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
+use crate::operations::collectives::resolve_named_axis_size;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
-use crate::programs::{Operation, ProgramError, ProjectedValue, Type, TypeError, Typed, Value, ValueProjection};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Typed,
+    Value, ValueProjection,
+};
+use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ParallelPermuteOperation`].
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 
-define_linear_collective_operation!(
-    /// [`Operation`] that routes input arrays between positions along the named axis according to explicit
-    /// `(source, target)` pairs. Both indices are zero-based coordinates along `axis_name`, in `0..axis_size`, rather
-    /// than global device IDs or element indices within an input array. Each position represents one execution of the
-    /// enclosing function with its own input array. A pair sends the entire input array at `source` to the output at
-    /// `target`. Sources must be unique, targets must be unique, and positions that no pair targets receive zeros.
-    /// The output type is the input type.
-    ///
-    /// For example, inside `shard_map` over a manual mesh axis `x` of size three, `(0, 2)` sends the input at mesh
-    /// coordinate `x = 0` to the output at `x = 2`. On a multidimensional mesh, this routing is repeated separately
-    /// for each fixed combination of coordinates along the other axes. The physical devices at these coordinates can
-    /// have arbitrary device IDs; the pair still uses axis coordinates `0` and `2`.
-    ///
-    /// Inside [`batch`](crate::batch) over a named axis of size three, `(0, 2)` instead sends batch item zero's input
-    /// array to batch item two's output. For either interpretation, if positions zero, one, and two hold arrays `A`,
-    /// `B`, and `C`, then pairs `[(0, 1), (2, 0)]` produce `C`, `A`, and a zero array at those respective positions.
-    ///
-    /// This is the Ryft analogue of JAX's
-    /// [`jax.lax.ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and StableHLO's
-    /// [`collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
-    ///
-    /// A permutation over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
-    /// [`ParallelPermute::parallel_permute`] supplies the mesh automatically from the enclosing manual region. Such a
-    /// permutation generally gives the axis positions different values, so its input must vary over the axis (refer
-    /// to [`ParallelVary`]) and its output varies over it as well. An ordinary permutation carries no mesh and never
-    /// applies this contract, even when its input carries a manual mesh axis with the same name, because a `batch`
-    /// level whose axis name shadows that mesh axis may bind it instead. The collective is linear and its transpose is
-    /// the permutation with every pair inverted, over the same mesh. Outside any binder, the single position of a
-    /// degenerate axis keeps its value when the pair `(0, 0)` is present and receives zeros otherwise.
-    ///
-    /// A matching `batch` level consumes the mapped batch axis of an ordinary permutation by reassembling it in target
-    /// order from per-item slices, with zero slices at untargeted positions, and passes a replicated input through
-    /// unchanged when every position is targeted. Unlike JAX's batching rule, which requires a full permutation,
-    /// partial permutations are supported. Bounded ragged extents follow the same source-to-target routing as their
-    /// packed values, and untargeted positions receive zero extents together with their zero-filled values.
-    /// A permutation over a manual mesh axis cannot be consumed by a `batch` level.
-    ParallelPermuteOperation,
-    PARALLEL_PERMUTE_OPERATION_NAME,
-    fields = {
-        /// Pairs of zero-based `(source, target)` coordinates along the named axis. Each pair routes the entire input
-        /// array at `source` to the output at `target`.
-        source_target_pairs: Vec<(usize, usize)>,
-    },
-    optional_fields = {
-        /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
-        mesh: LogicalMesh,
-    },
-    check_array_types = [@no_unreduced],
-    infer_output_type = |operation, input_type, _dimensions| {
-        let axis_name = &operation.axis_name;
-        let mut sources = BTreeSet::new();
-        let mut targets = BTreeSet::new();
-        for &(source, target) in &operation.source_target_pairs {
-            if source >= operation.axis_size || target >= operation.axis_size {
-                return Err(TypeError::invalid(format!(
-                    "`{}` pair ({}, {}) is out of bounds for axis size {}",
-                    PARALLEL_PERMUTE_OPERATION_NAME, source, target, operation.axis_size,
-                )));
-            }
-            if !sources.insert(source) || !targets.insert(target) {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` pairs must have unique sources and targets but \
-                     ({source}, {target}) repeats one",
-                )));
-            }
-        }
+/// [`Operation`] that routes input arrays between positions along the named axis according to explicit
+/// `(source, target)` pairs. Both indices are zero-based coordinates along `axis_name`, in `0..axis_size`, rather than
+/// global device IDs or element indices within an input array. Each position represents one execution of the enclosing
+/// function with its own input array. A pair sends the entire input array at `source` to the output at `target`.
+/// Sources must be unique, targets must be unique, and positions that no pair targets receive zeros. The output
+/// type is the input type.
+///
+/// For example, inside `shard_map` over a manual mesh axis `x` of size three, `(0, 2)` sends the input at mesh
+/// coordinate `x = 0` to the output at `x = 2`. On a multidimensional mesh, this routing is repeated separately for
+/// each fixed combination of coordinates along the other axes. The physical devices at these coordinates can have
+/// arbitrary device IDs; the pair still uses axis coordinates `0` and `2`.
+///
+/// Inside [`batch`](crate::batch) over a named axis of size three, `(0, 2)` instead sends batch item zero's input array
+/// to batch item two's output. For either interpretation, if positions zero, one, and two hold arrays `A`, `B`, and
+/// `C`, then pairs `[(0, 1), (2, 0)]` produce `C`, `A`, and a zero array at those respective positions.
+///
+/// This is the Ryft analogue of JAX's
+/// [`jax.lax.ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and StableHLO's
+/// [`collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
+///
+/// A permutation over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
+/// [`ParallelPermute::parallel_permute`] supplies the mesh automatically from the enclosing manual region. Such a
+/// permutation generally gives the axis positions different values, so its input must vary over the axis (refer to
+/// [`ParallelVary`]) and its output varies over it as well. An ordinary permutation carries no mesh and never applies
+/// this contract, even when its input carries a manual mesh axis with the same name, because a `batch` level whose axis
+/// name shadows that mesh axis may bind it instead. The collective is linear and its transpose is the permutation with
+/// every pair inverted, over the same mesh. Outside any binder, the single position of a degenerate axis keeps its
+/// value when the pair `(0, 0)` is present and receives zeros otherwise.
+///
+/// A matching `batch` level consumes the mapped batch axis of an ordinary permutation by reassembling it in target
+/// order from per-item slices, with zero slices at untargeted positions, and passes a replicated input through
+/// unchanged when every position is targeted. Unlike JAX's batching rule, which requires a full permutation, partial
+/// permutations are supported. Bounded ragged extents follow the same source-to-target routing as their packed values,
+/// and untargeted positions receive zero extents together with their zero-filled values. A permutation over a manual
+/// mesh axis cannot be consumed by a `batch` level.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ParallelPermuteOperation {
+    /// Axis name referenced by this collective.
+    axis_name: String,
 
-        // A permutation over a manual mesh axis gives the participants different values, so an input that is still
-        // invariant over that axis would yield an output whose type wrongly claims that it is invariant. An ordinary
-        // permutation never inspects the input's mesh, because a `batch` level may bind a shadowing axis name.
-        if let Some(mesh) = &operation.mesh {
-            if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
-                )));
-            }
-            if mesh.axis_size(axis_name) != Some(operation.axis_size) {
-                return Err(TypeError::invalid(format!(
-                    "`{}` axis size {} does not match the size of manual mesh axis `{}`",
-                    PARALLEL_PERMUTE_OPERATION_NAME, operation.axis_size, axis_name,
-                )));
-            }
-            let Some(sharding) = input_type.sharding() else {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` input must carry a mesh containing manual axis `{axis_name}`",
-                )));
-            };
-            if sharding.mesh() != mesh {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` input mesh does not match the operation mesh",
-                )));
-            }
-            if !sharding.varying_manual_axes().contains(axis_name) {
-                return Err(TypeError::invalid(format!(
-                    "`{}` input must vary over manual axis `{}`; pass an invariant value \
-                     through `{}` first so that the permuted output is typed as varying",
-                    PARALLEL_PERMUTE_OPERATION_NAME, axis_name, PARALLEL_VARY_OPERATION_NAME,
-                )));
-            }
-        }
+    /// Number of participants along the named axis, resolved from the active [`NamedAxes`] environment
+    /// when the operation is staged.
+    axis_size: usize,
 
-        Ok::<_, TypeError>(input_type.clone())
-    },
-    interpret<C> where C::Value: ZeroLike {
-        |operation, input| {
-            // With one participant, the only valid pairs are none at all and `(0, 0)`.
-            // Without a pair, nothing targets the participant, so it receives zeros.
-            if operation.source_target_pairs.is_empty() { input.zero_like() } else { Ok(input.clone()) }
-        }
-    },
-);
+    /// Pairs of zero-based `(source, target)` coordinates along the named axis. Each pair routes the entire input
+    /// array at `source` to the output at `target`.
+    source_target_pairs: Vec<(usize, usize)>,
+
+    /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
+    mesh: Option<LogicalMesh>,
+}
 
 impl ParallelPermuteOperation {
+    /// Creates a new [`ParallelPermuteOperation`] over the axis with the provided name and resolved axis size.
+    #[inline]
+    pub fn new(axis_name: String, axis_size: usize, source_target_pairs: Vec<(usize, usize)>) -> Self {
+        Self { axis_name, axis_size, source_target_pairs, mesh: None }
+    }
+
     /// Returns this [`ParallelPermuteOperation`] configured to permute over a manual axis of `mesh`. The input must
     /// vary over [`axis_name`](Self::axis_name) on that mesh, whose size must equal [`axis_size`](Self::axis_size).
     /// Type inference validates these requirements. [`ParallelPermute::parallel_permute`] supplies the mesh
@@ -143,6 +100,18 @@ impl ParallelPermuteOperation {
     pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
         self.mesh = Some(mesh);
         self
+    }
+
+    /// Returns the axis name referenced by this collective.
+    #[inline]
+    pub fn axis_name(&self) -> &str {
+        &self.axis_name
+    }
+
+    /// Returns the number of participants along the named axis.
+    #[inline]
+    pub fn axis_size(&self) -> usize {
+        self.axis_size
     }
 
     /// Returns the `(source, target)` pairs of participant positions along the named axis.
@@ -158,6 +127,181 @@ impl ParallelPermuteOperation {
     pub fn mesh(&self) -> Option<&LogicalMesh> {
         self.mesh.as_ref()
     }
+
+    /// Returns the adjoint collective that transposition stages on the output cotangent.
+    fn adjoint(&self) -> Result<ParallelPermuteOperation, ProgramError> {
+        let operation = self;
+        Ok({
+            // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
+            // is the permutation with every pair inverted, over the same axis and mesh.
+            ParallelPermuteOperation {
+                source_target_pairs: operation
+                    .source_target_pairs
+                    .iter()
+                    .map(|(source, target)| (*target, *source))
+                    .collect(),
+                ..operation.clone()
+            }
+        })
+    }
+}
+
+impl Display for ParallelPermuteOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ParallelPermuteOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        PARALLEL_PERMUTE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+
+        // A zero-participant collective is rejected before any extent arithmetic divides by its size.
+        if self.axis_size == 0 {
+            return Err(TypeError::invalid(format!(
+                "`{}` axis size must be greater than zero",
+                PARALLEL_PERMUTE_OPERATION_NAME,
+            )));
+        }
+
+        // Every linear collective has exactly one statically shaped input.
+        check_count!("input", input_types, 1, TypeError);
+        check_types!(@no_unreduced, PARALLEL_PERMUTE_OPERATION_NAME, input_types);
+        let Some(shape) = input_types[0].static_shape() else {
+            return Err(TypeError::invalid(format!(
+                "`{}` does not support dynamically shaped inputs",
+                PARALLEL_PERMUTE_OPERATION_NAME,
+            )));
+        };
+
+        let operation = self;
+        let input_type = &input_types[0];
+        Ok(vec![{
+            let axis_name = &operation.axis_name;
+            let mut sources = BTreeSet::new();
+            let mut targets = BTreeSet::new();
+            for &(source, target) in &operation.source_target_pairs {
+                if source >= operation.axis_size || target >= operation.axis_size {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` pair ({}, {}) is out of bounds for axis size {}",
+                        PARALLEL_PERMUTE_OPERATION_NAME, source, target, operation.axis_size,
+                    )));
+                }
+
+                if !sources.insert(source) || !targets.insert(target) {
+                    return Err(TypeError::invalid(format!(
+                        "`{PARALLEL_PERMUTE_OPERATION_NAME}` pairs must have unique sources and targets but \
+                         ({source}, {target}) repeats one",
+                    )));
+                }
+            }
+
+            // A permutation over a manual mesh axis gives the participants different values, so an input that is
+            // still invariant over that axis would yield an output whose type wrongly claims that it is invariant.
+            // An ordinary permutation never inspects the input's mesh, because a `batch` level may bind a shadowing
+            // axis name.
+            if let Some(mesh) = &operation.mesh {
+                if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+                    return Err(TypeError::invalid(format!(
+                        "`{PARALLEL_PERMUTE_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
+                    )));
+                }
+
+                if mesh.axis_size(axis_name) != Some(operation.axis_size) {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` axis size {} does not match the size of manual mesh axis `{}`",
+                        PARALLEL_PERMUTE_OPERATION_NAME, operation.axis_size, axis_name,
+                    )));
+                }
+
+                let Some(sharding) = input_type.sharding() else {
+                    return Err(TypeError::invalid(format!(
+                        "`{PARALLEL_PERMUTE_OPERATION_NAME}` input must carry a mesh containing \
+                         manual axis `{axis_name}`",
+                    )));
+                };
+
+                if sharding.mesh() != mesh {
+                    return Err(TypeError::invalid(format!(
+                        "`{PARALLEL_PERMUTE_OPERATION_NAME}` input mesh does not match the operation mesh",
+                    )));
+                }
+
+                if !sharding.varying_manual_axes().contains(axis_name) {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` input must vary over manual axis `{}`; pass an invariant value \
+                         through `{}` first so that the permuted output is typed as varying",
+                        PARALLEL_PERMUTE_OPERATION_NAME, axis_name, PARALLEL_VARY_OPERATION_NAME,
+                    )));
+                }
+            }
+
+            Ok::<_, TypeError>(input_type.clone())
+        }?])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, PARALLEL_PERMUTE_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            operation.field("axis_size", &self.axis_size)?;
+            operation.field("source_target_pairs", format_args!("{:?}", &self.source_target_pairs))?;
+            if let Some(value) = &self.mesh {
+                operation.field("mesh", value)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<C: Domain<Type = ArrayType, Value: ZeroLike>> InterpretableOperation<C> for ParallelPermuteOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[<C as Domain>::Value],
+    ) -> Result<Vec<<C as Domain>::Value>, ProgramError> {
+        // Eager binding does not infer output types, so interpretation validates the shared input contract
+        // and the operation payload before applying either degenerate-axis rule.
+        check_count!("input", inputs, 1, ProgramError);
+
+        // Outside any binder, only the degenerate single-participant axis has defined per-item semantics.
+        // Any larger axis is an error because the other participants do not exist per item.
+        if self.axis_size > 1 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                    PARALLEL_PERMUTE_OPERATION_NAME, self.axis_name, self.axis_size,
+                ),
+            });
+        }
+
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
+        let operation = self;
+        let input = &inputs[0];
+        Ok(vec![{
+            // With one participant, the only valid pairs are none at all and `(0, 0)`.
+            // Without a pair, nothing targets the participant, so it receives zeros.
+            if operation.source_target_pairs.is_empty() { input.zero_like() } else { Ok(input.clone()) }
+        }?])
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>> PartiallyEvaluatableOperation<C>
+    for ParallelPermuteOperation
+{
 }
 
 impl<
@@ -263,20 +407,64 @@ impl<
     }
 }
 
-impl_differentiable_linear_collective_operation! {
-    ParallelPermuteOperation,
-    transpose = |operation| -> ParallelPermuteOperation {
-        // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
-        // is the permutation with every pair inverted, over the same axis and mesh.
-        ParallelPermuteOperation {
-            source_target_pairs: operation
-                .source_target_pairs
-                .iter()
-                .map(|(source, target)| (*target, *source))
-                .collect(),
-            ..operation.clone()
+impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>> DifferentiableOperation<C>
+    for ParallelPermuteOperation
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let mut primals = context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
+        check_count!("output", primals, 1, ProgramError);
+        let primal = primals.remove(0);
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+            MaybeZero::Value(tangent) => {
+                let mut tangents = context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
+                check_count!("output", tangents, 1, ProgramError);
+                MaybeZero::Value(tangents.remove(0))
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+impl<
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelPermuteOperation>,
+> TransposableOperation<V, O> for ParallelPermuteOperation
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+
+        // The adjoint is resolved first, so that a configuration without one is rejected regardless of the
+        // cotangent, and only a live output cotangent of an unknown input then stages it.
+        let adjoint = self.adjoint()?;
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return Ok(());
+        };
+
+        if inputs[0].is_known() {
+            return Ok(());
         }
-    },
+
+        let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
+        check_count!("output", contributions, 1, ProgramError);
+        accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
+        Ok(())
+    }
 }
 
 impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOperation<A> {
