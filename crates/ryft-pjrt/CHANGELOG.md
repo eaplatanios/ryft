@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   asynchronous error observation. `LoadedExecutable::execute` now returns an `Execution<Vec<ExecutionDeviceOutputs>>`
   whose fence joins the per-device completion events of the launch, and `ExecutionDeviceOutputs` no longer exposes a
   per-device `done` event.
+- Added `ExecutionFence::on_ready` for notification with the joined execution result. Callbacks run inline when the
+  fence is already complete, and registered callbacks survive dropping every public fence handle.
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
 - Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
 - Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
 - Added `BufferType::element_size_in_bytes`.
+- Added a `Hash` implementation for `Version`.
 - Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types.
 - Added `CpuClientOptions::process_id` and `GpuClientOptions::maximum_in_flight_computations` for the new
   OpenXLA client creation options. Existing explicit option literals must supply the new fields or use
@@ -41,10 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and partitions of an execution.
 - Added `XlaTransformExtension::clear_transform` together with `Client::clear_xla_transform` and
   `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
+- Added `XlaTransformExtension::hlo_pass_pipeline_trace` to run the HLO pass pipeline on a serialized `HloModuleProto`
+  and return an owned serialized `HloModuleMetadataProto` trace, releasing the plugin-owned trace storage.
 - Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
   launcher behind the `cuda-12` and `cuda-13` features.
-- Fixed dangling native pointers to temporary buffer-layout descriptors and executable compilation options, and
-  preserved valid zero generated-code sizes instead of reporting them as unavailable.
 - Introduced `Error::MissingFunction`.
 
 ### Changed
@@ -52,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Updated our PJRT C API bindings for version `0.115` and XLA FFI bindings for version `0.4`, including
   GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
   FFI state access now rejects both execution and recording stages before calling native code, and invocation
-  extensions validate their generic header before exposing borrowed backend data.
+  extensions validate their generic header before exposing borrowed backend data. `FfiHandlerBundle::new` now requires
+  a `record` argument, and `GpuCustomCallTypedHandler::new` now requires a `traits` argument.
 - Renamed `GpuClientOptions::use_tfrt_gpu_client` to `use_async_dispatch` to reflect upstream's asynchronous host
   dispatch behavior in the Stream Executor client. The serialized native option key remains `use_tfrt_gpu_client`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
@@ -80,11 +84,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
+- Changed execution fences to join completion through native event callbacks and share the terminal result across
+  readiness queries, blocking waiters, and callbacks. Fence construction can wait when callback registration fails;
+  if neither native callback registration nor native await is available, a pending fence cannot observe completion.
+- Reduced execution overhead by caching device/output counts, flattening input-handle storage, skipping empty callback
+  allocations, avoiding fence allocations and callback registrations for already completed successful executions,
+  and allocating event waker storage only when a pending event is polled.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
-- Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures.
+- Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures,
+  distinguishing unavailable functions from native calls that return an unimplemented status.
 
 ### Fixed
 
+- Fixed dangling native pointers to temporary buffer-layout descriptors and executable compilation options.
+- Preserved valid zero generated-code sizes instead of reporting them as unavailable.
+- Required the full function-pointer field to be present before reading it from PJRT API and extension tables,
+  preventing out-of-bounds reads from truncated tables.
 - Omit array layouts for native `BufferType::Token` buffers in asynchronous host-to-device transfers.
 
 ### Removed
