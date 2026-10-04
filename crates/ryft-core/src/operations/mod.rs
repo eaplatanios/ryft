@@ -151,7 +151,7 @@ pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::{
     ATAN2_OPERATION_NAME, Atan2, Atan2Operation, COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin,
-    SinOperation, TANH_OPERATION_NAME, Tanh, TanhOperation,
+    SinOperation, TAN_OPERATION_NAME, TANH_OPERATION_NAME, Tan, TanOperation, Tanh, TanhOperation,
 };
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.

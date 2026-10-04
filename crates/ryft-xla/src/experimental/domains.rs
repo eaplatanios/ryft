@@ -5569,6 +5569,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Div(_)
         | ArrayOperation::Sin(_)
         | ArrayOperation::Cos(_)
+        | ArrayOperation::Tan(_)
         | ArrayOperation::Atan2(_)
         | ArrayOperation::Exp(_)
         | ArrayOperation::Log(_)

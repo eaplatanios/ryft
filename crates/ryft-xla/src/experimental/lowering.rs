@@ -35,7 +35,8 @@ use ryft_core::{
     RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
     ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
     SinOperation, SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation,
-    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    TanOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
+    WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -2241,6 +2242,23 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation<ArrayType>
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::tan(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -6086,6 +6104,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer,
             ),
             ArrayOperation::Cos(operation) => <CosOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Tan(operation) => <TanOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -20140,6 +20165,48 @@ mod tests {
         // Select the small-argument, scaled, and logarithmic paths while preserving exact zero components.
         assert_eq!(stablehlo.matches("stablehlo.select").count(), 18, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_tangent() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::F32, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tan %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::C64, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xcomplex<f32>> {
+                    %0 = stablehlo.tan %arg0 : tensor<2xcomplex<f32>>
+                    return %0 : tensor<2xcomplex<f32>>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Tan(TanOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tan %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]

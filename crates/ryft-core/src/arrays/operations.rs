@@ -51,9 +51,9 @@ use crate::operations::{
     Reverse, ReverseOperation, RngBitGeneratorOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
     ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
     SinOperation, Slice, SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    Sub, SubOperation, TagOperation, Tan, TanOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -91,7 +91,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Abs(AbsOperation<ArrayType>),
     Sin(SinOperation<ArrayType>),
     Cos(CosOperation<ArrayType>),
-    // TODO(eaplatanios): Add `Tan` and `TanOperation`.
+    Tan(TanOperation<ArrayType>),
     Tanh(TanhOperation<ArrayType>),
     Atan2(Atan2Operation<ArrayType>),
     Exp(ExpOperation<ArrayType>),
@@ -223,7 +223,7 @@ pub trait ArrayOperations:
     + std::ops::Mul<Output = Self> + std::ops::Div<Output = Self>
     + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Clamp + Abs + Sign
     // Elementwise math and logic.
-    + Sin + Cos + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
+    + Sin + Cos + Tan + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
     + Round
     + Not + And + Or + Xor
     // Complex numbers.
@@ -247,7 +247,7 @@ where
     V: Value<Type = ArrayType>,
     V: std::ops::Neg<Output = V> + std::ops::Add<Output = V> + std::ops::Sub<Output = V> + std::ops::Mul<Output = V>,
     V: std::ops::Div<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Clamp + Abs + Sign,
-    V: Sin + Cos + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
+    V: Sin + Cos + Tan + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
@@ -409,24 +409,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
 
-    /// Mixed comparison of two first-class dimensions that produces ordinary rank-zero Boolean array data.
-    ///
-    /// This variant has the precise composite member signature
-    /// `(Dimension, Dimension) -> Array(Boolean scalar)`. It lives directly in [`ArrayIrOperation`] because
-    /// [`DimensionOperation`] is intentionally homogeneous: its inputs and outputs are all first-class dimensions.
-    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than a
-    /// first-class dimension.
-    ///
-    /// Homogeneous array comparison remains [`ArrayIrOperation::Array`] wrapping [`ArrayOperation::Compare`]. This
-    /// variant does not permit array-dimension or dimension-array comparisons; it reuses [`CompareOperation`] for the
-    /// dimension-dimension signature whose result crosses from the dimension member kind to the array member kind.
-    Compare(CompareOperation<ArrayIrType>),
-
-    /// Asserts a Boolean array predicate with optional array or dimension diagnostics.
-    Assert(AssertOperation<ArrayIrType>),
-
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
+
+    /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
+    DimensionFromScalar(DimensionFromScalarOperation),
+
+    /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
+    DimensionToScalar(DimensionToScalarOperation),
 
     /// Creates a new whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
@@ -451,34 +441,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Consumes a whole-array reference and returns its final value.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
-    /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
-    DimensionFromScalar(DimensionFromScalarOperation),
-
-    /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
-    DimensionToScalar(DimensionToScalarOperation),
-
-    /// Mixed operation that reshapes an array using one first-class dimension input per output axis.
-    Reshape(DynamicReshapeOperation),
-
-    /// Mixed operation that broadcasts an array using one first-class dimension input per output axis.
-    Broadcast(DynamicBroadcastOperation),
-
-    /// Mixed operation that concatenates array inputs using one trailing result-extent input.
-    Concatenate(ConcatenateOperation<ArrayIrType>),
-
-    /// Mixed foreign-kernel call whose trailing dimension inputs define its dynamic output axes.
-    #[ryft(mixed)]
-    CustomCall(CustomCallOperation),
-
-    /// Mixed padding operation with one explicit result-extent input per output axis.
-    Pad(PadOperation<ArrayIrType>),
-
-    /// Mixed slice whose starts and output sizes are first-class dimension inputs.
-    DynamicSlice(DynamicSliceOperation<ArrayIrType>),
-
-    /// Mixed bit generator whose trailing dimension inputs define its dynamic bits-output axes.
-    RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
-
     /// Mixed all-gather whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
     ParallelAllGather(ParallelAllGatherOperation),
@@ -496,6 +458,34 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
+    /// Mixed comparison of two first-class dimensions that produces ordinary rank-zero Boolean array data.
+    ///
+    /// This variant has the precise composite member signature
+    /// `(Dimension, Dimension) -> Array(Boolean scalar)`. It lives directly in [`ArrayIrOperation`] because
+    /// [`DimensionOperation`] is intentionally homogeneous: its inputs and outputs are all first-class dimensions.
+    /// Storing comparison there would break that invariant because a predicate is ordinary data rather than a
+    /// first-class dimension.
+    ///
+    /// Homogeneous array comparison remains [`ArrayIrOperation::Array`] wrapping [`ArrayOperation::Compare`]. This
+    /// variant does not permit array-dimension or dimension-array comparisons; it reuses [`CompareOperation`] for the
+    /// dimension-dimension signature whose result crosses from the dimension member kind to the array member kind.
+    Compare(CompareOperation<ArrayIrType>),
+
+    /// Mixed operation that reshapes an array using one first-class dimension input per output axis.
+    Reshape(DynamicReshapeOperation),
+
+    /// Mixed operation that broadcasts an array using one first-class dimension input per output axis.
+    Broadcast(DynamicBroadcastOperation),
+
+    /// Mixed padding operation with one explicit result-extent input per output axis.
+    Pad(PadOperation<ArrayIrType>),
+
+    /// Mixed operation that concatenates array inputs using one trailing result-extent input.
+    Concatenate(ConcatenateOperation<ArrayIrType>),
+
+    /// Mixed slice whose starts and output sizes are first-class dimension inputs.
+    DynamicSlice(DynamicSliceOperation<ArrayIrType>),
+
     /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
     /// remain unsupported until discharge.
@@ -510,6 +500,22 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// dynamic trip counts, reference carries, and reference stacks (refer to the documentation of [`ScanOperation`]).
     Scan(ScanOperation<ArrayIrType>),
 
+    /// Composite rematerialized call whose body uses the complete array IR storage universe.
+    Rematerialize(RematerializeOperation<ArrayIrType>),
+
+    /// Differentiation-owned linear call with ordinary trailing residual inputs.
+    LinearCall(LinearCallOperation<ArrayIrType>),
+
+    /// Mixed bit generator whose trailing dimension inputs define its dynamic bits-output axes.
+    RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
+
+    /// Asserts a Boolean array predicate with optional array or dimension diagnostics.
+    Assert(AssertOperation<ArrayIrType>),
+
+    /// Mixed foreign-kernel call whose trailing dimension inputs define its dynamic output axes.
+    #[ryft(mixed)]
+    CustomCall(CustomCallOperation),
+
     /// Composite custom function call whose primal region uses the complete array IR storage universe, with either
     /// attached rule regions in that universe or retained rules registered in this family. Generic differentiation
     /// rejects reference members because they have no tangent or cotangent representation.
@@ -518,9 +524,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Reverse-mode carrier of a [`CustomFunction`](Self::CustomFunction) call, which transposition replaces with
     /// the call's backward rule.
     CustomFunctionTranspose(CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
-
-    /// Differentiation-owned linear call with ordinary trailing residual inputs.
-    LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Custom function call whose retained rules are registered in the [`ArrayOperation`] member family, promoted
     /// from its member payload by the array-operation lift. Its derivative rules are specialized by the member
@@ -536,9 +539,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     LiftedCustomFunctionTranspose(
         CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
-
-    /// Composite rematerialized call whose body uses the complete array IR storage universe.
-    Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
 /// Value-level capability bundle paired with the [`ArrayIrOperation`] family.

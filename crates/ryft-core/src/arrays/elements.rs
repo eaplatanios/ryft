@@ -2135,7 +2135,10 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
 
             #[inline]
             fn tan(self) -> Result<Self, ProgramError> {
-                Ok(Complex::tan(self))
+                // Rotate `tan(z) = -i · tanh(i · z)` to reuse the stable hyperbolic implementation without
+                // overflowing `sinh(2 · im(z)) / cosh(2 · im(z))` for large imaginary components.
+                let hyperbolic = FloatingPointArrayElement::tanh(Complex::new(-self.im, self.re))?;
+                Ok(Complex::new(hyperbolic.im, -hyperbolic.re))
             }
 
             #[inline]
@@ -3663,6 +3666,20 @@ mod tests {
         let result = FloatingPointArrayElement::tan(Complex::new(0.0f64, 1.0)).unwrap();
         assert_eq!(result.re, 0.0);
         assert_abs_diff_eq!(result.im, 0.7615941559557649, epsilon = f64::EPSILON);
+
+        // Large imaginary components saturate without overflowing, and real-axis signed zeros retain their signs.
+        for imaginary in [1000.0f64, -1000.0, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = FloatingPointArrayElement::tan(Complex::new(0.7f64, imaginary)).unwrap();
+            assert_eq!(result.re, 0.0);
+            assert_eq!(result.im, imaginary.signum());
+        }
+        for real in [0.0f64, -0.0f64] {
+            for imaginary in [0.0f64, -0.0f64] {
+                let result = FloatingPointArrayElement::tan(Complex::new(real, imaginary)).unwrap();
+                assert_eq!(result.re.to_bits(), real.to_bits());
+                assert_eq!(result.im.to_bits(), imaginary.to_bits());
+            }
+        }
     }
 
     #[test]

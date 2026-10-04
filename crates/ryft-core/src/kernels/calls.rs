@@ -1064,6 +1064,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Rsqrt(_)
                 | ArrayOperation::Sin(_)
                 | ArrayOperation::Cos(_)
+                | ArrayOperation::Tan(_)
                 | ArrayOperation::Tanh(_)
                 | ArrayOperation::Atan2(_)
                 | ArrayOperation::Exp(_)

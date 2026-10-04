@@ -308,7 +308,10 @@ impl TransferToMemory for Array {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
         // Reference array storage stays host-resident. Updating only placement metadata retains exact physical bytes,
         // layout and sharding while making interpreted output types agree with staged output types.
-        Ok(Self::new_unchecked(self.r#type().into_owned().with_memory(destination), self.shared_storage_bytes().clone()))
+        Ok(Self::new_unchecked(
+            self.r#type().into_owned().with_memory(destination),
+            self.shared_storage_bytes().clone(),
+        ))
     }
 }
 

@@ -403,7 +403,7 @@ With the primitives done, the remaining work re-scopes to five focused phases:
 The code below is written in the **current** `ryft` idiom, modeled on
 [crates/ryft/examples/mlp.rs](crates/ryft/examples/mlp.rs): model code is generic over a value
 type `A: ArrayOperations` (the capability bundle in
-[crates/ryft-core/src/arrays/operations/mod.rs](crates/ryft-core/src/arrays/operations/mod.rs)),
+[crates/ryft-core/src/arrays/operations.rs](crates/ryft-core/src/arrays/operations.rs)),
 so the same functions run eagerly on the reference `Array` backend, eagerly op-by-op on
 `ryft_xla::Array`, and under every transform tracer. Every IR primitive used below exists
 today; what remains aspirational is the `ryft-models` crate itself — the `common::nn` helpers
@@ -1760,7 +1760,7 @@ A consolidated list of every external source cited in this document, grouped by 
 - [`crates/ryft-core/src/operations/`](crates/ryft-core/src/operations/) — the complete
   primitive set (`arithmetic/`, `exponential/`, `reductions/`, `manipulation/`, `comparisons.rs`, `logical.rs`, `random.rs`,
   `collectives.rs`, `control_flow/`, `sort.rs`, `attention.rs`, `sharding.rs`, `dimensions/`).
-- [`crates/ryft-core/src/arrays/operations/mod.rs`](crates/ryft-core/src/arrays/operations/mod.rs) —
+- [`crates/ryft-core/src/arrays/operations.rs`](crates/ryft-core/src/arrays/operations.rs) —
   the `ArrayOperations` capability bundle and the closed `ArrayOperation` /
   `ArrayIrOperation` / `DimensionOperation` families.
 - [`crates/ryft-core/src/operations/attention.rs`](crates/ryft-core/src/operations/attention.rs) —

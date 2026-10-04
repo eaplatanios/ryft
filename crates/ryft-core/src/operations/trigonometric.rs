@@ -3,34 +3,35 @@
 //! [`Sin`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code
 //! executes immediately or records into a program depending on the value it runs on:
 //!
-//!   - [`Sin`] and [`Cos`] compute the sine and cosine of angles measured in radians.
+//!   - [`Sin`], [`Cos`], and [`Tan`] compute the sine, cosine, and tangent of angles measured in radians.
 //!   - [`Atan2`] computes the two-argument arc tangent (i.e., `(y, x) ↦ atan2(y, x)`, the angle of the point `(x, y)`
 //!     in its correct quadrant), with the principal value `-i · log((x + i · y) / sqrt(x² + y²))` for complex values.
 //!   - [`Tanh`] computes the hyperbolic tangent (i.e., `x ↦ tanh(x)`).
 //!
 //! Floating-point and complex inputs are supported, as for StableHLO's
 //! [`sine`](https://openxla.org/stablehlo/spec#sine), [`cosine`](https://openxla.org/stablehlo/spec#cosine),
-//! [`atan2`](https://openxla.org/stablehlo/spec#atan2), and [`tanh`](https://openxla.org/stablehlo/spec#tanh). Unary
-//! operations preserve the metadata of their input, and [`Atan2`] promotes the element types and broadcasts the shapes
-//! of its inputs. Inputs that carry partial sums over unreduced mesh axes are rejected. Complex sines and cosines
-//! evaluate `sin(a + b·i) = sin(a) · cosh(b) + i · cos(a) · sinh(b)` and `cos(a + b·i) = cos(a) · cosh(b) - i · sin(a)
-//! · sinh(b)` with hyperbolic factors formed from `expm1`, so they stay accurate for small imaginary parts. As in JAX,
-//! the component proportional to `sin(a)` is `+0` whenever `a` is zero, which keeps it finite when the hyperbolic
-//! factor overflows but does not preserve the sign of a negative zero.
+//! [`tan`](https://openxla.org/stablehlo/spec#tan), [`atan2`](https://openxla.org/stablehlo/spec#atan2), and
+//! [`tanh`](https://openxla.org/stablehlo/spec#tanh). Unary operations preserve the metadata of their input, and
+//! [`Atan2`] promotes the element types and broadcasts the shapes of its inputs. Inputs that carry partial sums over
+//! unreduced mesh axes are rejected. Complex sines and cosines evaluate `sin(a + b·i) = sin(a) · cosh(b) + i · cos(a) ·
+//! sinh(b)` and `cos(a + b·i) = cos(a) · cosh(b) - i · sin(a) · sinh(b)` with hyperbolic factors formed from `expm1`,
+//! so they stay accurate for small imaginary parts. As in JAX, the component proportional to `sin(a)` is `+0` whenever
+//! `a` is zero, which keeps it finite when the hyperbolic factor overflows but does not preserve the sign of a negative
+//! zero.
 //!
-//! [`Sin`], [`Cos`], and [`Tanh`] also accept a result [`Accuracy`] (e.g., through [`Sin::sin_with_accuracy`]), like
-//! the `accuracy` argument of JAX's [`jax.lax.sin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sin.html). It
-//! selects among the implementations of backends that provide several of them, and derivatives that evaluate another
+//! [`Sin`], [`Cos`], [`Tan`], and [`Tanh`] also accept a result [`Accuracy`] (e.g., through [`Sin::sin_with_accuracy`])
+//! like the `accuracy` argument of JAX's [`jax.lax.sin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sin.html).
+//! It selects among the implementations of backends that provide several of them, and derivatives that evaluate another
 //! such operation request the same accuracy from it.
 //!
-//! The derivatives of sine and cosine are the cosine and the negated sine. The derivative of the hyperbolic tangent is
-//! `1 - tanh(x)²`, except under [`Accuracy::Highest`], where it is `4 · logistic(2x) · logistic(-2x)` as in JAX, which
-//! stays accurate where `tanh(x)` saturates. (JAX evaluates the default form with a dedicated `one_minus_square`
-//! primitive whose factored `(1 + t) · (1 - t)` value is not uniformly more accurate once `tanh(x)` has rounded).
-//! The derivative of `atan2(y, x)` is `(x · dy - y · dx) / (x² + y²)`. For real inputs, it is evaluated after
-//! dividing both coordinates by `max(|x|, |y|)`, so that, unlike JAX's direct formula, its squared denominator
-//! neither overflows nor underflows. Every operation is nonlinear, so reverse-mode differentiation transposes
-//! its linearization instead.
+//! The derivatives of sine and cosine are the cosine and the negated sine, and the tangent derivative is `1 + tan(x)²`.
+//! The derivative of the hyperbolic tangent is `1 - tanh(x)²`, except under [`Accuracy::Highest`], where it is `4 ·
+//! logistic(2x) · logistic(-2x)` as in JAX, which stays accurate where `tanh(x)` saturates. (JAX evaluates the default
+//! form with a dedicated `one_minus_square` primitive whose factored `(1 + t) · (1 - t)` value is not uniformly more
+//! accurate once `tanh(x)` has rounded). The derivative of `atan2(y, x)` is `(x · dy - y · dx) / (x² + y²)`. For real
+//! inputs, it is evaluated after dividing both coordinates by `max(|x|, |y|)`, so that, unlike JAX's direct formula,
+//! its squared denominator neither overflows nor underflows. Every operation is nonlinear, so reverse-mode
+//! differentiation transposes its linearization instead.
 //!
 //! # Example
 //!
@@ -199,6 +200,77 @@ macro_rules! impl_cos_for_primitive {
 
 impl_cos_for_primitive!(f32);
 impl_cos_for_primitive!(f64);
+
+/// Canonical operation name for [`TanOperation`].
+pub const TAN_OPERATION_NAME: &str = "tan";
+
+define_elementwise_operation!(
+    @unary @accuracy
+    /// [`Operation`](crate::Operation) that computes the elementwise tangent of one value (i.e., `x ↦ tan(x)`,
+    /// with real angles measured in radians) while preserving its array metadata, as for StableHLO's
+    /// [`tangent`](https://openxla.org/stablehlo/spec#tan). Only floating-point and complex inputs are supported,
+    /// and inputs that still carry partial sums are rejected. The operation carries a result [`Accuracy`]. Its
+    /// derivative is `1 + tan(x)²`, using the output in the tangent representation.
+    TanOperation,
+    TAN_OPERATION_NAME,
+    Tan,
+    tan_with_accuracy,
+    check_data_types = [@float],
+    check_array_types = [@no_unreduced],
+);
+
+impl_differentiable_elementwise_operation! {
+    @unary
+    TanOperation,
+    jvp<C> where C::Value: OneLike + Add + Mul + Tan {
+        |_operation, inputs| {
+            // Reuse the output at the tangent type, recomputing it when the differential representation is wider.
+            let output = inputs.output_primal_at_tangent_type()?;
+            output.one_like()?.add(&output.mul(&output)?)?.mul(&inputs.input_tangent()?)?
+        }
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @unary @accuracy
+    /// Represents the ability to compute elementwise tangents. Concrete arrays compute immediately while
+    /// context-carrying values apply [`TanOperation`] through their context.
+    Tan,
+    /// Computes the tangent of each floating-point or complex element, with real angles measured in radians.
+    /// Returns an error if the input types or metadata are unsupported.
+    tan,
+    /// Behaves like [`tan`](Self::tan), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    tan_with_accuracy,
+    TanOperation,
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Tan,
+    tan_with_accuracy(_accuracy),
+    operation = "tan",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::tan(input),
+);
+
+/// Implements [`Tan`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
+macro_rules! impl_tan_for_primitive {
+    ($type:ty) => {
+        impl Tan for $type {
+            #[inline]
+            fn tan_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
+                Ok(<$type>::tan(*self))
+            }
+        }
+    };
+}
+
+impl_tan_for_primitive!(f32);
+impl_tan_for_primitive!(f64);
 
 /// Canonical operation name for [`Atan2Operation`].
 pub const ATAN2_OPERATION_NAME: &str = "atan2";
@@ -942,6 +1014,249 @@ mod tests {
         assert_eq!(Cos::cos(&0.0f32), Ok(1.0));
         assert_eq!(Cos::cos(&0.0f64), Ok(1.0));
         assert_eq!(Cos::cos_with_accuracy(&0.0f64, Accuracy::Highest), Ok(1.0));
+    }
+
+    #[test]
+    fn test_tan() {
+        let operation = TanOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "tan");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "tan [accuracy=highest]");
+    }
+
+    #[test]
+    fn test_tan_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = TanOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::I32],
+                    error = "`tan` does not support input data type `i32`",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = TanOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_tan_interpretation() {
+        assert_eq!(
+            TanOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(0.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(0.0f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_tan_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = TanOperation::new(),
+            inputs = [Array::scalar(0.5).unwrap()],
+            expected = Array::scalar(0.5f64.tan()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_tan_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = TanOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.tan(), (-1.0f64).tan()]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_tan_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = TanOperation::new(),
+            cases = [{
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64.tan()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 * (1.0 + 0.7f64.tan().powi(2))).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = tan %0
+                        %3:f64[] = one_like %2
+                        %4:f64[] = mul %2 %2
+                        %5:f64[] = add %3 %4
+                        %6:f64[] = mul %5 %1
+                    in (%2, %6)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_tan_differentiation_accuracy() {
+        // Widening recomputes the coefficient at the tangent type with the requested accuracy.
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let (_, tangent) = differentiate_at(primal)
+            .jvp(Array::scalar(3.0f32).unwrap(), |input| input.tan_with_accuracy(Accuracy::Highest))
+            .unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 * (1.0 + 2.0f32.tan().powi(2)), epsilon = 1e-5);
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
+        let output = builder
+            .add_instruction(TanOperation::new().with_accuracy(Accuracy::Highest), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:f8e8m0fnu[], %1:f32[] .
+            let %2:f8e8m0fnu[] = tan [accuracy=highest] %0
+                %3:f32[] = convert_element_type [data_type=f32] %0
+                %4:f32[] = tan [accuracy=highest] %3
+                %5:f32[] = one_like %4
+                %6:f32[] = mul %4 %4
+                %7:f32[] = add %5 %6
+                %8:f32[] = mul %7 %1
+            in (%2, %8)
+        "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tan_differentiation_complex() {
+        let input = ComplexNumber::new(0.7f64, -0.3);
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(input).unwrap()).holomorphic().gradient(|input| input.tan()).unwrap(),
+            Array::scalar(ComplexNumber::new(1.0, 0.0) + input.tan() * input.tan()).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_tan_differentiation_second_derivative() {
+        // Reusing the output retains its dependence on the input in higher derivatives.
+        let input = 0.7f64;
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let reference = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TanOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let outputs = program
+            .interpret(vec![
+                Array::scalar(input).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(0.0f64).unwrap(),
+            ])
+            .unwrap();
+        assert_abs_diff_eq!(
+            outputs[3],
+            Array::scalar(2.0 * input.tan() * (1.0 + input.tan().powi(2))).unwrap(),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_tan_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = TanOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_tan() {
+        // Native and half-precision inputs retain their element types, and vectors compute elementwise.
+        assert_eq!(Array::scalar(0.5f32).unwrap().tan(), Ok(Array::scalar(0.5f32.tan()).unwrap()));
+        assert_eq!(Array::scalar(0.5f64).unwrap().tan(), Ok(Array::scalar(0.5f64.tan()).unwrap()));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().tan(),
+            Ok(Array::scalar(bf16::from_f32(0.5f32.tan())).unwrap()),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().tan(),
+            Ok(Array::scalar(f16::from_f32(0.5f32.tan())).unwrap()),
+        );
+        assert_eq!(Array::vector(vec![0.0, 1.0]).unwrap().tan(), Ok(Array::vector(vec![0.0, 1.0f64.tan()]).unwrap()));
+
+        // Infinite inputs produce NaNs, and NaNs propagate.
+        for input in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(Array::scalar(input).unwrap().tan().unwrap().elements::<f64>().unwrap()[0].is_nan());
+        }
+
+        // Real signed zeros are preserved exactly.
+        for input in [0.0f64, -0.0f64] {
+            assert_eq!(
+                Array::scalar(input).unwrap().tan().unwrap().elements::<f64>().unwrap()[0].to_bits(),
+                input.to_bits(),
+            );
+        }
+
+        // Integer inputs are rejected.
+        assert_eq!(
+            Array::scalar(1i32).unwrap().tan(),
+            Err(TypeError::invalid("`tan` does not support input data type `i32`").into()),
+        );
+    }
+
+    #[test]
+    fn test_array_tan_complex() {
+        // Independent reference values were computed with CPython's `cmath.tan`.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap().tan().unwrap(),
+            Array::scalar(ComplexNumber::new(0.7270371862435201, -0.4697051659675581)).unwrap(),
+            epsilon = 1e-12,
+        );
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(0.7f32, -0.3)).unwrap().tan().unwrap(),
+            Array::scalar(ComplexNumber::new(0.7270372f32, -0.46970516)).unwrap(),
+            epsilon = 1e-6,
+        );
+        // Large imaginary inputs tend to `±i` without overflowing a hyperbolic quotient.
+        for imaginary in [1000.0f64, -1000.0, f64::INFINITY, f64::NEG_INFINITY] {
+            let output = Array::scalar(ComplexNumber::new(0.7f64, imaginary)).unwrap().tan().unwrap();
+            assert_abs_diff_eq!(
+                output,
+                Array::scalar(ComplexNumber::new(0.0f64, imaginary.signum())).unwrap(),
+                epsilon = 1e-12,
+            );
+        }
+    }
+
+    #[test]
+    fn test_tan_primitives() {
+        assert_eq!(Tan::tan(&0.7f32), Ok(0.7f32.tan()));
+        assert_eq!(Tan::tan(&0.7f64), Ok(0.7f64.tan()));
+        assert_eq!(Tan::tan_with_accuracy(&0.7f64, Accuracy::Highest), Ok(0.7f64.tan()));
     }
 
     #[test]

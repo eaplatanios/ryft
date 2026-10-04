@@ -1508,7 +1508,7 @@ mod tests {
     use crate::contexts::Context;
     use crate::kernels::authoring::whole_array_parameter;
     use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
-    use crate::operations::{SinOperation, TanhOperation};
+    use crate::operations::{SinOperation, TanOperation, TanhOperation};
     use crate::programs::{ProgramBuilder, TypeIdentityRenaming};
 
     use super::*;
@@ -1776,6 +1776,12 @@ mod tests {
         assert_eq!(
             Encoder::default().operation(&operation).err().unwrap().to_string(),
             "kernel source serialization does not support `sin`",
+        );
+
+        let operation = KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Tan(TanOperation::new())));
+        assert_eq!(
+            Encoder::default().operation(&operation).err().unwrap().to_string(),
+            "kernel source serialization does not support `tan`",
         );
 
         // The wire records encode only the default result accuracy, so other accuracies are rejected
