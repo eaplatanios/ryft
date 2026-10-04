@@ -239,7 +239,6 @@ impl Operation for ParallelSumScatterOperation {
         };
 
         let dimensions = shape.dimensions().to_vec();
-        // TODO(eaplatanios): Review from here onwards.
         Ok(vec![self.infer_static_output_type(&input_types[0], dimensions, true)?])
     }
 
@@ -295,6 +294,8 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
     for ParallelSumScatterOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by summing
 // over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into
