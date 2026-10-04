@@ -76,9 +76,7 @@ pub mod ragged_all_to_all;
 pub use all_gather::{ALL_GATHER_OPERATION_NAME, AllGather, AllGatherOperation, AllGatherOutputVariance};
 pub use all_to_all::{ALL_TO_ALL_OPERATION_NAME, AllToAll, AllToAllOperation, ParallelSwapAxes};
 pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
-pub use parallel_permute::{
-    PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation, ParallelShuffle,
-};
+pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
@@ -317,15 +315,20 @@ fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result
 }
 
 /// Infers a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
-/// sharding through with the same per-dimension placement (the dimension count never changes).
+/// sharding through with the same per-dimension placement (the dimension count never changes). An unchanged shape
+/// preserves the complete input type. Resizing clears explicit layout information because input strides and tiling
+/// do not generally describe storage for the resized shape; element type and memory are preserved.
 fn infer_linear_collective_operation_output_type(
     operation_name: &'static str,
     input_type: &ArrayType,
     output_dimensions: Vec<usize>,
 ) -> Result<ArrayType, TypeError> {
     let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
-    let output_sharding = input_type.resized_sharding(output_sizes.as_slice(), operation_name)?;
     let output_shape = Shape::new(output_sizes);
+    if &output_shape == input_type.shape() {
+        return Ok(input_type.clone());
+    }
+    let output_sharding = input_type.resized_sharding(output_shape.dimensions(), operation_name)?;
     Ok(ArrayType::new(input_type.data_type(), output_shape)
         .with_sharding(output_sharding)?
         .with_memory(input_type.memory()))
@@ -340,20 +343,18 @@ fn infer_linear_collective_operation_output_type(
 ///     which completes the pending reduction as part of its exchange).
 ///   - `input_types`: Array input type followed by one explicit extent type per output axis.
 ///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
-///   - `unchanged_input_axes`: For every output axis, the input axis whose extent it must preserve, if any.
-///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit extents against the array input.
-fn infer_explicit_shape_changing_collective_output_type<
-    F: FnOnce(&ArrayType, &[Dimension]) -> Result<(), TypeError>,
->(
+///   - `changed_output_axes`: Output axes whose extents may differ from `base_output_type`. Every other axis must
+///     retain the extent already projected into `base_output_type` by the caller.
+///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit output extents.
+fn infer_explicit_shape_changing_collective_output_type(
     operation_name: &'static str,
     accepts_unreduced: bool,
     input_types: &[ArrayIrType],
     base_output_type: ArrayType,
-    unchanged_input_axes: &[Option<usize>],
-    validate_exact_extents_fn: F,
+    changed_output_axes: &[usize],
+    validate_exact_extents_fn: impl FnOnce(&[Dimension]) -> Result<(), TypeError>,
 ) -> Result<Vec<ArrayIrType>, TypeError> {
-    let expected = 1 + base_output_type.rank();
-    check_count!("input", input_types, expected, TypeError);
+    check_count!("input", input_types, 1 + base_output_type.rank(), TypeError);
 
     let input_type = <&ArrayType>::try_from(&input_types[0])?;
     if !accepts_unreduced && !input_type.unreduced_axes().is_empty() {
@@ -361,36 +362,18 @@ fn infer_explicit_shape_changing_collective_output_type<
     }
 
     let output_extents = ArrayIrType::extents(&input_types[1..])?;
-    if unchanged_input_axes.len() != output_extents.len() {
-        return Err(TypeError::invalid(format!(
-            "`{}` internal output-axis mapping has length {} but the result rank is {}",
-            operation_name,
-            unchanged_input_axes.len(),
-            output_extents.len(),
-        )));
-    }
-
-    for (output_axis, (&input_axis, output_extent)) in unchanged_input_axes.iter().zip(&output_extents).enumerate() {
-        let Some(input_axis) = input_axis else { continue };
-        let input_extent = input_type.shape().dimensions().get(input_axis).ok_or_else(|| {
-            TypeError::invalid(format!(
-                "`{}` unchanged output axis {} references input axis {}, which is out of bounds for rank {}",
-                operation_name,
-                output_axis,
-                input_axis,
-                input_type.rank(),
-            ))
-        })?;
-
-        if output_extent != input_extent {
+    for (output_axis, (expected_extent, output_extent)) in
+        base_output_type.shape().dimensions().iter().zip(&output_extents).enumerate()
+    {
+        if !changed_output_axes.contains(&output_axis) && output_extent != expected_extent {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged input axis \
-                 {input_axis} extent {input_extent}",
+                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged extent \
+                 {expected_extent}",
             )));
         }
     }
 
-    validate_exact_extents_fn(input_type, output_extents.as_slice())?;
+    validate_exact_extents_fn(output_extents.as_slice())?;
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
@@ -441,6 +424,10 @@ fn infer_explicit_shape_changing_collective_output_type<
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `ALL_TO_ALL_OPERATION_NAME`).
 ///   - `fields = { ... }`: Documented payload fields that follow the shared `axis_name` and `axis_size` fields, in the
 ///     order in which the generated `new` function takes them and the operation renders them.
+///   - `optional_fields = { ... }`: Optional documented payload fields whose declared types are wrapped in [`Option`].
+///     The generated `new` function initializes them to [`None`], invocations provide their own builder and accessor
+///     functions, and the operation renders each one through its [`Display`](std::fmt::Display) implementation only
+///     when it is present (e.g., the manual mesh of a `parallel_permute` over a mesh axis).
 ///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types) selectors
 ///     applied to the input type (e.g., `@no_unreduced` for collectives that cannot complete a pending cross-device
 ///     sum as part of their exchange).
@@ -488,10 +475,14 @@ macro_rules! define_linear_collective_operation {
                 _driver: &D,
                 inputs: &[<$context as $crate::Domain>::Value],
             ) -> Result<Vec<<$context as $crate::Domain>::Value>, $crate::ProgramError> {
+                use $crate::{Operation as _, Typed as _};
+
+                // Eager binding does not infer output types, so interpretation validates the shared input contract
+                // and the operation payload before applying either degenerate-axis rule.
+                $crate::check_count!("input", inputs, 1, ProgramError);
                 // Outside any binder, only the degenerate single-participant axis has defined per-item semantics. Any
                 // larger axis is an error because the other participants do not exist per item.
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                if self.axis_size != 1 {
+                if self.axis_size > 1 {
                     return Err($crate::ProgramError::UnsupportedOperation {
                         message: format!(
                             "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
@@ -499,6 +490,8 @@ macro_rules! define_linear_collective_operation {
                         ),
                     });
                 }
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                self.infer_output_types(&input_types, &[])?;
                 let $interpret_operation = self;
                 let $interpret_input = &inputs[0];
                 Ok(vec![$interpret?])
@@ -512,6 +505,11 @@ macro_rules! define_linear_collective_operation {
         $operation:ident,
         $name:ident,
         fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
+        $(
+            optional_fields = {
+                $($(#[$optional_field_documentation:meta])* $optional_field:ident: $optional_field_type:ty),* $(,)?
+            },
+        )?
         $(check_array_types = [$(@$array_type_check:ident),* $(,)?],)?
         infer_output_type = |$operation_binding:ident, $input_type:ident, $dimensions:ident| $infer:block,
         $(
@@ -531,13 +529,15 @@ macro_rules! define_linear_collective_operation {
             axis_size: usize,
 
             $($(#[$field_documentation])* $field: $field_type,)*
+
+            $($($(#[$optional_field_documentation])* $optional_field: Option<$optional_field_type>,)*)?
         }
 
         impl $operation {
             /// Creates a new operation over the named axis with the provided resolved axis size.
             #[inline]
             pub fn new(axis_name: String, axis_size: usize, $($field: $field_type),*) -> Self {
-                Self { axis_name, axis_size, $($field),* }
+                Self { axis_name, axis_size, $($field,)* $($($optional_field: None,)*)? }
             }
 
             /// Returns the axis name referenced by this collective.
@@ -597,6 +597,11 @@ macro_rules! define_linear_collective_operation {
                     operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
                     operation.field("axis_size", &self.axis_size)?;
                     $(operation.field(stringify!($field), format_args!("{:?}", &self.$field))?;)*
+                    $($(
+                        if let Some(value) = &self.$optional_field {
+                            operation.field(stringify!($optional_field), value)?;
+                        }
+                    )*)?
                     Ok(())
                 })
             }
@@ -1420,7 +1425,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable,
-        Shape,
+        Layout, Memory, Shape, StridedLayout,
     };
     use crate::batching::BatchableOperation;
     use crate::contexts::{EagerContext, StagingContext};
@@ -1430,16 +1435,12 @@ mod tests {
         AllGatherOperation, AllGatherOutputVariance, infer_explicit_all_gather_output_types,
     };
     use crate::operations::collectives::all_to_all::{AllToAllOperation, infer_explicit_all_to_all_output_types};
+    use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::TracingContext;
 
     use super::*;
-
-    /// Returns the static `f32` vector type of the provided length shared by the collective tests.
-    pub(super) fn f32_vector(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]))
-    }
 
     #[test]
     fn test_collective_options_validate_axis_index_groups() {
@@ -1485,9 +1486,60 @@ mod tests {
         assert_eq!(
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new("x".to_string(), 4, 0, grouped, AllGatherOutputVariance::Varying,),
-                &[f32_vector(3).into(), result_extent.into(),],
+                &[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into(),],
             ),
-            Ok(vec![f32_vector(6).into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
+        );
+    }
+
+    #[test]
+    fn test_infer_linear_collective_operation_output_type() {
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            infer_linear_collective_operation_output_type("all_gather", &input_type, vec![2, 3]),
+            Ok(input_type.clone()),
+        );
+        assert_eq!(
+            infer_linear_collective_operation_output_type("all_gather", &input_type, vec![4, 3]),
+            Ok(ArrayType::new_static(DataType::F32, [4, 3]).with_memory(input_type.memory())),
+        );
+    }
+
+    #[test]
+    fn test_define_linear_collective_operation_interpretation() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+
+        // Eager binding validates the shared participant count before it can return an identity value.
+        assert_eq!(
+            context.bind(
+                AllToAllOperation::new("x".to_string(), 0, 0, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::Type(TypeError::invalid("`all_to_all` axis size must be greater than zero"))),
+        );
+
+        // The custom tiled identity rule must also honor its operation-specific axis validation.
+        assert_eq!(
+            context.bind(
+                AllToAllOperation::new("x".to_string(), 1, 1, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`all_to_all` split axis 1 or concat axis 0 is out of bounds for rank 1",
+            ))),
+        );
+        assert_eq!(
+            context.bind(
+                AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![input]),
         );
     }
 
@@ -1653,9 +1705,9 @@ mod tests {
                     CollectiveOptions::tiled(),
                     AllGatherOutputVariance::Varying
                 ),
-                &[f32_vector(3).into(), exact_six.into()],
+                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()],
             ),
-            Ok(vec![f32_vector(6).into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
         );
         let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
         assert_eq!(
@@ -1667,7 +1719,7 @@ mod tests {
                     CollectiveOptions::tiled(),
                     AllGatherOutputVariance::Varying
                 ),
-                &[f32_vector(3).into(), exact_five.into()],
+                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()],
             ),
             Err(TypeError::invalid(
                 "`all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
@@ -1675,6 +1727,72 @@ mod tests {
                  but got 5"
                     .to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_explicit_shape_changing_collective_type_inference_untiled() {
+        let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
+        let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
+        let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
+        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
+
+        // Inserting an axis preserves the extents already projected into the base output type on either side.
+        let gather = AllGatherOperation::new(
+            "x".to_string(),
+            2,
+            1,
+            CollectiveOptions::default(),
+            AllGatherOutputVariance::Varying,
+        );
+        assert_eq!(
+            infer_explicit_all_gather_output_types(
+                &gather,
+                &[
+                    ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                    exact_three.clone().into(),
+                    exact_two.clone().into(),
+                    exact_four.clone().into(),
+                ],
+            ),
+            Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_all_gather_output_types(
+                &gather,
+                &[
+                    ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                    exact_three.clone().into(),
+                    exact_two.clone().into(),
+                    exact_five.into(),
+                ],
+            ),
+            Err(TypeError::invalid("`all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
+        );
+
+        // Removing an axis or removing then inserting one needs no separate output-to-input axis mapping.
+        assert_eq!(
+            infer_explicit_parallel_sum_scatter_output_types(
+                &ParallelSumScatterOperation::new("x".to_string(), 2, 1, CollectiveOptions::default()),
+                &[
+                    ArrayType::new_static(DataType::F32, [3, 2, 4]).into(),
+                    exact_three.clone().into(),
+                    exact_four.clone().into(),
+                ],
+            ),
+            Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
+        );
+        assert_eq!(
+            infer_explicit_all_to_all_output_types(
+                &AllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default()),
+                &[
+                    ArrayType::new_static(DataType::F32, [2, 3, 4]).into(),
+                    exact_three.into(),
+                    exact_four.into(),
+                    exact_two.into(),
+                ],
+            ),
+            Ok(vec![ArrayType::new_static(DataType::F32, [3, 4, 2]).into()]),
         );
     }
 

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, MeshAxisType, RaggedAxis,
+    ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -10,14 +10,14 @@ use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    define_linear_collective_operation, impl_differentiable_linear_collective_operation,
-    infer_linear_collective_operation_output_type, resolve_named_axis_size,
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation, resolve_named_axis_size,
 };
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::programs::{Operation, ProgramError, ProjectedValue, TypeError, Typed, Value, ValueProjection};
+use crate::operations::sharding::Reshard;
+use crate::programs::{Operation, ProgramError, ProjectedValue, Type, TypeError, Typed, Value, ValueProjection};
 
 /// Canonical operation name for [`ParallelPermuteOperation`].
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
@@ -43,35 +43,42 @@ define_linear_collective_operation!(
     /// [`jax.lax.ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and StableHLO's
     /// [`collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
     ///
-    /// Over a manual mesh axis, a permutation generally gives the axis positions different values, so the input must
-    /// vary over the axis (refer to [`ParallelVary`]) and the output varies over it as well. The collective is linear
-    /// and its transpose is the permutation with every pair inverted. Outside any binder, the single position of a
+    /// A permutation over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
+    /// [`ParallelPermute::parallel_permute`] supplies the mesh automatically from the enclosing manual region. Such a
+    /// permutation generally gives the axis positions different values, so its input must vary over the axis (refer
+    /// to [`ParallelVary`]) and its output varies over it as well. An ordinary permutation carries no mesh and never
+    /// applies this contract, even when its input carries a manual mesh axis with the same name, because a `batch`
+    /// level whose axis name shadows that mesh axis may bind it instead. The collective is linear and its transpose is
+    /// the permutation with every pair inverted, over the same mesh. Outside any binder, the single position of a
     /// degenerate axis keeps its value when the pair `(0, 0)` is present and receives zeros otherwise.
     ///
-    /// A matching `batch` level consumes the mapped batch axis by reassembling it in target order from per-item slices,
-    /// with zero slices at untargeted positions, and passes a replicated input through unchanged when every position is
-    /// targeted. Unlike JAX's batching rule, which requires a full permutation, partial permutations are supported.
-    /// Bounded ragged extents follow the same source-to-target routing as their packed values, and untargeted
-    /// positions receive zero extents together with their zero-filled values.
+    /// A matching `batch` level consumes the mapped batch axis of an ordinary permutation by reassembling it in target
+    /// order from per-item slices, with zero slices at untargeted positions, and passes a replicated input through
+    /// unchanged when every position is targeted. Unlike JAX's batching rule, which requires a full permutation,
+    /// partial permutations are supported. Bounded ragged extents follow the same source-to-target routing as their
+    /// packed values, and untargeted positions receive zero extents together with their zero-filled values.
+    /// A permutation over a manual mesh axis cannot be consumed by a `batch` level.
     ParallelPermuteOperation,
     PARALLEL_PERMUTE_OPERATION_NAME,
     fields = {
-        /// Pairs of `(source, target)` positions along the named axis. For each pair, the value of participant `source`
-        /// is sent to participant `target`.
+        /// Pairs of zero-based `(source, target)` coordinates along the named axis. Each pair routes the entire input
+        /// array at `source` to the output at `target`.
         source_target_pairs: Vec<(usize, usize)>,
     },
+    optional_fields = {
+        /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
+        mesh: LogicalMesh,
+    },
     check_array_types = [@no_unreduced],
-    infer_output_type = |operation, input_type, dimensions| {
+    infer_output_type = |operation, input_type, _dimensions| {
+        let axis_name = &operation.axis_name;
         let mut sources = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for &(source, target) in &operation.source_target_pairs {
             if source >= operation.axis_size || target >= operation.axis_size {
                 return Err(TypeError::invalid(format!(
                     "`{}` pair ({}, {}) is out of bounds for axis size {}",
-                    PARALLEL_PERMUTE_OPERATION_NAME,
-                    source,
-                    target,
-                    operation.axis_size,
+                    PARALLEL_PERMUTE_OPERATION_NAME, source, target, operation.axis_size,
                 )));
             }
             if !sources.insert(source) || !targets.insert(target) {
@@ -83,21 +90,40 @@ define_linear_collective_operation!(
         }
 
         // A permutation over a manual mesh axis gives the participants different values, so an input that is still
-        // invariant over that axis would yield an output whose type wrongly claims that it is invariant.
-        if let Some(sharding) = input_type.sharding()
-            && sharding.mesh().axis_type(&operation.axis_name) == Some(MeshAxisType::Manual)
-            && !sharding.varying_manual_axes().contains(&operation.axis_name)
-        {
-            return Err(TypeError::invalid(format!(
-                "`{}` input must vary over manual axis `{}`; pass an invariant value \
-                 through `{}` first so that the permuted output is typed as varying",
-                PARALLEL_PERMUTE_OPERATION_NAME,
-                operation.axis_name,
-                PARALLEL_VARY_OPERATION_NAME,
-            )));
+        // invariant over that axis would yield an output whose type wrongly claims that it is invariant. An ordinary
+        // permutation never inspects the input's mesh, because a `batch` level may bind a shadowing axis name.
+        if let Some(mesh) = &operation.mesh {
+            if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
+                )));
+            }
+            if mesh.axis_size(axis_name) != Some(operation.axis_size) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` axis size {} does not match the size of manual mesh axis `{}`",
+                    PARALLEL_PERMUTE_OPERATION_NAME, operation.axis_size, axis_name,
+                )));
+            }
+            let Some(sharding) = input_type.sharding() else {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` input must carry a mesh containing manual axis `{axis_name}`",
+                )));
+            };
+            if sharding.mesh() != mesh {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` input mesh does not match the operation mesh",
+                )));
+            }
+            if !sharding.varying_manual_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` input must vary over manual axis `{}`; pass an invariant value \
+                     through `{}` first so that the permuted output is typed as varying",
+                    PARALLEL_PERMUTE_OPERATION_NAME, axis_name, PARALLEL_VARY_OPERATION_NAME,
+                )));
+            }
         }
 
-        infer_linear_collective_operation_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
+        Ok::<_, TypeError>(input_type.clone())
     },
     interpret<C> where C::Value: ZeroLike {
         |operation, input| {
@@ -109,17 +135,35 @@ define_linear_collective_operation!(
 );
 
 impl ParallelPermuteOperation {
+    /// Returns this [`ParallelPermuteOperation`] configured to permute over a manual axis of `mesh`. The input must
+    /// vary over [`axis_name`](Self::axis_name) on that mesh, whose size must equal [`axis_size`](Self::axis_size).
+    /// Type inference validates these requirements. [`ParallelPermute::parallel_permute`] supplies the mesh
+    /// automatically from the enclosing manual region.
+    #[inline]
+    pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
+        self.mesh = Some(mesh);
+        self
+    }
+
     /// Returns the `(source, target)` pairs of participant positions along the named axis.
     #[inline]
     pub fn source_target_pairs(&self) -> &[(usize, usize)] {
         self.source_target_pairs.as_slice()
+    }
+
+    /// Returns the logical mesh whose manual axis this [`ParallelPermuteOperation`] permutes over, or [`None`] for an
+    /// ordinary permutation, whose named axis may be bound by any enclosing binder. Only a permutation over a manual
+    /// mesh axis requires its input to vary over that axis.
+    #[inline]
+    pub fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
     }
 }
 
 impl<
     C: Context<
             Type = ArrayType,
-            Value: ZeroLike + Concatenate + Slice + Transpose,
+            Value: ZeroLike + Concatenate + Slice + Transpose + Reshard,
             Operation: From<ParallelPermuteOperation>,
         >,
     P: ArrayExtentBatchingPolicy<C>,
@@ -139,6 +183,14 @@ impl<
             return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
 
+        if self.mesh.is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` over a manual mesh axis cannot bind a named batch axis",
+                ),
+            });
+        }
+
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -146,6 +198,7 @@ impl<
         // A batching rule runs before any context infers the operation's output type, so the operation is validated
         // here, against the physical (i.e., padded) item type, before its pairs index the batch axis.
         self.infer_output_types(&[input.value().r#type().unbatched(input.batch_axis())?], &[])?;
+
         let batch_size = P::axis_size(context)?;
         if batch_size != self.axis_size {
             return Err(BatchingError::UnsupportedOperation {
@@ -214,12 +267,15 @@ impl_differentiable_linear_collective_operation! {
     ParallelPermuteOperation,
     transpose = |operation| -> ParallelPermuteOperation {
         // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
-        // is the permutation with every pair inverted.
-        ParallelPermuteOperation::new(
-            operation.axis_name.clone(),
-            operation.axis_size,
-            operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>(),
-        )
+        // is the permutation with every pair inverted, over the same axis and mesh.
+        ParallelPermuteOperation {
+            source_target_pairs: operation
+                .source_target_pairs
+                .iter()
+                .map(|(source, target)| (*target, *source))
+                .collect(),
+            ..operation.clone()
+        }
     },
 }
 
@@ -232,6 +288,9 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 
 /// Represents the ability to permute values across the participants of a named axis. Refer to the documentation
 /// of [`ParallelPermuteOperation`] for the semantics of this operation and its transformation rules.
+///
+/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
+/// values, which permute through their array views, share the same call syntax.
 ///
 /// # Example
 ///
@@ -257,7 +316,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelPermute: Sized {
+pub trait ParallelPermute<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
     /// Returns this value permuted across the participants of the named axis `axis_name`. For every `(source, target)`
     /// pair, participant `target` receives the value of participant `source`, and every participant that no pair
     /// targets receives zeros. Over a manual mesh axis, an input that does not vary over the axis is first made
@@ -276,46 +335,14 @@ pub trait ParallelPermute: Sized {
     /// if two pairs share a source or a target, or if this value carries unreduced axes.
     fn parallel_permute(&self, axis_name: &str, source_target_pairs: Vec<(usize, usize)>)
     -> Result<Self, ProgramError>;
-}
 
-impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
-        + ParallelVary,
-> ParallelPermute for V
-{
-    fn parallel_permute(
-        &self,
-        axis_name: &str,
-        source_target_pairs: Vec<(usize, usize)>,
-    ) -> Result<Self, ProgramError> {
-        // Any context-carrying value permutes by resolving the axis size from the active `NamedAxes` environment and
-        // binding a `ParallelPermuteOperation` through its own context. Over a manual mesh axis, an input that is still
-        // invariant over the axis is first made varying, exactly as JAX's `ppermute` does, so that the output type
-        // records that the participants hold different values.
-        let context = self.dispatch_domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let mut input = self.clone();
-        if matches!(context.named_axis(axis_name), Some(NamedAxis::Mesh { .. }))
-            && !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name))
-        {
-            input = input.parallel_vary(axis_name)?;
-        }
-        let operation = ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs);
-        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
-/// Represents the ability to shuffle values across the participants of a named axis by listing,
-/// for every output participant, the participant whose value it receives. This is the Ryft analogue of JAX's
-/// [`jax.lax.pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it stages a
-/// [`ParallelPermuteOperation`] with the pair `(permutation[target], target)` for every target through
-/// [`ParallelPermute`], whose manual-axis behavior therefore applies to shuffles as well.
-pub trait ParallelShuffle: Sized {
     /// Returns this value shuffled across the participants of the named axis `axis_name`, where participant `target`
     /// receives the value of participant `permutation[target]`. A permutation shorter than the axis shuffles only the
-    /// leading participants, and every remaining participant receives zeros.
+    /// leading participants, and every remaining participant receives zeros. This is the Ryft analogue of JAX's
+    /// [`jax.lax.pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it permutes with
+    /// the pair `(permutation[target], target)` for every target through
+    /// [`parallel_permute`](Self::parallel_permute), whose manual-axis
+    /// behavior therefore applies to shuffles as well.
     ///
     /// # Parameters
     ///
@@ -326,29 +353,7 @@ pub trait ParallelShuffle: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if `permutation` is not a permutation of `0..permutation.len()`, and any error
-    /// of [`ParallelPermute::parallel_permute`] otherwise (e.g., when `permutation` is longer than the axis).
-    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
-    ParallelShuffle for V
-where
-    ProjectedValue<ArrayType, V>: ParallelShuffle,
-{
-    #[inline]
-    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
-        // A composite value shuffles through its array view, so that every shuffle shares the staging path
-        // of `ParallelPermute`.
-        Ok(V::from_projected(
-            ValueProjection::<ArrayType>::into_projected(self.clone())?.parallel_shuffle(axis_name, permutation)?,
-        ))
-    }
-}
-
-impl<V> ParallelShuffle for ProjectedValue<ArrayType, V>
-where
-    Self: ParallelPermute,
-{
+    /// of [`parallel_permute`](Self::parallel_permute) otherwise (e.g., when `permutation` is longer than the axis).
     fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
         let mut seen = vec![false; permutation.len()];
         for &source in permutation {
@@ -372,6 +377,56 @@ where
     }
 }
 
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
+        + ParallelVary,
+> ParallelPermute<ArrayType> for V
+{
+    fn parallel_permute(
+        &self,
+        axis_name: &str,
+        source_target_pairs: Vec<(usize, usize)>,
+    ) -> Result<Self, ProgramError> {
+        // Any context-carrying value permutes by resolving the axis size from the active `NamedAxes` environment and
+        // binding a `ParallelPermuteOperation` through its own context. Over a manual mesh axis, the operation records
+        // the mesh, and an input that is still invariant over the axis is first made varying, exactly as JAX's
+        // `ppermute` does, so that the output type records that the participants hold different values.
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let mut operation = ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs);
+        let mut input = self.clone();
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+                input = input.parallel_vary(axis_name)?;
+            }
+            operation = operation.with_mesh(mesh);
+        }
+        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    ParallelPermute<ArrayIrType> for V
+where
+    ProjectedValue<ArrayType, V>: ParallelPermute<ArrayType>,
+{
+    #[inline]
+    fn parallel_permute(
+        &self,
+        axis_name: &str,
+        source_target_pairs: Vec<(usize, usize)>,
+    ) -> Result<Self, ProgramError> {
+        // A composite value permutes through its array view, which owns named-axis resolution and manual-axis
+        // variation, so that every permutation shares one staging path.
+        Ok(V::from_projected(
+            ValueProjection::<ArrayType>::into_projected(self.clone())?
+                .parallel_permute(axis_name, source_target_pairs)?,
+        ))
+    }
+}
+
 /// Returns `value` with its slices along `axis` routed from their source positions to their target positions.
 /// Specifically, slice `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when
 /// `sources[target]` is `None`. The result has `sources.len()` slices along `axis` and otherwise the shape of `value`.
@@ -385,7 +440,7 @@ where
 ///
 /// Returns a [`BatchingError`] if `value` is not statically shaped, or if staging one of the slices, the zero slice,
 /// or the concatenation fails.
-fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose>(
+fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose + Reshard>(
     value: &V,
     axis: usize,
     sources: &[Option<usize>],
@@ -399,6 +454,23 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
         });
     };
     let dimensions = shape.dimensions().to_vec();
+    let output_sharding = value.r#type().sharding().cloned();
+
+    // Extent-one slices cannot retain an explicit mesh placement whose axis product exceeds one.
+    // Route slices with this axis replicated, then restore its placement once on the complete result.
+    let value = if let Some(sharding) = &output_sharding
+        && matches!(sharding.dimensions().first(), Some(ShardingDimension::Sharded(axes)) if axes.iter().any(|axis| {
+            sharding.mesh().axis_type(axis) == Some(MeshAxisType::Explicit)
+                && sharding.mesh().axis_size(axis).is_some_and(|size| size > 1)
+        })) {
+        let mut dimensions = sharding.dimensions().to_vec();
+        dimensions[0] = ShardingDimension::Replicated;
+        let replicated = sharding.with_dimensions(dimensions).map_err(TypeError::from)?;
+        value.reshard(&replicated)?
+    } else {
+        value
+    };
+
     let rank = dimensions.len();
     let strides = vec![1; rank];
     let slice_item = |item: usize| -> Result<V, ProgramError> {
@@ -408,6 +480,7 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
         limit_indices[0] = item + 1;
         value.slice(&start_indices, &limit_indices, &strides)
     };
+
     let mut zero_item = None;
     let mut items = Vec::with_capacity(sources.len());
     for source in sources {
@@ -421,7 +494,14 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
             }
         }
     }
-    let permuted = Concatenate::concatenate(&items, 0)?;
+
+    let mut permuted = Concatenate::concatenate(&items, 0)?;
+    if let Some(sharding) = output_sharding
+        && permuted.r#type().sharding() != Some(&sharding)
+    {
+        permuted = permuted.reshard(&sharding)?;
+    }
+
     if axis == 0 { Ok(permuted) } else { Ok(permuted.move_axis(0, axis)?) }
 }
 
@@ -433,7 +513,7 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, DimensionBounds, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, Sharding,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, Sharding, StridedLayout,
     };
     use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
@@ -442,15 +522,14 @@ mod tests {
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_type_inference;
-    use crate::operations::collectives::tests::f32_vector;
+    use crate::macros::{check_gradient, check_operation_type_inference};
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
         PartiallyEvaluatableOperation,
     };
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, Operation, Program, ProgramBuilder};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -496,6 +575,7 @@ mod tests {
         assert_eq!(operation.axis_name(), "x");
         assert_eq!(operation.axis_size(), 3);
         assert_eq!(operation.source_target_pairs(), &[(0, 1), (2, 0)]);
+        assert_eq!(operation.mesh(), None);
         assert_eq!(
             operation.to_string(),
             "parallel_permute [axis_name=\"x\", axis_size=3, source_target_pairs=[(0, 1), (2, 0)]]",
@@ -503,24 +583,51 @@ mod tests {
         assert_eq!(operation, operation.clone());
         assert_ne!(operation, ParallelPermuteOperation::new("x".to_string(), 3, vec![(0, 1)]));
         assert_ne!(operation, ParallelPermuteOperation::new("y".to_string(), 3, vec![(0, 1), (2, 0)]));
+
+        // A permutation over a manual mesh axis records and renders its mesh.
+        let mesh_permutation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).with_mesh(manual_mesh());
+        assert_eq!(mesh_permutation.mesh(), Some(&manual_mesh()));
+        assert_eq!(
+            mesh_permutation.to_string(),
+            indoc! {"
+                parallel_permute [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    source_target_pairs=[(0, 1)],
+                    mesh=['x'=2:manual, 'y'=1:manual],
+                ]"
+            },
+        );
+        assert_ne!(mesh_permutation, ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]));
     }
 
     #[test]
     fn test_parallel_permute_type_inference() {
-        // A permutation preserves its input type, including the variation over a manual mesh axis, and an empty
-        // permutation, which zeros every participant, is valid.
-        let sharding = Sharding::replicated(manual_mesh(), 1);
-        let varying = f32_vector(4).with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap();
+        // A permutation preserves its input type, including its layout and memory, and an empty permutation, which
+        // zeros every participant, is valid. An ordinary permutation also accepts an input that is invariant over a
+        // manual mesh axis with the same name, because a `batch` level that shadows that mesh axis may bind it.
+        let mesh = manual_mesh();
+        let sharding = Sharding::replicated(mesh.clone(), 1);
+        let vector = ArrayType::new_static(DataType::F32, [3]);
+        let invariant = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let varying = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let placed = varying
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
         check_operation_type_inference!(
             operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]),
             cases = [
-                { input_types = [f32_vector(3)], output_types = [f32_vector(3)] },
-                { input_types = [varying.clone()], output_types = [varying.clone()] },
+                { input_types = [vector.clone()], output_types = [vector.clone()] },
+                { input_types = [placed.clone()], output_types = [placed.clone()] },
+                { input_types = [invariant.clone()], output_types = [invariant.clone()] },
             ],
         );
         check_operation_type_inference!(
             operation = ParallelPermuteOperation::new("x".to_string(), 2, Vec::new()),
-            cases = [{ input_types = [f32_vector(3)], output_types = [f32_vector(3)] }],
+            cases = [{ input_types = [vector.clone()], output_types = [vector.clone()] }],
         );
 
         // Every pair must reference participants of the axis, and no two pairs may share a source or a target.
@@ -538,25 +645,53 @@ mod tests {
         ] {
             check_operation_type_inference!(
                 operation = ParallelPermuteOperation::new("x".to_string(), 2, pairs),
-                cases = [{ input_types = [f32_vector(3)], error = message }],
+                cases = [{ input_types = [vector.clone()], error = message }],
             );
         }
 
-        // An input that is invariant over the manual axis would wrongly type the permuted output as invariant, and
-        // inputs with a pending cross-device sum are rejected.
+        // A permutation over a manual mesh axis preserves a varying input type, but an input that is invariant over
+        // the axis would wrongly type the permuted output as invariant, so the input must vary over the axis of the
+        // operation's mesh. Inputs with a pending cross-device sum are rejected for every permutation.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let other_varying = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(other_mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(sharding.with_unreduced_axes(["y"]).unwrap())
+            .unwrap();
         check_operation_type_inference!(
-            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]),
+            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).with_mesh(mesh.clone()),
             cases = [
+                { input_types = [varying.clone()], output_types = [varying.clone()] },
                 {
-                    input_types = [f32_vector(4).with_sharding(sharding.clone()).unwrap()],
+                    input_types = [invariant],
                     error = "`parallel_permute` input must vary over manual axis `x`; pass an invariant value through \
                              `parallel_vary` first so that the permuted output is typed as varying",
                 },
                 {
-                    input_types = [f32_vector(4).with_sharding(sharding.with_unreduced_axes(["y"]).unwrap()).unwrap()],
-                    error = "`parallel_permute` does not support unreduced inputs",
+                    input_types = [vector],
+                    error = "`parallel_permute` input must carry a mesh containing manual axis `x`",
                 },
+                {
+                    input_types = [other_varying],
+                    error = "`parallel_permute` input mesh does not match the operation mesh",
+                },
+                { input_types = [unreduced], error = "`parallel_permute` does not support unreduced inputs" },
             ],
+        );
+
+        // The mesh axis must be manual, and its size must equal the axis size of the operation.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).with_mesh(explicit_mesh),
+            cases = [{ input_types = [varying.clone()], error = "`parallel_permute` mesh axis `x` must be manual" }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelPermuteOperation::new("x".to_string(), 3, vec![(0, 1)]).with_mesh(mesh),
+            cases = [{
+                input_types = [varying],
+                error = "`parallel_permute` axis size 3 does not match the size of manual mesh axis `x`",
+            }],
         );
     }
 
@@ -564,7 +699,7 @@ mod tests {
     fn test_parallel_permute_interpretation() {
         // Outside any binder, the single participant of a degenerate axis keeps its value only when it sends to itself,
         // and receives zeros otherwise, while a larger axis has no per-item semantics.
-        let context = EagerContext::<Array>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(
             ParallelPermuteOperation::new("x".to_string(), 1, vec![(0, 0)]).interpret(
@@ -593,6 +728,24 @@ mod tests {
                     .to_string(),
             }),
         );
+
+        // Even a degenerate collective validates its mapping before interpreting it as identity or zero.
+        assert_eq!(
+            context.bind(
+                ParallelPermuteOperation::new("x".to_string(), 1, vec![(1, 0)]),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_permute` pair (1, 0) is out of bounds for axis size 1",
+            ))),
+        );
+        assert_eq!(
+            context.bind(ParallelPermuteOperation::new("x".to_string(), 1, vec![(0, 0), (0, 0)]), Vec::new(), &[input]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_permute` pairs must have unique sources and targets but (0, 0) repeats one",
+            ))),
+        );
     }
 
     #[test]
@@ -600,27 +753,29 @@ mod tests {
         // A known input over a degenerate axis folds through interpretation, here into zeros for the untargeted
         // participant.
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
-        let program =
-            parallel_permute_program(ParallelPermuteOperation::new("x".to_string(), 1, Vec::new()), f32_vector(2));
+        let program = parallel_permute_program(
+            ParallelPermuteOperation::new("x".to_string(), 1, Vec::new()),
+            ArrayType::new_static(DataType::F32, [2]),
+        );
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap();
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Known(Array::vector(vec![0.0f32, 0.0]).unwrap())]);
 
         // A known input over a larger axis under an eager parent residualizes the operation, which has no per-item
         // value, so the residual program is the source program itself.
         let operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
-        let program = parallel_permute_program(operation.clone(), f32_vector(2));
+        let program = parallel_permute_program(operation.clone(), ArrayType::new_static(DataType::F32, [2]));
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input)]).unwrap();
         assert_eq!(evaluation.program().to_string(), program.to_string());
         assert!(evaluation.outputs()[0].is_unknown());
 
         // A known input under a staging parent stays known, because the operation is staged into the parent trace.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(f32_vector(2)));
+        let input = PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F32, [2])));
         let outputs = operation
             .partially_evaluate(&PartialEvaluationContext::new(trace), &EmptyRegionDriver, &[input])
             .unwrap();
         assert!(outputs[0].is_known());
-        assert_eq!(outputs[0].r#type().as_ref(), &f32_vector(2));
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2]));
     }
 
     #[test]
@@ -689,6 +844,18 @@ mod tests {
             }),
         );
 
+        // A permutation over a manual mesh axis cannot be consumed by a level that binds a batch axis with its name.
+        assert_eq!(
+            batch_parallel_permute(
+                &swap.clone().with_mesh(manual_mesh()),
+                2,
+                ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap(),
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_permute` over a manual mesh axis cannot bind a named batch axis".to_string(),
+            }),
+        );
+
         // A level that binds another axis forwards the permutation to its parent and preserves its mapped axis.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input =
@@ -711,8 +878,77 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 3] .
-                let %1:f32[2, 3] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
+                let %1:f32[2, 3] = \
+                    parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
                 in (%1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_permute_batching_sharding() {
+        // Route explicitly sharded participants using replicated singleton slices, restoring their original placement
+        // on the complete output. Ragged extents with the same placement must follow that routing too.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["devices"]), ShardingDimension::Replicated])
+                .unwrap();
+        let extent_sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap();
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged = |values: Vec<f64>, extents: Vec<i32>| {
+            ArrayBatch::new(Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(extents).unwrap().reshard(&extent_sharding).unwrap(),
+                    length.clone(),
+                    vec![0],
+                )])
+                .unwrap()
+        };
+        let input = ragged(vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0], vec![1, 3]);
+        let swap = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
+        let send = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
+        assert_eq!(
+            batch_parallel_permute(&swap, 2, input.clone()),
+            Ok(vec![ragged(vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0], vec![3, 1])]),
+        );
+        assert_eq!(
+            batch_parallel_permute(&send, 2, input),
+            Ok(vec![ragged(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0], vec![0, 1])]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_permute_batching_shadows_manual_axis() {
+        // The inner named batch binds `x`, so an invariant value on an enclosing manual mesh axis with the same name
+        // needs no mesh-axis variation to permute its local batch items.
+        let mesh = manual_mesh();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let input = BatchingTracer::new(context, ArrayBatch::new(input, BatchAxis::new(0))?);
+                Ok(input.parallel_permute("x", vec![(0, 1), (1, 0)])?.into_batch().into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output_type, input_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] .
+                let %1:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = \
+                        slice [start_indices=[1], limits=[2]] %0
+                    %2:f32[1][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = \
+                        slice [start_indices=[0], limits=[1]] %0
+                    %3:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = concatenate [axis=0] %1 %2
+                in (%3)"
             },
         );
     }
@@ -768,7 +1004,7 @@ mod tests {
             vec![
                 ArrayBatch::new(Array::matrix(2, 3, vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
                     .unwrap()
-                    .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![0i32, 1]).unwrap(), length, vec![0],)])
+                    .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![0i32, 1]).unwrap(), length, vec![0])])
                     .unwrap(),
             ],
         );
@@ -813,7 +1049,10 @@ mod tests {
         // The collective is linear, so the tangent rides the same permutation as the primal.
         let operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
         assert_eq!(
-            parallel_permute_program(operation.clone(), f32_vector(2)).jvp().unwrap().to_string(),
+            parallel_permute_program(operation.clone(), ArrayType::new_static(DataType::F32, [2]))
+                .jvp()
+                .unwrap()
+                .to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:f32[2] .
                 let %2:f32[2] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
@@ -824,7 +1063,7 @@ mod tests {
 
         // A structural zero tangent stays a structural zero, and only the primal permutation is staged.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = context.input(f32_vector(2));
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]));
         let outputs = operation
             .jvp(
                 &DifferentiationContext::fused(context.clone()),
@@ -851,6 +1090,29 @@ mod tests {
             }),
             Ok((Array::scalar(3.0).unwrap(), Array::vector(vec![1.0, 1.0, 0.0]).unwrap())),
         );
+
+        // Unequal output weights distinguish the routing direction; finite differences also check that an input
+        // which sends nowhere contributes no derivative.
+        check_gradient!(
+            |inputs| {
+                let routed = batch(
+                    |item| item.parallel_permute("x", vec![(0, 2), (2, 1)]),
+                    inputs,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                let last = routed.slice(&[2], &[3], &[1])?;
+                let last = last.clone() + last;
+                let last = last.clone() + last;
+                let middle = routed.slice(&[1], &[2], &[1])?;
+                let weighted = last + middle.clone() + middle;
+                weighted.reduce(&[0], ReductionKind::Sum)
+            },
+            at = Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
     }
 
     #[test]
@@ -859,7 +1121,7 @@ mod tests {
         // permutation with every pair inverted, and transposing it again recovers the original permutation.
         let program = parallel_permute_program(
             ParallelPermuteOperation::new("x".to_string(), 3, vec![(0, 1), (1, 2)]),
-            f32_vector(2),
+            ArrayType::new_static(DataType::F32, [2]),
         );
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
@@ -871,6 +1133,29 @@ mod tests {
             },
         );
         assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+
+        // A permutation over a manual mesh axis transposes over the same mesh.
+        let varying = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let program = parallel_permute_program(
+            ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).with_mesh(manual_mesh()),
+            varying,
+        );
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_permute [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    source_target_pairs=[(1, 0)],
+                    mesh=['x'=2:manual, 'y'=1:manual],
+                ] %0
+                in (%1)"
+            },
+        );
     }
 
     #[test]
@@ -902,6 +1187,19 @@ mod tests {
             Ok(Array::vector(vec![3.0, 0.0, 1.0]).unwrap()),
         );
 
+        // A composite value permutes through its array view.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let input = BatchingTracer::new(context, ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap());
+        assert_eq!(
+            input.parallel_permute("x", vec![(0, 2), (2, 0)]).map(|output| output.into_batch().into_value()),
+            Ok(ArrayIrValue::Array(Array::vector(vec![3.0f32, 0.0, 1.0]).unwrap())),
+        );
+
         // Over a manual mesh axis, a varying value is permuted directly, while an invariant value, and a value without
         // a sharding, are first made varying, because the permuted participants generally hold different values.
         let mesh = manual_mesh();
@@ -916,7 +1214,12 @@ mod tests {
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] .
                     let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
+                        parallel_permute [
+                        axis_name=\"x\",
+                        axis_size=2,
+                        source_target_pairs=[(0, 1)],
+                        mesh=['x'=2:manual, 'y'=1:manual],
+                    ] %0
                     in (%1)"
                 },
             ),
@@ -927,7 +1230,12 @@ mod tests {
                     let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
                             parallel_vary [axis_name=\"x\"] %0
                         %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
-                            parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %1
+                            parallel_permute [
+                            axis_name=\"x\",
+                            axis_size=2,
+                            source_target_pairs=[(0, 1)],
+                            mesh=['x'=2:manual, 'y'=1:manual],
+                        ] %1
                     in (%2)"
                 },
             ),
@@ -942,7 +1250,12 @@ mod tests {
                         %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
                             parallel_vary [axis_name=\"x\"] %1
                         %3:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
-                            parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %2
+                            parallel_permute [
+                            axis_name=\"x\",
+                            axis_size=2,
+                            source_target_pairs=[(0, 1)],
+                            mesh=['x'=2:manual, 'y'=1:manual],
+                        ] %2
                     in (%3)"
                 },
             ),
@@ -959,7 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_shuffle_parallel_shuffle() {
+    fn test_parallel_permute_parallel_shuffle() {
+        // Homogeneous array values expose the same convenience as projected and composite values.
+        let input = Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            batch(
+                |item| item.parallel_shuffle("x", &[2, 0, 1]),
+                input.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::vector(vec![3.0f32, 1.0, 2.0]).unwrap()),
+        );
+        assert_eq!(
+            batch(
+                |item| item.parallel_shuffle("x", &[]),
+                input,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::vector(vec![0.0f32, 0.0, 0.0]).unwrap()),
+        );
+
         // A composite value shuffles through its array view: output item `i` receives input item `permutation[i]`,
         // and a permutation shorter than the axis gives every remaining item zeros.
         let shuffle = |permutation: &[usize]| {

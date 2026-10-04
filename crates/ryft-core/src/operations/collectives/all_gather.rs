@@ -145,21 +145,10 @@ pub(crate) fn infer_explicit_all_gather_output_types(
         return Err(TypeError::invalid("`all_gather` expects an array followed by its output extents"));
     };
     let input_type = <&ArrayType>::try_from(input_type)?;
-    let (base_output_type, unchanged_input_axes) = match operation.options.mode {
-        CollectiveMode::Untiled => (
-            input_type.with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?,
-            (0..=input_type.rank())
-                .map(|axis| {
-                    if axis == operation.concat_axis {
-                        None
-                    } else if axis < operation.concat_axis {
-                        Some(axis)
-                    } else {
-                        Some(axis - 1)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
+    let base_output_type = match operation.options.mode {
+        CollectiveMode::Untiled => {
+            input_type.with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?
+        }
         CollectiveMode::Tiled => {
             if operation.concat_axis >= input_type.rank() {
                 return Err(TypeError::invalid(format!(
@@ -174,7 +163,7 @@ pub(crate) fn infer_explicit_all_gather_output_types(
             let mut output_type =
                 ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
             output_type.sharding = sharding;
-            (output_type, (0..input_type.rank()).map(|axis| (axis != operation.concat_axis).then_some(axis)).collect())
+            output_type
         }
     };
     let mut output_types = infer_explicit_shape_changing_collective_output_type(
@@ -182,8 +171,8 @@ pub(crate) fn infer_explicit_all_gather_output_types(
         false,
         input_types,
         base_output_type,
-        unchanged_input_axes.as_slice(),
-        |input_type, output_extents| {
+        &[operation.concat_axis],
+        |output_extents| {
             match operation.options.mode {
                 CollectiveMode::Untiled => {
                     let output_extent = &output_extents[operation.concat_axis];
@@ -1034,7 +1023,6 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
-    use crate::operations::collectives::tests::f32_vector;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError};
     use crate::tracing::TracingContext;
@@ -1045,7 +1033,7 @@ mod tests {
     fn test_all_gather_output_variance_updates_canonical_sharding_state() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying_sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
-        let input = f32_vector(3).with_sharding(varying_sharding).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [3]).with_sharding(varying_sharding).unwrap();
 
         let infer = |output_variance| {
             infer_explicit_all_gather_output_types(
@@ -1384,7 +1372,7 @@ mod tests {
         // A tiled all-gather is the adjoint of a sum-scatter over the same axis and dimension, so the pullback stages
         // a `parallel_sum_scatter` on the output cotangent with the gather's concat axis as its scatter axis.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(f32_vector(2));
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
         let output = builder
             .add_instruction(
                 AllGatherOperation::new(
@@ -1413,7 +1401,7 @@ mod tests {
 
         let groups = vec![vec![0, 2], vec![3, 1]];
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(f32_vector(2));
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
         let output = builder
             .add_instruction(
                 AllGatherOperation::new(
@@ -1438,7 +1426,7 @@ mod tests {
         // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation consumes that
         // state and returns the original varying input cotangent.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type = f32_vector(2)
+        let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -1584,8 +1572,8 @@ mod tests {
             operation = operation,
             cases = [
                 {
-                    input_types = [f32_vector(2)],
-                    output_types = [f32_vector(8)],
+                    input_types = [ArrayType::new_static(DataType::F32, [2])],
+                    output_types = [ArrayType::new_static(DataType::F32, [8])],
                 },
                 {
                     input_types = [ArrayType::scalar(DataType::F32)],
@@ -1611,7 +1599,7 @@ mod tests {
                 CollectiveOptions::tiled(),
                 AllGatherOutputVariance::Varying,
             ),
-            input_types = [f32_vector(2)],
+            input_types = [ArrayType::new_static(DataType::F32, [2])],
         );
     }
 

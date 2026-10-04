@@ -75,16 +75,13 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
             .without_dimension(operation.split_axis)?
             .0
             .with_inserted_dimension(operation.concat_axis, Dimension::Static(effective_axis_size))?;
-        let mut unchanged_input_axes =
-            (0..input_type.rank()).filter(|axis| *axis != operation.split_axis).map(Some).collect::<Vec<_>>();
-        unchanged_input_axes.insert(operation.concat_axis, None);
         return infer_explicit_shape_changing_collective_output_type(
             ALL_TO_ALL_OPERATION_NAME,
             false,
             input_types,
             output_type,
-            unchanged_input_axes.as_slice(),
-            |_, output_extents| {
+            &[operation.concat_axis],
+            |output_extents| {
                 let output_extent = &output_extents[operation.concat_axis];
                 if output_extent != &Dimension::Static(effective_axis_size) {
                     return Err(TypeError::invalid(format!(
@@ -119,8 +116,8 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
             false,
             input_types,
             input_type.clone(),
-            &(0..input_type.rank()).map(Some).collect::<Vec<_>>(),
-            |_, _| Ok(()),
+            &[],
+            |_| Ok(()),
         );
     }
     if operation.split_axis >= input_type.rank() || operation.concat_axis >= input_type.rank() {
@@ -138,16 +135,13 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
     let mut base_output_type =
         ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
     base_output_type.sharding = sharding;
-    let unchanged_input_axes = (0..input_type.rank())
-        .map(|axis| (axis != operation.split_axis && axis != operation.concat_axis).then_some(axis))
-        .collect::<Vec<_>>();
     infer_explicit_shape_changing_collective_output_type(
         ALL_TO_ALL_OPERATION_NAME,
         false,
         input_types,
         base_output_type,
-        unchanged_input_axes.as_slice(),
-        |input_type, output_extents| {
+        &[operation.split_axis, operation.concat_axis],
+        |output_extents| {
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (&input_type.shape().dimensions()[operation.split_axis], &output_extents[operation.split_axis])
             {

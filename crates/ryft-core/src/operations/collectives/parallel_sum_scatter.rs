@@ -17,6 +17,16 @@ use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::Assert;
+use crate::operations::collectives::all_gather::{AllGatherOperation, AllGatherOutputVariance};
+use crate::operations::collectives::parallel_vary::ParallelVary;
+use crate::operations::collectives::{
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
+    define_linear_collective_operation, explicit_collective_inputs, forward_explicit_collective,
+    forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
+    validate_explicit_collective_output_extents,
+};
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -29,17 +39,6 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::programs::{
     MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue, RegionInterface, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueProjection,
-};
-
-use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
-use super::parallel_vary::ParallelVary;
-use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    collective_output_extents, define_linear_collective_operation, explicit_collective_inputs,
-    forward_explicit_collective, forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
-    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
-    validate_explicit_collective_output_extents,
 };
 
 /// Canonical operation name for [`ParallelSumScatterOperation`].
@@ -57,8 +56,10 @@ define_linear_collective_operation!(
     ///   - [`CollectiveMode::Tiled`] requires the extent of `scatter_axis` to be divisible by `n` and divides it by
     ///     `n`, so that participant `i` receives the `i`-th contiguous chunk of the sum.
     ///
-    /// Inputs must be numeric (or structural zeros), and the sum accumulates in the input element type, without the
-    /// `f32` accumulation that [`ReductionKind::Sum`] documents for narrower floating-point `reduce` inputs.
+    /// Inputs must be numeric (or structural zeros). Cross-device sums accumulate in the input element type. A
+    /// matching `batch` level uses [`ReductionKind::Sum`] along its local participant axis; when interpreted eagerly
+    /// on [`Array`](crate::Array), this widens narrow floating-point accumulation to `f32` before rounding the
+    /// result back to the input element type. Its rounding can therefore differ from cross-device execution.
     /// Participant groups (refer to [`CollectiveOptions`]) restrict the sum and the scatter to each group.
     ///
     /// Over a manual mesh axis, every participant receives a different chunk, so the input must vary over the axis
@@ -82,57 +83,9 @@ define_linear_collective_operation!(
         /// Shared rank and participant-group semantics.
         options: CollectiveOptions,
     },
+    // TODO(eaplatanios): Review from here onwards.
     infer_output_type = |operation, input_type, dimensions| {
-        let effective_axis_size = operation.effective_axis_size()?;
-        let output_type = match operation.options.mode {
-            CollectiveMode::Untiled => {
-                let Some(dimension) = dimensions.get(operation.scatter_axis) else {
-                    return Err(TypeError::invalid(format!(
-                        "`{}` scatter axis {} is out of bounds for rank {}",
-                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                        operation.scatter_axis,
-                        dimensions.len(),
-                    )));
-                };
-                if *dimension != effective_axis_size {
-                    return Err(TypeError::invalid(format!(
-                        "`{}` untiled scatter axis {} size {} must equal group size {}",
-                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                        operation.scatter_axis,
-                        dimension,
-                        effective_axis_size,
-                    )));
-                }
-                input_type.without_dimension(operation.scatter_axis)?.0
-            }
-            CollectiveMode::Tiled => {
-                let mut output_dimensions = dimensions;
-                let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
-                    return Err(TypeError::invalid(format!(
-                        "`{}` scatter axis {} is out of bounds for rank {}",
-                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                        operation.scatter_axis,
-                        output_dimensions.len(),
-                    )));
-                };
-                if *dimension % effective_axis_size != 0 {
-                    return Err(TypeError::invalid(format!(
-                        "`{}` scatter axis {} size {} is not divisible by group size {}",
-                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                        operation.scatter_axis,
-                        *dimension,
-                        effective_axis_size,
-                    )));
-                }
-                *dimension /= effective_axis_size;
-                infer_linear_collective_operation_output_type(
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                    input_type,
-                    output_dimensions,
-                )?
-            }
-        };
-        parallel_sum_scatter_output_type(input_type, output_type, operation)
+        infer_parallel_sum_scatter_output_type(operation, input_type, dimensions, true)
     },
     interpret<C> where C::Value: Reshape {
         |operation, input| {
@@ -149,8 +102,6 @@ define_linear_collective_operation!(
     },
 );
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ParallelSumScatterOperation {
     /// Returns the axis of the input along which the summed result is scattered across the participants.
     #[inline]
@@ -165,6 +116,10 @@ impl ParallelSumScatterOperation {
     }
 
     /// Returns the participant count used for result-shape arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the axis size or participant groups violate [`CollectiveOptions`] requirements.
     #[inline]
     pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
         self.options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size)
@@ -202,7 +157,17 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let input_type = input.unbatched_type();
-        let (output_type, output_extents) = collective_output_extents(context, self, &input_type)?;
+        let dimensions = input_type
+            .static_shape()
+            .ok_or_else(|| TypeError::invalid("`parallel_sum_scatter` does not support dynamically shaped inputs"))?;
+        let output_type =
+            infer_parallel_sum_scatter_output_type(self, &input_type, dimensions.dimensions().to_vec(), false)?;
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(vec![batch_parallel_sum_scatter_matching_axis::<C, P>(
             self,
             context,
@@ -266,8 +231,11 @@ where
         ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
         validate_explicit_collective_output_extents(output_extents)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
-        let mut logical_output_types =
-            infer_explicit_parallel_sum_scatter_output_types(self, logical_input_types.as_slice())?;
+        let mut logical_output_types = infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
+            self,
+            logical_input_types.as_slice(),
+            context.axis_name() != Some(self.axis_name()),
+        )?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
         if context.axis_name() != Some(self.axis_name()) {
@@ -355,6 +323,32 @@ where
 /// is first made varying through [`ParallelVary`], so that every device's copy is counted, as with
 /// [`ParallelReduce::parallel_reduce`](super::ParallelReduce::parallel_reduce). The output extents are staged as
 /// explicit extent values, and a runtime assertion checks every extent that is not statically known.
+///
+/// # Examples
+///
+/// Sum two rows elementwise and give each batch item half of the summed row:
+///
+/// ```
+/// # use ryft_core::operations::collectives::ParallelSumScatter;
+/// # use ryft_core::{
+/// #     Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, BatchAxis, BatchAxisSpecification,
+/// #     BatchingTracer, EagerContext, batch,
+/// # };
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let rows = ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])?);
+/// let chunks = batch(
+///     |row: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatchingPolicy>| {
+///         row.parallel_sum_scatter_tiled("rows", 0)
+///     },
+///     rows,
+///     BatchAxis::new(0),
+///     BatchAxis::new(0),
+///     BatchAxisSpecification::named("rows"),
+/// )?;
+/// assert_eq!(chunks, ArrayIrValue::Array(Array::matrix(2, 2, vec![11.0, 22.0, 33.0, 44.0])?));
+/// # Ok(())
+/// # }
+/// ```
 pub trait ParallelSumScatter: Sized {
     /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
     /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed, so
@@ -493,21 +487,82 @@ where
     }
 }
 
+/// Infers the statically shaped output, optionally applying mesh-axis reduction and variance semantics. Matching
+/// named batches bind their own axis independently of the mesh and preserve the mesh state of their local inputs.
+fn infer_parallel_sum_scatter_output_type(
+    operation: &ParallelSumScatterOperation,
+    input_type: &ArrayType,
+    dimensions: Vec<usize>,
+    apply_mesh_axis_semantics: bool,
+) -> Result<ArrayType, TypeError> {
+    let effective_axis_size = operation.effective_axis_size()?;
+    let output_type = match operation.options.mode {
+        CollectiveMode::Untiled => {
+            let Some(dimension) = dimensions.get(operation.scatter_axis) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` scatter axis {} is out of bounds for rank {}",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                    operation.scatter_axis,
+                    dimensions.len(),
+                )));
+            };
+            if *dimension != effective_axis_size {
+                return Err(TypeError::invalid(format!(
+                    "`{}` untiled scatter axis {} size {} must equal group size {}",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME, operation.scatter_axis, dimension, effective_axis_size,
+                )));
+            }
+            input_type.without_dimension(operation.scatter_axis)?.0
+        }
+        CollectiveMode::Tiled => {
+            let mut output_dimensions = dimensions;
+            let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
+                return Err(TypeError::invalid(format!(
+                    "`{}` scatter axis {} is out of bounds for rank {}",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                    operation.scatter_axis,
+                    output_dimensions.len(),
+                )));
+            };
+            if *dimension % effective_axis_size != 0 {
+                return Err(TypeError::invalid(format!(
+                    "`{}` scatter axis {} size {} is not divisible by group size {}",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME, operation.scatter_axis, *dimension, effective_axis_size,
+                )));
+            }
+            *dimension /= effective_axis_size;
+            infer_linear_collective_operation_output_type(
+                PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                input_type,
+                output_dimensions,
+            )?
+        }
+    };
+    parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)
+}
+
 /// Validates the element data type and the manual variation of a sum-scatter input, and applies the reduction-state
 /// transition to the shape-only `output_type` shared by the static and explicit-extent inference paths. Ordinary inputs
 /// preserve their variance metadata. An input that is unreduced over the scattered manual axis is the cotangent of a
 /// reduced all-gather result, so the sum-scatter consumes that pending reduction and returns a value that varies over
-/// the manual axis.
+/// the manual axis. A matching local batch passes `apply_mesh_axis_semantics = false` because it does not perform a
+/// mesh exchange, even when it shadows a mesh axis with the same name; it preserves pending mesh sums and variance.
 fn parallel_sum_scatter_output_type(
     input_type: &ArrayType,
     mut output_type: ArrayType,
     operation: &ParallelSumScatterOperation,
+    apply_mesh_axis_semantics: bool,
 ) -> Result<ArrayType, TypeError> {
     let data_type = input_type.data_type();
     if !data_type.is_numeric() && data_type != DataType::Zero {
         return Err(TypeError::invalid(format!(
             "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` requires numeric inputs but got `{data_type}`",
         )));
+    }
+    // A matching batch performs only local array arithmetic. It neither consumes nor introduces mesh-axis
+    // reduction or variation state, including when its axis name shadows an enclosing mesh axis.
+    if !apply_mesh_axis_semantics {
+        return Ok(output_type);
     }
     if input_type.unreduced_axes().is_empty() {
         // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant over
@@ -551,6 +606,15 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
     operation: &ParallelSumScatterOperation,
     input_types: &[ArrayIrType],
 ) -> Result<Vec<ArrayIrType>, TypeError> {
+    infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(operation, input_types, true)
+}
+
+/// Infers explicit-extent outputs with the mesh-axis reduction and variance semantics required by the calling binder.
+fn infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
+    operation: &ParallelSumScatterOperation,
+    input_types: &[ArrayIrType],
+    apply_mesh_axis_semantics: bool,
+) -> Result<Vec<ArrayIrType>, TypeError> {
     let effective_axis_size = operation.effective_axis_size()?;
     let Some(input_type) = input_types.first() else {
         return Err(TypeError::invalid(format!(
@@ -576,19 +640,18 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
             )));
         }
         let base_output_type = input_type.without_dimension(operation.scatter_axis)?.0;
-        let unchanged_input_axes = (0..base_output_type.rank())
-            .map(|axis| if axis < operation.scatter_axis { Some(axis) } else { Some(axis + 1) })
-            .collect::<Vec<_>>();
         let mut output_types = infer_explicit_shape_changing_collective_output_type(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
             true,
             input_types,
             base_output_type,
-            unchanged_input_axes.as_slice(),
-            |_, _| Ok(()),
+            &[],
+            |_| Ok(()),
         )?;
         let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
-        return Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation)?.into()]);
+        return Ok(vec![
+            parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?.into(),
+        ]);
     }
     if operation.scatter_axis >= input_type.rank() {
         return Err(TypeError::invalid(format!(
@@ -597,22 +660,28 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
             input_type.rank(),
         )));
     }
+    if let Dimension::Static(input_extent) = &input_type.shape().dimensions()[operation.scatter_axis]
+        && *input_extent % effective_axis_size != 0
+    {
+        return Err(TypeError::invalid(format!(
+            "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {} size {input_extent} is not \
+             divisible by group size {effective_axis_size}",
+            operation.scatter_axis,
+        )));
+    }
     let mut dimensions = input_type.shape().dimensions().to_vec();
     dimensions[operation.scatter_axis] = Dimension::Static(0);
     let sharding = input_type.resized_sharding(dimensions.as_slice(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
     let mut base_output_type =
         ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
     base_output_type.sharding = sharding;
-    let unchanged_input_axes = (0..input_type.rank())
-        .map(|axis| (axis != operation.scatter_axis).then_some(axis))
-        .collect::<Vec<_>>();
     let mut output_types = infer_explicit_shape_changing_collective_output_type(
         PARALLEL_SUM_SCATTER_OPERATION_NAME,
         true,
         input_types,
         base_output_type,
-        unchanged_input_axes.as_slice(),
-        |input_type, output_extents| {
+        &[operation.scatter_axis],
+        |output_extents| {
             let rank = input_type.rank();
             let Some(input_extent) = input_type.shape().dimensions().get(operation.scatter_axis) else {
                 return Err(TypeError::invalid(format!(
@@ -623,13 +692,6 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
             if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                 (input_extent, &output_extents[operation.scatter_axis])
             {
-                if *input_extent % effective_axis_size != 0 {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {} size {input_extent} is not \
-                         divisible by group size {effective_axis_size}",
-                        operation.scatter_axis,
-                    )));
-                }
                 let expected = *input_extent / effective_axis_size;
                 if *output_extent != expected {
                     return Err(TypeError::invalid(format!(
@@ -643,8 +705,14 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
             Ok(())
         },
     )?;
-    let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
-    Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation)?.into()])
+    let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+    // Check the actual result geometry: the placeholder zero above cannot establish explicit-sharding divisibility.
+    output_type.sharding =
+        input_type.resized_sharding(output_type.shape().dimensions(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
+    if output_type.shape() == input_type.shape() {
+        output_type = output_type.with_layout(input_type.layout().cloned());
+    }
+    Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?.into()])
 }
 
 /// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
@@ -719,18 +787,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use half::f16;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, LogicalMesh, MeshAxis, RaggedAxis,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis,
+        RaggedAxis, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{TranspositionContext, transpose_mixed_operation};
+    use crate::differentiation::{DifferentiationTracer, TranspositionContext, transpose_mixed_operation};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_type_inference;
-    use crate::operations::collectives::tests::f32_vector;
+    use crate::macros::{check_gradient, check_operation_type_inference};
+    use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
@@ -740,16 +810,6 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
-
-    /// Returns the static `f32` matrix type with the provided number of rows and columns.
-    fn f32_matrix(rows: usize, columns: usize) -> ArrayType {
-        ArrayType::new_static(DataType::F32, [rows, columns])
-    }
-
-    /// Returns the type of the explicit extent value `extent` of the composite array/dimension family.
-    fn extent_type(extent: usize) -> ArrayIrType {
-        DimensionValue::constant(extent).unwrap().r#type().into_owned().into()
-    }
 
     /// Creates a manual mesh whose axis `"x"` has two participants and whose axis `"y"` has one.
     fn manual_mesh() -> LogicalMesh {
@@ -789,17 +849,9 @@ mod tests {
     fn test_parallel_sum_scatter() {
         let operation = ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::tiled());
         assert_eq!(operation.name(), PARALLEL_SUM_SCATTER_OPERATION_NAME);
-        assert_eq!(operation.axis_name(), "x");
-        assert_eq!(operation.axis_size(), 4);
         assert_eq!(operation.scatter_axis(), 1);
         assert_eq!(operation.options(), &CollectiveOptions::tiled());
         assert_eq!(operation.effective_axis_size(), Ok(4));
-        assert_eq!(
-            operation.to_string(),
-            "parallel_sum_scatter [axis_name=\"x\", axis_size=4, scatter_axis=1, options=Tiled]",
-        );
-        assert_eq!(operation, operation.clone());
-        assert_ne!(operation, ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()));
 
         // Participant groups restrict the effective axis size to the size of one group.
         let grouped = ParallelSumScatterOperation::new(
@@ -818,13 +870,16 @@ mod tests {
         check_operation_type_inference!(
             operation = ParallelSumScatterOperation::new("x".to_string(), 4, 0, CollectiveOptions::tiled()),
             cases = [
-                { input_types = [f32_vector(8)], output_types = [f32_vector(2)] },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [8])],
+                    output_types = [ArrayType::new_static(DataType::F32, [2])],
+                },
                 {
                     input_types = [ArrayType::new_static(DataType::Zero, [8])],
                     output_types = [ArrayType::new_static(DataType::Zero, [2])],
                 },
                 {
-                    input_types = [f32_vector(6)],
+                    input_types = [ArrayType::new_static(DataType::F32, [6])],
                     error = "`parallel_sum_scatter` scatter axis 0 size 6 is not divisible by group size 4",
                 },
                 {
@@ -840,9 +895,12 @@ mod tests {
         check_operation_type_inference!(
             operation = ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
             cases = [
-                { input_types = [f32_matrix(3, 4)], output_types = [f32_vector(3)] },
                 {
-                    input_types = [f32_matrix(4, 3)],
+                    input_types = [ArrayType::new_static(DataType::F32, [3, 4])],
+                    output_types = [ArrayType::new_static(DataType::F32, [3])],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [4, 3])],
                     error = "`parallel_sum_scatter` untiled scatter axis 1 size 3 must equal group size 4",
                 },
             ],
@@ -854,15 +912,20 @@ mod tests {
                 0,
                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
             ),
-            cases = [{ input_types = [f32_vector(6)], output_types = [f32_vector(3)] }],
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [6])],
+                output_types = [ArrayType::new_static(DataType::F32, [3])],
+            }],
         );
 
         // Over a manual mesh axis, every participant receives a different chunk, so an invariant input is rejected and
         // a varying input keeps its variation. An input that is unreduced over the operation's own axis has its pending
         // sum completed and its output varies over the axis, while any other unreduced axis is rejected.
         let sharding = Sharding::replicated(manual_mesh(), 1);
-        let with_sharding = |sharding: Sharding| f32_vector(4).with_sharding(sharding).unwrap();
-        let output_with_sharding = |sharding: Sharding| f32_vector(2).with_sharding(sharding).unwrap();
+        let with_sharding =
+            |sharding: Sharding| ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let output_with_sharding =
+            |sharding: Sharding| ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding).unwrap();
         let varying = sharding.clone().with_varying_manual_axes(["x"]).unwrap();
         check_operation_type_inference!(
             operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
@@ -892,14 +955,21 @@ mod tests {
         assert_eq!(
             infer_explicit_parallel_sum_scatter_output_types(
                 &ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[ArrayType::new_static(DataType::F32, [2, 4, 3]).into(), extent_type(2), extent_type(3)],
+                &[
+                    ArrayType::new_static(DataType::F32, [2, 4, 3]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into()
+                ],
             ),
-            Ok(vec![f32_matrix(2, 3).into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2, 3]).into()]),
         );
         assert_eq!(
             infer_explicit_parallel_sum_scatter_output_types(
                 &ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[f32_matrix(2, 5).into(), extent_type(2)],
+                &[
+                    ArrayType::new_static(DataType::F32, [2, 5]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into()
+                ],
             ),
             Err(TypeError::invalid("`parallel_sum_scatter` untiled scatter axis 1 size 5 must equal group size 4")),
         );
@@ -911,9 +981,12 @@ mod tests {
                     0,
                     CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
                 ),
-                &[f32_vector(6).into(), extent_type(3)],
+                &[
+                    ArrayType::new_static(DataType::F32, [6]).into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into()
+                ],
             ),
-            Ok(vec![f32_vector(3).into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [3]).into()]),
         );
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
         let output_axis = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
@@ -927,7 +1000,7 @@ mod tests {
                     )
                     .into(),
                     ArrayIrType::Dimension(DimensionType::from(output_axis.clone())),
-                    extent_type(3),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![
@@ -938,9 +1011,57 @@ mod tests {
         assert_eq!(
             infer_explicit_parallel_sum_scatter_output_types(
                 &ParallelSumScatterOperation::new("x".to_string(), 0, 0, CollectiveOptions::tiled()),
-                &[f32_vector(3).into(), extent_type(3)],
+                &[
+                    ArrayType::new_static(DataType::F32, [3]).into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into()
+                ],
             ),
             Err(TypeError::invalid("`parallel_sum_scatter` axis size must be greater than zero")),
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_type_inference_metadata() {
+        let operation = ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled());
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), Ok(vec![input_type.clone()]));
+        assert_eq!(
+            infer_explicit_parallel_sum_scatter_output_types(
+                &operation,
+                &[input_type.clone().into(), DimensionValue::constant(2).unwrap().r#type().into_owned().into()],
+            ),
+            Ok(vec![input_type.into()]),
+        );
+
+        // A known invalid input extent remains invalid when the caller supplies a dynamic output extent.
+        let output_extent = DimensionVariable::new("output", DimensionBounds::unbounded());
+        assert_eq!(
+            infer_explicit_parallel_sum_scatter_output_types(
+                &ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
+                &[
+                    ArrayType::new_static(DataType::F32, [3]).into(),
+                    ArrayIrType::Dimension(DimensionType::from(output_extent)),
+                ],
+            ),
+            Err(TypeError::invalid("`parallel_sum_scatter` scatter axis 0 size 3 is not divisible by group size 2")),
+        );
+
+        // Validate explicit sharding against the final result extent rather than the temporary shape placeholder.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert_eq!(
+            infer_explicit_parallel_sum_scatter_output_types(
+                &ParallelSumScatterOperation::new("y".to_string(), 4, 0, CollectiveOptions::tiled()),
+                &[input_type.into(), DimensionValue::constant(1).unwrap().r#type().into_owned().into()],
+            ),
+            Err(TypeError::invalid(
+                "`parallel_sum_scatter` on a dimension sharded over explicit mesh axes requires the output size \
+                 (1) at axis 0 to be divisible by the mesh-axis product (2)",
+            )),
         );
     }
 
@@ -1006,7 +1127,7 @@ mod tests {
         let input = Array::matrix(1, 2, vec![1.0f32, 2.0]).unwrap();
         let program = parallel_sum_scatter_program(
             ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::default()),
-            f32_matrix(1, 2),
+            ArrayType::new_static(DataType::F32, [1, 2]),
         );
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap();
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Known(Array::vector(vec![1.0f32, 2.0]).unwrap())]);
@@ -1014,19 +1135,19 @@ mod tests {
         // A known input over a larger axis under an eager parent residualizes the operation, which has no per-item
         // value, so the residual program is the source program itself.
         let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 1, CollectiveOptions::tiled());
-        let program = parallel_sum_scatter_program(operation.clone(), f32_matrix(1, 2));
+        let program = parallel_sum_scatter_program(operation.clone(), ArrayType::new_static(DataType::F32, [1, 2]));
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input)]).unwrap();
         assert_eq!(evaluation.program().to_string(), program.to_string());
         assert!(evaluation.outputs()[0].is_unknown());
 
         // A known input under a staging parent stays known, because the operation is staged into the parent trace.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(f32_matrix(1, 2)));
+        let input = PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F32, [1, 2])));
         let outputs = operation
             .partially_evaluate(&PartialEvaluationContext::new(trace), &EmptyRegionDriver, &[input])
             .unwrap();
         assert!(outputs[0].is_known());
-        assert_eq!(outputs[0].r#type().as_ref(), &f32_matrix(1, 1));
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::new_static(DataType::F32, [1, 1]));
     }
 
     #[test]
@@ -1047,6 +1168,33 @@ mod tests {
         assert_eq!(
             batch_parallel_sum_scatter(&untiled, 2, mapped(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap())),
             Ok(vec![mapped(Array::vector(vec![4.0, 6.0]).unwrap())]),
+        );
+
+        // Eager matching batches use the ordinary local sum kernel, whose narrow floating-point accumulator is
+        // `f32`. The cancellation retains a unit contribution that element-type accumulation could round away.
+        let narrow = Array::matrix(
+            3,
+            3,
+            vec![
+                f16::from_f32(2048.0),
+                f16::ZERO,
+                f16::ZERO,
+                f16::ONE,
+                f16::ZERO,
+                f16::ZERO,
+                f16::from_f32(-2048.0),
+                f16::ZERO,
+                f16::ZERO,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            batch_parallel_sum_scatter(
+                &ParallelSumScatterOperation::new("x".to_string(), 3, 0, CollectiveOptions::default()),
+                3,
+                mapped(narrow),
+            ),
+            Ok(vec![mapped(Array::vector(vec![f16::ONE, f16::ZERO, f16::ZERO]).unwrap())]),
         );
 
         // A replicated input holds the same value for every item, so every item's copy is counted in the sum.
@@ -1087,7 +1235,7 @@ mod tests {
         for (operation, input_type, batch_axis, expected) in [
             (
                 tiled.clone(),
-                f32_matrix(3, 4),
+                ArrayType::new_static(DataType::F32, [3, 4]),
                 BatchAxis::new(0),
                 indoc! {"
                     lambda %0:f32[3, 4] .
@@ -1097,7 +1245,7 @@ mod tests {
             ),
             (
                 ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default()),
-                f32_matrix(2, 3),
+                ArrayType::new_static(DataType::F32, [2, 3]),
                 BatchAxis::new(1),
                 indoc! {"
                     lambda %0:f32[2, 3] .
@@ -1149,17 +1297,122 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_sum_scatter_batching_shadows_manual_axis() {
+        // An inner named batch binds `x` independently of a manual mesh axis with the same name. Its local sums
+        // preserve invariant mesh variance and pending mesh sums instead of introducing or consuming mesh state.
+        let mesh = manual_mesh();
+        let sharding = Sharding::replicated(mesh.clone(), 2);
+        for sharding in [sharding.clone(), sharding.with_unreduced_axes(["x"]).unwrap()] {
+            let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
+            let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
+            let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                        .with_axis_name("x".to_string());
+                    let input = ArrayBatch::new(input, BatchAxis::new(0))?;
+                    let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                    let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                    Ok(outputs.remove(0).into_value())
+                },
+                input_type.clone(),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+            assert_eq!(output_type, expected_type);
+            assert_eq!(
+                program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+                vec!["reduce", "reshape"],
+            );
+
+            // Differentiation inside the batch keeps a structural-zero tangent and lets the batch binder resolve
+            // the shadowed name instead of rejecting the primal in standalone operation inference.
+            let (differentiated_output_type, _) =
+                TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                    |input| {
+                        let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                            .with_axis_name("x".to_string());
+                        let item =
+                            BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                        let context = DifferentiationContext::fused(batch_context);
+                        let item = DifferentiationTracer::new(
+                            DifferentiationDual::new_with_zero_tangent(item)?,
+                            context.clone(),
+                        );
+                        let operation =
+                            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                        let mut outputs = context.bind(operation, Vec::new(), &[item])?;
+                        let output = outputs.remove(0);
+                        assert!(output.tangent().is_zero());
+                        Ok(output.primal().clone().into_batch().into_value())
+                    },
+                    input_type.clone(),
+                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                )
+                .unwrap();
+            assert_eq!(differentiated_output_type, expected_type);
+
+            // The composite family's explicit output extents use the same local batching rule.
+            let (output_type, _) =
+                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                    |input| {
+                        batch(
+                            |item| item.parallel_sum_scatter_tiled("x", 0),
+                            input,
+                            BatchAxis::new(0),
+                            BatchAxis::new(0),
+                            BatchAxisSpecification::named("x"),
+                        )
+                        .map_err(Into::into)
+                    },
+                    ArrayIrType::Array(input_type),
+                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                )
+                .unwrap();
+            assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        }
+    }
+
+    #[test]
     fn test_parallel_sum_scatter_differentiation() {
         // The collective is linear, so the tangent rides the same sum-scatter as the primal.
         let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
         assert_eq!(
-            parallel_sum_scatter_program(operation, f32_vector(4)).jvp().unwrap().to_string(),
+            parallel_sum_scatter_program(operation, ArrayType::new_static(DataType::F32, [4]))
+                .jvp()
+                .unwrap()
+                .to_string(),
             indoc! {"
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:f32[2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0
                     %3:f32[2] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %1
                 in (%2, %3)"
             },
+        );
+
+        // Distinct weights on the participants' output chunks verify that the pullback gathers each chunk's
+        // cotangent to every summand, including when the physical batch axis follows the scatter axis.
+        check_gradient!(
+            |inputs| {
+                let scattered = batch(
+                    |item| {
+                        let operation =
+                            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                        let mut outputs = item.dispatch_domain().bind(operation, Vec::new(), &[item])?;
+                        Ok::<_, ProgramError>(outputs.remove(0))
+                    },
+                    inputs,
+                    BatchAxis::new(1),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                let first = scattered.slice(&[0, 0], &[1, 2], &[1, 1])?;
+                let second = scattered.slice(&[1, 0], &[2, 2], &[1, 1])?;
+                let weighted = first + second.clone() + second;
+                weighted.reduce(&[0, 1], ReductionKind::Sum)
+            },
+            at = Array::matrix(4, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
         );
 
         // The composite family linearizes a sum-scatter with an explicit extent into a linear call whose pullback, over
@@ -1203,7 +1456,7 @@ mod tests {
         // cotangent into a varying all-gather, and transposing that recovers the sum-scatter.
         let program = parallel_sum_scatter_program(
             ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
-            f32_vector(8),
+            ArrayType::new_static(DataType::F32, [8]),
         );
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
@@ -1225,9 +1478,12 @@ mod tests {
         // The composite family transposes the array input through the same all-gather and gives the explicit extent a
         // structural-zero cotangent.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let output_cotangent = context.input(f32_vector(3).into());
+        let output_cotangent = context.input(ArrayType::new_static(DataType::F32, [3]).into());
         let mut context = TranspositionContext::new(context);
-        let inputs = [PartialValue::Unknown(f32_vector(3).into()), PartialValue::Unknown(extent_type(3))];
+        let inputs = [
+            PartialValue::Unknown(ArrayType::new_static(DataType::F32, [3]).into()),
+            PartialValue::Unknown(DimensionValue::constant(3).unwrap().r#type().into_owned().into()),
+        ];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         transpose_mixed_operation(
             &mut context,
@@ -1275,42 +1531,31 @@ mod tests {
 
         // Over a manual mesh axis, the capability stages the output extents and the sum-scatter for a varying value
         // directly, while an invariant value, and a value without a sharding, are first made varying, so that every
-        // copy is counted. A dynamic scatter extent is checked by a staged runtime assertion.
+        // copy is counted. A static scatter extent stages only its result extent, while a dynamic one is checked by a
+        // staged runtime assertion.
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 1);
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(5)).unwrap());
         for (input_type, expected) in [
             (
-                f32_vector(4).with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap(),
+                ArrayType::new_static(DataType::F32, [4])
+                    .with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap())
+                    .unwrap(),
                 indoc! {"
                     lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
-                    let %1:dimension<4> = constant [value=4]
-                        %2:dimension<2> = constant [value=2]
-                        %3:dimension<0> = constant [value=0]
-                        %4:dimension<1> = constant [value=1]
-                        %5:bool[] = const true
-                        %6:dimension<0> = dimension_rem %1 %2
-                        %7:bool[] = const true
-                        %8:dimension<2> = dimension_div %1 %2
-                        %9:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0 %8
-                    in (%9)"
+                    let %1:dimension<2> = constant [value=2]
+                        %2:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0 %1
+                    in (%2)"
                 },
             ),
             (
-                f32_vector(4).with_sharding(sharding).unwrap(),
+                ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap(),
                 indoc! {"
                     lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] .
                     let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
-                        %2:dimension<4> = constant [value=4]
-                        %3:dimension<2> = constant [value=2]
-                        %4:dimension<0> = constant [value=0]
-                        %5:dimension<1> = constant [value=1]
-                        %6:bool[] = const true
-                        %7:dimension<0> = dimension_rem %2 %3
-                        %8:bool[] = const true
-                        %9:dimension<2> = dimension_div %2 %3
-                        %10:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %1 %9
-                    in (%10)"
+                        %2:dimension<2> = constant [value=2]
+                        %3:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %1 %2
+                    in (%3)"
                 },
             ),
             (
@@ -1325,17 +1570,15 @@ mod tests {
                         %3:dimension<items ∈ [1, 5)> = dimension_size [axis=0] %2
                         %4:dimension<2> = constant [value=2]
                         %5:dimension<0> = constant [value=0]
-                        %6:dimension<1> = constant [value=1]
-                        %7:bool[] = const true
-                        %8:dimension<items % 2 ∈ [0, 2)> = dimension_rem %3 %4
-                        %9:bool[] = compare [direction=Equal] %8 %5
+                        %6:dimension<items % 2 ∈ [0, 2)> = dimension_rem %3 %4
+                        %7:bool[] = compare [direction=Equal] %6 %5
                         () = assert [
                             message=\"collective extent must be divisible by the participant count\",
                             labels=[\"extent\", \"divisor\"],
-                        ] %9 %3 %4
-                        %10:dimension<items / 2 ∈ [0, 3)> = dimension_div %3 %4
-                        %11:f32[items / 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %2 %10
-                    in (%11)"
+                        ] %7 %3 %4
+                        %8:dimension<items / 2 ∈ [0, 3)> = dimension_div %3 %4
+                        %9:f32[items / 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %2 %8
+                    in (%9)"
                 },
             ),
         ] {
@@ -1345,7 +1588,6 @@ mod tests {
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
             )
             .unwrap();
-            println!("CAPTURE\n{program}\nEND");
             assert_eq!(program.to_string(), expected);
         }
     }
