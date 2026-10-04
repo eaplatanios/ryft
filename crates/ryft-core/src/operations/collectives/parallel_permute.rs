@@ -184,7 +184,7 @@ impl<
         }
 
         let input = P::match_axis(context, input, 0.into())?;
-        let permuted = permute_participant_axis(input.value(), 0, sources.as_slice())?;
+        let permuted = route_axis_slices(input.value(), 0, sources.as_slice())?;
         let ragged_axes = input
             .ragged_axes()
             .iter()
@@ -193,13 +193,13 @@ impl<
                 // untargeted participant receives zero metadata together with its zero-filled packed value.
                 let mut extent_axes = ragged_axis.extent_axes().to_vec();
                 let extents = if let Some(extent_axis) = extent_axes.iter().position(|axis| *axis == 0) {
-                    permute_participant_axis(ragged_axis.extents(), extent_axis, sources.as_slice())?
+                    route_axis_slices(ragged_axis.extents(), extent_axis, sources.as_slice())?
                 } else if has_untargeted_participant {
                     let extents =
                         P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?
                             .into_value();
                     extent_axes.insert(0, 0);
-                    permute_participant_axis(&extents, 0, sources.as_slice())?
+                    route_axis_slices(&extents, 0, sources.as_slice())?
                 } else {
                     ragged_axis.extents().clone()
                 };
@@ -372,8 +372,20 @@ where
     }
 }
 
-/// Applies one participant permutation to `axis` of a packed value, filling untargeted destinations with zeros.
-fn permute_participant_axis<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose>(
+/// Returns `value` with its slices along `axis` routed from their source positions to their target positions: slice
+/// `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when `sources[target]` is `None`.
+/// The result has `sources.len()` slices along `axis` and otherwise the shape of `value`. For example, routing the rows
+/// `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
+///
+/// The batching rule of [`ParallelPermuteOperation`] applies this function along the batch axis, where every slice is
+/// one batch item, both to the packed values and to the extents of their bounded ragged axes, so that the extents move
+/// together with their values and untargeted items receive zero extents together with their zero-filled values.
+///
+/// # Errors
+///
+/// Returns a [`BatchingError`] if `value` is not statically shaped, or if staging one of the slices, the zero slice, or
+/// the concatenation fails.
+fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose>(
     value: &V,
     axis: usize,
     sources: &[Option<usize>],

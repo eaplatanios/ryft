@@ -1382,17 +1382,13 @@ mod tests {
     };
     use crate::batching::BatchableOperation;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{MemberDifferentiableOperation, transpose_mixed_operation};
+    use crate::differentiation::MemberDifferentiableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::all_gather::{
         AllGatherOperation, AllGatherOutputVariance, infer_explicit_all_gather_output_types,
     };
     use crate::operations::collectives::all_to_all::{AllToAllOperation, infer_explicit_all_to_all_output_types};
-    use crate::operations::collectives::parallel_sum_scatter::{
-        ParallelSumScatterOperation, infer_explicit_parallel_sum_scatter_output_types,
-    };
     use crate::parameters::Placeholder;
-    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::TracingContext;
 
@@ -1446,17 +1442,10 @@ mod tests {
         let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
             infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
+                &AllGatherOperation::new("x".to_string(), 4, 0, grouped, AllGatherOutputVariance::Varying,),
                 &[f32_vector(3).into(), result_extent.into(),],
             ),
             Ok(vec![f32_vector(6).into()]),
-        );
-        assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 4, 0, grouped),
-                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
-            ),
-            Ok(vec![f32_vector(3).into()]),
         );
     }
 
@@ -1499,29 +1488,6 @@ mod tests {
                 .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
         );
 
-        // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
-        // the explicit extent input a structural-zero cotangent.
-        let context = Context::new();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let output_cotangent = context.input(array_type.clone().into());
-        let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
-        let mut context = crate::differentiation::TranspositionContext::new(context);
-        let inputs = [PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())];
-        let accumulators = context.cotangent_accumulators(&inputs, &[])?;
-        transpose_mixed_operation(
-            &mut context,
-            &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
-            &inputs,
-            &[MaybeZero::Value(output_cotangent)],
-            &accumulators,
-        )?;
-        let cotangents = context.take_cotangents(&accumulators)?;
-        assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
-        assert!(matches!(
-            context.builder().borrow().instructions()[0].operation(),
-            ArrayIrOperation::Array(ArrayOperation::AllGather(_)),
-        ));
-
         Ok(())
     }
 
@@ -1548,17 +1514,6 @@ mod tests {
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[
-                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
-            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()]),
-        );
-        assert_eq!(
             infer_explicit_all_to_all_output_types(
                 &AllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
                 &[
@@ -1581,16 +1536,6 @@ mod tests {
                 ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
-        );
-        assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
-                &[
-                    shape(vec![Dimension::Static(2), Dimension::Static(5)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                ],
-            ),
-            Err(TypeError::invalid("`parallel_sum_scatter` untiled scatter axis 1 size 5 must equal group size 4",)),
         );
     }
 
@@ -1623,23 +1568,6 @@ mod tests {
                 ArrayType::new(
                     DataType::F32,
                     Shape::new(vec![Dimension::Dynamic(concat_result.clone()), Dimension::Static(3)]),
-                )
-                .into()
-            ]),
-        );
-        assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
-                &[
-                    input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
-            Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(split_result.clone()), Dimension::Static(3)]),
                 )
                 .into()
             ]),
@@ -1706,13 +1634,6 @@ mod tests {
                     .to_string(),
             )),
         );
-        assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
-                &[f32_vector(3).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
-            ),
-            Err(TypeError::invalid("`parallel_sum_scatter` axis size must be greater than zero")),
-        );
     }
 
     #[test]
@@ -1736,15 +1657,6 @@ mod tests {
         assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
 
-        let scattered = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
-            .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(scattered[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(scattered[0].value(), &Array::vector(vec![4.0_f32, 6.0]).unwrap());
-        assert_eq!(scattered[0].unbatched_type(), ArrayType::scalar(DataType::F32));
-
         let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
             .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
             .unwrap()
@@ -1758,23 +1670,6 @@ mod tests {
     fn test_shape_changing_collective_transposes_are_involutive() {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(f32_vector(8));
-        let output = builder
-            .add_instruction(
-                ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let transposed_twice =
-            program.transpose_with_respect_to(&[0], &[]).unwrap().transpose_with_respect_to(&[0], &[]).unwrap();
-        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
-        assert_eq!(transposed_twice.input_types(), program.input_types());
-        assert_eq!(transposed_twice.output_types(), program.output_types());
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder
@@ -1810,14 +1705,6 @@ mod tests {
                     CollectiveOptions::tiled(),
                     AllGatherOutputVariance::Varying
                 ),
-                Vec::new(),
-                &[input.clone(), extent.clone()],
-            ),
-            Ok(vec![input.clone()]),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 &[input.clone(), extent.clone()],
             ),
@@ -1879,16 +1766,6 @@ mod tests {
                 message: "cannot interpret `all_gather` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
             },
-        );
-        assert_eq!(
-            context
-                .bind(
-                    ParallelSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
-                    Vec::new(),
-                    &[input.clone(), extent.clone()],
-                )
-                .unwrap_err(),
-            ProgramError::Type(TypeError::invalid("`parallel_sum_scatter` axis size must be greater than zero")),
         );
 
         check_operation_partial_evaluation!(
@@ -1985,39 +1862,6 @@ mod tests {
 
     #[test]
     fn test_array_ir_shape_changing_collective_linearization() {
-        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dimension_type = DimensionType::from(variable.clone());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let array = builder.add_input(array_type.into());
-        let result_extent = builder.add_input(dimension_type.clone().into());
-        let output = builder
-            .add_instruction(
-                ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                vec![array, result_extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
-        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
-        let mut pullback_inputs = vec![cotangent.clone()];
-        pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
-
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
         let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));

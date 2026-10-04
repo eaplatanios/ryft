@@ -41,8 +41,8 @@ use super::{
     collective_input_extents, collective_output_extents, define_linear_collective_operation, divided_collective_extent,
     explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
     impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    infer_linear_collective_operation_output_type, multiplied_collective_extent, require_collective_axis_divisible,
+    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, require_collective_axis_divisible,
     require_collective_axis_extent, resolve_named_axis_size, validate_explicit_collective_output_extents,
 };
 
@@ -257,6 +257,19 @@ define_linear_collective_operation!(
                     TypeError::invalid("`all_to_all` concatenation result extent does not fit in usize".to_string())
                 })?;
             infer_linear_collective_operation_output_type(ALL_TO_ALL_OPERATION_NAME, input_type, output_dimensions)
+        }
+    },    interpret<C> where C::Value: Reshape {
+        |operation, input| {
+            // A single participant exchanges chunks only with itself. Untiled mode removes the size-one split axis and
+            // inserts a size-one concatenation axis, which a reshape to the inferred output type expresses, while tiled
+            // mode leaves the shape unchanged.
+            match operation.options.mode {
+                CollectiveMode::Tiled => Ok(input.clone()),
+                CollectiveMode::Untiled => {
+                    let output_type = operation.infer_output_types(&[input.r#type().into_owned()], &[])?.remove(0);
+                    input.reshape_with_output_sharding(output_type.shape().clone(), output_type.sharding().cloned())
+                }
+            }
         }
     },
 );
@@ -719,6 +732,7 @@ mod tests {
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramError};
     use crate::tracing::TracingContext;
@@ -837,6 +851,42 @@ mod tests {
                     error = "`all_to_all` split axis 0 size 6 is not divisible by group size 4",
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_all_to_all_interpretation() {
+        // A single participant exchanges chunks only with itself, so tiled mode is the identity, while untiled mode
+        // removes the size-one split axis and inserts a size-one concatenation axis. Any larger axis has no per-item
+        // semantics outside an enclosing binder.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let input = Array::matrix(1, 2, vec![1.0, 2.0]).unwrap();
+        assert_eq!(
+            AllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()).interpret(
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            AllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default()).interpret(
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![Array::matrix(2, 1, vec![1.0, 2.0]).unwrap()]),
+        );
+        assert_eq!(
+            AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()).interpret(
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot interpret `all_to_all` over axis `x` of size 2 without an enclosing binder"
+                    .to_string(),
+            }),
         );
     }
 

@@ -47,8 +47,8 @@ use super::{
     collective_input_extents, collective_output_extents, define_linear_collective_operation,
     explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
     impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    infer_linear_collective_operation_output_type, multiplied_collective_extent, resolve_named_axis_size,
+    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, resolve_named_axis_size,
     validate_explicit_collective_output_extents,
 };
 
@@ -275,6 +275,18 @@ define_linear_collective_operation!(
             }
         };
         all_gather_output_type(input_type, output_type, operation)
+    },    interpret<C> where C::Value: Reshape {
+        |operation, input| {
+            // A single participant gathers only its own value. Untiled mode inserts a size-one gathered axis, which a
+            // reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
+            match operation.options.mode {
+                CollectiveMode::Tiled => Ok(input.clone()),
+                CollectiveMode::Untiled => {
+                    let output_type = operation.infer_output_types(&[input.r#type().into_owned()], &[])?.remove(0);
+                    input.reshape_with_output_sharding(output_type.shape().clone(), output_type.sharding().cloned())
+                }
+            }
+        }
     },
 );
 
@@ -1623,6 +1635,22 @@ mod tests {
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
+
+        // An untiled gather over a single participant inserts its size-one gathered axis.
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::default(),
+            AllGatherOutputVariance::Varying,
+        )
+        .interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &EmptyRegionDriver,
+            &[Array::vector(vec![1.0, 2.0]).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![Array::matrix(1, 2, vec![1.0, 2.0]).unwrap()]);
 
         // Any larger axis has no per-item semantics: the other participants do not exist outside an enclosing binder.
         let error = AllGatherOperation::new(
