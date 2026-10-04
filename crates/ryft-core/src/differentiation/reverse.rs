@@ -3984,7 +3984,8 @@ pub(crate) mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -5677,6 +5678,48 @@ pub(crate) mod tests {
         let transposed = region.transpose(&[], &[], &[]).unwrap();
         assert!(transposed.output_ids().is_empty());
         assert!(transposed.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_region_transpose_manual_variation() {
+        // Transposition stages its rules in a fresh trace that binds no named axes. A rule that combines a fresh
+        // invariant value with a varying cotangent through value-level capabilities (here, the mean's scaling factor)
+        // still gets a `parallel_vary` transition instead of a variation mismatch, because manual variation alignment
+        // takes the mesh of an axis that the trace does not bind from the input that varies over it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |dimensions: Vec<usize>| {
+            ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), dimensions.len()).with_varying_manual_axes(["x"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(varying(vec![4]));
+        let output = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(transposed.input_types(), vec![varying(vec![])]);
+        assert_eq!(transposed.output_types(), vec![varying(vec![4])]);
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                    output_type=f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    output_axes=[],
+                ] %0
+                    %2:f32[] = constant [value=0.25]
+                    %3:f32[][sharding={mesh<['x'=2:manual]>, []}] = broadcast [\
+                        output_type=f32[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %2
+                    %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %3
+                    %5:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = mul %4 %1
+                in (%5)"
+            },
+        );
     }
 
     #[test]
