@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DimensionType, DimensionValue,
+    ArrayType, DimensionType, DimensionValue, Sharding,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -27,7 +27,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::Assert;
-use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
+use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -54,7 +54,7 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this.
+// TODO(eaplatanios): Review this since it is mostly vibe coded.
 
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
@@ -183,9 +183,12 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
         if !input_types[0].is_condition_predicate() {
             return Err(TypeError::invalid(format!(
-                "`{}` predicate type must be a scalar boolean invariant over manual axes, but got `{}`",
+                "`{}` predicate type must be a scalar boolean, but got `{}`",
                 CONDITION_OPERATION_NAME, input_types[0],
             )));
+        }
+        for output_type in true_interface.output_types() {
+            output_type.validate_condition_output(&input_types[0])?;
         }
         // Branch value inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation
         // rather than strict type equality, as for `while` and `scan`, so actual inputs that carry metadata the branch
@@ -1105,22 +1108,49 @@ where
 
 /// Type-family predicate semantics for [`ConditionOperation`].
 ///
-/// Conditions require the predicate to be invariant over manual mesh axes, so all participants take the same branch.
-/// [`ArrayType`] accepts rank-zero Boolean predicates without varying manual axes, while a
-/// composite [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an
-/// array extent rather than Boolean data, even though its runtime representation is scalar, and a reference is a
-/// mutable state handle rather than a predicate value.
+/// [`ArrayType`] accepts rank-zero Boolean predicates, while a composite [`ArrayIrType`] accepts only its rank-zero
+/// Boolean array member. A first-class dimension describes an array extent rather than Boolean data, even though its
+/// runtime representation is scalar, and a reference is a mutable state handle rather than a predicate value.
+///
+/// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. Such a
+/// condition is accepted only when its outputs are typed accordingly: every branch output must vary over each manual
+/// axis that the predicate varies over (refer to [`validate_condition_output`](Self::validate_condition_output)). An
+/// invariant predicate keeps every device on the same branch. As for a `while` loop with a varying predicate, keeping
+/// collectives out of branches that devices may take differently is the program's responsibility.
 pub trait ConditionType: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;
+
+    /// Validates that a branch output of this type is well-typed under a predicate of type `predicate`: because
+    /// devices whose predicates differ may take different branches, the output must vary over every manual mesh axis
+    /// that the predicate varies over.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the output lacks one of the predicate's varying manual axes, or if it cannot record
+    /// manual variation at all (e.g., a first-class dimension) while the predicate varies.
+    fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError>;
 }
 
 impl ConditionType for ArrayType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
-        self.is_scalar()
-            && self.data_type().is_boolean()
-            && self.sharding().is_none_or(|sharding| sharding.varying_manual_axes().is_empty())
+        self.is_scalar() && self.data_type().is_boolean()
+    }
+
+    fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError> {
+        let Some(predicate_axes) = predicate.sharding().map(Sharding::varying_manual_axes) else {
+            return Ok(());
+        };
+        let output_axes = self.sharding().map(Sharding::varying_manual_axes);
+        if predicate_axes.iter().all(|axis| output_axes.is_some_and(|output_axes| output_axes.contains(axis))) {
+            return Ok(());
+        }
+        Err(TypeError::invalid(format!(
+            "`{CONDITION_OPERATION_NAME}` output `{self}` must vary over every manual axis that the predicate \
+             `{predicate}` varies over, because devices may take different branches; insert \
+             `{PARALLEL_VARY_OPERATION_NAME}` on the branch outputs",
+        )))
     }
 }
 
@@ -1128,6 +1158,25 @@ impl ConditionType for ArrayIrType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
         matches!(self, Self::Array(r#type) if r#type.is_condition_predicate())
+    }
+
+    fn validate_condition_output(&self, predicate: &Self) -> Result<(), TypeError> {
+        let Self::Array(predicate) = predicate else {
+            return Ok(());
+        };
+        match self {
+            Self::Array(output) => output.validate_condition_output(predicate),
+            Self::Reference(output) => output.referent().validate_condition_output(predicate),
+            Self::Dimension(_) => {
+                if predicate.sharding().is_none_or(|sharding| sharding.varying_manual_axes().is_empty()) {
+                    return Ok(());
+                }
+                Err(TypeError::invalid(format!(
+                    "`{CONDITION_OPERATION_NAME}` output `{self}` cannot record manual variation, so it cannot be \
+                     produced under the varying predicate `{predicate}`",
+                )))
+            }
+        }
     }
 }
 
@@ -2329,10 +2378,7 @@ mod tests {
         assert_eq!(
             operation
                 .infer_output_types(&[branch_input_type.clone(), branch_input_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid(
-                "`condition` predicate type must be a scalar boolean invariant over manual axes, but got `f64[]`"
-                    .to_string()
-            )),
+            Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `f64[]`".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2340,8 +2386,7 @@ mod tests {
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid(
-                "`condition` predicate type must be a scalar boolean invariant over manual axes, but got `bool[2]`"
-                    .to_string()
+                "`condition` predicate type must be a scalar boolean, but got `bool[2]`".to_string()
             )),
         );
         assert_eq!(
@@ -2580,9 +2625,7 @@ mod tests {
                 ],
             ),
             Err(TypeError::invalid(
-                "`condition` predicate type must be a scalar boolean invariant over manual axes, but got \
-                 `dimension<extent ∈ [1, 8)>`"
-                    .to_string(),
+                "`condition` predicate type must be a scalar boolean, but got `dimension<extent ∈ [1, 8)>`".to_string(),
             )),
         );
     }
@@ -2593,11 +2636,40 @@ mod tests {
         let invariant =
             ArrayType::scalar(DataType::Boolean).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let varying = ArrayType::scalar(DataType::Boolean)
-            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
             .unwrap();
         assert!(invariant.is_condition_predicate());
-        assert!(!varying.is_condition_predicate());
-        assert!(!ArrayIrType::Array(varying).is_condition_predicate());
+        assert!(varying.is_condition_predicate());
+        assert!(ArrayIrType::Array(varying.clone()).is_condition_predicate());
+
+        // Outputs must vary over every manual axis that the predicate varies over.
+        let varying_output = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let invariant_output = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        assert_eq!(varying_output.validate_condition_output(&varying), Ok(()));
+        assert_eq!(invariant_output.validate_condition_output(&invariant), Ok(()));
+        assert_eq!(ArrayType::scalar(DataType::F32).validate_condition_output(&invariant), Ok(()));
+        assert_eq!(
+            invariant_output.validate_condition_output(&varying),
+            Err(TypeError::invalid(
+                "`condition` output `f32[]{mesh=[devices=2:manual], sharding=[]}` must vary over every manual axis \
+                 that the predicate `bool[]{mesh=[devices=2:manual], sharding=[], varying=[devices]}` varies over, \
+                 because devices may take different branches; insert `parallel_vary` on the branch outputs",
+            )),
+        );
+        assert_eq!(
+            ArrayIrType::Array(varying_output).validate_condition_output(&ArrayIrType::Array(varying.clone())),
+            Ok(()),
+        );
+        assert_eq!(
+            ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()))
+                .validate_condition_output(&ArrayIrType::Array(varying)),
+            Err(TypeError::invalid(
+                "`condition` output `dimension<extent ∈ [1, 8)>` cannot record manual variation, so it cannot be \
+                 produced under the varying predicate `bool[]{mesh=[devices=2:manual], sharding=[], varying=[devices]}`",
+            )),
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@ use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOpe
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeRefinements};
 
-// TODO(eaplatanios): Review this module and also add a module docstring that follows our established conventions.
+// TODO(eaplatanios): Review this module since it is mostly vibe coded and also add a module docstring that follows
+//  our established conventions.
 
 pub mod condition;
 pub mod scan;

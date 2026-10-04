@@ -33,7 +33,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
+use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVaryOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -65,7 +65,7 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this.
+// TODO(eaplatanios): Review this since it is mostly vibe coded.
 
 /// Canonical operation name for [`WhileOperation`].
 pub const WHILE_OPERATION_NAME: &str = "while";
@@ -1267,7 +1267,8 @@ pub trait WhileType: Type {
 impl WhileType for ArrayType {
     #[inline]
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
-        validate_while_array_predicate(condition_output, state_types)
+        validate_while_array_predicate(condition_output, state_types)?;
+        validate_while_state_variation(condition_output, state_types)
     }
 
     #[inline]
@@ -1291,6 +1292,16 @@ impl WhileType for ArrayIrType {
             state_types.iter().filter_map(|state_type| match state_type {
                 Self::Array(state_type) => Some(state_type),
                 Self::Dimension(_) | Self::Reference(_) => None,
+            }),
+        )?;
+        // A reference's referent changes with every iteration that writes it, so it follows the same variation rule
+        // as array state.
+        validate_while_state_variation(
+            predicate,
+            state_types.iter().filter_map(|state_type| match state_type {
+                Self::Array(state_type) => Some(state_type),
+                Self::Reference(state_type) => Some(state_type.referent()),
+                Self::Dimension(_) => None,
             }),
         )?;
         // Reference operations are effectful, and a batched predicate masks carries per batch item after the body ran
@@ -1332,6 +1343,35 @@ fn validate_while_array_predicate<'t>(
             return Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate {predicate} is not a prefix of state {state_type}",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every array state element of a [`while`](WhileOperation) loop varies over each manual mesh axis that
+/// its `predicate` varies over. Devices whose predicates differ run different numbers of iterations, so any state that
+/// the body may change can differ across those devices, and its type must say so. JAX does not enforce this, which
+/// leaves such state typed as identical across devices. A first-class dimension carries no manual variation and is not
+/// checked.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming the first state type that lacks one of the predicate's varying manual axes.
+fn validate_while_state_variation<'t>(
+    predicate: &ArrayType,
+    state_types: impl IntoIterator<Item = &'t ArrayType>,
+) -> Result<(), TypeError> {
+    let Some(predicate_axes) = predicate.sharding().map(Sharding::varying_manual_axes) else {
+        return Ok(());
+    };
+    for state_type in state_types {
+        let state_axes = state_type.sharding().map(Sharding::varying_manual_axes);
+        if !predicate_axes.iter().all(|axis| state_axes.is_some_and(|state_axes| state_axes.contains(axis))) {
+            return Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` state `{state_type}` must vary over every manual axis that the predicate \
+                 `{predicate}` varies over, because devices may run different numbers of iterations; insert \
+                 `{PARALLEL_VARY_OPERATION_NAME}` on the initial state",
             )));
         }
     }
@@ -2069,8 +2109,9 @@ where
     };
 
     // Run the primal loop over its original state plus a counter, one stack per stored residual, and a validity mask.
-    let counter_type = C::Type::from_array_type(ArrayType::scalar(DataType::I64));
-    let boolean_scalar_type = C::Type::from_array_type(ArrayType::scalar(DataType::Boolean));
+    let predicate_type = condition.output_types()[0].array_type()?.clone();
+    let counter_type = C::Type::from_array_type(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
+    let boolean_scalar_type = C::Type::from_array_type(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
     let mask_stack_type = C::Type::from_array_type(stacked_scan_type(boolean_scalar_type.array_type()?, bound));
     let (extended_condition, augmented_body, stack_types) =
         build_bounded_while_programs(condition, &stacked_primal_program, stacked_residual_types.as_slice(), bound)?;
@@ -2492,6 +2533,22 @@ where
     ))
 }
 
+/// Returns the scalar type of a loop counter (for `DataType::I64`) or of a validity-mask item (for `DataType::Boolean`)
+/// in a bounded `while` program whose predicate has type `predicate_type`. Devices whose predicates differ run
+/// different numbers of iterations, so these values vary over every manual mesh axis that the predicate varies over.
+/// They are non-differentiable integers and Booleans, so they are created with that variation directly instead of
+/// through `parallel_vary` transitions. Outside manual regions, the scalar type carries no sharding.
+fn bounded_while_scalar_type(data_type: DataType, predicate_type: &ArrayType) -> Result<ArrayType, TypeError> {
+    let scalar_type = ArrayType::scalar(data_type);
+    let Some(sharding) = predicate_type.sharding().filter(|sharding| !sharding.varying_manual_axes().is_empty()) else {
+        return Ok(scalar_type);
+    };
+    let scalar_sharding = Sharding::replicated(sharding.mesh().clone(), 0)
+        .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    scalar_type.with_sharding(scalar_sharding).map_err(|error| TypeError::invalid(error.to_string()))
+}
+
 /// Stages the transitions that make `value`, a loop index or Boolean mask inside a bounded or masked `while` program
 /// that carries no tangent, vary over every manual mesh axis that `target` varies over, so that it can be combined with
 /// stacks or state of type `target`. A value without a sharding is first placed, replicated, on the mesh of `target`.
@@ -2569,19 +2626,36 @@ where
     O: WhileResidualStackOperation<V::Type>,
 {
     let state_count = condition.input_types().len();
-    let counter_type = V::Type::from_array_type(ArrayType::scalar(DataType::I64));
-    let boolean_scalar_type = V::Type::from_array_type(ArrayType::scalar(DataType::Boolean));
+    let predicate_type = condition.output_types()[0].array_type()?.clone();
+    let counter_type = V::Type::from_array_type(bounded_while_scalar_type(DataType::I64, &predicate_type)?);
+    let boolean_scalar_type = V::Type::from_array_type(bounded_while_scalar_type(DataType::Boolean, &predicate_type)?);
     let mask_stack_type = V::Type::from_array_type(stacked_scan_type(boolean_scalar_type.array_type()?, bound));
     let storage_types = residual_types
         .iter()
         .map(TemporalResidualType::temporal_storage_type)
         .collect::<Result<Vec<_>, _>>()?;
+    let predicate_axes = predicate_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     for storage_type in &storage_types {
         let storage_type = storage_type.array_type()?;
         if storage_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
                 "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires statically shaped residual storage but got \
                  `{storage_type}`",
+            ))
+            .into());
+        }
+
+        // Devices whose predicates differ fill different numbers of stack slots, so every stack must vary over the
+        // predicate's manual axes. A residual that depends on loop state already does, because all array state varies
+        // over those axes. A residual that does not cannot be retyped without changing the tangent program that
+        // consumes it, so it is rejected instead of being mistyped.
+        if !predicate_axes
+            .iter()
+            .all(|axis| storage_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis)))
+        {
+            return Err(TypeError::invalid(format!(
+                "`jvp` of a bounded `{WHILE_OPERATION_NAME}` loop requires every residual to vary over the manual axes \
+                 that the predicate `{predicate_type}` varies over, but got residual storage `{storage_type}`",
             ))
             .into());
         }
@@ -3589,6 +3663,60 @@ mod tests {
             Err(TypeError::invalid(
                 "`while` body output type signature mismatch: expected [f32[carry]] but got [f32[next]]".to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_while_type_inference_manual_variation() {
+        // Devices whose predicates differ run different numbers of iterations, so every state element must vary over
+        // the predicate's manual axes. The rule covers array state and reference referents but not dimensions.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = |data_type| ArrayType::scalar(data_type).with_sharding(Sharding::replicated(mesh.clone(), 0));
+        let varying = |data_type| {
+            ArrayType::scalar(data_type)
+                .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+        };
+        let infer = |predicate_type: ArrayIrType, state_types: Vec<ArrayIrType>| {
+            WhileOperation::new().infer_output_types(
+                state_types.as_slice(),
+                &[
+                    RegionInterface::new(state_types.clone(), vec![predicate_type], EffectClasses::NONE),
+                    RegionInterface::new(state_types.clone(), state_types.clone(), EffectClasses::NONE),
+                ],
+            )
+        };
+        let varying_predicate = ArrayIrType::Array(varying(DataType::Boolean).unwrap());
+        let invariant_predicate = ArrayIrType::Array(invariant(DataType::Boolean).unwrap());
+        let varying_state = ArrayIrType::Array(varying(DataType::F32).unwrap());
+        let invariant_state = ArrayIrType::Array(invariant(DataType::F32).unwrap());
+        let dimension_state =
+            ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let state_types = vec![varying_state.clone(), dimension_state];
+        assert_eq!(infer(varying_predicate.clone(), state_types.clone()), Ok(state_types));
+        let state_types = vec![invariant_state.clone(), ArrayIrType::Array(ArrayType::scalar(DataType::F32))];
+        assert_eq!(infer(invariant_predicate, state_types.clone()), Ok(state_types));
+        assert_eq!(
+            infer(varying_predicate.clone(), vec![varying_state.clone(), invariant_state]),
+            Err(TypeError::invalid("")),
+        );
+        assert_eq!(
+            infer(varying_predicate.clone(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]),
+            Err(TypeError::invalid("")),
+        );
+        assert_eq!(
+            infer(
+                varying_predicate.clone(),
+                vec![ArrayIrType::Reference(ReferenceType::new(varying(DataType::F32).unwrap()))],
+            )
+            .map(|output_types| output_types.len()),
+            Ok(1),
+        );
+        assert_eq!(
+            infer(
+                varying_predicate,
+                vec![ArrayIrType::Reference(ReferenceType::new(invariant(DataType::F32).unwrap()))],
+            ),
+            Err(TypeError::invalid("")),
         );
     }
 
@@ -8446,6 +8574,65 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_bounded_while_jvp_types_counter_and_mask_with_varying_predicates() {
+        // A varying predicate makes devices run different numbers of iterations, so the loop counter and the validity
+        // mask, which are non-differentiable integers and Booleans, are created varying like the predicate. The tangent
+        // scan's per-step `condition` guard is then a varying predicate whose outputs, the tangent carries, vary too.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let state = builder.add_input(state_type.clone());
+        let limit = builder.add_input(state_type.clone());
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![state, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let state = builder.add_input(state_type.clone());
+        let limit = builder.add_input(state_type.clone());
+        let next_state = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![next_state, limit], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                inputs[0].dispatch_domain().bind(
+                    ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
+                    vec![condition, body],
+                    &inputs,
+                )
+            },
+            vec![state_type.clone(), state_type.clone()],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        let jvp = program.jvp_with_respect_to(&[0]).unwrap();
+        assert_eq!(jvp.to_string(), "");
+
+        // Reverse mode transposes the tangent scan, including its varying `condition` guard. At `x = 2` with limit
+        // `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and gradient `4 x³ = 32`.
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.to_string(), "");
+        let state_value = |value: f32| Array::from_elements(state_type.clone(), &[value]).unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![state_value(2.0), state_value(10.0)]).unwrap();
+        assert_eq!(primal_outputs[0], state_value(16.0));
+        let mut pullback_inputs = vec![state_value(1.0)];
+        pullback_inputs.extend(primal_outputs.split_off(2));
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![state_value(32.0)]));
     }
 
     #[test]
