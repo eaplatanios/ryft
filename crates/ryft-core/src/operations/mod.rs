@@ -36,26 +36,26 @@ pub mod tagging;
 pub mod trigonometric;
 
 pub use arithmetic::{
-    ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, DIV_OPERATION_NAME, Div,
-    DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME,
-    Pow, PowOperation, REM_OPERATION_NAME, RSQRT_OPERATION_NAME, Rem, RemOperation, Rsqrt, RsqrtOperation,
-    SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME, Sign, SignOperation, Sqrt, SqrtOperation, Sub,
-    SubOperation,
+    ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, ArithmeticOperations,
+    DIV_OPERATION_NAME, Div, DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg,
+    NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME, RSQRT_OPERATION_NAME, Rem, RemOperation,
+    Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME, Sign, SignOperation, Sqrt,
+    SqrtOperation, Sub, SubOperation,
 };
 pub use assertions::{
     ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
 };
 pub use collectives::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, ManualVariationAlignment,
+    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveOperations, ManualVariationAlignment,
     PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelPermute,
     ParallelPermuteOperation, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use constants::{
-    CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant, DynamicFill, DynamicIota, DynamicOne,
-    DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One,
-    OneLike, OneLikeOperation, OneOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
+    DynamicIota, DynamicOne, DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME,
+    ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME,
+    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
@@ -89,21 +89,21 @@ pub use dimensions::{
     DimensionToScalarOperation,
 };
 pub use dot::{
-    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
+    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOperations, DotOps, RAGGED_DOT_OPERATION_NAME,
+    RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
 pub use exponential::{
-    EXP_OPERATION_NAME, Exp, ExpOperation, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
-    LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
-    LogisticOperation,
+    EXP_OPERATION_NAME, Exp, ExpOperation, ExponentialOperations, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME,
+    LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation,
+    Logistic, LogisticOperation,
 };
 pub use extrema::{
-    CLAMP_OPERATION_NAME, Clamp, ClampOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min,
-    MinOperation,
+    CLAMP_OPERATION_NAME, Clamp, ClampOperation, ExtremaOperations, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max,
+    MaxOperation, Min, MinOperation,
 };
 pub use logical::{
-    AND_OPERATION_NAME, And, AndOperation, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME, Or, OrOperation,
-    XOR_OPERATION_NAME, Xor, XorOperation,
+    AND_OPERATION_NAME, And, AndOperation, LogicalOperations, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME,
+    Or, OrOperation, XOR_OPERATION_NAME, Xor, XorOperation,
 };
 pub use manipulation::{
     BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
@@ -113,13 +113,13 @@ pub use manipulation::{
     DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions,
     DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather,
     GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
-    IndexSlice, Indexed, Indexing, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
-    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
-    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation,
+    REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision,
+    ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME,
+    SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+    ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME,
+    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
+    UpdateSlice, UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{
@@ -128,7 +128,7 @@ pub use random::{
 };
 pub use reductions::{
     ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
-    REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind,
+    REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind, ReductionOperations,
 };
 pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
@@ -140,11 +140,11 @@ pub use references::{
 };
 pub use rounding::{
     CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,
-    RoundOperation,
+    RoundOperation, RoundingOperations,
 };
 pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard,
-    ReshardOperation,
+    ReshardOperation, ShardingOperations,
 };
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
@@ -152,6 +152,7 @@ pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::{
     ATAN2_OPERATION_NAME, Atan2, Atan2Operation, COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin,
     SinOperation, TAN_OPERATION_NAME, TANH_OPERATION_NAME, Tan, TanOperation, Tanh, TanhOperation,
+    TrigonometricOperations,
 };
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.

@@ -7,10 +7,10 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
     DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
 };
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -748,6 +748,22 @@ impl<
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         self.shape_changing_collective_batch_in_parent(context, inputs)
+    }
+}
+
+impl ParallelAllToAll for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        _split_axis: usize,
+        _concat_axis: usize,
+        _options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
 

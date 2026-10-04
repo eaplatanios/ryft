@@ -24,36 +24,35 @@ use crate::operations::collectives::{
     ParallelSumScatterOperation,
 };
 use crate::operations::complex::{
-    Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
+    ComplexOperation, ComplexOperations, ConjugateOperation, ImaginaryOperation, RealOperation,
 };
-use crate::operations::custom_call::CustomCallOperation;
+use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::{
-    Abs, AbsOperation, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, Assert,
-    AssertOperation, Atan2, Atan2Operation, AxisIndexOperation, Broadcast, BroadcastOperation, Ceil, CeilOperation,
-    Clamp, ClampOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation,
-    ConstantOperation, ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
-    Cumulative, CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
+    AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
+    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, CeilOperation, ClampOperation,
+    CollectiveOperations, Compare, CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation,
+    ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, Cumulative,
+    CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
-    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
-    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
-    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation,
-    ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
-    ReducePrecisionOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation, ReshardOperation,
-    Reverse, ReverseOperation, RngBitGeneratorOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
-    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, TagOperation, Tan, TanOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    DotOperation, DotOperations, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations,
+    ExtremaOperations, FloorOperation, GatherOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
+    MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
+    RaggedDotOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
+    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
+    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -163,97 +162,83 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Value-level capability bundle paired with the [`ArrayOperation`] family.
+/// Value-level capability bundle that groups every operation Ryft supports on arrays, so that generic array code can
+/// state one bound instead of listing each capability it uses. Its members are the capability groups and individual
+/// capabilities through which values stage or execute [`ArrayOperation`] variants, listed in variant order. It is
+/// implemented automatically for every value that implements all of its members, and so it must never be implemented
+/// manually.
 ///
-/// [`ArrayOperations`] collects, as supertraits, the value-level capabilities through which a value materializes the
-/// [`ArrayOperation`] variants, so that generic array code states one bound instead of re-listing every capability it
-/// happens to use. It is a pure bundle: the blanket implementation below covers every value that satisfies the same
-/// supertrait list, so this trait must never be implemented manually.
-///
-/// # Membership
-///
-/// Membership is limited to *value-level capabilities of the family*: traits whose methods take and return values of
-/// the implementing type and stage or execute one [`ArrayOperation`] variant. Everything that a variant needs in
-/// order to exist, but that a value does not itself perform, stays out:
-///
-///   - type-family plumbing such as [`WhileType`](crate::operations::control_flow::WhileType),
-///     [`ScanType`](crate::operations::control_flow::scan::ScanType),
-///     [`ConditionType`](crate::operations::control_flow::condition::ConditionType), and
-///     [`WhilePredicate`](crate::WhilePredicate);
-///   - staging machinery such as [`Constant`](crate::operations::constants::Constant) and
-///     [`Tag`](crate::operations::tagging::Tag), and the context-side constructors [`Zero`],
-///     [`One`](crate::operations::constants::One), [`Fill`](crate::operations::constants::Fill), and
-///     [`Iota`](crate::operations::constants::Iota), whose value-driven counterparts [`ZeroLike`] and [`OneLike`] are
-///     members instead;
-///   - effects and debugging such as [`Print`](crate::operations::debugging::Print), and the foreign-kernel escape
-///     hatch [`CustomCall`](crate::operations::custom_call::CustomCall);
-///   - first-class dimension plumbing, which belongs to [`ArrayIrOperations`] rather than to the homogeneous array
-///     family;
-///   - random bit generation, whose [`RngBitGenerator`](crate::RngBitGenerator) contract threads
-///     explicit algorithm state rather than shaping a value-to-value capability;
-///   - the collectives ([`ParallelAllGather`](crate::operations::collectives::ParallelAllGather),
-///     [`ParallelAllToAll`](crate::operations::collectives::ParallelAllToAll),
-///     [`ParallelRaggedAllToAll`](crate::operations::collectives::ParallelRaggedAllToAll),
-///     [`ParallelSumScatter`](crate::operations::collectives::ParallelSumScatter),
-///     [`ParallelSwapAxes`](crate::operations::collectives::ParallelSwapAxes),
-///     [`ParallelPermute`](crate::operations::collectives::ParallelPermute),
-///     [`Reshard`](crate::operations::sharding::Reshard),
-///     [`ConstrainSharding`](crate::operations::sharding::ConstrainSharding),
-///     [`ParallelReduce`](crate::operations::collectives::ParallelReduce), and
-///     [`TransferToMemory`](crate::operations::manipulation::memory::TransferToMemory)), so that single-device generic
-///     code never
-///     carries sharded-programming obligations; and
-///   - differentiation plumbing such as [`ReverseModeDifferentiate`](crate::differentiation::ReverseModeDifferentiate)
-///     and the operation-family `From` bounds that transforms require of a domain.
-///
-/// Derived conveniences that a member already implies are also left out, because bounding them would only duplicate
-/// solver work: [`TopK`](crate::operations::TopK) follows from [`Sort`], [`Slice`], and [`Reshape`], and
-/// [`DotOps`](crate::operations::dot::DotOps) follows from [`Dot`] and [`Transpose`].
+/// Variants without a value-level capability are necessarily absent. These are the context-side constructors
+/// [`Zero`], [`One`](crate::operations::constants::One), [`Constant`](crate::operations::constants::Constant),
+/// [`Iota`](crate::operations::constants::Iota), and [`AxisIndex`](crate::operations::collectives::AxisIndex), and
+/// the variants that function-level APIs and transforms stage on behalf of values, namely control flow,
+/// rematerialization, linear calls, custom functions, and [`ArrayOperation::DotProductAttentionBackward`].
 ///
 /// # Tracers
 ///
-/// This bundle deliberately does *not* imply anything about the tracers derived from an implementing value. Generic
-/// code that traces (for example, code that differentiates) states the tracer requirement as its own separate bound,
-/// such as `LinearizationTracer<A::ExecutionDomain>: ArrayOperations`. Making the bundle recursively imply its own
-/// tracer bounds would make the trait solver chase an unbounded tower of nested tracer types.
+/// This bundle implies nothing about the tracers derived from an implementing value. Generic code that traces (e.g.,
+/// to differentiate) states that requirement as a separate bound, such as
+/// `LinearizationTracer<A::ExecutionDomain>: ArrayOperations`, because implying it here would make the trait solver
+/// chase an unbounded tower of nested tracer types.
 pub trait ArrayOperations:
     Value<Type = ArrayType>
-    // Arithmetic, in both the panicking operator sugar and the fallible capability forms.
-    + std::ops::Neg<Output = Self> + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self>
-    + std::ops::Mul<Output = Self> + std::ops::Div<Output = Self>
-    + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Clamp + Abs + Sign
-    // Elementwise math and logic.
-    + Sin + Cos + Tan + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
-    + Round
-    + Not + And + Or + Xor
-    // Complex numbers.
-    + Complex + Conjugate + Real + Imaginary
-    // Comparison and selection.
-    + Compare + Select
-    // Shape and layout manipulation.
-    + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
-    + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
-    // Linear algebra and reduction.
-    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + ArgMax + ArgMin + Cumulative
-    // Constants and differentiation barriers.
-    + ZeroLike + OneLike + StopGradient + Assert
+    + ConstantOperations
+    + ExtremaOperations
+    + ArithmeticOperations
+    + TrigonometricOperations
+    + ExponentialOperations
+    + Erf
+    + RoundingOperations
+    + LogicalOperations
+    + ComplexOperations
+    + ReductionOperations
+    + Cumulative
+    + Sort
+    + DotOperations
+    + ScaledDot
+    + DotProductAttention
+    + CollectiveOperations<ArrayType>
+    + Compare
+    + Select
+    + ManipulationOperations
+    + ShardingOperations
+    + StopGradient
+    + Tag
+    + RngBitGenerator
+    + Print
+    + Assert
+    + CustomCall
 {
 }
 
-// The predicates below restate the supertrait list of `ArrayOperations`, one predicate per category, so that the
-// bundle is satisfied exactly when every one of its member capabilities is.
-impl<V> ArrayOperations for V
-where
-    V: Value<Type = ArrayType>,
-    V: std::ops::Neg<Output = V> + std::ops::Add<Output = V> + std::ops::Sub<Output = V> + std::ops::Mul<Output = V>,
-    V: std::ops::Div<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Clamp + Abs + Sign,
-    V: Sin + Cos + Tan + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
-    V: Floor + Ceil + Round,
-    V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
-    V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
-    V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
-    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + ArgMax + ArgMin + Cumulative,
-    V: ZeroLike + OneLike + StopGradient + Assert,
+impl<V> ArrayOperations for V where
+    V: Value<Type = ArrayType>
+        + ConstantOperations
+        + ExtremaOperations
+        + ArithmeticOperations
+        + TrigonometricOperations
+        + ExponentialOperations
+        + Erf
+        + RoundingOperations
+        + LogicalOperations
+        + ComplexOperations
+        + ReductionOperations
+        + Cumulative
+        + Sort
+        + DotOperations
+        + ScaledDot
+        + DotProductAttention
+        + CollectiveOperations<ArrayType>
+        + Compare
+        + Select
+        + ManipulationOperations
+        + ShardingOperations
+        + StopGradient
+        + Tag
+        + RngBitGenerator
+        + Print
+        + Assert
+        + CustomCall
 {
 }
 

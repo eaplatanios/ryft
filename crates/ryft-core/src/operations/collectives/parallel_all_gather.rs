@@ -8,11 +8,11 @@ use std::fmt::Display;
 
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayType,
-    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, LogicalMesh,
-    RaggedAxis, Shape, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType,
+    ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals,
+    LogicalMesh, RaggedAxis, Shape, Sharding,
 };
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -888,6 +888,22 @@ where
             ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()))
                 .with_ragged_axes(ragged_axes)?;
         Ok(vec![output].into())
+    }
+}
+
+impl ParallelAllGather for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_all_gather_with_options(
+        &self,
+        axis_name: &str,
+        _concat_axis: usize,
+        _options: CollectiveOptions,
+        _output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
 

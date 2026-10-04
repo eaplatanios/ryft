@@ -619,6 +619,26 @@ pub trait ParallelReduce: Sized {
     ) -> Result<Self, ProgramError>;
 }
 
+impl ParallelReduce for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_reduce(&self, _kind: ReductionKind, axis_name: &str) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
+
+    #[inline]
+    fn parallel_reduce_with_axis_index_groups(
+        &self,
+        _kind: ReductionKind,
+        axis_name: &str,
+        _axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
+}
+
 // Any context-carrying value reduces by validating the axis name against the active `NamedAxes` environment and binding
 // a `ParallelReduceOperation` through its own context (i.e., a staged tracer records the operation, a batching tracer
 // resolves the named axis against the batching context stack, and a JVP dual forwards to the primal-side resolution).

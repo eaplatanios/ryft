@@ -1440,6 +1440,14 @@ where
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayIrOperation::ParallelRaggedAllToAll(operation) => {
+            collective_state.check_manual_collective(
+                operation.name(),
+                operation.axis_name(),
+                operation.axis_size(),
+                operation.mesh(),
+                output_types,
+                |mesh| operation.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            )?;
             if input_values.len() != 6 {
                 return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
             }

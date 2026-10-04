@@ -1,10 +1,10 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType,
+    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
 };
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -826,6 +826,21 @@ pub trait ParallelSumScatter: Sized {
         scatter_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
+}
+
+impl ParallelSumScatter for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        _scatter_axis: usize,
+        _options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
 }
 
 // A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit extent

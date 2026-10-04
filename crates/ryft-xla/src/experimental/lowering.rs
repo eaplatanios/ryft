@@ -6905,7 +6905,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 }
             }
             ArrayOperation::ParallelRaggedAllToAll(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                collective_state.check_manual_collective(
+                    operation.name(),
+                    operation.axis_name(),
+                    operation.axis_size(),
+                    operation.mesh(),
+                    output_types,
+                    |mesh| operation.clone().with_mesh(mesh.clone()).infer_output_types(&lowerer.input_types, &[]),
+                )?;
                 lower_parallel_ragged_all_to_all_to_mlir(
                     operation,
                     &collective_state,

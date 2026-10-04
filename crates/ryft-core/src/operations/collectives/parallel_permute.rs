@@ -2,10 +2,10 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
     ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
 };
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -505,6 +505,20 @@ pub trait ParallelPermute<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Si
             *source_seen = true;
         }
         self.parallel_permute(axis_name, permutation.iter().copied().zip(0..).collect())
+    }
+}
+
+impl ParallelPermute<ArrayType> for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_permute(
+        &self,
+        axis_name: &str,
+        _source_target_pairs: Vec<(usize, usize)>,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
 
