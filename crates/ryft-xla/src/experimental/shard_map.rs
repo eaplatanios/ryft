@@ -2190,8 +2190,8 @@ mod tests {
     };
     use ryft_core::{
         Array as CpuArray, BatchAxis, BatchAxisSpecification, DataType, Device, DeviceMesh, Differentiate,
-        DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Reduce, ReductionKind,
-        RegionRole, Sharding, ShardingDimension, Sin, batch,
+        DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Mul, Reduce,
+        ReductionKind, RegionRole, Sharding, ShardingDimension, Sin, batch,
     };
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -4505,6 +4505,118 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_invariant_all_gather_gradient_executes_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // The gradient of `sum(g * g)`, where `g` is the invariant all-gather of `x`, is `2 * x`. Linearizing the
+        // all-gather keeps its gathered extent as a first-class dimension residual, which crosses the boundary between
+        // the primal and the tangent `shard_map`s.
+        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+            {
+                let replicated = replicated.clone();
+                let sharded = sharded.clone();
+                move |x: ShardMapTracer| {
+                    let (value, gradient) = x
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at(x.into_value())
+                        .value_and_gradient(|x| {
+                            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                            Ok(shard_map::<_, _, ArrayType, _>(
+                                |local_x: ShardMapTracer| {
+                                    let gathered = local_x
+                                        .parallel_all_gather_with_options(
+                                            "x",
+                                            0,
+                                            CollectiveOptions::tiled(),
+                                            ParallelAllGatherOutputVariance::Invariant,
+                                        )
+                                        .unwrap();
+                                    gathered.mul(&gathered).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
+                                },
+                                x,
+                                mesh.clone(),
+                                sharded.clone(),
+                                replicated.clone(),
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                    ]
+                }
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(std::slice::from_ref(&sharded)),
+                Some(&[replicated, sharded.clone()]),
+            )
+            .unwrap();
+        // Recovering the dimension residual in the tangent body checks its bounds with a runtime assertion.
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let inputs = [1.0f32, 2.0, 3.0, 4.0];
+        let buffers = devices
+            .iter()
+            .zip(inputs)
+            .map(|(device, input)| {
+                client
+                    .buffer(values_to_bytes(&[input]).as_slice(), BufferType::F32, [1], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[4], sharded),
+            device_mesh,
+            buffers,
+        )
+        .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 4);
+        for (output, input) in outputs.into_iter().zip(inputs) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap())[0])
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec![30.0, 2.0 * input]);
+        }
+    }
+
+    #[test]
     fn test_shard_map_checked_variation_gradients_execute_on_cpu() {
         use ryft_core::{Fill, ParallelReduce, ReductionKind};
 
@@ -6331,8 +6443,11 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %1 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
-                      sdy.return %1 : tensor<4xf32>
+                      %c = stablehlo.constant dense<2> : tensor<i64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %1 = stablehlo.multiply %c, %c_0 : tensor<i64>
+                      %2 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
+                      sdy.return %2 : tensor<4xf32>
                     } : (tensor<4xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -6715,12 +6830,15 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<4xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
+                      %c = stablehlo.constant dense<4> : tensor<i64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %1 = stablehlo.divide %c, %c_0 : tensor<i64>
+                      %2 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
-                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
-                        stablehlo.return %2 : tensor<f32>
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
                       }) : (tensor<4xf32>) -> tensor<2xf32>
-                      sdy.return %1 : tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<4xf32>
                     return %0 : tensor<4xf32>
                   }

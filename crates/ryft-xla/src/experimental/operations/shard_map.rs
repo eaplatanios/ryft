@@ -7,11 +7,12 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchableOperation, BatchedOutputs,
     BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant,
-    Concretizable, Context, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation,
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Dimension, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, NamedAxes,
-    NamedAxis, Operation, OperationFormatter, OutputRegionProvenance, Parameterized, ParameterizedFamily,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    Concretizable, Context, CotangentDestinationKind, CotangentDestinations, DIMENSION_DATA_TYPE,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, DimensionFromScalarOperation, DimensionToScalarOperation,
+    InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, NamedAxes, NamedAxis, Operation, OperationFormatter,
+    OutputRegionProvenance, ParallelVaryOperation, Parameterized, ParameterizedFamily, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder, ProgramError, ProjectedValue,
     ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
@@ -798,8 +799,8 @@ where
             .zip(partition.residual_program().input_types())
             .filter_map(|(source, edge_type)| source.is_known().then_some(edge_type))
             .map(|edge_type| {
-                let edge_type = <&ArrayType>::try_from(&edge_type).map_err(ProgramError::from)?;
-                residual_boundary(edge_type, &self.shard_map).map_err(trace_error_from_shard_map)
+                let edge_type = residual_edge_type(&edge_type, &self.shard_map)?;
+                residual_boundary(&edge_type, &self.shard_map).map_err(trace_error_from_shard_map)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -861,7 +862,7 @@ where
         let known_program = partition.known_program().clone();
         let mut known_output_types = known_program.output_types();
         for r#type in &mut known_output_types[known_output_indices.len()..] {
-            *r#type = packed_residual_type(<&ArrayType>::try_from(&*r#type)?, &self.shard_map)?.into();
+            *r#type = packed_residual_type(&residual_edge_type(r#type, &self.shard_map)?, &self.shard_map)?.into();
         }
         let known_input_types = known_program.input_types();
         let packed_known_program = reshape_program_boundary(&known_program, known_input_types, known_output_types)?;
@@ -869,7 +870,7 @@ where
         let mut residual_input_types = residual_program.input_types();
         for (source, r#type) in partition.residual_inputs().iter().zip(&mut residual_input_types) {
             if source.is_known() {
-                *r#type = packed_residual_type(<&ArrayType>::try_from(&*r#type)?, &self.shard_map)?.into();
+                *r#type = packed_residual_type(&residual_edge_type(r#type, &self.shard_map)?, &self.shard_map)?.into();
             }
         }
         let residual_output_types = residual_program.output_types();
@@ -999,7 +1000,29 @@ fn packed_residual_type(local_type: &ArrayType, shard_map: &ShardMap) -> Result<
     local_type.with_inserted_dimension(0, Dimension::Static(1))
 }
 
-/// Rewraps a body's array boundary with element-preserving reshapes. Reference positions must remain unchanged.
+/// Returns the local array type that carries a residual edge of local type `local_type` across a shard-map boundary,
+/// whose positions must be arrays or references. An array residual crosses as itself. A first-class dimension residual
+/// crosses as its integer scalar value, typed as varying over every active manual axis because dimension types record
+/// no manual variation: each device then keeps the value that it computed instead of relying on all devices agreeing.
+/// [`reshape_program_boundary`] converts between the dimension and its edge on either side of the boundary.
+fn residual_edge_type(local_type: &ArrayIrType, shard_map: &ShardMap) -> Result<ArrayType, ProgramError> {
+    match local_type {
+        ArrayIrType::Dimension(_) => {
+            let sharding = Sharding::replicated(shard_map.mesh().clone(), 0)
+                .with_varying_manual_axes(shard_map.manual_axes().iter().cloned())
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            Ok(ArrayType::scalar(DIMENSION_DATA_TYPE)
+                .with_sharding(sharding)
+                .map_err(|error| TypeError::invalid(error.to_string()))?)
+        }
+        _ => Ok(<&ArrayType>::try_from(local_type)?.clone()),
+    }
+}
+
+/// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape, and reference
+/// positions must remain unchanged. A first-class dimension leaves a body as its integer scalar value, placed on the
+/// mesh of the target edge and marked varying over that edge's manual axes before it is packed, and re-enters a body by
+/// unpacking that scalar and redefining the same dimension variable from it (refer to [`residual_edge_type`]).
 fn reshape_program_boundary<V>(
     program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
     input_types: Vec<ArrayIrType>,
@@ -1010,22 +1033,53 @@ where
 {
     let mut builder = ProgramBuilder::new();
     let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+    let bind = |builder: &mut ProgramBuilder<V, XlaOperation<V>>, operation: XlaOperation<V>, value| {
+        Ok::<_, ProgramError>(builder.add_instruction(operation, Vec::new(), vec![value], None)?[0])
+    };
+    let reshape_array = |builder: &mut ProgramBuilder<V, XlaOperation<V>>, value, target: &ArrayType| {
+        let operation = ReshapeOperation::new(target.shape().clone()).with_output_sharding(target.sharding().cloned());
+        bind(builder, XlaOperation::Array(ArrayOperation::Reshape(operation)), value)
+    };
     let reshape =
         |builder: &mut ProgramBuilder<V, XlaOperation<V>>, value, source: &ArrayIrType, target: &ArrayIrType| {
             if source == target {
                 return Ok(value);
             }
-            let target = <&ArrayType>::try_from(target)?;
-            let operation =
-                ReshapeOperation::new(target.shape().clone()).with_output_sharding(target.sharding().cloned());
-            Ok::<_, ProgramError>(
-                builder.add_instruction(
-                    XlaOperation::Array(ArrayOperation::Reshape(operation)),
-                    Vec::new(),
-                    vec![value],
-                    None,
-                )?[0],
-            )
+            match (source, target) {
+                (ArrayIrType::Dimension(_), ArrayIrType::Array(target)) => {
+                    let mut value = bind(builder, XlaOperation::DimensionToScalar(DimensionToScalarOperation), value)?;
+                    if let Some(sharding) = target.sharding() {
+                        let mesh_type = ArrayType::scalar(target.data_type())
+                            .with_sharding(Sharding::replicated(sharding.mesh().clone(), 0))
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        let operation = BroadcastOperation::new(mesh_type, Vec::new());
+                        value = bind(builder, XlaOperation::Array(ArrayOperation::Broadcast(operation)), value)?;
+                        for axis_name in sharding.varying_manual_axes() {
+                            let operation = ParallelVaryOperation::new(axis_name.clone());
+                            value = bind(builder, XlaOperation::Array(ArrayOperation::ParallelVary(operation)), value)?;
+                        }
+                    }
+                    if target.rank() == 0 { Ok(value) } else { reshape_array(builder, value, target) }
+                }
+                (ArrayIrType::Array(source), ArrayIrType::Dimension(target)) => {
+                    let mut value = value;
+                    if source.rank() != 0 {
+                        let scalar_sharding = source
+                            .sharding()
+                            .map(|sharding| sharding.with_dimensions(Vec::new()))
+                            .transpose()
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        let scalar_type = ArrayType::scalar(source.data_type())
+                            .with_memory(source.memory())
+                            .with_sharding(scalar_sharding)
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        value = reshape_array(builder, value, &scalar_type)?;
+                    }
+                    let operation = DimensionFromScalarOperation::new(target.variable().clone());
+                    bind(builder, XlaOperation::DimensionFromScalar(operation), value)
+                }
+                _ => reshape_array(builder, value, <&ArrayType>::try_from(target)?),
+            }
         };
     let operands = inputs
         .iter()
@@ -1103,15 +1157,15 @@ where
     let mut residual_global_types = Vec::with_capacity(residual_count);
     let mut residual_shardings = Vec::with_capacity(residual_count);
     for residual_local_type in &primal_output_types[output_count..] {
-        let residual_local_type = <&ArrayType>::try_from(residual_local_type).map_err(ProgramError::from)?;
+        let residual_edge_type = residual_edge_type(residual_local_type, shard_map)?;
         let (residual_global_type, residual_sharding) =
-            residual_boundary(residual_local_type, shard_map).map_err(trace_error_from_shard_map)?;
+            residual_boundary(&residual_edge_type, shard_map).map_err(trace_error_from_shard_map)?;
         residual_global_types.push(ArrayIrType::Array(residual_global_type));
         residual_shardings.push(residual_sharding);
     }
 
     for r#type in &mut primal_output_types[output_count..] {
-        *r#type = packed_residual_type(<&ArrayType>::try_from(&*r#type)?, shard_map)?.into();
+        *r#type = packed_residual_type(&residual_edge_type(r#type, shard_map)?, shard_map)?.into();
     }
     let mut tangent_input_types = tangent_program.input_types();
     let tangent_residual_start = tangent_input_types.len() - residual_count;
@@ -1949,14 +2003,15 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context, CotangentDestinationKind,
-        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionType, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, Operation, ParallelVaryOperation, PartialValue, Placeholder, Program, ProgramBuilder,
-        ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceType, RegionDriver, RegionInterface, RegionRef, Shape,
-        Sharding, ShardingDimension, StagingContext, TracingContext, TransposableOperation, TranspositionContext,
-        TranspositionDriver, TypeError, Typed, ZeroOperation,
+        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context,
+        ConvertElementTypeOperation, CotangentDestinationKind, CotangentDestinations, DataType, DifferentiableType,
+        DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType,
+        DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClasses, LogicalMesh, MaybeZero,
+        MeshAxis, MeshAxisType, MulOperation, Operation, ParallelVaryOperation, PartialValue, Placeholder, Program,
+        ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
+        ReferenceAnalysisError, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
+        RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
+        TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, Typed, ZeroOperation,
     };
 
     use crate::experimental::domains::XlaDomain;
@@ -2824,6 +2879,166 @@ mod tests {
         assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
         assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    /// Online partial evaluation of a `shard_map` whose unknown half consumes a first-class dimension computed by its
+    /// known half: the dimension crosses the split as its integer scalar value, packed per device by the known-side
+    /// `shard_map`, and the residual `shard_map` redefines the same dimension from that scalar.
+    #[test]
+    fn test_shard_map_online_partial_evaluation_threads_dimension_residuals() {
+        use ryft_core::PartialEvaluationInput;
+
+        let array_type = test_array_type();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let shard_map = ShardMap::from_shardings(
+            mesh,
+            vec![replicated.clone(), replicated.clone()],
+            vec![replicated],
+            vec!["x".to_string()],
+        );
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let mut builder = XlaProgramBuilder::new();
+        let known_input = builder.add_input(array_type.clone().into());
+        let runtime_input = builder.add_input(array_type.clone().into());
+        let count = builder
+            .add_instruction(
+                XlaOperation::Array(ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(
+                    DataType::I64,
+                    false,
+                ))),
+                Vec::new(),
+                vec![known_input],
+                None,
+            )
+            .unwrap()[0];
+        let dimension = builder
+            .add_instruction(
+                XlaOperation::DimensionFromScalar(DimensionFromScalarOperation::new(extent)),
+                Vec::new(),
+                vec![count],
+                None,
+            )
+            .unwrap()[0];
+        let broadcast = builder
+            .add_instruction(
+                XlaOperation::from(ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(Vec::new()))),
+                Vec::new(),
+                vec![runtime_input, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let sum = builder
+            .add_instruction(
+                XlaOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![broadcast],
+                None,
+            )
+            .unwrap()[0];
+        let (operation, body_program) = ShardMapOperation::<XlaConstant>::from_body(FlatTracedShardMap::from_parts(
+            shard_map,
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone(), array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+        ));
+
+        let mut builder = XlaProgramBuilder::new();
+        let known_input = builder.add_input(array_type.clone().into());
+        let runtime_input = builder.add_input(array_type.clone().into());
+        let body_region = builder.import_program(body_program);
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::ShardMap(Box::new(operation)),
+                vec![body_region],
+                vec![known_input, runtime_input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(ArrayIrType::Array(array_type.clone()));
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(known), PartialValue::Unknown(ArrayIrType::Array(array_type))],
+            )
+            .unwrap();
+        let PartialEvaluationInput::Known(residual) = &evaluation.inputs()[1] else {
+            panic!("expected the dimension residual to be fed by the known-side `shard_map`");
+        };
+        let known_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![residual.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{mesh<['x'=2:manual]>, []}],
+                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[]],
+                    global_output_types=[i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        let %1:i64[] = convert_element_type [data_type=i64] %0
+                            %2:dimension<extent ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %1
+                            %3:i64[] = dimension_to_scalar %2
+                            %4:i64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %3
+                            %5:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %4
+                            %6:i64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [shape=[1], output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %5
+                        in (%6)
+                    },
+                ]
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}] .
+                let %2:f32[] = shard_map [
+                    mesh=['x'=2:manual],
+                    in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, [{'x'}]}],
+                    out_shardings=[{mesh<['x'=2:manual]>, []}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[], i64[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[]],
+                ] %0 %1 [
+                    body={
+                        lambda %0:f32[], %1:i64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reshape [shape=[], \
+                            output_sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] %1
+                            %3:dimension<extent ∈ [0, 5)> = dimension_from_scalar [bounds=[0, 5)] %2
+                            %4:f32[extent] = broadcast [output_axes=[]] %0 %3
+                            %5:f32[] = reduce [kind=sum, axes=[0]] %4
+                        in (%5)
+                    },
+                ]
+                in (%2)"
+            },
+        );
     }
 
     /// Two-device manual mesh over `x`.
