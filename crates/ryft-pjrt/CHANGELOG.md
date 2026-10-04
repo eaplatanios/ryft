@@ -27,8 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
 - Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
 - Added `BufferType::element_size_in_bytes`.
-- Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types. Note
-  that the PJRT C API cannot represent these types yet and so they are only supported in Protobuf-backed APIs.
+- Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types.
+- Added `CpuClientOptions::process_id` and `GpuClientOptions::maximum_in_flight_computations` for the new
+  OpenXLA client creation options. Existing explicit option literals must supply the new fields or use
+  `..Default::default()`.
 - Added the `FeedbackDirectedProfile` wrapper for OpenXLA's XProf-to-feedback-directed-profile conversion and
   deterministic multi-profile aggregation used by profile-guided latency estimation, owning the profile bytes
   produced by the native profiler bridge.
@@ -39,10 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and partitions of an execution.
 - Added `XlaTransformExtension::clear_transform` together with `Client::clear_xla_transform` and
   `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
+- Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
+  launcher behind the `cuda-12` and `cuda-13` features.
+- Fixed dangling native pointers to temporary buffer-layout descriptors and executable compilation options, and
+  preserved valid zero generated-code sizes instead of reporting them as unavailable.
+- Introduced `Error::MissingFunction`.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.113`.
+- Updated our PJRT C API bindings for version `0.115` and XLA FFI bindings for version `0.4`, including
+  GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
+  FFI state access now rejects both execution and recording stages before calling native code, and invocation
+  extensions validate their generic header before exposing borrowed backend data.
+- Renamed `GpuClientOptions::use_tfrt_gpu_client` to `use_async_dispatch` to reflect upstream's asynchronous host
+  dispatch behavior in the Stream Executor client. The serialized native option key remains `use_tfrt_gpu_client`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
   handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
   unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
@@ -69,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
+- Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures.
+
+### Fixed
+
+- Omit array layouts for native `BufferType::Token` buffers in asynchronous host-to-device transfers.
+
+### Removed
+
+- Removed the deprecated PJRT Host-Allocator and Triton extension wrappers, their FFI definitions, and associated APIs.
+  Host allocation remains available through `Client::host_memory_allocate` and `HostMemoryAllocation`.
 
 ## [0.0.2] - 2026-03-02
 

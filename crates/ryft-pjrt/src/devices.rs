@@ -120,7 +120,9 @@ impl Device<'_> {
                 });
                 match attributes {
                     Ok(attributes) => Ok(attributes),
-                    Err(Error::Unimplemented { .. }) => Ok(self.description()?.attributes()?.clone()),
+                    Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }) => {
+                        Ok(self.description()?.attributes()?.clone())
+                    }
                     Err(error) => Err(error),
                 }
             })
@@ -1328,6 +1330,7 @@ mod tests {
             }),
             compile_portable_executable: false,
             profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
             serialized_multi_slice_configuration: Vec::new(),
             environment_option_overrides: HashMap::new(),
             target_config: None,

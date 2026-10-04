@@ -2,10 +2,13 @@ use std::backtrace::Backtrace;
 
 use thiserror::Error;
 
-use crate::{Api, invoke_pjrt_api_error_fn, invoke_pjrt_api_void_fn, str_from_c_api};
+use crate::{Api, Version, invoke_pjrt_api_error_fn, invoke_pjrt_api_void_fn, str_from_c_api};
 
 /// Represents errors that can occur when interacting with the PJRT C API. The error types are based on the
 /// [Abseil status codes](https://abseil.io/docs/cpp/guides/status-codes) which PJRT uses internally.
+///
+/// Note that [`Error::MissingFunction`] means that dispatch did not invoke the requested C API function. It is distinct
+/// from [`Error::Unimplemented`], which can be returned by native execution after the function was invoked.
 ///
 /// PJRT-originated errors can carry payload metadata which can be accessed using [`Error::payloads`]. Each variant also
 /// includes a `backtrace` field that captures the call stack at the point where the error was created, which is useful
@@ -18,6 +21,9 @@ pub enum Error {
 
     #[error("the loaded PJRT plugin version is not supported by ryft; {message}")]
     PluginVersionMismatch { message: String, backtrace: String },
+
+    #[error("`{function_name}` is not available in the loaded PJRT plugin (version {pjrt_version})")]
+    MissingFunction { function_name: &'static str, pjrt_version: Version, backtrace: String },
 
     #[error("{message}")]
     Cancelled { message: String, payload: Vec<(String, String)>, backtrace: String },
@@ -114,7 +120,7 @@ impl Error {
                     payload.sort_unstable();
                     payload
                 }
-                Err(Error::Unimplemented { .. }) => Vec::new(),
+                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }) => Vec::new(),
                 Err(error) => {
                     drop(destroy_error());
                     return Err(error);
@@ -199,6 +205,11 @@ impl Error {
     /// Creates a new [`Error::PluginVersionMismatch`].
     pub fn plugin_version_mismatch<M: Into<String>>(message: M) -> Self {
         Self::PluginVersionMismatch { message: message.into(), backtrace: Backtrace::capture().to_string() }
+    }
+
+    /// Creates a new [`Error::MissingFunction`].
+    pub fn missing_function(function_name: &'static str, pjrt_version: Version) -> Self {
+        Self::MissingFunction { function_name, pjrt_version, backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::Cancelled`].
@@ -332,7 +343,7 @@ impl Error {
             | Self::Unavailable { payload, .. }
             | Self::DataLoss { payload, .. }
             | Self::Unauthenticated { payload, .. } => payload,
-            Self::PluginLoadingError { .. } | Self::PluginVersionMismatch { .. } => &[],
+            Self::PluginLoadingError { .. } | Self::PluginVersionMismatch { .. } | Self::MissingFunction { .. } => &[],
         }
     }
 
@@ -361,7 +372,7 @@ impl Error {
             Self::FailedPrecondition { .. } => ffi::PJRT_Error_Code_FAILED_PRECONDITION,
             Self::Aborted { .. } => ffi::PJRT_Error_Code_ABORTED,
             Self::OutOfRange { .. } => ffi::PJRT_Error_Code_OUT_OF_RANGE,
-            Self::Unimplemented { .. } => ffi::PJRT_Error_Code_UNIMPLEMENTED,
+            Self::MissingFunction { .. } | Self::Unimplemented { .. } => ffi::PJRT_Error_Code_UNIMPLEMENTED,
             Self::Internal { .. } => ffi::PJRT_Error_Code_INTERNAL,
             Self::Unavailable { .. } => ffi::PJRT_Error_Code_UNAVAILABLE,
             Self::DataLoss { .. } => ffi::PJRT_Error_Code_DATA_LOSS,
@@ -380,6 +391,7 @@ impl Error {
                 let message = format!("plugin version mismatch; {message}");
                 std::ffi::CString::new(message.as_str()).unwrap()
             }
+            Self::MissingFunction { .. } => std::ffi::CString::new(self.to_string()).unwrap(),
             Self::Cancelled { message, .. }
             | Self::Unknown { message, .. }
             | Self::InvalidArgument { message, .. }
@@ -528,6 +540,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     #[test]
@@ -602,6 +616,31 @@ mod tests {
         assert_eq!(errors[0].payloads().len(), 0);
         assert_eq!(errors[3].payload("missing"), None);
         assert_eq!(errors[3].payloads().len(), 0);
+    }
+
+    #[test]
+    fn test_error_missing_function() {
+        let version = Version { major: 0, minor: 115 };
+        let error = Error::missing_function("PJRT_Event_Await", version);
+        let Error::MissingFunction { function_name, pjrt_version, backtrace } = &error else {
+            panic!("expected a missing-function error");
+        };
+        assert_eq!(*function_name, "PJRT_Event_Await");
+        assert_eq!(*pjrt_version, version);
+        assert!(!backtrace.is_empty());
+        let message = "`PJRT_Event_Await` is not available in the loaded PJRT plugin (version 0.115)";
+        assert_eq!(error.to_string(), message);
+        assert_eq!(error.message().to_str().unwrap(), message);
+        assert_eq!(error.code(), ffi::PJRT_Error_Code_UNIMPLEMENTED);
+        assert_eq!(error.payloads(), &[]);
+        assert_ne!(error, Error::unimplemented(message));
+        assert_eq!(
+            format!("{error:?}"),
+            format!(
+                "MissingFunction {{ function_name: \"PJRT_Event_Await\", \
+                 pjrt_version: Version {{ major: 0, minor: 115 }}, backtrace: {backtrace:?} }}",
+            ),
+        );
     }
 
     #[test]

@@ -61,7 +61,7 @@ pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
-    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Extension_Base;
+    use crate::extensions::ffi::handlers::ffi::XLA_FFI_InternalExtension;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
@@ -74,7 +74,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Future_Create_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub future: *mut XLA_FFI_Future,
     }
 
@@ -90,7 +90,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Future_SetAvailable_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub future: *mut XLA_FFI_Future,
     }
 
@@ -107,7 +107,7 @@ pub(crate) mod ffi {
     #[derive(Copy, Clone, Debug)]
     pub struct XLA_FFI_Future_SetError_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub future: *mut XLA_FFI_Future,
         pub error: *mut XLA_FFI_Error,
     }

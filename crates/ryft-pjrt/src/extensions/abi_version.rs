@@ -774,7 +774,7 @@ mod tests {
     use crate::tests::{test_cpu_client, test_cpu_plugin};
 
     #[test]
-    fn test_host_allocator_extension() {
+    fn test_abi_version_extension() {
         assert!(test_cpu_plugin().abi_version_extension().is_err());
         assert!(test_cpu_client().abi_version_extension().is_err());
     }

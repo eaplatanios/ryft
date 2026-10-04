@@ -446,9 +446,12 @@ impl Default for ClientOptions {
 /// easier and type safe.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CpuClientOptions {
-    /// Number of CPU devices to use that defaults to the number of logical CPUs on the host.
+    /// Number of CPU devices to use. The OpenXLA CPU PJRT plugin defaults to `4` when omitted.
     /// This is intended for making debugging or testing multi-device functionality easier.
     pub device_count: Option<usize>,
+
+    /// Process identifier reported by [`Client::process_index`]. Defaults to `0` when omitted.
+    pub process_id: Option<ProcessIndex>,
 }
 
 impl CpuClientOptions {
@@ -458,6 +461,9 @@ impl CpuClientOptions {
         let mut values = Vec::new();
         if let Some(device_count) = self.device_count {
             values.push(NamedValue::new("cpu_device_count", device_count as i64));
+        }
+        if let Some(process_id) = self.process_id {
+            values.push(NamedValue::new("process_id", process_id as i64));
         }
         values
     }
@@ -509,12 +515,13 @@ pub struct GpuClientOptions {
     /// collectives with a failed participant will be canceled to avoid getting stuck.
     pub abort_collectives_on_failure: bool,
 
-    /// Boolean value indicating whether to use the [TFRT GPU client](
-    /// https://github.com/openxla/xla/blob/5af63fc1c5ae4033172f6599135d948d9337812d/xla/pjrt/gpu/tfrt/tfrt_gpu_client.h#L115)
-    /// instead of the [Stream Executor GPU client](
-    /// https://github.com/openxla/xla/blob/5af63fc1c5ae4033172f6599135d948d9337812d/xla/pjrt/gpu/se_gpu_pjrt_client.h#L106)
-    /// in [XLA](https://openxla.org/xla).
-    pub use_tfrt_gpu_client: bool,
+    /// Enables asynchronous host dispatch in the Stream Executor GPU client. The upstream option
+    /// retains the `use_tfrt_gpu_client` name but no longer selects a separate TFRT client.
+    pub use_async_dispatch: bool,
+
+    /// Maximum number of computations allowed in flight. When omitted, the runtime chooses its default. The GPU
+    /// plugin requires a value in `1..=i32::MAX` and returns [`Error::InvalidArgument`] otherwise.
+    pub maximum_in_flight_computations: Option<u32>,
 
     /// Optional mock GPU topology configuration to use for simulating distributed programs on systems
     /// without the necessary hardware. If provided, this will also enable the simulation of e.g.,
@@ -524,7 +531,7 @@ pub struct GpuClientOptions {
 }
 
 impl GpuClientOptions {
-    /// Returns a collection of [`NamedValue`]s that correspond to this [`CpuClientOptions`] instance.
+    /// Returns a collection of [`NamedValue`]s that correspond to this [`GpuClientOptions`] instance.
     pub(crate) fn to_named_values(&self) -> Vec<NamedValue> {
         let mut values = Vec::new();
         match self.platform {
@@ -573,7 +580,10 @@ impl GpuClientOptions {
             values.push(NamedValue::new("collective_memory_size", collective_memory_size as i64));
         }
         values.push(NamedValue::new("abort_collectives_on_failure", self.abort_collectives_on_failure));
-        values.push(NamedValue::new("use_tfrt_gpu_client", self.use_tfrt_gpu_client));
+        values.push(NamedValue::new("use_tfrt_gpu_client", self.use_async_dispatch));
+        if let Some(maximum_in_flight_computations) = self.maximum_in_flight_computations {
+            values.push(NamedValue::new("max_inflight_computations", i64::from(maximum_in_flight_computations)));
+        }
         if let Some(mock_gpu_topology) = &self.mock_gpu_topology {
             values.push(NamedValue::new("enable_mock_nccl", true));
             values.push(NamedValue::new(
@@ -602,7 +612,8 @@ impl Default for GpuClientOptions {
             allocator: GpuMemoryAllocator::default(),
             collective_memory_size: None,
             abort_collectives_on_failure: false,
-            use_tfrt_gpu_client: false,
+            use_async_dispatch: false,
+            maximum_in_flight_computations: None,
             mock_gpu_topology: None,
         }
     }
@@ -1307,6 +1318,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use pretty_assertions::assert_eq;
+
     use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
     use crate::{
         Client, ClientOptions, CpuClientOptions, DeviceAssignment, Error, GpuClientOptions, GpuMemoryAllocator,
@@ -1347,14 +1360,14 @@ mod tests {
 
         let plugin = test_cpu_plugin();
         let client = test_cpu_client();
-        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 18, 0])));
+        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 20, 0])));
         assert_eq!(client.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(client.attribute("xla_version"), Ok(Value::i64(2)));
         assert!(matches!(
             client.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = client.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 18, 0])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 20, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);
@@ -1392,7 +1405,7 @@ mod tests {
                 }
                 TestPlatform::Cuda13 => {
                     assert_eq!(client.platform_name().unwrap(), "cuda");
-                    assert_eq!(client.platform_version().unwrap(), "cuda 13000");
+                    assert_eq!(client.platform_version().unwrap(), "cuda 13020");
                 }
                 TestPlatform::Rocm7 => {
                     assert_eq!(client.platform_name().unwrap(), "rocm");
@@ -1454,11 +1467,19 @@ mod tests {
     }
 
     #[test]
+    fn test_client_process_index_with_cpu_process_id() {
+        let client = test_cpu_plugin()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(16) }))
+            .unwrap();
+        assert_eq!(client.process_index(), Ok(16));
+    }
+
+    #[test]
     fn test_client_options() {
         let cpu_client_options_0 = ClientOptions::CPU(CpuClientOptions::default());
         assert_eq!(cpu_client_options_0.to_named_values(), Vec::new());
 
-        let cpu_client_options_1 = ClientOptions::CPU(CpuClientOptions { device_count: Some(4) });
+        let cpu_client_options_1 = ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() });
         assert_eq!(cpu_client_options_1.to_named_values(), vec![NamedValue::new("cpu_device_count", 4i64)]);
 
         let gpu_client_options_0 = ClientOptions::GPU(GpuClientOptions {
@@ -1490,7 +1511,8 @@ mod tests {
             allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: Some(0.5) },
             collective_memory_size: Some(1024),
             abort_collectives_on_failure: true,
-            use_tfrt_gpu_client: true,
+            use_async_dispatch: true,
+            maximum_in_flight_computations: None,
             mock_gpu_topology: Some(MockGpuTopology {
                 partition_count: 2,
                 host_count_per_partition: 3,
@@ -1544,5 +1566,38 @@ mod tests {
         assert_eq!(other_client_options, other_client_options);
         assert_ne!(other_client_options, cpu_client_options_0);
         assert_ne!(other_client_options, gpu_client_options_1);
+    }
+
+    #[test]
+    fn test_cpu_client_options_to_named_values() {
+        assert_eq!(CpuClientOptions::default().to_named_values(), Vec::new());
+        let options = CpuClientOptions { process_id: Some(0), ..Default::default() };
+        assert_eq!(options.to_named_values(), vec![NamedValue::new("process_id", 0i64)]);
+        let options = CpuClientOptions { device_count: Some(2), process_id: Some(3) };
+        assert_eq!(
+            options.to_named_values(),
+            vec![NamedValue::new("cpu_device_count", 2i64), NamedValue::new("process_id", 3i64)],
+        );
+    }
+
+    #[test]
+    fn test_gpu_client_options_to_named_values() {
+        let options = GpuClientOptions {
+            use_async_dispatch: true,
+            maximum_in_flight_computations: Some(32),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.to_named_values(),
+            vec![
+                NamedValue::new("should_stage_host_to_device_transfers", true),
+                NamedValue::new("preallocate", true),
+                NamedValue::new("memory_fraction", 0.75f32),
+                NamedValue::new("allocator", "bfc"),
+                NamedValue::new("abort_collectives_on_failure", false),
+                NamedValue::new("use_tfrt_gpu_client", true),
+                NamedValue::new("max_inflight_computations", 32i64),
+            ],
+        );
     }
 }

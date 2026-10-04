@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 
 use crate::{Api, Client, Device, Error, Plugin, invoke_pjrt_api_error_fn};
@@ -54,7 +54,7 @@ impl<O> Event<O> {
             Err(Error::invalid_argument("the provided PJRT event handle is a null pointer"))
         } else {
             Ok(Self {
-                state: Arc::new(EventState { api, handle: EventHandle(handle), waker: Arc::new(Mutex::new(None)) }),
+                state: Arc::new(EventState { api, handle: EventHandle(handle), waker: OnceLock::new() }),
                 output: Some(output),
                 callback_registered: Cell::new(false),
                 marker: PhantomData,
@@ -102,6 +102,9 @@ impl<O> Event<O> {
     /// been invoked. The PJRT runtime may release threads blocked in an await before, after, or concurrently with
     /// invoking "on-ready" callbacks (which typically run on the thread that completed the event), so callers must not
     /// rely on any ordering between the two.
+    ///
+    /// Returns [`Error::MissingFunction`] if native await cannot be dispatched; that error does not imply readiness.
+    /// This function consumes the event and its payload on failure, as it does for native computation errors.
     pub fn r#await(self) -> Result<O, Error> {
         use ffi::PJRT_Event_Await_Args;
 
@@ -122,9 +125,17 @@ impl<O> Event<O> {
         if !self.ready()? {
             Err(Error::failed_precondition("`Event::ready` must return `true` for `Event::error` to be meaningful"))
         } else {
-            use ffi::PJRT_Event_Error_Args;
-            Ok(invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Error, { event = self.state.handle.0 }).err())
+            Ok(self.ready_error())
         }
+    }
+
+    /// Returns the [`Error`] that the underlying computation of this [`Event`] encountered, or [`None`] if it was
+    /// successful, without first checking readiness like [`Self::error`] does. Callers must have already observed
+    /// [`Self::ready`] returning `true`, which lets them avoid a second native readiness query.
+    #[inline]
+    pub(crate) fn ready_error(&self) -> Option<Error> {
+        use ffi::PJRT_Event_Error_Args;
+        invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Error, { event = self.state.handle.0 }).err()
     }
 }
 
@@ -144,7 +155,8 @@ impl<O> Future for Event<O> {
                 Err(_) => unreachable!(),
             },
             Ok(false) => {
-                *self.state.waker.lock().expect("PJRT event waker mutex poisoned") = Some(cx.waker().clone());
+                let waker = self.state.waker.get_or_init(Arc::default);
+                *waker.lock().expect("PJRT event waker mutex poisoned") = Some(cx.waker().clone());
                 let callback_registration_result = (!self.callback_registered.get()).then(|| {
                     self.callback_registered.set(true);
                     // The callback must capture only the shared waker slot, never the whole `EventState`. The native
@@ -152,7 +164,7 @@ impl<O> Future for Event<O> {
                     // reference cycle (i.e., `EventState` -> native event -> callback -> `EventState`) that leaks the
                     // native event whenever it never completes (e.g., when a pending `Event` is canceled after its
                     // `EventPromise` was dropped without being set).
-                    let waker = self.state.waker.clone();
+                    let waker = Arc::clone(waker);
                     self.on_ready(move |_| {
                         let waker = waker.lock().expect("PJRT event waker mutex poisoned").take();
                         if let Some(waker) = waker {
@@ -188,7 +200,9 @@ impl<O> Drop for Event<O> {
         // We clear any waker registered by `Future::poll` so that an outstanding native "on-ready" callback does not
         // retain a canceled executor task indefinitely if the underlying computation never completes. The native event
         // itself is destroyed by `EventState`'s `Drop` implementation once all owners have been dropped.
-        *self.state.waker.lock().expect("PJRT event waker mutex poisoned") = None;
+        if let Some(waker) = self.state.waker.get() {
+            *waker.lock().expect("PJRT event waker mutex poisoned") = None;
+        }
     }
 }
 
@@ -303,8 +317,10 @@ struct EventState {
     /// [`Waker`] slot shared with the "on-ready" callback that [`Event::poll`] registers, used to integrate the event
     /// with Rust's [`Future`] protocol. It is shared through its own [`Arc`] so that the callback never owns the whole
     /// [`EventState`]. The native event owns that callback, so a callback owning an [`Arc<EventState>`] would form a
-    /// reference cycle that leaks the native event whenever it never completes.
-    waker: Arc<Mutex<Option<Waker>>>,
+    /// reference cycle that leaks the native event whenever it never completes. The slot is allocated by the first
+    /// [`Event::poll`] that finds the event pending, so events that are never polled (e.g., execution completion
+    /// events joined by an [`ExecutionFence`](crate::ExecutionFence)) allocate nothing for it.
+    waker: OnceLock<Arc<Mutex<Option<Waker>>>>,
 }
 
 impl Drop for EventState {
@@ -579,9 +595,12 @@ mod tests {
 
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
+    use pretty_assertions::assert_eq;
 
+    use crate::errors::Error;
     use crate::tests::{test_cpu_client, test_for_each_platform};
-    use crate::{Error, Event};
+
+    use super::*;
 
     fn assert_send<T: Send>() {}
 
@@ -652,6 +671,51 @@ mod tests {
             unsafe { Event::from_c_api(std::ptr::null_mut(), client.api(), ()) },
             Err(Error::InvalidArgument { message, .. })
                 if message == "the provided PJRT event handle is a null pointer",
+        ));
+    }
+
+    #[test]
+    fn test_event_await_missing_function() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_Await = None;
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let error = event.r#await().unwrap_err();
+        assert!(matches!(error, Error::MissingFunction { function_name: "PJRT_Event_Await", .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("`PJRT_Event_Await` is not available in the loaded PJRT plugin (version {})", api.version(),)
+        );
+        promise.set(None).unwrap();
+    }
+
+    #[test]
+    fn test_event_await_truncated_api() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let original_size = table.struct_size;
+        table.struct_size = std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Event_Await) + 1;
+        let error = event.r#await().unwrap_err();
+        assert!(matches!(error, Error::MissingFunction { function_name: "PJRT_Event_Await", .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("`PJRT_Event_Await` is not available in the loaded PJRT plugin (version {})", api.version(),)
+        );
+        table.struct_size = original_size;
+        promise.set(None).unwrap();
+    }
+
+    #[test]
+    fn test_event_await_native_unimplemented() {
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(Error::unimplemented("test terminal failure"))).unwrap();
+        assert!(matches!(
+            event.r#await(),
+            Err(Error::Unimplemented { message, .. }) if message == "test terminal failure",
         ));
     }
 
