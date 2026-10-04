@@ -91,6 +91,7 @@ fn gradient_descent_step<A>(model: Mlp<A>, gradients: Mlp<A>, learning_rate: &A)
 where
     A: Clone + Parameter + Mul<Output = A> + Sub<Output = A>,
 {
+    // TODO(eaplatanios): Support our value capability traits over parameterized structures.
     let structure = model.parameter_structure();
     let gradients = Mlp::from_named_parameters(structure.clone(), gradients.into_named_parameters())?;
     let updates = gradients.map_parameters(|gradient| gradient * learning_rate.clone())?;

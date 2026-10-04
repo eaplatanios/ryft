@@ -23,23 +23,36 @@ use crate::programs::{Operation, ProgramError, ProjectedValue, TypeError, Typed,
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 
 define_linear_collective_operation!(
-    /// [`Operation`] that sends every participant's input to another participant along the named axis, according to
-    /// explicit `(source, target)` pairs. The input of participant `source` becomes the output of participant `target`.
-    /// Sources must be unique, targets must be unique, and both must lie in `0..axis_size`. Participants that no pair
-    /// targets receive zeros, and the output type is the input type. This is the Ryft analogue of JAX's
+    /// [`Operation`] that routes input arrays between positions along the named axis according to explicit
+    /// `(source, target)` pairs. Both indices are zero-based coordinates along `axis_name`, in `0..axis_size`, rather
+    /// than global device IDs or element indices within an input array. Each position represents one execution of the
+    /// enclosing function with its own input array. A pair sends the entire input array at `source` to the output at
+    /// `target`. Sources must be unique, targets must be unique, and positions that no pair targets receive zeros.
+    /// The output type is the input type.
+    ///
+    /// For example, inside `shard_map` over a manual mesh axis `x` of size three, `(0, 2)` sends the input at mesh
+    /// coordinate `x = 0` to the output at `x = 2`. On a multidimensional mesh, this routing is repeated separately
+    /// for each fixed combination of coordinates along the other axes. The physical devices at these coordinates can
+    /// have arbitrary device IDs; the pair still uses axis coordinates `0` and `2`.
+    ///
+    /// Inside [`batch`](crate::batch) over a named axis of size three, `(0, 2)` instead sends batch item zero's input
+    /// array to batch item two's output. For either interpretation, if positions zero, one, and two hold arrays `A`,
+    /// `B`, and `C`, then pairs `[(0, 1), (2, 0)]` produce `C`, `A`, and a zero array at those respective positions.
+    ///
+    /// This is the Ryft analogue of JAX's
     /// [`jax.lax.ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and StableHLO's
     /// [`collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
     ///
-    /// Over a manual mesh axis, a permutation generally gives the participants different values, so the input must
+    /// Over a manual mesh axis, a permutation generally gives the axis positions different values, so the input must
     /// vary over the axis (refer to [`ParallelVary`]) and the output varies over it as well. The collective is linear
-    /// and its transpose is the permutation with every pair inverted. Outside any binder, the single participant of a
+    /// and its transpose is the permutation with every pair inverted. Outside any binder, the single position of a
     /// degenerate axis keeps its value when the pair `(0, 0)` is present and receives zeros otherwise.
     ///
     /// A matching `batch` level consumes the mapped batch axis by reassembling it in target order from per-item slices,
     /// with zero slices at untargeted positions, and passes a replicated input through unchanged when every position is
     /// targeted. Unlike JAX's batching rule, which requires a full permutation, partial permutations are supported.
     /// Bounded ragged extents follow the same source-to-target routing as their packed values, and untargeted
-    /// participants receive zero extents together with their zero-filled values.
+    /// positions receive zero extents together with their zero-filled values.
     ParallelPermuteOperation,
     PARALLEL_PERMUTE_OPERATION_NAME,
     fields = {
@@ -95,8 +108,6 @@ define_linear_collective_operation!(
     },
 );
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ParallelPermuteOperation {
     /// Returns the `(source, target)` pairs of participant positions along the named axis.
     #[inline]
@@ -105,14 +116,14 @@ impl ParallelPermuteOperation {
     }
 }
 
-// A matching `batch` level consumes the mapped batch axis by reassembling it in target order: for each position `t`
-// along the batch axis, the output receives the slice of the source item that sends to `t`, or a zero slice when no
-// pair targets `t`. A non-matching level forwards the collective untouched to the parent context.
-impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<ParallelPermuteOperation>,
-    <C as Domain>::Value: Concatenate + Slice + Transpose + ZeroLike,
+impl<
+    C: Context<
+            Type = ArrayType,
+            Value: ZeroLike + Concatenate + Slice + Transpose,
+            Operation: From<ParallelPermuteOperation>,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -120,10 +131,14 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A matching `batch` level consumes the mapped batch axis by reassembling it in target order: for each position
+        // `t` along the batch axis, the output receives the slice of the source item that sends to `t`, or a zero slice
+        // when no pair targets `t`. A non-matching level forwards the collective untouched to the parent context.
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
+
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -135,9 +150,8 @@ where
         if batch_size != self.axis_size {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` over axis `{}` resolved axis size {} but the mapped batch \
-                     axis has size {batch_size}",
-                    self.axis_name, self.axis_size,
+                    "`{}` over axis `{}` resolved axis size {} but the mapped batch axis has size {}",
+                    PARALLEL_PERMUTE_OPERATION_NAME, self.axis_name, self.axis_size, batch_size,
                 ),
             });
         }
@@ -161,13 +175,14 @@ where
         {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` cannot assign a zero extent to bounded ragged dimension `{}` \
-                     whose lower bound is {}",
+                    "`{}` cannot assign a zero extent to bounded ragged dimension `{}` whose lower bound is {}",
+                    PARALLEL_PERMUTE_OPERATION_NAME,
                     ragged_axis.dimension(),
                     ragged_axis.dimension().bounds().lower(),
                 ),
             });
         }
+
         let input = P::match_axis(context, input, 0.into())?;
         let permuted = permute_participant_axis(input.value(), 0, sources.as_slice())?;
         let ragged_axes = input
@@ -195,14 +210,16 @@ where
     }
 }
 
-// Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
-// `(target, source)`, so the input cotangent is the permutation with every pair inverted.
 impl_differentiable_linear_collective_operation! {
     ParallelPermuteOperation,
     transpose = |operation| -> ParallelPermuteOperation {
-        let inverted_pairs =
-            operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
-        ParallelPermuteOperation::new(operation.axis_name.clone(), operation.axis_size, inverted_pairs)
+        // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
+        // is the permutation with every pair inverted.
+        ParallelPermuteOperation::new(
+            operation.axis_name.clone(),
+            operation.axis_size,
+            operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>(),
+        )
     },
 }
 
@@ -213,20 +230,17 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
     }
 }
 
-/// Represents the ability to permute values across the participants of a named axis by staging a
-/// [`ParallelPermuteOperation`], the analogue of
-/// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html). Refer to
-/// [`ParallelPermuteOperation`] for the semantics and transformation rules.
+/// Represents the ability to permute values across the participants of a named axis. Refer to the documentation
+/// of [`ParallelPermuteOperation`] for the semantics of this operation and its transformation rules.
 ///
 /// # Example
 ///
 /// Every batch item sends its row to the next item. No item sends to the first item, which receives zeros:
 ///
 /// ```rust
-/// # use ryft_core::operations::collectives::ParallelPermute;
 /// # use ryft_core::{
 /// #     Array, ArrayBatchingPolicy, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchingTracer, EagerContext,
-/// #     batch,
+/// #     ParallelPermute, batch,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rows = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
@@ -244,7 +258,7 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 /// # }
 /// ```
 pub trait ParallelPermute: Sized {
-    /// Returns this value permuted across the participants of the named axis `axis_name`: for every `(source, target)`
+    /// Returns this value permuted across the participants of the named axis `axis_name`. For every `(source, target)`
     /// pair, participant `target` receives the value of participant `source`, and every participant that no pair
     /// targets receives zeros. Over a manual mesh axis, an input that does not vary over the axis is first made
     /// varying through [`ParallelVary`], because the permuted participants generally hold different values.
@@ -252,8 +266,8 @@ pub trait ParallelPermute: Sized {
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `source_target_pairs`: Pairs of `(source, target)` positions along the named axis, with unique sources and
-    ///     unique targets.
+    ///   - `source_target_pairs`: Pairs of `(source, target)` positions along the named axis,
+    ///     with unique sources and unique targets.
     ///
     /// # Errors
     ///
@@ -264,20 +278,20 @@ pub trait ParallelPermute: Sized {
     -> Result<Self, ProgramError>;
 }
 
-// Any context-carrying value permutes by resolving the axis size from the active `NamedAxes` environment and binding a
-// `ParallelPermuteOperation` through its own context. Over a manual mesh axis, an input that is still invariant over
-// the axis is first made varying, exactly as JAX's `ppermute` does, so that the output type records that the
-// participants hold different values.
-impl<V: Value<Type = ArrayType> + ParallelVary> ParallelPermute for V
-where
-    V::DispatchDomain: Context + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelPermuteOperation>,
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
+        + ParallelVary,
+> ParallelPermute for V
 {
     fn parallel_permute(
         &self,
         axis_name: &str,
         source_target_pairs: Vec<(usize, usize)>,
     ) -> Result<Self, ProgramError> {
+        // Any context-carrying value permutes by resolving the axis size from the active `NamedAxes` environment and
+        // binding a `ParallelPermuteOperation` through its own context. Over a manual mesh axis, an input that is still
+        // invariant over the axis is first made varying, exactly as JAX's `ppermute` does, so that the output type
+        // records that the participants hold different values.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let mut input = self.clone();
@@ -293,9 +307,11 @@ where
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Represents the ability to shuffle values across the participants of a named axis by listing, for every output
-/// participant, the participant whose value it receives. This is the analogue of
-/// [JAX's `pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it stages the
+/// participant, the participant whose value it receives. This is the Ryft analogue of JAX's
+/// [`pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it stages a
 /// [`ParallelPermuteOperation`] with the pair `(permutation[target], target)` for every target through
 /// [`ParallelPermute`], whose manual-axis behavior therefore applies to shuffles as well.
 pub trait ParallelShuffle: Sized {
