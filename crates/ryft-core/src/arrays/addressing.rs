@@ -131,7 +131,7 @@ impl ArrayAddressing {
                             .and_then(|span| occupied_span.checked_add(span))
                             .ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "physical storage span for array type {} cannot be represented",
+                                    "physical storage span for array type `{}` cannot be represented",
                                     addressing.r#type,
                                 ))
                             })?;
@@ -330,7 +330,7 @@ impl ArrayAddressing {
     pub fn validate_storage_bytes(&self, bytes: &[u8]) -> Result<(), ProgramError> {
         if bytes.len() != self.storage_byte_len() {
             return Err(TypeError::invalid(format!(
-                "array type {} requires {} physical storage bytes but got {}",
+                "array type `{}` requires {} physical storage bytes but got {}",
                 self.r#type,
                 self.storage_byte_len(),
                 bytes.len(),
@@ -374,7 +374,7 @@ impl ArrayAddressing {
             .flatten()
             .and_then(|element_count| element_count.checked_mul(self.element_byte_width()))
             .ok_or_else(|| {
-                TypeError::invalid(format!("array type {} requires more bytes than can be represented", self.r#type))
+                TypeError::invalid(format!("array type `{}` requires more bytes than can be represented", self.r#type))
                     .into()
             })
     }
@@ -394,14 +394,14 @@ impl ArrayAddressing {
                         .and_then(|axis_span| span.checked_add(axis_span))
                         .ok_or_else(|| {
                             TypeError::invalid(format!(
-                                "physical storage span for array type {} cannot be represented",
+                                "physical storage span for array type `{}` cannot be represented",
                                 self.r#type,
                             ))
                         })
                 })?;
                 span.checked_add(element_byte_width).ok_or_else(|| {
                     TypeError::invalid(format!(
-                        "physical storage span for array type {} cannot be represented",
+                        "physical storage span for array type `{}` cannot be represented",
                         self.r#type,
                     ))
                     .into()
@@ -415,7 +415,7 @@ impl ArrayAddressing {
                 });
                 padded_element_count.and_then(|count| count.checked_mul(element_byte_width)).ok_or_else(|| {
                     TypeError::invalid(format!(
-                        "physical storage span for array type {} cannot be represented",
+                        "physical storage span for array type `{}` cannot be represented",
                         self.r#type,
                     ))
                     .into()
@@ -813,7 +813,7 @@ mod tests {
         assert!(matches!(
             addressing.validate_storage_bytes(&[0; 23]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array type f32[2, 3] requires 24 physical storage bytes but got 23",
+                if message == "array type `f32[2, 3]` requires 24 physical storage bytes but got 23",
         ));
         let booleans =
             ArrayAddressing::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]))).unwrap();
@@ -892,7 +892,7 @@ mod tests {
         assert!(matches!(
             ArrayAddressing::new(oversized),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == format!("array type c128[{}] requires more bytes than can be represented", usize::MAX),
+                if message == format!("array type `c128[{}]` requires more bytes than can be represented", usize::MAX),
         ));
 
         // Element counts that overflow before the byte multiplication are rejected instead of panicking.
@@ -902,7 +902,7 @@ mod tests {
             ArrayAddressing::new(overflowing_element_count.clone()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == format!(
-                    "array type {overflowing_element_count} requires more bytes than can be represented",
+                    "array type `{overflowing_element_count}` requires more bytes than can be represented",
                 ),
         ));
     }
@@ -964,7 +964,7 @@ mod tests {
         assert!(matches!(
             positive.validate_storage_bytes(&[0; 24]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array type f32[2, 3][layout=strided{16,4}] requires 28 physical storage bytes but \
+                if message == "array type `f32[2, 3][layout=strided{16,4}]` requires 28 physical storage bytes but \
                                got 24",
         ));
         bytes[12] = 1;
@@ -995,7 +995,7 @@ mod tests {
         assert!(matches!(
             ArrayAddressing::new(overflowing),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "physical storage span for array type f32[3][layout=strided{9223372036854775807}] \
+                if message == "physical storage span for array type `f32[3][layout=strided{9223372036854775807}]` \
                 cannot be represented",
         ));
     }
@@ -1143,7 +1143,7 @@ mod tests {
             ArrayAddressing::new(overflowing),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == format!(
-                    "physical storage span for array type u8[{}][layout=tiled{{0:T(2)}}] cannot be represented",
+                    "physical storage span for array type `u8[{}][layout=tiled{{0:T(2)}}]` cannot be represented",
                     usize::MAX,
                 ),
         ));

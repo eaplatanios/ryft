@@ -2724,7 +2724,7 @@ pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> R
     let addressing = ArrayAddressing::new(r#type.clone())?;
     if elements.len() != addressing.element_count() {
         return Err(TypeError::invalid(format!(
-            "array type {} requires {} logical elements but got {}",
+            "array type `{}` requires {} logical elements but got {}",
             r#type,
             addressing.element_count(),
             elements.len(),
@@ -2765,7 +2765,7 @@ pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
     let addressing = ArrayAddressing::new(r#type.clone())?;
     if bytes.len() != addressing.logical_byte_len() {
         return Err(TypeError::invalid(format!(
-            "array type {} requires {} logical element bytes but got {}",
+            "array type `{}` requires {} logical element bytes but got {}",
             r#type,
             addressing.logical_byte_len(),
             bytes.len(),
@@ -4548,7 +4548,7 @@ mod tests {
         assert!(matches!(
             encode_elements(&booleans, &[true]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array type bool[2] requires 2 logical elements but got 1",
+                if message == "array type `bool[2]` requires 2 logical elements but got 1",
         ));
 
         let payload_free = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(usize::MAX)]));

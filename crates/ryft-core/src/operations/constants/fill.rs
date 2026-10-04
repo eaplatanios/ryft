@@ -584,7 +584,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F32, [2, large_extent]);
         assert!(matches!(context.dynamic_fill(&invalid_type, 1f32, &[extent]),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == format!("array type {static_type} requires more bytes than can be represented")));
+                if message == format!("array type `{static_type}` requires more bytes than can be represented")));
         assert!(context.builder().borrow().instructions().is_empty());
 
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -693,7 +693,7 @@ mod tests {
         let resolved_type = overflow_type.with_shape(Shape::new(vec![3.into(), 2.into()]));
         assert!(matches!(program.interpret(vec![extent]),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == format!("physical storage span for array type {resolved_type} cannot be represented"),
+                if message == format!("physical storage span for array type `{resolved_type}` cannot be represented"),
         ));
     }
 

@@ -1604,7 +1604,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::U64, [usize::MAX]);
         assert_eq!(
             state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
-            Err(TypeError::invalid(format!("array type {output_type} requires more bytes than can be represented"))
+            Err(TypeError::invalid(format!("array type `{output_type}` requires more bytes than can be represented"))
                 .into()),
         );
         let output_type =

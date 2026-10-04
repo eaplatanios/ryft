@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(
             context.iota(&oversized_type, 0),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "array type {oversized_type} requires more bytes than can be represented",
+                "array type `{oversized_type}` requires more bytes than can be represented",
             )))),
         );
 

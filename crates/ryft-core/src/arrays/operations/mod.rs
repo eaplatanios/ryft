@@ -1,11 +1,3 @@
-//! Closed operation families and array-owned operation implementations.
-//!
-//! [`ArrayOperation`], [`DimensionOperation`], and [`ArrayIrOperation`] are the staged operation families for the
-//! array universe. Most child modules group private mixed array-IR machinery by the semantic families used under
-//! [`crate::operations`].
-
-// TODO(eaplatanios): Review this module.
-
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
@@ -71,18 +63,9 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
-// type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
+// TODO(eaplatanios): Review from here onwards.
 
-/// Reusable [`Operation`] enum for ordinary staged programs over arrays.
-///
-/// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
-/// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
-/// [`crate::operations::differentiation`].
-///
-/// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
-/// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and
-/// [`Dot`](Self::Dot) a [`DotOperation`].
+/// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(identity, dispatch(batching, differentiation, transposition))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
@@ -95,49 +78,50 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Min(MinOperation<ArrayType>),
     Max(MaxOperation<ArrayType>),
     Clamp(ClampOperation<ArrayType>),
+    Sign(SignOperation<ArrayType>),
     Neg(NegOperation<ArrayType>),
     Add(AddOperation<ArrayType>),
     Sub(SubOperation<ArrayType>),
     Mul(MulOperation<ArrayType>),
     Div(DivOperation<ArrayType>),
-    Abs(AbsOperation<ArrayType>),
-    Sign(SignOperation<ArrayType>),
     Rem(RemOperation<ArrayType>),
     Pow(PowOperation<ArrayType>),
     Sqrt(SqrtOperation<ArrayType>),
     Rsqrt(RsqrtOperation<ArrayType>),
+    Abs(AbsOperation<ArrayType>),
     Sin(SinOperation<ArrayType>),
     Cos(CosOperation<ArrayType>),
+    // TODO(eaplatanios): Add `Tan` and `TanOperation`.
     Tanh(TanhOperation<ArrayType>),
     Atan2(Atan2Operation<ArrayType>),
     Exp(ExpOperation<ArrayType>),
     Log(LogOperation<ArrayType>),
+    Ln1p(Ln1pOperation<ArrayType>),
+    LogAddExp(LogAddExpOperation<ArrayType>),
     Logistic(LogisticOperation<ArrayType>),
+    Erf(ErfOperation<ArrayType>),
     Floor(FloorOperation<ArrayType>),
     Ceil(CeilOperation<ArrayType>),
     Round(RoundOperation<ArrayType>),
-    Ln1p(Ln1pOperation<ArrayType>),
-    LogAddExp(LogAddExpOperation<ArrayType>),
-    Erf(ErfOperation<ArrayType>),
     Not(NotOperation<ArrayType>),
     And(AndOperation<ArrayType>),
     Or(OrOperation<ArrayType>),
     Xor(XorOperation<ArrayType>),
     Complex(ComplexOperation<ArrayType>),
-    Conjugate(ConjugateOperation<ArrayType>),
     Real(RealOperation<ArrayType>),
     Imaginary(ImaginaryOperation<ArrayType>),
-    Dot(DotOperation),
-    RaggedDot(RaggedDotOperation),
-    ScaledDot(ScaledDotOperation),
-    DotProductAttention(DotProductAttentionOperation),
-    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
+    Conjugate(ConjugateOperation<ArrayType>),
     Reduce(ReduceOperation),
     ArgMax(ArgMaxOperation),
     ArgMin(ArgMinOperation),
     Cumulative(CumulativeOperation),
     Sort(SortOperation),
-    RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
+    Dot(DotOperation),
+    RaggedDot(RaggedDotOperation),
+    ScaledDot(ScaledDotOperation),
+    DotProductAttention(DotProductAttentionOperation),
+    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
+    AxisIndex(AxisIndexOperation),
     ParallelReduce(ParallelReduceOperation),
     ParallelVary(ParallelVaryOperation),
     ParallelAllGather(ParallelAllGatherOperation),
@@ -145,7 +129,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     ParallelPermute(ParallelPermuteOperation),
     ParallelAllToAll(ParallelAllToAllOperation),
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
-    AxisIndex(AxisIndexOperation),
+    Compare(CompareOperation<ArrayType>),
+    Select(SelectOperation<ArrayType>),
     Transpose(TransposeOperation),
     Reverse(ReverseOperation),
     Reshape(ReshapeOperation),
@@ -158,25 +143,24 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     UpdateSlice(UpdateSliceOperation),
     DynamicSlice(DynamicSliceOperation),
     DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    Compare(CompareOperation<ArrayType>),
-    Select(SelectOperation<ArrayType>),
-    Condition(ConditionOperation<ArrayType>),
-    While(WhileOperation<ArrayType>),
-    Scan(ScanOperation<ArrayType>),
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
     ReducePrecision(ReducePrecisionOperation<ArrayType>),
     TransferToMemory(TransferToMemoryOperation),
     Reshard(ReshardOperation),
     ConstrainSharding(ConstrainShardingOperation),
+    Condition(ConditionOperation<ArrayType>),
+    While(WhileOperation<ArrayType>),
+    Scan(ScanOperation<ArrayType>),
     StopGradient(StopGradientOperation<ArrayType>),
     Tag(TagOperation<ArrayType>),
     Rematerialize(RematerializeOperation<ArrayType>),
+    LinearCall(LinearCallOperation<ArrayType>),
+    RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
     CustomCall(CustomCallOperation),
     CustomFunction(CustomFunctionOperation<V, ArrayOperation<V>>),
     CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
-    LinearCall(LinearCallOperation<ArrayType>),
 }
 
 /// Value-level capability bundle paired with the [`ArrayOperation`] family.
