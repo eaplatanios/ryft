@@ -43,12 +43,11 @@ use crate::programs::{
 use super::axis_index::AxisIndexOperation;
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, collective_output_extents, define_linear_collective_operation,
-    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
-    impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, resolve_named_axis_size,
+    CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions, collective_input_extents,
+    collective_output_extents, define_linear_collective_operation, explicit_collective_inputs,
+    forward_explicit_collective, forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
     validate_explicit_collective_output_extents,
 };
 
@@ -706,7 +705,7 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<AllGatherOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: Mul,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
 {
     fn all_gather_with_options(
         &self,
@@ -727,7 +726,7 @@ where
         }
         let operation =
             AllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options.clone(), output_variance);
-        let mut output_extents = collective_input_extents(&context, self)?;
+        let mut output_extents = collective_input_extents(self)?;
         match options.mode {
             CollectiveMode::Untiled => {
                 if concat_axis > output_extents.len() {
@@ -737,7 +736,7 @@ where
                     ))
                     .into());
                 }
-                output_extents.insert(concat_axis, collective_extent_constant(&context, effective_axis_size)?);
+                output_extents.insert(concat_axis, CollectiveExtent::Static(effective_axis_size));
             }
             CollectiveMode::Tiled => {
                 let rank = output_extents.len();
@@ -747,9 +746,11 @@ where
                     ))
                     .into());
                 };
-                *output_extent = multiplied_collective_extent(&context, output_extent, effective_axis_size)?;
+                *output_extent = output_extent.multiplied(&context, effective_axis_size)?;
             }
         };
+        let output_extents =
+            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
         let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
@@ -1760,19 +1761,17 @@ mod tests {
                         labels=[\"extent\", \"participants\"],
                     ] %5 %0 %4
                     %6:dimension<0> = constant [value=0]
-                    %7:dimension<1> = constant [value=1]
-                    %8:bool[] = const true
-                    %9:dimension<gathered % batch ∈ [0, 8)> = dimension_rem %2 %0
-                    %10:bool[] = compare [direction=Equal] %9 %6
+                    %7:dimension<gathered % batch ∈ [0, 8)> = dimension_rem %2 %0
+                    %8:bool[] = compare [direction=Equal] %7 %6
                     () = assert [
                         message=\"collective extent must be divisible by the participant count\",
                         labels=[\"extent\", \"divisor\"],
-                    ] %10 %2 %0
-                    %11:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
-                    %12:f32[gathered / batch, width] = reshape %1 %11 %3
-                    %13:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %12 %0 %11 %3
-                    %14:f32[gathered, width] = reshape %13 %2 %3
-                in (%14)
+                    ] %8 %2 %0
+                    %9:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
+                    %10:f32[gathered / batch, width] = reshape %1 %9 %3
+                    %11:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %10 %0 %9 %3
+                    %12:f32[gathered, width] = reshape %11 %2 %3
+                in (%12)
             "}
             .trim_end(),
         );

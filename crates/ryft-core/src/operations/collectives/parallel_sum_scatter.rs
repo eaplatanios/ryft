@@ -35,11 +35,10 @@ use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
 use super::parallel_vary::ParallelVary;
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    collective_output_extents, define_linear_collective_operation, divided_collective_extent,
-    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
-    impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    jvp_shape_changing_collective_with_adjoint, require_collective_axis_extent, resolve_named_axis_size,
+    collective_output_extents, define_linear_collective_operation, explicit_collective_inputs,
+    forward_explicit_collective, forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
     validate_explicit_collective_output_extents,
 };
 
@@ -428,8 +427,7 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<ParallelSumScatterOperation>,
-    <V as ValueProjection<DimensionType>>::Projected:
-        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Rem + Div,
     ProjectedValue<ArrayType, V>: ParallelVary,
 {
     fn parallel_sum_scatter_with_options(
@@ -452,7 +450,7 @@ where
         }
         let operation =
             ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
-        let mut output_extents = collective_input_extents(&context, &input)?;
+        let mut output_extents = collective_input_extents(&input)?;
         if scatter_axis >= output_extents.len() {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {scatter_axis} is out of bounds for rank {}",
@@ -462,14 +460,15 @@ where
         }
         match options.mode {
             CollectiveMode::Untiled => {
-                require_collective_axis_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
+                output_extents[scatter_axis].require_equal(&context, effective_axis_size)?;
                 output_extents.remove(scatter_axis);
             }
             CollectiveMode::Tiled => {
-                output_extents[scatter_axis] =
-                    divided_collective_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
+                output_extents[scatter_axis] = output_extents[scatter_axis].divided(&context, effective_axis_size)?;
             }
         };
+        let output_extents =
+            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
         let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
@@ -1346,6 +1345,7 @@ mod tests {
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
             )
             .unwrap();
+            println!("CAPTURE\n{program}\nEND");
             assert_eq!(program.to_string(), expected);
         }
     }

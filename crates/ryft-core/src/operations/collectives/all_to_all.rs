@@ -37,13 +37,12 @@ use crate::programs::{
 };
 
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, collective_output_extents, define_linear_collective_operation, divided_collective_extent,
-    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
-    impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, require_collective_axis_divisible,
-    require_collective_axis_extent, resolve_named_axis_size, validate_explicit_collective_output_extents,
+    CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions, collective_input_extents,
+    collective_output_extents, define_linear_collective_operation, explicit_collective_inputs,
+    forward_explicit_collective, forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
+    validate_explicit_collective_output_extents,
 };
 
 /// Infers the composite all-to-all contract.
@@ -523,8 +522,7 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
-    <V as ValueProjection<DimensionType>>::Projected:
-        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div + Mul,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Rem + Div + Mul,
 {
     fn all_to_all_with_options(
         &self,
@@ -538,7 +536,7 @@ where
         let effective_axis_size = options.effective_axis_size(ALL_TO_ALL_OPERATION_NAME, axis_size)?;
         let operation =
             AllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options.clone());
-        let mut output_extents = collective_input_extents(&context, self)?;
+        let mut output_extents = collective_input_extents(self)?;
         let rank = output_extents.len();
         if split_axis >= rank || concat_axis >= rank {
             return Err(TypeError::invalid(format!(
@@ -548,22 +546,22 @@ where
         }
         match options.mode {
             CollectiveMode::Untiled => {
-                require_collective_axis_extent(&context, &output_extents[split_axis], effective_axis_size)?;
+                output_extents[split_axis].require_equal(&context, effective_axis_size)?;
                 output_extents.remove(split_axis);
-                output_extents.insert(concat_axis, collective_extent_constant(&context, effective_axis_size)?);
+                output_extents.insert(concat_axis, CollectiveExtent::Static(effective_axis_size));
             }
             CollectiveMode::Tiled if split_axis == concat_axis => {
-                require_collective_axis_divisible(&context, &output_extents[split_axis], effective_axis_size)?;
+                output_extents[split_axis].require_divisible(&context, effective_axis_size)?;
             }
             CollectiveMode::Tiled => {
-                let split_extent =
-                    divided_collective_extent(&context, &output_extents[split_axis], effective_axis_size)?;
-                let concat_extent =
-                    multiplied_collective_extent(&context, &output_extents[concat_axis], effective_axis_size)?;
+                let split_extent = output_extents[split_axis].divided(&context, effective_axis_size)?;
+                let concat_extent = output_extents[concat_axis].multiplied(&context, effective_axis_size)?;
                 output_extents[split_axis] = split_extent;
                 output_extents[concat_axis] = concat_extent;
             }
         };
+        let output_extents =
+            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
         let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
         Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
     }
@@ -1025,21 +1023,19 @@ mod tests {
                         labels=[\"extent\", \"participants\"],
                     ] %5 %0 %4
                     %6:dimension<0> = constant [value=0]
-                    %7:dimension<1> = constant [value=1]
-                    %8:bool[] = const true
-                    %9:dimension<output_concat % batch ∈ [0, 8)> = dimension_rem %3 %0
-                    %10:bool[] = compare [direction=Equal] %9 %6
+                    %7:dimension<output_concat % batch ∈ [0, 8)> = dimension_rem %3 %0
+                    %8:bool[] = compare [direction=Equal] %7 %6
                     () = assert [
                         message=\"collective extent must be divisible by the participant count\",
                         labels=[\"extent\", \"divisor\"],
-                    ] %10 %3 %0
-                    %11:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
-                    %12:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
-                    %13:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %12
-                    %14:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %13
-                    %15:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %14
-                    %16:f32[batch, output_split, output_concat] = reshape %15 %0 %2 %3
-                in (%16)
+                    ] %8 %3 %0
+                    %9:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
+                    %10:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
+                    %11:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %10
+                    %12:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %11
+                    %13:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %12
+                    %14:f32[batch, output_split, output_concat] = reshape %13 %0 %2 %3
+                in (%14)
             "}
             .trim_end(),
         );
