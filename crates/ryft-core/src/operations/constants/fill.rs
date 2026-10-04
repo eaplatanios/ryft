@@ -24,6 +24,13 @@ use crate::tracing::Tracer;
 /// [`Memory`](crate::Memory), and use ordinary broadcasting for every rank-positive result. This keeps the fill value
 /// explicit in Static Single Assignment (SSA) dataflow and avoids the need for a separate array fill operation type.
 ///
+/// The rank-zero literal carries the rank-zero form of the requested [`Sharding`](crate::Sharding) (i.e., its mesh,
+/// reduced axes, and varying manual axes), so a fill of a type that varies over manual mesh axes (e.g., inside
+/// `shard_map`) is itself varying and combines with other varying values without further alignment. This is sound
+/// because a fill is a nondifferentiable constant, so no tangent flows through the `parallel_vary` that it skips.
+/// A fill holds the same value on every device, which is a valid value along reduced axes but not a partial sum, so
+/// types that are unreduced over any mesh axis are rejected. Use [`Zero`](crate::Zero) to create zero partial sums.
+///
 /// For a fill value that is already an array or a tracer, compose [`ConvertElementType::convert_element_type`] with
 /// [`Broadcast::broadcast`] or [`Broadcast::broadcast_to`]. A scalar fills the whole result; array inputs follow the
 /// same trailing-axis alignment and size-one expansion as any other broadcast. The value stays in dataflow, so its
@@ -63,10 +70,7 @@ impl<L: ArrayElement, O: Operation<Type = ArrayType>> Fill<L, Array> for EagerCo
             ))
             .into());
         }
-        Array::scalar(value)?
-            .convert_element_type(r#type.data_type())?
-            .transfer_to_memory(r#type.memory())?
-            .broadcast(r#type.clone(), &[])
+        fill_literal_array(r#type, value)?.broadcast(r#type.clone(), &[])
     }
 }
 
@@ -134,9 +138,7 @@ where
     C::Operation: From<ConstantOperation<Array>>,
 {
     fn fill_literal(&self, r#type: &ArrayType, value: L) -> Result<Self::Value, ProgramError> {
-        let value = Array::scalar(value)?
-            .convert_element_type(r#type.data_type())?
-            .transfer_to_memory(r#type.memory())?;
+        let value = fill_literal_array(r#type, value)?;
         r#type
             .clone()
             .with_sharding(r#type.sharding().cloned())
@@ -220,9 +222,7 @@ where
             .clone()
             .with_sharding(r#type.sharding().cloned())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let literal = Array::scalar(value)?
-            .convert_element_type(r#type.data_type())?
-            .transfer_to_memory(r#type.memory())?;
+        let literal = fill_literal_array(r#type, value)?;
 
         // Check every locally decidable failure before binding the literal. Static output axes of a dynamic
         // broadcast need dimension constants too, and their extents must fit the dimension representation.
@@ -297,6 +297,45 @@ where
     }
 }
 
+/// Returns the rank-zero [`Array`] literal that a fill of `type` broadcasts, holding `value` converted to the element
+/// [`DataType`](crate::DataType) and placed in the [`Memory`](crate::Memory) of `type`. The literal carries the
+/// rank-zero form of the [`Sharding`](crate::Sharding) of `type` (i.e., the same mesh, reduced axes, and varying manual
+/// axes, but no dimension placements), so that broadcasting it to `type` changes neither its manual variation nor its
+/// manual reduction state. A fill holds the same value on every device, which is a valid value along reduced axes
+/// (they are computationally indistinguishable from replicated ones) but not a partial sum that still needs a
+/// cross-device reduction. Fills of types that are unreduced over any mesh axis are therefore rejected; use
+/// [`Zero`](crate::Zero) to create zero partial sums.
+fn fill_literal_array<L: ArrayElement>(r#type: &ArrayType, value: L) -> Result<Array, ProgramError> {
+    let literal = Array::scalar(value)?
+        .convert_element_type(r#type.data_type())?
+        .transfer_to_memory(r#type.memory())?;
+
+    let Some(sharding) = r#type.sharding() else {
+        return Ok(literal);
+    };
+
+    if !sharding.unreduced_axes().is_empty() {
+        return Err(TypeError::invalid(format!(
+            "cannot fill type `{}` because it is unreduced over mesh axes; a fill holds the same value on every \
+             device rather than partial sums that still need a cross-device reduction",
+            r#type,
+        ))
+        .into());
+    }
+
+    // A fill is a non-differentiable constant, so typing it as varying directly is sound: no tangent flows through
+    // the skipped `parallel_vary`, whose transpose would otherwise be a cross-device sum.
+    let sharding = sharding.with_dimensions(Vec::new()).map_err(|error| TypeError::invalid(error.to_string()))?;
+    let literal_type = literal
+        .r#type()
+        .into_owned()
+        .with_sharding(sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+
+    // Sharding metadata does not affect the physical storage of an array, so the literal bytes are reused as is.
+    Ok(Array::new_unchecked(literal_type, literal.shared_storage_bytes().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -308,6 +347,7 @@ mod tests {
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory,
         MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, Tile, TileDimension, TiledLayout, f6e2m3fn, u4,
     };
+    use crate::axes::NamedAxis;
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, MaybeZero, ProgramBuilder};
@@ -358,6 +398,39 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot materialize a value of dynamically sized type `f32[size]`; stage a rank-zero \
                                fill and expand it with a dynamic `broadcast` operation instead",
+        ));
+    }
+
+    #[test]
+    fn test_fill_interpretation_manual_variation() {
+        // A fill holds the same value on every device, so it takes the varying manual axes and the reduced axes of the
+        // requested type directly, but it cannot represent partial sums that still need a cross-device reduction.
+        let context = EagerContext::<Array>::new();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            context.fill(&varying_type, 2.5f64),
+            Array::from_elements(varying_type, &[2.5f32; 2]).map_err(Into::into),
+        );
+        let reduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            context.fill(&reduced_type, 2.5f64),
+            Array::from_elements(reduced_type, &[2.5f32; 2]).map_err(Into::into),
+        );
+        let unreduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            context.fill(&unreduced_type, 2.5f64),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "cannot fill type `{unreduced_type}` because it is unreduced over mesh axes; a fill holds the \
+                     same value on every device rather than partial sums that still need a cross-device reduction",
+                ),
         ));
     }
 
@@ -498,6 +571,39 @@ mod tests {
                     %1:f32[2, 3]@Host[Unpinned] = broadcast \
                         [output_type=f32[2, 3]@Host[Unpinned], output_axes=[]] %0
                 in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_fill_staging_manual_variation() {
+        // Inside a manual region, the staged literal carries the varying manual axes of the requested type, so its
+        // broadcast preserves variation without staging a `parallel_vary` for the non-differentiable fill.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let output: Tracer<_> = input.dispatch_domain().fill(&input.r#type(), 2.5f64)?;
+                Ok(output)
+            },
+            varying_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output_type, varying_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=2.5]
+                    %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                        output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                        output_axes=[],
+                    ] %1
+                in (%2)
             "}
             .trim_end(),
         );

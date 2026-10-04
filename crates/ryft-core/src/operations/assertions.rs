@@ -778,7 +778,20 @@ impl<
             } else {
                 (0..input_type.rank()).collect::<Vec<_>>()
             };
-            let output_type = condition_type.clone().with_data_type(input_type.data_type());
+
+            // Each device records its own observations, so an observation keeps its memory space, placement, and
+            // manual variation, with its sharding mapped onto the condition's axes and any new axis replicated, as
+            // the array IR policy's dynamic broadcast infers. Assertions do not require their inputs to share manual
+            // variation, and a broadcast cannot change it.
+            let output_sharding = input_type
+                .sharding()
+                .map(|sharding| sharding.with_broadcasted_dimensions(condition_type.rank(), &output_axes))
+                .transpose()
+                .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+            let output_type = ArrayType::new(input_type.data_type(), condition_type.shape().clone())
+                .with_memory(input_type.memory())
+                .with_sharding(output_sharding)
+                .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
             let mut outputs =
                 context.parent().bind(BroadcastOperation::new(output_type, output_axes), Vec::new(), &[value])?;
             check_count!("output", outputs, 1, ProgramError);
@@ -873,12 +886,12 @@ impl<
         if extent.bounds().lower() > 0 {
             return Ok(observation);
         }
-        let input_type = <&ArrayType>::try_from(observation.r#type().as_ref())?.clone();
-        let mut zero = context.parent().bind(
-            ZeroOperation::new(ArrayType::scalar(input_type.data_type()).with_memory(input_type.memory())),
-            Vec::new(),
-            &[],
-        )?;
+
+        // The padding zero is created with the observation's memory space and manual variation, which `pad` requires
+        // of its padding value. This skips a `parallel_vary` transition, which is sound only because assertions are
+        // not differentiable, so the padding never carries a tangent.
+        let padding_type = <&ArrayType>::try_from(observation.r#type().as_ref())?.scalar_like()?;
+        let mut zero = context.parent().bind(ZeroOperation::new(padding_type), Vec::new(), &[])?;
         check_count!("output", zero, 1, ProgramError);
         let padded_extent = match padded_extent.clone() {
             Some(value) => value,
@@ -1314,8 +1327,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayBatch, ArrayIrBatch, ArrayIrOperation, ArrayOperation, ArrayReference, DimensionBounds, Shape,
+        ArrayBatch, ArrayIrBatch, ArrayIrOperation, ArrayOperation, ArrayReference, DimensionBounds, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
@@ -1323,7 +1338,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -1931,6 +1946,70 @@ mod tests {
     }
 
     #[test]
+    fn test_assert_batching_dynamic_manual_variation() {
+        // Inside a manual region, the zero that pads a varying observation for a possibly empty batch takes the
+        // observation's manual variation, as `pad` requires of its padding value.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        let varying = |data_type: DataType| {
+            ArrayIrType::Array(
+                ArrayType::new(data_type, Shape::new(vec![extent_type.to_dimension()]))
+                    .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+                    .unwrap(),
+            )
+        };
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |(extent, condition, observation)| {
+                let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                AssertOperation::new("dynamic").with_labels(vec!["value".to_owned()]).batch(
+                    &batching,
+                    &EmptyRegionDriver,
+                    &[
+                        ArrayIrBatch::new(condition, BatchAxis::new(0))?,
+                        ArrayIrBatch::new(observation, BatchAxis::new(0))?,
+                    ],
+                )?;
+                Ok(())
+            },
+            (ArrayIrType::Dimension(extent_type.clone()), varying(DataType::Boolean), varying(DataType::I32)),
+            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [0, 5)>, %1:bool[batch][sharding={mesh<['x'=2:manual]>, [{}], \
+                    varying_manual={'x'}}], %2:i32[batch][sharding={mesh<['x'=2:manual]>, [{}], \
+                    varying_manual={'x'}}] .
+                let %3:i32[batch][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                    type=i32[batch][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                    dimension=0,
+                ] %0
+                    %4:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=max, \
+                        axes=[0]] %3
+                    %5:i32[batch][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %1 %4 %3
+                    %6:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=min, \
+                        axes=[0]] %5
+                    %7:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=all, \
+                        axes=[0]] %1
+                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %6
+                    %9:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %7 %8 %6
+                    %10:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero \
+                        [type=i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                    %11:dimension<1> = constant [value=1]
+                    %12:dimension<batch + 1 ∈ [1, 6)> = dimension_add %0 %11
+                    %13:i32[batch + 1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = pad \
+                        [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[0]] %2 %10 %12
+                    %14:i32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                        [sizes=[1], allow_negative_indices=false] %13 %9
+                    %15:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reshape [shape=[]] %14
+                    () = assert [message=\"dynamic\", labels=[\"value\", \"batch_index\"]] %7 %15 %9
+                in ()"
+            },
+        );
+    }
+
+    #[test]
     fn test_assert_batching_dynamic_nested() {
         let extent_type = DimensionType::new("inner", DimensionBounds::new(0, Some(4)).unwrap());
         let shape = Shape::new(vec![Dimension::Static(2), extent_type.to_dimension()]);
@@ -2190,6 +2269,52 @@ mod tests {
             None,
         );
         assert_eq!(output, Ok(()));
+    }
+
+    #[test]
+    fn test_assert_batching_with_limit_manual_variation() {
+        type ArrayTrace = TracingContext<Array, ArrayOperation<Array>>;
+
+        // Inside a manual region, each device records its own observations, so materializing an observation along
+        // the batch axis keeps its own manual variation rather than taking that of the condition.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let condition_type = ArrayType::new_static(DataType::Boolean, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let observation_type = ArrayType::new_static(DataType::I32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let (_, program) = ArrayTrace::trace_with_named_axes(
+            |(condition, observation): (Tracer<ArrayTrace>, Tracer<ArrayTrace>)| {
+                let batching = BatchingContext::<_, ArrayBatchingPolicy>::new(condition.dispatch_domain(), 2);
+                AssertOperation::new("valid")
+                    .with_labels(vec!["value".to_owned()])
+                    .with_failure_limit(NonZeroUsize::MIN)
+                    .batch(
+                        &batching,
+                        &EmptyRegionDriver,
+                        &[
+                            ArrayBatch::new(condition, BatchAxis::new(0))?,
+                            ArrayBatch::new(observation, BatchAxis::new(0))?,
+                        ],
+                    )?;
+                Ok(())
+            },
+            (condition_type, observation_type),
+            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %1:i32[2][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                let %2:i32[2][sharding={mesh<['x'=2:manual]>, [{}]}] = broadcast \
+                    [output_type=i32[2][sharding={mesh<['x'=2:manual]>, [{}]}], output_axes=[0]] %1
+                    () = assert [message=\"valid\", labels=[\"value\"], failure_limit=1] %0 %2
+                in ()"
+            },
+        );
     }
 
     #[test]

@@ -1633,14 +1633,15 @@ where
         edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
-        self.r#type()
-            .pad(padding_value.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding)?;
-        if is_effective_identity(self.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
-            return Ok(self.clone());
+        // The padding value is aligned before validation because type inference requires matching manual variation,
+        // and a varying input may be padded with an invariant scalar.
+        let inputs = ManualVariationAlignment::align_manual_variation(&[self.clone(), padding_value.clone()])?;
+        let input_type = inputs[0].r#type();
+        input_type.pad(inputs[1].r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding)?;
+        if is_effective_identity(input_type.as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
+            return Ok(inputs[0].clone());
         }
-        let inputs = [self.clone(), padding_value.clone()];
-        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = inputs[0].dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
             Vec::new(),
             &inputs,
@@ -1743,11 +1744,16 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             + DimensionToScalar
             + DynamicBroadcast
             + DynamicReshape
+            + ManualVariationAlignment<ArrayIrType>
             + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Compare<Self>>,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
-        let input_type = self.r#type();
+        // The padding value is aligned first because the fill is broadcast to the input's manual variation,
+        // and a varying input may be padded with an invariant scalar.
+        let inputs = ManualVariationAlignment::align_manual_variation(&[self.clone(), padding_value.clone()])?;
+        let (input, padding_value) = (&inputs[0], &inputs[1]);
+        let input_type = input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let padding_type = padding_value.r#type();
         let padding_type = <&ArrayType>::try_from(padding_type.as_ref())?;
@@ -1768,7 +1774,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             .map_err(|error| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output type is invalid: {error}")))?;
 
         let input_dimensions = (0..input_type.rank())
-            .map(|input_axis| self.dimension_size(input_axis))
+            .map(|input_axis| input.dimension_size(input_axis))
             .collect::<Result<Vec<_>, _>>()?;
         let size = input_dimensions[axis].clone();
         let end = ValueProjection::<DimensionType>::into_projected(edge_padding_low.clone())?
@@ -1795,7 +1801,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         // cannot create a dynamic axis.
         let query_type = ArrayType::new(DataType::I64, Shape::new(vec![input_type.dimension(axis)]))
             .with_memory(input_type.memory());
-        let context = self.dispatch_domain();
+        let context = input.dispatch_domain();
         let queries = context.dynamic_iota(
             &query_type,
             0,
@@ -1827,7 +1833,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             )?)?;
         let padded = fill.scatter(
             &indices,
-            &ValueProjection::<ArrayType>::into_projected(self.clone())?,
+            &ValueProjection::<ArrayType>::into_projected(input.clone())?,
             &dimensions,
             ScatterReductionKind::Overwrite,
             &options.with_output_sharding(output_type.sharding().cloned()),
@@ -1886,7 +1892,7 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for Arr
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicPad for V
+impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicPad for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<PadOperation<ArrayIrType>>>,
 {
@@ -1903,9 +1909,7 @@ where
             edge_padding_high.to_vec(),
             interior_padding.to_vec(),
         )?;
-        let mut inputs = Vec::with_capacity(2 + output_dimensions.len());
-        inputs.push(self.clone());
-        inputs.push(padding_value.clone());
+        let mut inputs = ManualVariationAlignment::align_manual_variation(&[self.clone(), padding_value.clone()])?;
         inputs.extend_from_slice(output_dimensions);
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = operation.with_input_types(&input_types)?;
@@ -2195,7 +2199,7 @@ mod tests {
         DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationContext, TranspositionContext};
@@ -3489,6 +3493,57 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_pad_pad_manual_variation() {
+        // A varying input may be padded with an invariant or unsharded padding value, which is aligned before the
+        // padding is validated. An effective identity returns the aligned input.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |dimensions: &[usize]| {
+            ArrayType::new_static(DataType::F32, dimensions.to_vec())
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), dimensions.len()).with_varying_manual_axes(["m"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                input.pad(&padding_value, &[1], &[1], &[0])
+            },
+            (varying(&[4]), invariant.clone()),
+            named_axes.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(&[6]));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["parallel_vary", "pad"],
+        );
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                input.pad(&padding_value, &[1], &[1], &[0])
+            },
+            (varying(&[4]), ArrayType::scalar(DataType::F32)),
+            named_axes.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(&[6]));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", "parallel_vary", "pad"],
+        );
+        let (output_type, _) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                input.pad(&padding_value, &[0], &[0], &[0])
+            },
+            (varying(&[4]), invariant),
+            named_axes,
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(&[4]));
     }
 
     #[test]
@@ -5812,6 +5867,41 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_pad_dynamic_pad_manual_variation() {
+        // An invariant padding value is aligned with a varying input before the mixed pad is staged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let output_size = DimensionVariable::new("output_size", DimensionBounds::new(3, Some(7)).unwrap());
+        let (output_types, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                    Ok(vec![inputs[0].dynamic_pad(&inputs[1], &inputs[2..], &[1], &[1], &[0])?])
+                },
+                vec![
+                    ArrayIrType::Array(
+                        ArrayType::new_static(DataType::F32, [2]).with_sharding(varying.clone()).unwrap(),
+                    ),
+                    ArrayIrType::Array(
+                        ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
+                    ),
+                    DimensionType::from(output_size.clone()).into(),
+                ],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            )
+            .unwrap();
+        assert_eq!(
+            output_types,
+            vec![ArrayIrType::Array(
+                ArrayType::new(DataType::F32, Shape::new(vec![output_size.into()])).with_sharding(varying).unwrap(),
+            )],
+        );
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["parallel_vary", "pad"],
+        );
+    }
+
+    #[test]
     fn test_dynamic_pad_dynamic_pad_to_extent() {
         // Runtime padding amounts have no primitive, so padding to a first-class extent at a runtime offset composes
         // a requirement that the input fits, an offset iota of queries, and a unique-index overwrite scatter into
@@ -6047,6 +6137,61 @@ mod tests {
                 plain_fill.r#type(),
             )
         ));
+    }
+
+    #[test]
+    fn test_dynamic_pad_dynamic_pad_to_extent_manual_variation() {
+        // An invariant fill is aligned with a varying input before it is broadcast to the varying output.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let low = DimensionVariable::new("low", DimensionBounds::new(0, Some(3)).unwrap());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(5)).unwrap());
+        let (output_types, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                    Ok(vec![inputs[0].dynamic_pad_to_extent(&inputs[1], 0, &inputs[2], &inputs[3])?])
+                },
+                vec![
+                    ArrayIrType::Array(
+                        ArrayType::new_static(DataType::F32, [2]).with_sharding(varying.clone()).unwrap(),
+                    ),
+                    ArrayIrType::Array(
+                        ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
+                    ),
+                    DimensionType::from(low).into(),
+                    DimensionType::from(extent.clone()).into(),
+                ],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            )
+            .unwrap();
+        assert_eq!(
+            output_types,
+            vec![ArrayIrType::Array(
+                ArrayType::new(DataType::F32, Shape::new(vec![extent.into()])).with_sharding(varying).unwrap(),
+            )],
+        );
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![
+                "parallel_vary",
+                "constant",
+                "dimension_add",
+                "compare",
+                "assert",
+                "iota",
+                "dimension_to_scalar",
+                "transfer_to_memory",
+                "broadcast",
+                "add",
+                "constant",
+                "constant",
+                "reshape",
+                "broadcast",
+                "broadcast",
+                "parallel_vary",
+                "scatter",
+            ],
+        );
     }
 
     #[test]

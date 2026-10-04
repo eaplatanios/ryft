@@ -94,7 +94,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType, f4e2m1fn, f8e8m0fnu};
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding, f4e2m1fn, f8e8m0fnu,
+    };
+    use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -104,6 +107,7 @@ mod tests {
     };
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::programs::EmptyRegionDriver;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -215,6 +219,38 @@ mod tests {
         assert_eq!(primal.elements::<f8e8m0fnu>().unwrap()[0].to_bits(), 0x7e);
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 0.8787826, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn test_erf_differentiation_manual_variation() {
+        // Inside a manual region, the coefficient filled at the input type varies like the input, so the rule combines
+        // it with the varying input without aligning it through `parallel_vary`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.erf(),
+            varying_type,
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                    %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                let %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = erf %0
+                    %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=1.1283792]
+                    %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %0 %0
+                    %5:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %4
+                    %6:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = exp %5
+                    %7:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %3 %6
+                    %8:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %7 %1
+                in (%2, %8)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

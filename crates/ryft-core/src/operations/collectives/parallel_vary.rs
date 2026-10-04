@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, DataType, DimensionType, MeshAxisType, Sharding,
+    ArrayType, DataType, DimensionType, LogicalMesh, MeshAxisType, Sharding,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -348,6 +348,24 @@ pub trait ParallelVary: Sized {
     /// Returns a [`ProgramError`] if `axis_name` is not bound by an enclosing manual region, if the axis is empty,
     /// or if this value already varies over it or carries reduction state along it.
     fn parallel_vary(&self, axis_name: &str) -> Result<Self, ProgramError>;
+
+    /// Returns this value marked as varying across the manual axis `axis_name` of `mesh`, like
+    /// [`parallel_vary`](Self::parallel_vary), but with the mesh supplied by the caller instead of resolved from an
+    /// enclosing manual region. [`ManualVariationAlignment`] uses this function in traces that do not bind `axis_name`,
+    /// such as the fresh trace in which [`Region`](crate::Region) transposition stages its rules. It takes `mesh` from
+    /// an input whose type varies over the axis, which shows that an enclosing manual region of the original
+    /// computation binds it.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of a manual axis of `mesh`.
+    ///   - `mesh`: [`LogicalMesh`] that owns the axis named `axis_name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `axis_name` is not a non-empty manual axis of `mesh`, or if this value carries a
+    /// sharding on a different mesh, already varies over the axis, or carries reduction state along it.
+    fn parallel_vary_on_mesh(&self, axis_name: &str, mesh: &LogicalMesh) -> Result<Self, ProgramError>;
 }
 
 // The derived `ArrayOperation` interpreter requires every variant's value capability, even when a program does not use
@@ -361,6 +379,11 @@ impl ParallelVary for Array {
                 "`{PARALLEL_VARY_OPERATION_NAME}` requires an active non-empty manual mesh axis `{axis_name}`",
             ),
         })
+    }
+
+    #[inline]
+    fn parallel_vary_on_mesh(&self, axis_name: &str, _mesh: &LogicalMesh) -> Result<Self, ProgramError> {
+        self.parallel_vary(axis_name)
     }
 }
 
@@ -389,14 +412,24 @@ impl<
                 TypeError::invalid(message).into()
             });
         };
+        self.parallel_vary_on_mesh(axis_name, &mesh)
+    }
 
+    fn parallel_vary_on_mesh(&self, axis_name: &str, mesh: &LogicalMesh) -> Result<Self, ProgramError> {
+        if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) || mesh.axis_size(axis_name) == Some(0) {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_VARY_OPERATION_NAME}` requires a non-empty manual mesh axis `{axis_name}`",
+            ))
+            .into());
+        }
+        let context = self.dispatch_domain();
         let mut input = self.clone();
         let input_type = input.r#type().into_owned();
         if input_type.sharding().is_none() {
             let rank = input_type.rank();
             let mesh_type = input_type
                 .clone()
-                .with_sharding(Sharding::replicated(mesh, rank))
+                .with_sharding(Sharding::replicated(mesh.clone(), rank))
                 .map_err(|error| TypeError::invalid(error.to_string()))?;
             let operation = BroadcastOperation::new(mesh_type, (0..rank).collect());
             let operation = C::Operation::provide(operation, &[&input_type])?;
@@ -423,8 +456,11 @@ impl<
 /// lacks. The inserted transition owns the collective adjoint, so gradients through the operation stay correct. Local
 /// shapes and values are unchanged, and ordinary shape broadcasting never manufactures or erases variation.
 ///
-/// Only axes that an enclosing manual region binds take part. Scalar data-type and dimension values have no manual
-/// variation and pass through unchanged, and a composite [`ArrayIrType`] value aligns only its array members.
+/// An axis whose name a `batch` level binds does not take part, because that level shadows the manual mesh axis. A
+/// trace that does not bind the name at all, such as the fresh trace in which [`Region`](crate::Region) transposition
+/// stages its rules, still aligns over it, using the mesh of an input that varies over the axis (refer to
+/// [`ParallelVary::parallel_vary_on_mesh`]). Scalar data-type and dimension values have no manual variation
+/// and pass through unchanged, and a composite [`ArrayIrType`] value aligns only its array members.
 pub trait ManualVariationAlignment<T: Type>: Value<Type = T> {
     /// Returns `inputs` with their manual variation aligned, in the same order.
     ///
@@ -446,27 +482,33 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context + NamedAxes> + ParallelV
 {
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
         // Every input is weakened to the union of the axes that any input varies over, computed once from the unaligned
-        // inputs. Only axes that an enclosing manual region binds take part: a name that no enclosing binder owns, or
-        // that a `batch` level binds, is not a manual variation axis of this computation, so no transition is inserted
-        // for it. Each input resolves names against its own context.
-        let axes = inputs
-            .iter()
-            .filter_map(|input| input.r#type().sharding().map(|sharding| sharding.varying_manual_axes().clone()))
-            .flatten()
-            .collect::<BTreeSet<_>>();
+        // inputs together with the mesh of the first input that varies over each axis. Each input resolves names
+        // against its own context. A name that a `batch` level binds shadows the mesh axis, so no transition is
+        // inserted for it. A name that the context does not bind at all belongs to a trace staged outside of the
+        // original manual region (e.g., the fresh trace of `Region` transposition), and the varying input's type
+        // is evidence that an enclosing manual region binds it, so the transition uses that input's mesh.
+        let mut axes = BTreeMap::<String, LogicalMesh>::new();
+        for input in inputs {
+            if let Some(sharding) = input.r#type().sharding() {
+                for axis in sharding.varying_manual_axes() {
+                    axes.entry(axis.clone()).or_insert_with(|| sharding.mesh().clone());
+                }
+            }
+        }
         inputs
             .iter()
             .map(|input| {
                 let context = input.dispatch_domain();
-                let input_type = input.r#type();
+                let input_type = input.r#type().into_owned();
                 axes.iter()
-                    .filter(|axis| {
-                        matches!(context.named_axis(axis), Some(NamedAxis::Mesh { .. }))
-                            && !input_type
-                                .sharding()
-                                .is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
+                    .filter(|(axis, _)| {
+                        !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
                     })
-                    .try_fold(input.clone(), |input, axis| input.parallel_vary(axis))
+                    .try_fold(input.clone(), |input, (axis, mesh)| match context.named_axis(axis) {
+                        Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
+                        Some(NamedAxis::Batched { .. }) => Ok(input),
+                        None => input.parallel_vary_on_mesh(axis, mesh),
+                    })
             })
             .collect()
     }
@@ -830,6 +872,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_vary_capability_on_mesh() {
+        // With an explicit mesh, a trace that binds no named axes still varies invariant and unsharded values.
+        let (invariant, varying) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.parallel_vary_on_mesh("m", &mesh),
+            invariant,
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![PARALLEL_VARY_OPERATION_NAME],
+        );
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.parallel_vary_on_mesh("m", &mesh),
+            ArrayType::scalar(DataType::F32),
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME],
+        );
+
+        // The axis must be a non-empty manual axis of the provided mesh.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        for (axis_name, mesh) in [("m", &explicit_mesh), ("n", &mesh)] {
+            assert_eq!(
+                TracingContext::<Array, ArrayOperation<Array>>::trace(
+                    |input| input.parallel_vary_on_mesh(axis_name, mesh),
+                    ArrayType::scalar(DataType::F32),
+                )
+                .map(|(output, _)| output),
+                Err(ProgramError::Type(TypeError::invalid(format!(
+                    "`parallel_vary` requires a non-empty manual mesh axis `{axis_name}`",
+                )))),
+            );
+        }
+    }
+
+    #[test]
     fn test_manual_variation_alignment() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
@@ -847,6 +931,23 @@ mod tests {
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec!["parallel_vary", "add"],
+        );
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_unbound_axis() {
+        // A trace that does not bind an axis name (e.g., the fresh trace of `Region` transposition) still aligns over
+        // it, using the mesh of the input whose type varies over the axis.
+        let (_, varying) = scalar_types();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| Add::add(&left, &right),
+            (ArrayType::scalar(DataType::F32), varying.clone()),
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME, "add"],
         );
     }
 

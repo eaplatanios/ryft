@@ -27,6 +27,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::Assert;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -457,7 +458,7 @@ impl<C, O, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingP
     for ConditionOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: Broadcast + Transpose + Select + StopGradient,
+    <C as Domain>::Value: Broadcast + Transpose + Select + StopGradient + ManualVariationAlignment<ArrayType>,
     O: Operation<Type = ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
@@ -503,22 +504,34 @@ where
                         .with_ragged_axes(input.ragged_axes().to_vec())
                 })
                 .collect::<Result<Vec<_>, BatchingError>>()?;
+            // `Context::bind` does not align manual variation, so each selection first aligns the predicate with its
+            // candidates, which may vary over manual mesh axes that the predicate does not vary over. This stages
+            // `parallel_vary` on the Boolean predicate, which carries no tangent, or on a candidate that varies less
+            // than the predicate, whose transition then owns the adjoint. Values without manual variation pass
+            // through unchanged.
+            let select = |on_true: &ArrayBatch<<C as Domain>::Value>, on_false: &ArrayBatch<<C as Domain>::Value>| {
+                let candidates = [predicate_batch, on_true, on_false];
+                let values = candidates.iter().map(|batch| batch.value().clone()).collect::<Vec<_>>();
+                let aligned_inputs = ManualVariationAlignment::align_manual_variation(&values)?
+                    .into_iter()
+                    .zip(candidates)
+                    .map(|(value, batch)| {
+                        ArrayBatch::new(value, batch.batch_axis())?.with_ragged_axes(batch.ragged_axes().to_vec())
+                    })
+                    .collect::<Result<Vec<_>, BatchingError>>()?;
+                let (mut selected, _) = SelectOperation::<ArrayType>::new()
+                    .batch(context, &EmptyRegionDriver, &aligned_inputs)?
+                    .into_parts();
+                check_count!("output", selected, 1, ProgramError);
+                Ok::<_, BatchingError>(selected.remove(0))
+            };
             let batch_branch = |branch_index: usize| {
                 let gated_inputs = branch_inputs
                     .iter()
                     .zip(&stopped_inputs)
                     .map(|(input, stopped)| {
-                        let (true_input, false_input) =
-                            if branch_index == 0 { (input, stopped) } else { (stopped, input) };
-                        let (mut gated, _) = SelectOperation::<ArrayType>::new()
-                            .batch(
-                                context,
-                                &EmptyRegionDriver,
-                                &[predicate_batch.clone(), true_input.clone(), false_input.clone()],
-                            )?
-                            .into_parts();
-                        check_count!("output", gated, 1, ProgramError);
-                        Ok(gated.remove(0))
+                        let (on_true, on_false) = if branch_index == 0 { (input, stopped) } else { (stopped, input) };
+                        select(on_true, on_false)
                     })
                     .collect::<Result<Vec<_>, BatchingError>>()?;
                 driver.batch_region(context, branch_index, gated_inputs)
@@ -527,15 +540,9 @@ where
             let false_outputs = batch_branch(1)?;
             check_count!("output", true_outputs, false_outputs.len(), ProgramError);
             return Ok(true_outputs
-                .into_iter()
-                .zip(false_outputs)
-                .map(|(true_output, false_output)| {
-                    let (mut selected, _) = SelectOperation::<ArrayType>::new()
-                        .batch(context, &EmptyRegionDriver, &[predicate_batch.clone(), true_output, false_output])?
-                        .into_parts();
-                    check_count!("output", selected, 1, ProgramError);
-                    Ok(selected.remove(0))
-                })
+                .iter()
+                .zip(&false_outputs)
+                .map(|(true_output, false_output)| select(true_output, false_output))
                 .collect::<Result<Vec<_>, BatchingError>>()?
                 .into());
         }
@@ -617,8 +624,15 @@ where
     C::Value: DimensionSize
         + Assert
         + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Broadcast + Select + StopGradient + Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: Compare<C::Value>>,
+        + ValueProjection<
+            ArrayType,
+            Projected: Broadcast
+                           + Select
+                           + StopGradient
+                           + Transpose
+                           + ManualVariationAlignment<ArrayType>
+                           + Value<Type = ArrayType>,
+        > + ValueProjection<DimensionType, Projected: Compare<C::Value>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
 {
@@ -740,6 +754,26 @@ where
                 }
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
+        // `Context::bind` does not align manual variation, so each selection first aligns the predicate with its
+        // array candidates, which may vary over manual mesh axes that the predicate does not vary over. This stages
+        // `parallel_vary` on the Boolean predicate, which carries no tangent, or on a candidate that varies less than
+        // the predicate, whose transition then owns the adjoint. Values without manual variation pass through
+        // unchanged.
+        let select = |on_true: &ArrayIrBatch<C::Value>, on_false: &ArrayIrBatch<C::Value>| {
+            let candidates = [predicate, on_true, on_false];
+            let values = candidates.iter().map(|batch| batch.value().clone()).collect::<Vec<_>>();
+            let aligned_inputs = ManualVariationAlignment::<ArrayIrType>::align_manual_variation(&values)?
+                .into_iter()
+                .zip(candidates)
+                .map(|(value, batch)| {
+                    ArrayIrBatch::new(value, batch.batch_axis())?.with_ragged_axes(batch.ragged_axes().to_vec())
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+            let (mut selected, _) =
+                batch_projected_operation(context, &SelectOperation::<ArrayType>::new(), &aligned_inputs)?.into_parts();
+            check_count!("output", selected, 1, ProgramError);
+            Ok::<_, BatchingError>(selected.remove(0))
+        };
         let batch_branch = |branch_index: usize| {
             let gated_inputs = branch_inputs
                 .iter()
@@ -748,15 +782,8 @@ where
                     if !matches!(input.unbatched_type(), ArrayIrType::Array(_)) {
                         return Ok(input.clone());
                     }
-                    let (true_input, false_input) = if branch_index == 0 { (input, stopped) } else { (stopped, input) };
-                    let (mut gated, _) = batch_projected_operation(
-                        context,
-                        &SelectOperation::<ArrayType>::new(),
-                        &[predicate.clone(), true_input.clone(), false_input.clone()],
-                    )?
-                    .into_parts();
-                    check_count!("output", gated, 1, ProgramError);
-                    Ok(gated.remove(0))
+                    let (on_true, on_false) = if branch_index == 0 { (input, stopped) } else { (stopped, input) };
+                    select(on_true, on_false)
                 })
                 .collect::<Result<Vec<_>, BatchingError>>()?;
             driver.batch_region(context, branch_index, gated_inputs)
@@ -771,14 +798,7 @@ where
             .map(|(index, (true_output, false_output))| match true_output.unbatched_type() {
                 ArrayIrType::Array(_) => {
                     <&ArrayType>::try_from(&false_output.unbatched_type())?;
-                    let (mut selected, _) = batch_projected_operation(
-                        context,
-                        &SelectOperation::<ArrayType>::new(),
-                        &[predicate.clone(), true_output, false_output],
-                    )?
-                    .into_parts();
-                    check_count!("output", selected, 1, ProgramError);
-                    Ok(selected.remove(0))
+                    select(&true_output, &false_output)
                 }
                 ArrayIrType::Dimension(_) => {
                     true_output.validate_replicated_dimension()?;
@@ -1871,6 +1891,7 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
         ShardingDimension,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
@@ -4674,6 +4695,68 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_batching_aligns_manual_variation_for_batch_varying_predicates() {
+        // Inside a manual region, branch values may vary over manual axes while the predicate stays invariant. The
+        // selections that gate the branch inputs and merge the branch outputs per batch item first give the Boolean
+        // predicate, which carries no tangent, the variation of the branch values through `parallel_vary`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["x"]).unwrap();
+        let predicate_type = ArrayType::new_static(DataType::Boolean, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let value_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(varying_sharding(1)).unwrap();
+        let branch_type = ArrayType::scalar(DataType::F64).with_sharding(varying_sharding(0)).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(branch_type.clone());
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let sine_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(branch_type);
+        let identity_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2);
+                let predicate =
+                    BatchingTracer::new(context.clone(), ArrayBatch::new(inputs[0].clone(), BatchAxis::new(0))?);
+                let value =
+                    BatchingTracer::new(context.clone(), ArrayBatch::new(inputs[1].clone(), BatchAxis::new(0))?);
+                let outputs = context.bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![sine_branch, identity_branch],
+                    &[predicate, value],
+                )?;
+                Ok(outputs.into_iter().next().unwrap().into_batch().into_value())
+            },
+            vec![predicate_type, value_type.clone()],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output_type, value_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[2][sharding={mesh<['x'=2:manual]>, [{}]}], \
+                    %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = stop_gradient %1
+                    %3:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %4:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %3 %1 %2
+                    %5:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sin %4
+                    %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %7:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %2 %1
+                    %8:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %9:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %8 %5 %7
+                in (%9)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_condition_batching_aligns_replicated_and_mapped_branch_outputs() {
         let batch_size = 2;
         let item_size = 3;
@@ -5073,6 +5156,79 @@ mod tests {
         assert_eq!(outputs[1].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[1].batch().value(), &TestValue::Array(Array::vector(vec![6.0f32, 4.0]).unwrap()));
         assert_eq!(reference.read(), Ok(Array::vector(vec![1.0f32, 2.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_composite_condition_batching_aligns_manual_variation_for_batch_varying_predicates() {
+        // Composite batching gives the invariant Boolean predicate the variation of the array branch values in the same
+        // way as array batching, for both the gating and the merging selections.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["x"]).unwrap();
+        let predicate_type = ArrayType::new_static(DataType::Boolean, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let value_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(varying_sharding(1)).unwrap();
+        let branch_type = ArrayType::scalar(DataType::F64).with_sharding(varying_sharding(0)).unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(branch_type.clone().into());
+        let sine = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(SinOperation::new())),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let sine_branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sine], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(branch_type.into());
+        let identity_branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let (output_type, program) = TracingContext::<TestValue, TestOperation>::trace_with_named_axes(
+            |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
+                let parent = inputs[0].dispatch_domain();
+                let extent = parent.constant(TestValue::Dimension(DimensionValue::constant(2).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, extent);
+                let predicate =
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(inputs[0].clone(), BatchAxis::new(0))?);
+                let value =
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(inputs[1].clone(), BatchAxis::new(0))?);
+                let outputs = context.bind(
+                    TestOperation::Condition(ConditionOperation::new()),
+                    vec![sine_branch, identity_branch],
+                    &[predicate, value],
+                )?;
+                Ok(outputs.into_iter().next().unwrap().into_batch().into_value())
+            },
+            vec![ArrayIrType::Array(predicate_type), ArrayIrType::Array(value_type.clone())],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(value_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[2][sharding={mesh<['x'=2:manual]>, [{}]}], \
+                    %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %2:dimension<2> = const 2
+                    %3:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = stop_gradient %1
+                    %4:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %5:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %4 %1 %3
+                    %6:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sin %5
+                    %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %8:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %3 %1
+                    %9:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %10:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %9 %6 %8
+                in (%10)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

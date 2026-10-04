@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionValue, MAX_DIMENSION_EXTENT,
+    Sharding,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -32,6 +33,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -1719,6 +1721,11 @@ pub(crate) trait WhileResidualStackOperation<T: WhileResidualStackType>:
 
     /// Constructs a Boolean conjunction used to retain only active loop items.
     fn mask_and() -> Self;
+
+    /// Constructs the transition that adds variation over the manual mesh axis `axis_name` to a loop index or mask of
+    /// type `input_type`, so that it can be combined with stacks or state that vary over that axis. Operation
+    /// families that cannot stage variation transitions return an error.
+    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError>;
 }
 
 impl WhileResidualStackType for ArrayType {
@@ -1748,7 +1755,8 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<SelectOperation<ArrayType>>
         + From<ReduceOperation>
-        + From<AndOperation<ArrayType>>,
+        + From<AndOperation<ArrayType>>
+        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>,
 {
     #[inline]
     fn residual_stack_zero(r#type: ArrayType) -> Self {
@@ -1788,6 +1796,11 @@ where
     #[inline]
     fn mask_and() -> Self {
         Self::from(AndOperation::new())
+    }
+
+    #[inline]
+    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError> {
+        O::provide(ParallelVaryOperation::new(axis_name.to_string()), &[input_type])
     }
 }
 
@@ -1833,6 +1846,7 @@ where
                            + From<ReduceOperation>
                            + From<AndOperation<ArrayType>>,
         > + TemporalResidualOperation<ArrayIrType>,
+    O::Projected: OperationProvider<ArrayType, ParallelVaryOperation, Operation = O::Projected>,
 {
     fn residual_stack_zero(r#type: ArrayIrType) -> Self {
         let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack zeros are always arrays") };
@@ -1872,6 +1886,11 @@ where
     #[inline]
     fn mask_and() -> Self {
         Self::from(O::Projected::from(AndOperation::<ArrayType>::new()))
+    }
+
+    #[inline]
+    fn residual_stack_vary(axis_name: &str, input_type: &ArrayType) -> Result<Self, ProgramError> {
+        Ok(Self::from(O::Projected::provide(ParallelVaryOperation::new(axis_name.to_string()), &[input_type])?))
     }
 }
 
@@ -2473,6 +2492,56 @@ where
     ))
 }
 
+/// Stages the transitions that make `value`, a loop index or Boolean mask inside a bounded or masked `while` program
+/// that carries no tangent, vary over every manual mesh axis that `target` varies over, so that it can be combined with
+/// stacks or state of type `target`. A value without a sharding is first placed, replicated, on the mesh of `target`.
+/// The value is returned unchanged when it already varies over those axes, which keeps programs outside manual regions
+/// unchanged. The transitions are bound as raw operations because the tracing contexts that build these programs bind
+/// no named axes, and they are never transposed because their inputs are integer or Boolean values.
+fn vary_while_index_or_mask<V, O>(
+    context: &TracingContext<V, O>,
+    value: Tracer<TracingContext<V, O>>,
+    target: &ArrayType,
+) -> Result<Tracer<TracingContext<V, O>>, ProgramError>
+where
+    V: Value<Type: WhileResidualStackType>,
+    O: WhileResidualStackOperation<V::Type>,
+{
+    let Some(target_sharding) = target.sharding() else {
+        return Ok(value);
+    };
+    let value_type = value.r#type().array_type()?.clone();
+    let missing_axes = target_sharding
+        .varying_manual_axes()
+        .iter()
+        .filter(|axis| !value_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis)))
+        .collect::<Vec<_>>();
+    if missing_axes.is_empty() {
+        return Ok(value);
+    }
+    let mut value = value;
+    if value_type.sharding().is_none() {
+        let rank = value_type.rank();
+        let placed_type = value_type
+            .with_sharding(Sharding::replicated(target_sharding.mesh().clone(), rank))
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let mut outputs = context.bind(
+            O::residual_stack_broadcast(placed_type, (0..rank).collect()),
+            Vec::new(),
+            std::slice::from_ref(&value),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        value = outputs.remove(0);
+    }
+    for axis in missing_axes {
+        let operation = O::residual_stack_vary(axis, value.r#type().array_type()?)?;
+        let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(&value))?;
+        check_count!("output", outputs, 1, ProgramError);
+        value = outputs.remove(0);
+    }
+    Ok(value)
+}
+
 /// Builds the augmented condition and body programs of the bounded staged while loop (see the [`WhileOperation`] JVP
 /// rule below). The body replays the original body through its tracing context before adding the augmented-state
 /// operations, while the condition structurally relocates the original condition into a builder with the extended
@@ -2554,16 +2623,26 @@ where
                 primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
             let residual_outputs = body_outputs.split_off(state_count);
             check_count!("output", residual_outputs, residual_types.len(), ProgramError);
-            let zero_index = if storage_types
-                .iter()
-                .any(|storage_type| storage_type.array_type().map(ArrayType::rank).unwrap_or_default() > 0)
-            {
+            // Integer indices carry no tangent, but `dynamic_update_slice` requires them to vary over the same manual
+            // mesh axes as the stack that they index. Invariant stacks use the counter and one shared zero index. For
+            // each distinct stack variation, the counter, which is loop state, takes that variation through staged
+            // transitions, while the zero index is a non-differentiable constant and is therefore created directly
+            // with the variation of that varied counter.
+            let manual_variation = |storage_type: &ArrayType| {
+                storage_type.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default()
+            };
+            let zero_index = if storage_types.iter().any(|storage_type| {
+                storage_type
+                    .array_type()
+                    .is_ok_and(|storage_type| storage_type.rank() > 0 && manual_variation(storage_type).is_empty())
+            }) {
                 let mut outputs = context.bind(O::residual_stack_zero(counter_type.clone()), Vec::new(), &[])?;
                 check_count!("output", outputs, 1, ProgramError);
                 Some(outputs.remove(0))
             } else {
                 None
             };
+            let mut varying_indices = Vec::<(BTreeSet<String>, Tracer<TracingContext<V, O>>, Option<_>)>::new();
             let mut next_stacks = Vec::with_capacity(stack_types.len());
             for (((residual_output, residual_type), storage_type), stack_input) in
                 residual_outputs.iter().zip(residual_types).zip(storage_types.iter()).zip(stack_inputs.iter())
@@ -2584,8 +2663,30 @@ where
                     std::slice::from_ref(&storage_output),
                 )?;
                 check_count!("output", expanded, 1, ProgramError);
-                let mut start_indices = vec![counter_input.clone()];
-                if let Some(zero_index) = &zero_index {
+                let variation = manual_variation(storage_array_type);
+                let (counter_index, zero_index) = if variation.is_empty() {
+                    (counter_input.clone(), zero_index.clone())
+                } else {
+                    let position = match varying_indices.iter().position(|(axes, ..)| *axes == variation) {
+                        Some(position) => position,
+                        None => {
+                            let counter =
+                                vary_while_index_or_mask(&context, counter_input.clone(), storage_array_type)?;
+                            varying_indices.push((variation, counter, None));
+                            varying_indices.len() - 1
+                        }
+                    };
+                    let (_, counter, zero) = &mut varying_indices[position];
+                    if zero.is_none() && storage_array_type.rank() > 0 {
+                        let mut outputs =
+                            context.bind(O::residual_stack_zero(counter.r#type().into_owned()), Vec::new(), &[])?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        *zero = Some(outputs.remove(0));
+                    }
+                    (counter.clone(), zero.clone())
+                };
+                let mut start_indices = vec![counter_index];
+                if let Some(zero_index) = zero_index {
                     start_indices.extend((0..storage_array_type.rank()).map(|_| zero_index.clone()));
                 }
                 let mut next_stack = context.bind(
@@ -2705,17 +2806,28 @@ where
                     next_state.push(candidate.clone());
                     continue;
                 };
-                // The mask broadcasts to each state element's shape so the selection is per predicate item; a state
+                // The Boolean mask carries no tangent, so it first takes the manual variation of the state element
+                // that it selects through staged transitions. It then broadcasts to the state element's shape with its
+                // own sharding extended over the trailing axes, so that the selection is per predicate item. A state
                 // element already shaped like the mask reuses it directly.
-                let element_mask_type = ArrayType::new(DataType::Boolean, state_array_type.shape().clone());
-                let element_mask = if element_mask_type == *mask_type.array_type()? {
-                    mask.clone()
+                let varied_mask = vary_while_index_or_mask(&trace_context, mask.clone(), state_array_type)?;
+                let varied_mask_type = varied_mask.r#type().array_type()?.clone();
+                let element_mask_sharding = varied_mask_type
+                    .sharding()
+                    .map(|sharding| sharding.with_broadcasted_dimensions(state_array_type.rank(), &mask_axes))
+                    .transpose()
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                let element_mask_type = ArrayType::new(DataType::Boolean, state_array_type.shape().clone())
+                    .with_sharding(element_mask_sharding)
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                let element_mask = if element_mask_type == varied_mask_type {
+                    varied_mask
                 } else {
                     trace_context
                         .bind(
                             O::residual_stack_broadcast(element_mask_type, mask_axes.clone()),
                             Vec::new(),
-                            std::slice::from_ref(mask),
+                            std::slice::from_ref(&varied_mask),
                         )?
                         .remove(0)
                 };
@@ -2802,10 +2914,26 @@ impl WhilePredicate for Array {
             });
         }
         validate_while_array_predicate(self.r#type().as_ref(), [on_true.r#type().as_ref()])?;
-        ArrayType::check_matching_manual_variation(
-            "mask_select",
-            &[self.r#type().as_ref(), on_true.r#type().as_ref(), on_false.r#type().as_ref()],
-        )?;
+        // Both candidates share the state type, which the selection keeps. A scalar predicate selects one candidate
+        // wholesale, and the `while` interpreter only calls this function once that predicate is true, so its manual
+        // variation never mixes candidate items and does not constrain the state type. A batched predicate selects per
+        // item, so the state type must already vary over every manual axis that the predicate varies over. Over an axis
+        // that it is invariant over, a batched predicate selects the same items on every device, so it can select
+        // between candidates that vary over that axis.
+        if self.r#type().rank() > 0 {
+            let predicate_axes =
+                self.r#type().sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+            let state_axes =
+                on_true.r#type().sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+            if !predicate_axes.is_subset(&state_axes) {
+                return Err(TypeError::invalid(format!(
+                    "batched `while` predicate `{}` varies over manual axes that state `{}` does not vary over",
+                    self.r#type(),
+                    on_true.r#type(),
+                ))
+                .into());
+            }
+        }
         if predicate_addressing.element_count() == 0 {
             return Ok(on_false.clone());
         }
@@ -2954,6 +3082,7 @@ mod tests {
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
     };
+    use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Parameter;
     use crate::programs::{
         BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
@@ -8189,6 +8318,312 @@ mod tests {
     }
 
     #[test]
+    fn test_bounded_while_jvp_indexes_varying_residual_stacks_in_manual_regions() {
+        // Inside a manual region, the residual stacks vary like the residuals that they store, while the loop counter
+        // and the zero index are invariant integers. The augmented body therefore varies the counter through
+        // `parallel_vary` and creates the zero index, a non-differentiable constant, with that variation directly
+        // before it writes into a varying stack.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let counter_type = ArrayType::scalar(DataType::I64);
+        let state_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let counter = builder.add_input(counter_type.clone());
+        builder.add_input(state_type.clone());
+        let limit = builder.add_constant(Array::scalar(100i64).unwrap());
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let counter = builder.add_input(counter_type.clone());
+        let state = builder.add_input(state_type.clone());
+        let one = builder.add_constant(Array::scalar(1i64).unwrap());
+        let next_counter =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
+        let next_state = builder.add_instruction(SinOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![next_counter, next_state], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                inputs[0].dispatch_domain().bind(
+                    ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
+                    vec![condition, body],
+                    &inputs,
+                )
+            },
+            vec![counter_type, state_type],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %3:i64[] = zero [type=i64[]]
+                    %4:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        zero [type=f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}]]
+                    %5:bool[3] = zero [type=bool[3]]
+                    %6:i64[], %7:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %8:i64[], \
+                        %9:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], %10:bool[3] = \
+                        while [iteration_bound=3] %0 %1 %3 %4 %5 [
+                        condition={
+                            lambda %0:i64[], %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                %2:i64[], \
+                                %3:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %4:bool[3] .
+                            let %5:i64[] = const 100
+                                %6:bool[] = compare [direction=LessThan] %0 %5
+                            in (%6)
+                        },
+                        body={
+                            lambda %0:i64[], %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                %2:i64[], \
+                                %3:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %4:bool[3] .
+                            let %5:i64[] = const 1
+                                %6:i64[] = add %0 %5
+                                %7:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = sin %1
+                                %8:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = cos %1
+                                %9:f32[1, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                    broadcast [
+                                    output_type=f32[1, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], \
+                                        varying_manual={'x'}}],
+                                    output_axes=[1],
+                                ] %8
+                                %10:i64[][sharding={mesh<['x'=2:manual]>, []}] = \
+                                    broadcast [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] \
+                                    %2
+                                %11:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                                    parallel_vary [axis_name=\"x\"] %10
+                                %12:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                                %13:f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                    dynamic_update_slice %3 %9 %11 %12
+                                %14:bool[] = one [type=bool[]]
+                                %15:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %14
+                                %16:bool[3] = dynamic_update_slice %4 %15 %2
+                                %17:i64[] = one [type=i64[]]
+                                %18:i64[] = add %2 %17
+                            in (%6, %7, %18, %13, %16)
+                        },
+                    ]
+                    %11:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        scan [carry_count=1, length=3, reverse=false] %2 %9 %10 [
+                        body={
+                            lambda %0:i64[], %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %3:bool[] .
+                            let %4:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                condition %3 %1 %2 [
+                                true={
+                                    lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                        %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                                    let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                        mul %1 %0
+                                    in (%2)
+                                },
+                                false={
+                                    lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                        %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%4)
+                        },
+                    ]
+                in (%6, %7, %11)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_bounded_while_jvp_masks_varying_state_under_invariant_batched_predicates() {
+        // The masked normal form of a batched-predicate loop selects every array state element under the loop mask.
+        // Inside a manual region, the Boolean mask, which carries no tangent, first takes the variation of the state
+        // element that it selects through `parallel_vary`, and its broadcast keeps the resulting sharding.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let counter_type = ArrayType::new_static(DataType::I64, [2]);
+        let state_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let counter = builder.add_input(counter_type.clone());
+        builder.add_input(state_type.clone());
+        let limit = builder.add_constant(Array::vector(vec![1i64, 2]).unwrap());
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let counter = builder.add_input(counter_type.clone());
+        let state = builder.add_input(state_type.clone());
+        let one = builder.add_constant(Array::vector(vec![1i64, 1]).unwrap());
+        let next_counter =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
+        let next_state = builder.add_instruction(SinOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![next_counter, next_state], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                inputs[0].dispatch_domain().bind(
+                    ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
+                    vec![condition, body],
+                    &inputs,
+                )
+            },
+            vec![counter_type, state_type],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:i64[2], %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                    %2:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                let %3:i64[2] = const [1, 2]
+                    %4:bool[2] = compare [direction=LessThan] %0 %3
+                    %5:i64[] = zero [type=i64[]]
+                    %6:f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] = zero [
+                        type=f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}],
+                    ]
+                    %7:bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] = zero [
+                        type=bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}],
+                    ]
+                    %8:bool[3] = zero [type=bool[3]]
+                    %9:i64[2], %10:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                        %11:bool[2], %12:i64[], \
+                        %13:f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                        %14:bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                        %15:bool[3] = while [iteration_bound=3] %0 %1 %4 %5 %6 %7 %8 [
+                        condition={
+                            lambda %0:i64[2], \
+                                %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %2:bool[2], %3:i64[], \
+                                %4:f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                                %5:bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                                %6:bool[3] .
+                            let %7:bool[] = reduce [kind=any, axes=[0]] %2
+                            in (%7)
+                        },
+                        body={
+                            lambda %0:i64[2], \
+                                %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %2:bool[2], %3:i64[], \
+                                %4:f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                                %5:bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}], \
+                                %6:bool[3] .
+                            let %7:i64[2] = const [1, 1]
+                                %8:i64[2] = const [1, 2]
+                                %9:i64[2] = add %0 %7
+                                %10:i64[2] = select %2 %9 %0
+                                %11:bool[2][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                                    broadcast [output_type=bool[2][sharding={mesh<['x'=2:manual]>, [{}]}], \
+                                    output_axes=[0]] %2
+                                %12:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                    parallel_vary [axis_name=\"x\"] %11
+                                %13:bool[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                    broadcast [
+                                    output_type=bool[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], \
+                                        varying_manual={'x'}}],
+                                    output_axes=[0],
+                                ] %12
+                                %14:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = sin %1
+                                %15:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                    select %13 %14 %1
+                                %16:bool[2] = compare [direction=LessThan] %10 %8
+                                %17:bool[2] = and %2 %16
+                                %18:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = cos %1
+                                %19:f32[1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] \
+                                    = broadcast [
+                                    output_type=f32[1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], \
+                                        varying_manual={'x'}}],
+                                    output_axes=[1, 2],
+                                ] %18
+                                %20:i64[][sharding={mesh<['x'=2:manual]>, []}] = \
+                                    broadcast [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] \
+                                    %3
+                                %21:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                                    parallel_vary [axis_name=\"x\"] %20
+                                %22:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                                %23:f32[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] \
+                                    = dynamic_update_slice %4 %19 %21 %22 %22
+                                %24:bool[1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] \
+                                    = broadcast [
+                                    output_type=bool[1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], \
+                                        varying_manual={'x'}}],
+                                    output_axes=[1, 2],
+                                ] %13
+                                %25:bool[3, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], varying_manual={'x'}}] \
+                                    = dynamic_update_slice %5 %24 %21 %22 %22
+                                %26:bool[] = one [type=bool[]]
+                                %27:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %26
+                                %28:bool[3] = dynamic_update_slice %6 %27 %3
+                                %29:i64[] = one [type=i64[]]
+                                %30:i64[] = add %3 %29
+                            in (%10, %15, %17, %30, %23, %25, %28)
+                        },
+                    ]
+                    %16:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        scan [carry_count=1, length=3, reverse=false] %2 %13 %14 %15 [
+                        body={
+                            lambda %0:i64[], \
+                                %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %2:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %3:bool[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                %4:bool[] .
+                            let %5:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                condition %4 %1 %2 %3 [
+                                true={
+                                    lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], \
+                                        varying_manual={'x'}}], \
+                                        %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                        %2:bool[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                                    let %3:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] \
+                                        = mul %1 %0
+                                        %4:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] \
+                                            = select %2 %3 %0
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], \
+                                        varying_manual={'x'}}], \
+                                        %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                                        %2:bool[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%5)
+                        },
+                    ]
+                in (%9, %10, %16)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_unbounded_while_staged_jvp_stages_one_fused_doubled_state_loop() {
         // JAX-parity forward mode through a *staged* unbounded while loop: the rule stages one fused doubled-state
         // loop whose trip decision reads the primal half. For `f(x) = while (x < 16) { x = x * x }` at `x = 2` the
@@ -8830,21 +9265,38 @@ mod tests {
     #[test]
     fn test_array_mask_select_manual_variation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying_type = ArrayType::scalar(DataType::Boolean)
-            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
-            .unwrap();
-        let predicate = Array::from_elements(varying_type.clone(), &[true]).unwrap();
-        let invariant = Array::scalar(false).unwrap();
+        let varying_sharding = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["m"]).unwrap();
+        let varying_scalar_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding(0)).unwrap();
+        let varying_vector_type =
+            ArrayType::new_static(DataType::Boolean, [2]).with_sharding(varying_sharding(1)).unwrap();
+        let invariant = Array::vector(vec![false, true]).unwrap();
+        let varying = Array::from_elements(varying_vector_type.clone(), &[true, false]).unwrap();
+
+        // A scalar predicate selects a whole candidate, so its variation does not constrain the state.
+        let predicate = Array::from_elements(varying_scalar_type, &[true]).unwrap();
+        assert_eq!(predicate.mask_select(&invariant, &invariant), Ok(invariant.clone()));
+        assert_eq!(predicate.mask_select(&varying, &varying), Ok(varying.clone()));
+
+        // A batched predicate may be invariant over axes that the state varies over, but not the other way around.
+        let predicate = Array::vector(vec![true, false]).unwrap();
+        let other = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
+        assert_eq!(
+            predicate.mask_select(&varying, &other),
+            Ok(Array::from_elements(varying_vector_type.clone(), &[true, true]).unwrap()),
+        );
+        let predicate = Array::from_elements(varying_vector_type.clone(), &[false, true]).unwrap();
+        assert_eq!(
+            predicate.mask_select(&varying, &other),
+            Ok(Array::from_elements(varying_vector_type, &[false, false]).unwrap()),
+        );
         assert_eq!(
             predicate.mask_select(&invariant, &invariant),
             Err(TypeError::invalid(
-                "`mask_select` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
-                 that lack an axis, as `align_manual_variation` does"
+                "batched `while` predicate `bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]` \
+                 varies over manual axes that state `bool[2]` does not vary over"
             )
             .into()),
         );
-        let varying = Array::from_elements(varying_type, &[false]).unwrap();
-        assert_eq!(predicate.mask_select(&varying, &varying), Ok(varying));
     }
 
     #[test]

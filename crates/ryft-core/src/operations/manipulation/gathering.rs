@@ -1880,8 +1880,12 @@ pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array>: Value<Type = A
     ) -> Result<Self, ProgramError>;
 }
 
-impl<Stored: Value<Type = ArrayType>, A: Value<Type = ArrayType, DispatchDomain: Zero<A>> + Gather<Stored> + Reshape>
-    DynamicGather<Stored> for ArrayIrValue<A>
+impl<Stored: Value<Type = ArrayType>, A> DynamicGather<Stored> for ArrayIrValue<A>
+where
+    A: Value<Type = ArrayType, DispatchDomain: Zero<A>>
+        + ManualVariationAlignment<ArrayType>
+        + Gather<Stored>
+        + Reshape,
 {
     fn dynamic_gather_axis<AxisValue: Into<Axis>>(
         &self,
@@ -1896,15 +1900,18 @@ impl<Stored: Value<Type = ArrayType>, A: Value<Type = ArrayType, DispatchDomain:
         if input_type.dimension(axis) == Dimension::Static(0)
             && indices.r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))? == Some(0)
         {
-            // Validate the integer query type and placement even though the empty result reads no elements.
+            // Validate the integer query type and placement even though the empty result reads no elements. The inputs
+            // are aligned first, like the gather that a non-empty query binds, so that the empty result takes their
+            // combined manual variation.
+            let inputs = ManualVariationAlignment::align_manual_variation(&[input.clone(), indices.clone()])?;
             let mut validation_shape = input_type.shape().dimensions().to_vec();
             validation_shape[axis] = Dimension::Static(1);
-            let output_type = input_type.clone().into_owned().with_shape(Shape::new(validation_shape)).gather_axis(
-                indices.r#type().as_ref(),
+            let output_type = inputs[0].r#type().into_owned().with_shape(Shape::new(validation_shape)).gather_axis(
+                inputs[1].r#type().as_ref(),
                 axis,
                 mode,
             )?;
-            return Ok(Self::Array(input.dispatch_domain().zero(&output_type)?));
+            return Ok(Self::Array(inputs[0].dispatch_domain().zero(&output_type)?));
         }
         Ok(Self::Array(input.gather_axis(indices, axis, mode)?))
     }
@@ -1912,7 +1919,10 @@ impl<Stored: Value<Type = ArrayType>, A: Value<Type = ArrayType, DispatchDomain:
 
 impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>> DynamicGather<Stored> for V
 where
-    V: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Gather<Stored>>,
+    V: DimensionSize
+        + DynamicBroadcast
+        + ManualVariationAlignment<ArrayIrType>
+        + ValueProjection<ArrayType, Projected: Gather<Stored>>,
     V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,
 {
     fn dynamic_gather_axis<A: Into<Axis>>(
@@ -1921,7 +1931,11 @@ where
         axis: A,
         mode: GatherMode<Stored>,
     ) -> Result<Self, ProgramError> {
-        let input_type = self.r#type();
+        // The inputs are aligned up front, rather than only by the gather that a non-empty query binds, so that the
+        // empty-query result below also takes their combined manual variation.
+        let inputs = ManualVariationAlignment::align_manual_variation(&[self.clone(), indices.clone()])?;
+        let (input, indices) = (&inputs[0], &inputs[1]);
+        let input_type = input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let indices_type = indices.r#type();
         let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
@@ -1935,10 +1949,10 @@ where
                 }
             } else {
                 batching.push((input_axis, dimensions.len()));
-                dimensions.push(self.dimension_size(input_axis)?);
+                dimensions.push(input.dimension_size(input_axis)?);
             }
         }
-        dimensions.push(self.dispatch_domain().dimension_constant(1)?);
+        dimensions.push(input.dispatch_domain().dimension_constant(1)?);
 
         // Broadcast each scalar query over the untouched input coordinates. Those coordinates select matching
         // input/indices batches, so no symbolic extent is encoded as a host-sized gather window.
@@ -1976,10 +1990,10 @@ where
                 .zip(&dimensions)
                 .filter_map(|(dimension, value)| matches!(dimension, Dimension::Dynamic(_)).then_some(value.clone()))
                 .collect::<Vec<_>>();
-            return self.dispatch_domain().dynamic_zero(&output_type, &dynamic_dimensions);
+            return input.dispatch_domain().dynamic_zero(&output_type, &dynamic_dimensions);
         }
 
-        Ok(V::from_projected(self.clone().into_projected()?.gather(
+        Ok(V::from_projected(input.clone().into_projected()?.gather(
             &indices.into_projected()?,
             &gather_dimensions,
             &slice_sizes,
@@ -4710,6 +4724,58 @@ mod tests {
         assert_eq!(
             program.interpret((four_rows, no_queries)),
             Ok(ArrayIrValue::Array(Array::matrix(4, 0, Vec::<f64>::new()).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_gather_dynamic_gather_axis_manual_variation() {
+        // An empty query reads no input elements, but its result still takes the combined manual variation
+        // of a varying input and invariant indices, like the gather that a nonempty query binds.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |dimensions: &[usize]| {
+            ArrayType::new_static(DataType::F64, dimensions.to_vec())
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), dimensions.len()).with_varying_manual_axes(["m"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let indices = ArrayType::new_static(DataType::I32, [0])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let (output_types, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                    Ok(vec![inputs[0].dynamic_gather_axis(&inputs[1], 0, GatherMode::Clip)?])
+                },
+                vec![ArrayIrType::Array(varying(&[3])), ArrayIrType::Array(indices.clone())],
+                named_axes.clone(),
+            )
+            .unwrap();
+        assert_eq!(output_types, vec![ArrayIrType::Array(varying(&[0]))]);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["parallel_vary", "constant", "constant", "broadcast", "zero"],
+        );
+
+        // The same alignment applies to the empty shortcut for mixed values that wrap context-carrying arrays.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(input, indices): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                let output = ArrayIrValue::Array(input).dynamic_gather_axis(
+                    &ArrayIrValue::Array(indices),
+                    0,
+                    GatherMode::Clip,
+                )?;
+                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
+            },
+            (varying(&[0]), indices),
+            named_axes,
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(&[0]));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["parallel_vary", "zero"],
         );
     }
 

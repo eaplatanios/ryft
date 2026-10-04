@@ -1726,10 +1726,22 @@ where
                         let wraps = !starts_type.data_type().is_unsigned() && starts_type.data_type() != DataType::I1;
                         let starts = if self.allow_negative_indices && wraps {
                             let extent = match input_type.dimension(axis) {
-                                Dimension::Static(extent) => context
-                                    .parent()
-                                    .bind(ConstantOperation::new(Array::scalar(extent as i64)?), Vec::new(), &[])?
-                                    .remove(0),
+                                Dimension::Static(extent) => {
+                                    // The extent is a non-differentiable integer constant, so it is created directly
+                                    // with the mesh and manual variation of the starts that it is combined with,
+                                    // because broadcasting cannot add manual variation.
+                                    let sharding = starts_type.sharding().map(|sharding| {
+                                        Sharding::replicated(sharding.mesh().clone(), 0)
+                                            .with_varying_manual_axes(sharding.varying_manual_axes().clone())
+                                    });
+                                    let extent_type = ArrayType::scalar(DataType::I64)
+                                        .with_sharding(sharding.transpose().map_err(|error| {
+                                            ProgramError::from(TypeError::invalid(error.to_string()))
+                                        })?)
+                                        .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+                                    let extent = Array::from_elements(extent_type, &[extent as i64])?;
+                                    context.parent().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+                                }
                                 Dimension::Dynamic(_) => {
                                     // The homogeneous array family has no dimension operation, so the runtime extent
                                     // is counted from the source itself: a reduction of ones over every other axis
@@ -6740,6 +6752,63 @@ mod tests {
         assert_eq!(outputs[0].r#type().sharding(), Some(&mapped_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
     }
+
+    #[test]
+    fn test_dynamic_slice_batching_manual_variation() {
+        // Mapped signed starts are wrapped by adding a static axis extent constant, which is created with the varying
+        // starts' manual variation, for both a shared and a paired source.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |data_type: DataType, dimensions: &[usize]| {
+            ArrayType::new_static(data_type, dimensions.to_vec())
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), dimensions.len()).with_varying_manual_axes(["m"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let extent = ArrayOperation::Constant(ConstantOperation::new(
+            Array::from_elements(varying(DataType::I64, &[]), &[4i64]).unwrap(),
+        ));
+        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.dispatch_domain(), 2);
+                let outputs = DynamicSliceOperation::new(vec![2])
+                    .batch(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[ArrayBatch::replicated(source), ArrayBatch::new(starts, BatchAxis::new(0))?],
+                    )?
+                    .into_parts()
+                    .0;
+                Ok(outputs.into_iter().next().unwrap().into_value())
+            },
+            (varying(DataType::F64, &[4]), varying(DataType::I32, &[2])),
+            named_axes.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(DataType::F64, &[2, 2]));
+        assert_eq!(program.instructions()[0].operation(), &extent);
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.dispatch_domain(), 2);
+                let outputs = DynamicSliceOperation::new(vec![2])
+                    .batch(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[ArrayBatch::new(source, BatchAxis::new(0))?, ArrayBatch::new(starts, BatchAxis::new(0))?],
+                    )?
+                    .into_parts()
+                    .0;
+                Ok(outputs.into_iter().next().unwrap().into_value())
+            },
+            (varying(DataType::F64, &[2, 4]), varying(DataType::I32, &[2])),
+            named_axes,
+        )
+        .unwrap();
+        assert_eq!(output_type, varying(DataType::F64, &[2, 2]));
+        assert_eq!(program.instructions()[0].operation(), &extent);
+    }
+
     #[test]
     fn test_dynamic_slice_batching_nested() {
         // Both maps supply independent starts while sharing one input and a fixed two-element window.

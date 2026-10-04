@@ -37,7 +37,8 @@ use crate::operations::{
     AndOperation, Assert, Broadcast, BroadcastOperation, Compare, CompareOperation, ComparisonDirection,
     ConstantOperation, DimensionConstant, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
     DynamicBroadcastOperation, DynamicIota, ElementwiseOperation, Gather, GatherDimensionNumbers, GatherOptions, Iota,
-    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
+    IotaOperation, ManualVariationAlignment, ReductionKind, SelectOperation, Transpose, TransposeOperation,
+    ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -1754,8 +1755,10 @@ where
 impl<C: Context<Type = ArrayIrType>> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize
+        + DynamicBroadcast
+        + ManualVariationAlignment<ArrayIrType>
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -1833,12 +1836,12 @@ where
         //
         // The staged instructions carry the nested `ryft::batching::ragged_identity_mask` provenance scopes.
         // Those scopes are purely diagnostic; nothing may match on them for correctness.
-        let mut masked = input
+        let masked = input
             .ragged_axes()
             .iter()
             .filter(|ragged_axis| masked_axes.contains(&ragged_axis.axis()))
-            .peekable();
-        if masked.peek().is_none() {
+            .collect::<Vec<_>>();
+        if masked.is_empty() {
             return Ok(input.clone());
         }
 
@@ -1847,8 +1850,6 @@ where
         // composite parent two levels up, so both views of the same underlying context are kept at hand.
         let outer_context = context.parent().parent();
         let array_context = context.parent();
-        let input_value = input.value().clone();
-        let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
         let packed_type = input.r#type().into_owned();
 
         // A non-zero identity is written over padding as a broadcast rank-zero constant of the input's element type,
@@ -1890,6 +1891,43 @@ where
                 outer_context.invoke_with_provenance_scope(
                     ProvenanceScope::new("ragged_identity_mask"),
                     || -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
+                        // Inside a manual region (e.g., the body of a `shard_map` operation in the XLA backend), the
+                        // input and the extents of every masked ragged axis are combined elementwise, so they must
+                        // vary over the same manual mesh axes. The input can carry a tangent, and so they are aligned
+                        // through the value-level capability, which stages real `parallel_vary` transitions only for
+                        // the axes that a value lacks and stages nothing outside a manual region.
+                        let mut aligned_values = Vec::with_capacity(1 + masked.len());
+                        aligned_values
+                            .push(<C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone()));
+                        aligned_values.extend(masked.iter().map(|ragged_axis| {
+                            <C::Value as ValueProjection<ArrayType>>::from_projected(ragged_axis.extents().clone())
+                        }));
+                        let mut aligned_values =
+                            <C::Value as ManualVariationAlignment<ArrayIrType>>::align_manual_variation(
+                                &aligned_values,
+                            )?
+                            .into_iter();
+                        let lifted_input_value = aligned_values.next().unwrap();
+                        let input_value =
+                            <C::Value as ValueProjection<ArrayType>>::into_projected(lifted_input_value.clone())?;
+
+                        // The `iota` and the identity constant created below are non-differentiable constants, and so
+                        // they take the aligned manual variation of the input directly at creation instead of through
+                        // `parallel_vary` transitions, whose transposes are cross-device sums that only values that
+                        // can carry tangents need. Outside a manual region they remain unsharded.
+                        let input_type = input_value.r#type().into_owned();
+                        let variation_sharding = |rank: usize| -> Result<Option<Sharding>, TypeError> {
+                            input_type
+                                .sharding()
+                                .filter(|sharding| !sharding.varying_manual_axes().is_empty())
+                                .map(|sharding| {
+                                    Sharding::replicated(sharding.mesh().clone(), rank)
+                                        .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
+                                        .map_err(|error| TypeError::invalid(error.to_string()))
+                                })
+                                .transpose()
+                        };
+
                         // Every broadcast below targets the input's full packed shape, so its first-class dimensions
                         // are read once and shared.
                         let output_dimensions = (0..packed_type.rank())
@@ -1901,11 +1939,7 @@ where
                         // per-item extents are broadcast along the axes they vary over, so the two align elementwise
                         // over the packed shape. The predicates are then conjoined into one liveness mask.
                         let mut mask = None;
-                        for ragged_axis in masked {
-                            let extent_value = ragged_axis.extents().clone();
-                            let extent_value_type = extent_value.r#type();
-                            let extent_type = extent_value_type.as_ref();
-
+                        for (ragged_axis, extent_value) in masked.iter().zip(aligned_values) {
                             // A ragged axis stores its per-item extents against a finite physical bound, which is what
                             // the packed type records, so a non-static packed extent is malformed batch metadata.
                             let physical_extent = packed_type.shape()[ragged_axis.axis()].value().ok_or_else(|| {
@@ -1918,16 +1952,17 @@ where
                                 }
                             })?;
                             let iota_type = ArrayType::new(
-                                extent_type.data_type(),
+                                ragged_axis.extents().r#type().data_type(),
                                 Shape::new(vec![Dimension::Static(physical_extent)]),
-                            );
+                            )
+                            .with_sharding(variation_sharding(1)?)
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
                             let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
                             check_count!("output", iota, 1, ProgramError);
                             let iota = <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0))
                                 .dynamic_broadcast(&output_dimensions, &[ragged_axis.axis()])?;
                             let broadcasted_extent =
-                                <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value)
-                                    .dynamic_broadcast(&output_dimensions, ragged_axis.extent_axes())?;
+                                extent_value.dynamic_broadcast(&output_dimensions, ragged_axis.extent_axes())?;
                             let mut current = array_context.bind(
                                 CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
                                 Vec::new(),
@@ -1966,6 +2001,17 @@ where
                                 zero.remove(0)
                             }
                             Some(scalar) => {
+                                let scalar = match variation_sharding(0)? {
+                                    None => scalar,
+                                    Some(sharding) => Array::new(
+                                        scalar
+                                            .r#type()
+                                            .into_owned()
+                                            .with_sharding(sharding)
+                                            .map_err(|error| TypeError::invalid(error.to_string()))?,
+                                        scalar.storage_bytes().to_vec(),
+                                    )?,
+                                };
                                 let mut constant =
                                     array_context.bind(ConstantOperation::new(scalar), Vec::new(), &[])?;
                                 check_count!("output", constant, 1, ProgramError);
@@ -5785,6 +5831,115 @@ mod tests {
                     %9:f32[] = constant [value=inf] ; provenance=ryft::batching::ragged_identity_mask
                     %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4 ; provenance=ryft::batching::ragged_identity_mask
                     %11:f32[items, 3] = select %8 %1 %10 ; provenance=ryft::batching::ragged_identity_mask
+                in (%11)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_mask_identity_input_manual_variation() -> Result<(), BatchingError> {
+        // Inside a manual region, the packed input and its per-item extents may vary over different manual mesh axes.
+        // Masking aligns whichever of them lacks an axis with a real `parallel_vary` transition, so that the input
+        // keeps its collective adjoint, while the non-differentiable `iota` and identity constant are created with the
+        // aligned variation directly. The trace binds no named axes, so alignment takes the mesh of the varying value.
+        // Each case masks the ragged axis 1 (physical bound 3) of one mapped `[items, 3]` input and renders the staged
+        // program.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = |rank: usize, varying: bool| {
+            Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(varying.then_some("x")).unwrap()
+        };
+        let stage = |input_varying: bool, extents_varying: bool, identity: RaggedMaskIdentity| {
+            let trace = ArrayIrTraceContext::new();
+            let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+            let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+            let batch_extent = trace.input(DimensionType::from(items.clone()).into());
+            let packed = trace.input(
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]),
+                )
+                .with_sharding(sharding(2, input_varying))
+                .unwrap()
+                .into(),
+            );
+            let extents = trace.input(
+                ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)]))
+                    .with_sharding(sharding(1, extents_varying))
+                    .unwrap()
+                    .into(),
+            );
+            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                ProjectedContext::new(trace.clone()),
+                batch_extent,
+            );
+            let input = ArrayBatch::new(packed.into_projected()?, BatchAxis::new(0))?
+                .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected()?, length, vec![0])])?;
+            let output = DynamicArrayExtentBatchingPolicy::mask_identity_input(&context, &input, &[1], identity)?;
+            let output_id = output.into_value().into_value().atom_id()?;
+            let program =
+                trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output_id],
+                    vec![Placeholder, Placeholder, Placeholder],
+                    vec![Placeholder],
+                )?;
+            Ok::<_, BatchingError>(program.to_string())
+        };
+
+        // A varying input with invariant extents varies the extents, and the identity constant is created varying.
+        assert_eq!(
+            stage(true, false, RaggedMaskIdentity::Highest)?,
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], \
+                    varying_manual={'x'}}], %2:i32[items][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                let %3:i32[items][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                    [axis_name=\"x\"] %2
+                    %4:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
+                    %5:dimension<3> = constant [value=3]
+                    %6:i32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                        type=i32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                        dimension=0,
+                    ]
+                    %7:i32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast \
+                        [output_axes=[1]] %6 %4 %5
+                    %8:i32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast \
+                        [output_axes=[0]] %3 %4 %5
+                    %9:bool[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = compare \
+                        [direction=LessThan] %7 %8
+                    %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=inf]
+                    %11:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast \
+                        [output_axes=[]] %10 %4 %5
+                    %12:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = select %9 %1 \
+                        %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+
+        // Invariant input with varying extents varies the input itself, whose zero-like replacement follows it.
+        assert_eq!(
+            stage(false, true, RaggedMaskIdentity::Zero)?,
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+                    %2:i32[items][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %3:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = parallel_vary \
+                    [axis_name=\"x\"] %1
+                    %4:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %3
+                    %5:dimension<3> = constant [value=3]
+                    %6:i32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = iota [
+                        type=i32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                        dimension=0,
+                    ]
+                    %7:i32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast \
+                        [output_axes=[1]] %6 %4 %5
+                    %8:i32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = broadcast \
+                        [output_axes=[0]] %2 %4 %5
+                    %9:bool[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = compare \
+                        [direction=LessThan] %7 %8
+                    %10:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = zero_like %3
+                    %11:f32[items, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = select %9 %3 \
+                        %10
                 in (%11)
             "}
             .trim_end(),

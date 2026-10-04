@@ -533,7 +533,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding, f8e8m0fnu,
+    };
+    use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -1688,6 +1691,45 @@ mod tests {
             .jvp(Array::scalar(1.0f64).unwrap(), |input| input.tanh())
             .unwrap();
         assert_eq!(tangent, Array::scalar(0.0f64).unwrap());
+    }
+
+    #[test]
+    fn test_tanh_differentiation_accuracy_manual_variation() {
+        // Inside a manual region, the highest-accuracy rule fills its constants at the input type, so they vary like
+        // the input and combine with it without being aligned through `parallel_vary`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.tanh_with_accuracy(Accuracy::Highest),
+            varying_type,
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                    %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                let %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = tanh \
+                        [accuracy=highest] %0
+                    %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=2.0]
+                    %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %3 %0
+                    %5:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = logistic \
+                        [accuracy=highest] %4
+                    %6:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=-2.0]
+                    %7:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %6 %0
+                    %8:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = logistic \
+                        [accuracy=highest] %7
+                    %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=4.0]
+                    %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %5 %8
+                    %11:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %9 %10
+                    %12:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %11
+                in (%2, %12)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

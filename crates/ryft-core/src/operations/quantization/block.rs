@@ -134,7 +134,7 @@ where
         let fill = |value: f64| domain.fill(&scale_value_type, value);
 
         // Per-block maximum magnitude along the trailing dimension.
-        let block_max = self.reshape(block_shape.clone())?.abs()?.reduce(&[scale_dimensions.len()], ReductionKind::Max);
+        let block_max = self.reshape(block_shape)?.abs()?.reduce(&[scale_dimensions.len()], ReductionKind::Max);
         let (scale, smallest_scale) = match scale_type {
             // NVFP4-style linear scaling: the block maximum maps to the element type's maximum magnitude. The clamp
             // floor is the scale type's smallest positive normal, `2^-6`.
@@ -159,7 +159,12 @@ where
 
         // Divide by the *stored* scale — exactly the value `scaled_dot` dequantizes with — and narrow the elements.
         let stored_scales = scales.convert_element_type(compute_type)?;
-        let expanded_type = ArrayType::new(compute_type, block_shape);
+
+        // The scales derive from the input, so the expanded scales keep their memory space, placement, and manual
+        // variation and only add the replicated per-block axis, because broadcasting cannot change manual variation.
+        let expanded_type = stored_scales
+            .r#type()
+            .with_inserted_dimension(scale_dimensions.len(), Dimension::Static(block_size))?;
         let scale_axes = (0..scale_dimensions.len()).collect::<Vec<_>>();
         let expanded_scales =
             stored_scales.broadcast(expanded_type, scale_axes.as_slice())?.reshape(input_type.shape().clone())?;
@@ -177,12 +182,16 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Shape};
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
+    };
+    use crate::axes::NamedAxis;
     use crate::contexts::StagingContext;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::quantization::ScaledDot;
     use crate::programs::Typed;
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -347,5 +356,52 @@ mod tests {
             scales.r#type().as_ref(),
             &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
+    }
+
+    #[test]
+    fn test_block_quantize_sharding() {
+        type ArrayTrace = TracingContext<Array, ArrayOperation<Array>>;
+
+        // Inside a manual region, the elements and scales of a varying input keep its variation, because the scales
+        // are broadcast back over their blocks with their own variation rather than to an invariant type.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |data_type: DataType, size: usize| {
+            ArrayType::new_static(data_type, [size])
+                .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap()
+        };
+        let (output_types, _) = ArrayTrace::trace_with_named_axes(
+            |input: Tracer<ArrayTrace>| {
+                let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+                Ok(vec![elements, scales])
+            },
+            varying(DataType::F32, 8),
+            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+        )
+        .unwrap();
+        assert_eq!(output_types, vec![varying(DataType::F4E2M1FN, 8), varying(DataType::F8E4M3FN, 2)]);
+
+        // Explicit placement of the leading axis is likewise kept rather than dropped by the scale broadcast.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = |data_type: DataType, columns: usize| {
+            ArrayType::new_static(data_type, [2, columns])
+                .with_sharding(
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let (output_types, _) = ArrayTrace::trace(
+            |input: Tracer<ArrayTrace>| {
+                let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+                Ok(vec![elements, scales])
+            },
+            sharded(DataType::F32, 8),
+        )
+        .unwrap();
+        assert_eq!(output_types, vec![sharded(DataType::F4E2M1FN, 8), sharded(DataType::F8E4M3FN, 2)]);
     }
 }

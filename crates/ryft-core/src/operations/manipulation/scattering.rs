@@ -692,7 +692,22 @@ impl ScatterOperation {
                 .into());
             }
 
-            let id_type = ArrayType::new_static(DataType::U64, [count]).with_memory(updates_type.memory());
+            // The ID iota is typed with the mesh and manual variation of the updates that it is combined with. An iota
+            // holds the same elements on every device, so typing it as varying is always valid (i.e., it is what a
+            // `parallel_vary` of the invariant iota produces, and the integer IDs carry no tangent for that transition
+            // to affect).
+            let id_sharding = updates_type
+                .sharding()
+                .map(|sharding| {
+                    Sharding::replicated(sharding.mesh().clone(), 1)
+                        .with_varying_manual_axes(sharding.varying_manual_axes().clone())
+                })
+                .transpose()
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            let id_type = ArrayType::new_static(DataType::U64, [count])
+                .with_memory(updates_type.memory())
+                .with_sharding(id_sharding)
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
             let ids = context.iota(&id_type, 0)?.reshape(updates_type.shape().clone())?;
             let ids = ids.add(&ids.one_like()?)?;
 
@@ -6011,6 +6026,43 @@ mod tests {
                 cotangent,
                 ArrayIrValue::Array(Array::from_elements(updates_type.cotangent().unwrap(), &[0.0_f64, 0.0]).unwrap()),
             ]),
+        );
+    }
+
+    #[test]
+    fn test_scatter_differentiation_manual_variation() {
+        // The update IDs of the overwrite JVP take the manual variation of the varying updates that they are
+        // compared with.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = |data_type: DataType, dimensions: &[usize]| {
+            ArrayType::new_static(data_type, dimensions.to_vec())
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), dimensions.len()).with_varying_manual_axes(["m"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(input, indices, updates): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _, _)| {
+                input.scatter(
+                    &indices,
+                    &updates,
+                    &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                    ScatterReductionKind::Overwrite,
+                    &ScatterOptions::new(),
+                )
+            },
+            (varying(DataType::F64, &[4]), varying(DataType::I32, &[2, 1]), varying(DataType::F64, &[2])),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        let jvp = program.to_flat_program().jvp_with_respect_to(&[0, 2]).unwrap();
+        assert_eq!(jvp.output_types(), vec![varying(DataType::F64, &[4]), varying(DataType::F64, &[4])]);
+        assert_eq!(
+            jvp.instructions()
+                .iter()
+                .find(|instruction| instruction.operation().name() == "iota")
+                .map(|instruction| instruction.operation()),
+            Some(&ArrayOperation::Iota(IotaOperation::new(varying(DataType::U64, &[2]), 0).unwrap())),
         );
     }
 

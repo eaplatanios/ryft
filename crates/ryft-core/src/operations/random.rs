@@ -38,7 +38,7 @@ use std::marker::PhantomData;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
-    DimensionVariable, Shape, ShardingDimension,
+    DimensionVariable, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -133,8 +133,11 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 
 /// [`Operation`] that deterministically generates uniformly distributed random bits from a counter-based generator
 /// state. Refer to the documentation of [`RngBitGenerator`] for the generation semantics. The first input is the
-/// generator state, and the two outputs are the advanced state followed by the generated bits at the declared
-/// [`output_type`](Self::output_type).
+/// generator state, and the two outputs are the advanced state (at the state type) followed by the generated bits at
+/// the declared [`output_type`](Self::output_type). Inside a manual region (e.g., `shard_map`), a state that varies
+/// over manual mesh axes draws different bits on different devices, so the bits additionally vary over the varying
+/// manual axes of the state. A declared output type that cannot vary over those axes (e.g., because it is reduced
+/// over one of them) is rejected.
 ///
 /// The type parameter selects the input contract without introducing a separate bit-generation operation:
 ///
@@ -176,16 +179,19 @@ impl<T: Type> RngBitGeneratorOperation<T> {
         self.algorithm
     }
 
-    /// Returns the declared type of the generated bits for this [`RngBitGeneratorOperation`].
+    /// Returns the declared type of the generated bits for this [`RngBitGeneratorOperation`]. The inferred bits type
+    /// additionally varies over the varying manual axes of the state.
     #[inline]
     pub fn output_type(&self) -> &ArrayType {
         &self.output_type
     }
 
-    /// Validates the state type, output element type, and sharding constraints shared by both input contracts.
-    /// States and outputs must be unsharded and carry no unreduced mesh axes because generation is nonlinear.
-    /// Any statically known output element count must fit in [`usize`].
-    fn validate_types(&self, state_type: &ArrayType) -> Result<(), TypeError> {
+    /// Validates the state type, output element type, and sharding constraints shared by both input contracts, and
+    /// returns the type of the generated bits. States and outputs must be unsharded and carry no unreduced mesh axes
+    /// because generation is nonlinear. Any statically known output element count must fit in [`usize`]. The bits
+    /// vary over the union of the declared varying manual axes and those of the state, because states that differ
+    /// across devices draw different bits.
+    fn infer_bits_type(&self, state_type: &ArrayType) -> Result<ArrayType, TypeError> {
         let algorithm = self.algorithm;
         let expected_state_type = algorithm.state_type();
         if state_type.data_type() != expected_state_type.data_type()
@@ -224,7 +230,30 @@ impl<T: Type> RngBitGeneratorOperation<T> {
         }
         self.output_type.element_count()?;
 
-        Ok(())
+        // Declaring an invariant bits type for a varying state would let a replicated `shard_map` output accept bits
+        // that actually differ across devices, so the state's variation is union-ed into the declared type. A declared
+        // type that cannot vary over those axes (e.g., because it is reduced over one of them) is rejected.
+        let Some(state_sharding) = state_type.sharding().filter(|sharding| !sharding.varying_manual_axes().is_empty())
+        else {
+            return Ok(self.output_type.clone());
+        };
+        let mut output_sharding = match self.output_type.sharding() {
+            Some(sharding) => sharding.clone(),
+            None => Sharding::replicated(state_sharding.mesh().clone(), self.output_type.rank()),
+        };
+        output_sharding
+            .extend_varying_manual_axes(state_sharding.varying_manual_axes().iter().cloned())
+            .map_err(|error| {
+                TypeError::invalid(format!(
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` output type `{}` cannot vary over the varying manual axes \
+                     of its state: {error}",
+                    self.output_type,
+                ))
+            })?;
+        self.output_type
+            .clone()
+            .with_sharding(output_sharding)
+            .map_err(|error| TypeError::invalid(error.to_string()))
     }
 
     /// Renders this payload independently of its homogeneous or composite input contract. This is a separate function
@@ -263,13 +292,13 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        self.validate_types(&input_types[0])?;
+        let bits_type = self.infer_bits_type(&input_types[0])?;
         if self.output_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
                 "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support dynamically shaped outputs",
             )));
         }
-        Ok(vec![input_types[0].clone(), self.output_type.clone()])
+        Ok(vec![input_types[0].clone(), bits_type])
     }
 
     #[inline]
@@ -303,7 +332,7 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
             self.output_type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
         check_count!("input", input_types, dynamic_output_dimensions.len() + 1, TypeError);
         let state_type = <&ArrayType>::try_from(&input_types[0])?;
-        self.validate_types(state_type)?;
+        let bits_type = self.infer_bits_type(state_type)?;
         for (input_type, expected_variable) in input_types[1..].iter().zip(dynamic_output_dimensions) {
             let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
@@ -313,7 +342,7 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
                 )));
             }
         }
-        Ok(vec![state_type.clone().into(), self.output_type.clone().into()])
+        Ok(vec![state_type.clone().into(), bits_type.into()])
     }
 
     #[inline]
@@ -511,7 +540,8 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// be statically shaped (refer to [`DynamicRngBitGenerator`] for dynamic shape support), and neither the state nor the
 /// output may be sharded, since every shard would otherwise draw the same bits, or carry unreduced mesh axes.
 /// For XLA's `shard_map` operation, for example, you must derive per-shard states inside that operation instead.
-/// Concrete [`Array`]s generate the bits immediately, bit-identical with XLA's
+/// The bits then vary over the varying manual axes of their state in addition to those of `output_type`. Concrete
+/// [`Array`]s generate the bits immediately, bit-identical with XLA's
 /// [`rng_bit_generator`](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) expansion, while
 /// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers,
 /// and so their derivative is a structural zero.
@@ -540,8 +570,9 @@ pub trait RngBitGenerator: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if this state does not have the state type of `algorithm`, if `output_type` is not
-    /// a statically shaped and unsharded unsigned-integer type, if the state or output has unreduced mesh axes,
-    /// if the output element count overflows [`usize`], or if the context of the value fails to bind the operation.
+    /// a statically shaped and unsharded unsigned-integer type, if the state or output has unreduced mesh axes, if
+    /// the output cannot vary over the varying manual axes of the state, if the output element count overflows
+    /// [`usize`], or if the context of the value fails to bind the operation.
     fn rng_bit_generator(
         &self,
         algorithm: RandomAlgorithm,
@@ -555,13 +586,15 @@ impl RngBitGenerator for Array {
         algorithm: RandomAlgorithm,
         output_type: &ArrayType,
     ) -> Result<(Self, Self), ProgramError> {
-        RngBitGeneratorOperation::<ArrayType>::new(algorithm, output_type.clone())
+        let mut output_types = RngBitGeneratorOperation::<ArrayType>::new(algorithm, output_type.clone())
             .infer_output_types(&[self.r#type().into_owned()], &[])?;
+        let output_type = output_types.remove(1);
 
         // Type inference guarantees a static output shape, an unsigned-integer output data type, and exactly as many
         // decoded `u64` state elements as the algorithm requires. Narrower-than-32-bit outputs keep the low bits of
         // each generated `u32` word. The generated values are encoded in logical order, so the declared physical
-        // layouts of both the state and the bits are preserved.
+        // layouts of both the state and the bits are preserved. The bits take the inferred output type, which also
+        // varies over the varying manual axes of the state.
 
         // Validate storage size and layout before allocating any cipher-word buffers.
         let addressing = ArrayAddressing::new(output_type.clone())?;
@@ -1184,6 +1217,7 @@ mod tests {
         ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         Sharding, StridedLayout,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -1454,6 +1488,67 @@ mod tests {
             RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, unreduced_output)
                 .infer_output_types(&[state_type.into()], &[]),
             Err(TypeError::invalid("`rng_bit_generator` does not support unreduced outputs")),
+        );
+    }
+
+    #[test]
+    fn test_rng_bit_generator_type_inference_manual_variation() {
+        // Bits drawn from a state that varies over a manual mesh axis differ across devices, so they vary over that
+        // axis even when the declared output type is invariant or unsharded. An output type that is reduced over that
+        // axis cannot hold them and is rejected.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = RandomAlgorithm::ThreeFry.state_type();
+        let varying_state_type = state_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::U32, [4]);
+        let invariant_output_type = output_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let varying_output_type = output_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_output_type = output_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type.clone()),
+            cases = [
+                {
+                    input_types = [varying_state_type.clone()],
+                    output_types = [varying_state_type.clone(), varying_output_type.clone()],
+                },
+                {
+                    input_types = [state_type.clone()],
+                    output_types = [state_type, output_type.clone()],
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, invariant_output_type),
+            cases = [{
+                input_types = [varying_state_type.clone()],
+                output_types = [varying_state_type.clone(), varying_output_type.clone()],
+            }],
+        );
+        check_operation_type_inference!(
+            operation =
+                RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, reduced_output_type.clone()),
+            cases = [{
+                input_types = [varying_state_type.clone()],
+                error = format!(
+                    "`rng_bit_generator` output type `{reduced_output_type}` cannot vary over the varying manual axes \
+                     of its state: manual axis `x` cannot be both varying and reduced",
+                ),
+            }],
+        );
+
+        // The composite type universe applies the same rule.
+        assert_eq!(
+            RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, output_type)
+                .infer_output_types(&[varying_state_type.clone().into()], &[]),
+            Ok(vec![varying_state_type.into(), varying_output_type.into()]),
         );
     }
 
@@ -2148,6 +2243,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program.interpret(maximum.clone()), maximum.random_uniform(&output_type));
+    }
+
+    #[test]
+    fn test_random_uniform_manual_variation() {
+        // Inside a manual region, a state that varies over a manual mesh axis draws different samples on every device,
+        // so the samples vary over that axis even though the requested sample type is invariant.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = RandomAlgorithm::ThreeFry
+            .state_type()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let sample_type = ArrayType::new_static(DataType::F32, [3]);
+        let (output_types, _) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |state| state.random_uniform(&sample_type),
+            state_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        let varying_sample_type = sample_type
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(output_types, (state_type, varying_sample_type));
     }
 
     #[test]

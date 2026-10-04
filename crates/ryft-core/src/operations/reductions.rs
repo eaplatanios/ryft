@@ -934,11 +934,13 @@ where
         + OperationProjection<
             ArrayType,
             Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-                           + From<CompareOperation<ArrayType>>
-                           + From<ConvertElementTypeOperation<ArrayType>>
-                           + From<DivOperation<ArrayType>>
                            + From<MulOperation<ArrayType>>
-                           + From<ReduceOperation>,
+                           + From<DivOperation<ArrayType>>
+                           + From<ReduceOperation>
+                           + From<BroadcastOperation>
+                           + From<ConvertElementTypeOperation<ArrayType>>
+                           + From<CompareOperation<ArrayType>>
+                           + From<ParallelVaryOperation>,
         > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -1076,10 +1078,30 @@ where
                     }
                     let element_count =
                         context.bind(DimensionToScalarOperation, Vec::new(), &[element_count])?.remove(0);
-                    let element_count = context.bind_array(
+                    let mut element_count = context.bind_array(
                         ConvertElementTypeOperation::new(cotangent_type.data_type(), false),
                         &[element_count],
                     )?;
+
+                    // Inside a manual region, the division requires the element count to vary like the cotangent.
+                    // The count is a non-differentiable value derived from the input shape, but it is only known at
+                    // runtime, so no operation can create it with that variation directly. It is instead placed on
+                    // the cotangent's mesh and marked varying with `parallel_vary` transitions, whose collective
+                    // adjoints never run because the count carries no cotangent.
+                    if let Some(sharding) = cotangent_type.sharding()
+                        && !sharding.varying_manual_axes().is_empty()
+                    {
+                        let mesh_type = ArrayType::scalar(cotangent_type.data_type())
+                            .with_sharding(Sharding::replicated(sharding.mesh().clone(), 0))
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        element_count =
+                            context.bind_array(BroadcastOperation::new(mesh_type, Vec::new()), &[element_count])?;
+                        for axis_name in sharding.varying_manual_axes() {
+                            element_count =
+                                context.bind_array(ParallelVaryOperation::new(axis_name.clone()), &[element_count])?;
+                        }
+                    }
+
                     Ok(vec![context.bind_array(DivOperation::new(), &[cotangent, element_count])?])
                 },
             )?
@@ -3214,6 +3236,73 @@ mod tests {
                     ] %5
                     %7:f64[batch][sharding={mesh<['x'=2:explicit]>, [{}]}] = reduce [kind=sum, axes=[1]] %6
                 in (%1, %2, %6, %7)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_reduce_differentiation_dynamic_reduced_axis_manual_variation() {
+        // Inside a manual region, the runtime element count that scales a mean cotangent takes the cotangent's manual
+        // variation, so that the division inputs match.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]))
+                .with_sharding(Sharding::replicated(mesh, 2).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean))),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+                    %1:dimension<batch ∈ [1, 9)> .
+                let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = linear_call \
+                    [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch, 2][sharding={mesh<['x'=2:manual]>, [{}, \
+                            {}], varying_manual={'x'}}] .
+                        let %2:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reduce \
+                            [kind=mean, axes=[0]] %1
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], \
+                            varying_manual={'x'}}] .
+                        let %2:dimension<2> = constant [value=2]
+                            %3:f64[batch, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                                broadcast [
+                                output_axes=[1],
+                                output_sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}},
+                            ] %1 %0 %2
+                            %4:i64[] = dimension_to_scalar %0
+                            %5:f64[] = convert_element_type [data_type=f64] %4
+                            %6:f64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=f64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %5
+                            %7:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %6
+                            %8:f64[batch, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = div \
+                                %3 %7
+                        in (%8)
+                    },
+                ]
+                in (%2)"
             },
         );
     }

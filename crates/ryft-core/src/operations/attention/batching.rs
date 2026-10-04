@@ -134,19 +134,27 @@ where
                     let rank = logical_type.rank();
                     let output_axes =
                         std::iter::once(0).chain((0..rank).map(|axis| 5 - rank + axis)).collect::<Vec<_>>();
-                    aligned
-                        .value()
-                        .clone()
-                        .broadcast(
-                            ArrayType::new(logical_type.data_type(), static_shape(&target_dimensions)),
-                            output_axes.as_slice(),
-                        )?
-                        .reshape(static_shape(&[
-                            axis_size * batch_size,
-                            head_count,
-                            query_sequence_size,
-                            key_sequence_size,
-                        ]))?
+
+                    // The normalized input keeps its memory space, placement, and manual variation: its sharding
+                    // follows the mapped axes and the new axes are replicated, because a broadcast cannot change
+                    // manual variation.
+                    let aligned_type = aligned.r#type();
+                    let output_sharding = aligned_type
+                        .sharding()
+                        .map(|sharding| sharding.with_broadcasted_dimensions(5, &output_axes))
+                        .transpose()
+                        .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+                    let output_type = ArrayType::new(logical_type.data_type(), static_shape(&target_dimensions))
+                        .with_memory(aligned_type.memory())
+                        .with_sharding(output_sharding)
+                        .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
+                    let normalized = aligned.value().broadcast(output_type, output_axes.as_slice())?;
+                    normalized.reshape(static_shape(&[
+                        axis_size * batch_size,
+                        head_count,
+                        query_sequence_size,
+                        key_sequence_size,
+                    ]))?
                 }
                 AttentionBatchInput::Length => aligned.value().reshape(static_shape(&[axis_size * batch_size]))?,
                 AttentionBatchInput::Statistic => {

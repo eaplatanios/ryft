@@ -426,6 +426,45 @@ fn test_dot_product_attention_batching() {
 }
 
 #[test]
+fn test_dot_product_attention_batching_manual_variation() {
+    use crate::arrays::{ArrayOperation, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::axes::NamedAxis;
+    use crate::programs::EmptyRegionDriver;
+    use crate::tracing::Tracer;
+
+    type ArrayTrace = TracingContext<Array, ArrayOperation<Array>>;
+
+    // Inside a manual region, a mapped bias is normalized to the canonical score shape with its own manual variation,
+    // so that it still matches the varying query, key, and value of the fused attention.
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    let varying = |dimensions: Vec<usize>| {
+        let rank = dimensions.len();
+        ArrayType::new_static(DataType::F32, dimensions)
+            .with_sharding(Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap()
+    };
+    let signature = AttentionInputSignature::new(true, false, false, false);
+    let (output_type, _) = ArrayTrace::trace_with_named_axes(
+        |inputs: Vec<Tracer<ArrayTrace>>| {
+            let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2);
+            let inputs = inputs
+                .into_iter()
+                .map(|input| ArrayBatch::new(input, BatchAxis::new(0)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = DotProductAttentionOperation::new(AttentionConfiguration::new(), signature)
+                .batch(&context, &EmptyRegionDriver, &inputs)?
+                .into_parts()
+                .0;
+            Ok(outputs.into_iter().next().unwrap().into_value())
+        },
+        vec![varying(vec![2, 1, 1, 1]), varying(vec![2, 2, 1, 1]), varying(vec![2, 2, 1, 1]), varying(vec![2, 1, 2])],
+        vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+    )
+    .unwrap();
+    assert_eq!(output_type, varying(vec![2, 1, 1, 1]));
+}
+
+#[test]
 fn test_dot_product_attention_batching_with_dynamic_extent() -> Result<(), ProgramError> {
     type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 

@@ -7,6 +7,7 @@ use crate::arrays::{
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::arithmetic::Add;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::control_flow::select::Select;
@@ -463,7 +464,8 @@ impl<
         + Select
         + Slice
         + Reverse
-        + Gather,
+        + Gather
+        + ManualVariationAlignment<ArrayType>,
 > Indexed<'_, '_, '_, V, ArrayType>
 {
     /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
@@ -590,6 +592,9 @@ impl<
             .any(|&axis| input_type.dimension(axis).value() == Some(0));
 
         let gathered = if empty_indexed_axis {
+            // The input and indices are aligned like the inputs of the gather that a nonempty selection binds,
+            // so that the result type takes their combined manual variation.
+            let inputs = ManualVariationAlignment::align_manual_variation(&[self.input.clone(), plan.indices.clone()])?;
             let mut validation_shape = input_type.shape().dimensions().to_vec();
             for &axis in plan.dimensions.collapsed_slice_dimensions() {
                 if validation_shape[axis].value() == Some(0) {
@@ -597,8 +602,8 @@ impl<
                 }
             }
 
-            let output_type = input_type.clone().into_owned().with_shape(Shape::new(validation_shape)).gather(
-                plan.indices.r#type().as_ref(),
+            let output_type = inputs[0].r#type().into_owned().with_shape(Shape::new(validation_shape)).gather(
+                inputs[1].r#type().as_ref(),
                 &plan.dimensions,
                 &plan.sizes,
                 &gather_options,
@@ -612,8 +617,10 @@ impl<
                 .into());
             }
 
-            let fill = gather_options.resolved_fill_value(input_type.data_type())?;
-            self.constant(fill)?.broadcast(output_type, &[])?
+            // The fill constant is aligned with the input because broadcasting cannot add manual variation.
+            let fill = self.constant(gather_options.resolved_fill_value(input_type.data_type())?)?;
+            let mut aligned = ManualVariationAlignment::align_manual_variation(&[inputs[0].clone(), fill])?;
+            aligned.remove(1).broadcast(output_type, &[])?
         } else {
             self.input.gather(&plan.indices, &plan.dimensions, &plan.sizes, &gather_options)?
         };
@@ -1144,7 +1151,8 @@ impl<
                            + Slice
                            + Reverse
                            + Gather
-                           + TransferToMemory,
+                           + TransferToMemory
+                           + ManualVariationAlignment<ArrayType>,
         > + DimensionSize
         + DimensionToScalar
         + DynamicGather
@@ -2072,11 +2080,13 @@ mod tests {
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::operations::references::{ReferenceFreeze, ReferenceNew};
     use crate::partial::PartialValue;
+    use crate::programs::Operation;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -2634,6 +2644,33 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`gather` input and indices shardings must use the same mesh",
         ));
+    }
+
+    #[test]
+    fn test_indexed_get_empty_axis_manual_variation() {
+        // A read from an empty indexed axis broadcasts the fill to the selection, which takes the combined manual
+        // variation of the varying input and the invariant index constants.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let fill =
+            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-1f32).unwrap())) });
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input: Tracer<TracingContext<Array, ArrayOperation<Array>>>| input.at(&index![0]).get(&fill),
+            ArrayType::new_static(DataType::F32, [0])
+                .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayType::scalar(DataType::F32)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["constant", "reshape", "broadcast", "parallel_vary", "constant", "broadcast", "parallel_vary"],
+        );
     }
 
     #[test]

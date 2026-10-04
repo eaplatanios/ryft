@@ -47,7 +47,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::axis_index::AxisIndexOperation;
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
-use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
+use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
@@ -942,7 +942,7 @@ where
         + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1144,7 +1144,9 @@ where
 }
 
 /// Applies the mixed array IR JVP for invariant all-gather. Its transpose selects the current participant's
-/// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away.
+/// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away. Over a
+/// manual mesh axis, the invariant output cotangent is first made varying over that axis, because every participant
+/// selects a different chunk of it.
 fn jvp_invariant_parallel_all_gather<C, P: DifferentiationPolicy<C>>(
     operation: &ParallelAllGatherOperation,
     context: &DifferentiationContext<C, P>,
@@ -1161,7 +1163,7 @@ where
         + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
 {
     let Some((array, _)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1217,8 +1219,12 @@ where
                     let start = if transpose_operation.axis_size() == 1 {
                         zero.clone()
                     } else {
-                        let axis_index = transpose_context
-                            .bind_array(AxisIndexOperation::new(transpose_operation.axis_name().to_string()), &[])?;
+                        let mut axis_index_operation =
+                            AxisIndexOperation::new(transpose_operation.axis_name().to_string());
+                        if let Some(mesh) = transpose_operation.mesh() {
+                            axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
+                        }
+                        let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
                         let axis_index_variable = DimensionVariable::new(
                             format!("{}_index", transpose_operation.axis_name()),
                             crate::arrays::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
@@ -1249,8 +1255,26 @@ where
                     if transpose_operation.options().mode() == CollectiveMode::Untiled {
                         slice_sizes.insert(transpose_operation.concat_axis(), chunk_extent);
                     }
+                    // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
+                    // every participant selects a different chunk of it, so the selected chunk varies over that axis.
+                    // The cotangent can carry a tangent itself (e.g., under nested differentiation), and so it is
+                    // made varying with a real `parallel_vary` transition, whose transpose is the cross-device sum,
+                    // rather than by retyping the selected chunk.
+                    let output_cotangent = match transpose_operation.mesh() {
+                        Some(_)
+                            if !output_cotangent_type.sharding().is_some_and(|sharding| {
+                                sharding.varying_manual_axes().contains(transpose_operation.axis_name())
+                            }) =>
+                        {
+                            transpose_context.bind_array(
+                                ParallelVaryOperation::new(transpose_operation.axis_name().to_string()),
+                                std::slice::from_ref(&output_cotangents[0]),
+                            )?
+                        }
+                        _ => output_cotangents[0].clone(),
+                    };
                     let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
-                    slice_inputs.push(output_cotangents[0].clone());
+                    slice_inputs.push(output_cotangent);
                     slice_inputs.extend(starts);
                     slice_inputs.extend(slice_sizes);
                     let selected = transpose_context
@@ -1857,6 +1881,70 @@ mod tests {
         assert!(pullback.contains("dimension_from_scalar"));
         assert!(!pullback.contains("dimension_mul"));
         assert!(pullback.contains("dynamic_slice"));
+    }
+
+    #[test]
+    fn test_array_ir_invariant_parallel_all_gather_linearization_inside_manual_region() {
+        // Inside a manual region, the output cotangent of an invariant gather is invariant across the gathered axis,
+        // while every participant selects a different chunk of it. The pullback therefore varies the cotangent over
+        // that axis with a real `parallel_vary` transition before slicing it at the checked participant index, so that
+        // the selected chunk has the input cotangent's variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                input.parallel_all_gather_with_options(
+                    "x",
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                )
+            },
+            ArrayIrType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}], %1:dimension<4> .
+                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = linear_call \
+                    [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %2:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                            [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %3:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %2
+                            %4:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %1
+                            %5:dimension<2> = constant [value=2]
+                            %6:dimension<x_index * 2 ∈ [0, 3)> = dimension_mul %3 %5
+                            %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %4 %6 %5
+                            %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %7 %5
+                        in (%8)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=2,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
