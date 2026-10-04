@@ -12,24 +12,25 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    BatchingTracer, MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
+use crate::operations::collectives::parallel_ragged_all_to_all::PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
-    collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
+    ShapeChangingCollectiveValue, collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
     infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
@@ -238,8 +239,8 @@ impl LinearCollectiveOperation for ParallelAllToAllOperation {
     }
 
     #[inline]
-    fn forwarded(&self, batch_axis: usize) -> (Self, usize) {
-        let (split_axis, output_batch_axis) = self.options.mode.forwarded_split_axes(self.split_axis, batch_axis);
+    fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize) {
+        let (split_axis, output_batch_axis) = self.options.mode.forwarded_split_axes(self.split_axis, input_batch_axis);
         let (concat_axis, output_batch_axis) =
             self.options.mode.forwarded_concatenation_axes(self.concat_axis, output_batch_axis);
         (Self { split_axis, concat_axis, ..self.clone() }, output_batch_axis)
@@ -248,7 +249,7 @@ impl LinearCollectiveOperation for ParallelAllToAllOperation {
 
 impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
     #[inline]
-    fn options(&self) -> &CollectiveOptions {
+    fn collective_options(&self) -> &CollectiveOptions {
         &self.options
     }
 
@@ -402,13 +403,13 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
         Ok(vec![self.finalize_output_type(input_type, output_type)?.into()])
     }
 
-    fn ragged_input_error(&self, dimension: &DimensionVariable, _input_index: usize) -> BatchingError {
+    fn unsupported_ragged_input_error(&self, dimension: &DimensionVariable, _input_index: usize) -> BatchingError {
         // One extent per item does not determine how each sender partitions its live prefix among the receivers, which
         // requires the explicit offsets and per-destination sizes of a ragged all-to-all instead.
         BatchingError::UnsupportedOperation {
             message: format!(
-                "`parallel_all_to_all` cannot route bounded ragged dimension `{dimension}` without explicit \
-                 per-destination offsets and sizes; use `parallel_ragged_all_to_all`",
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` cannot route bounded ragged dimension `{dimension}` \
+                 without explicit per-destination offsets and sizes; use `{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}`",
             ),
         }
     }
@@ -714,7 +715,7 @@ impl<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        self.shape_changing_collective_interpret::<C>(inputs)
+        self.shape_changing_collective_interpret_in_parent::<C>(inputs)
     }
 }
 
@@ -804,7 +805,7 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        self.shape_changing_collective_jvp(context, inputs)
+        self.shape_changing_collective_jvp_in_parent(context, inputs)
     }
 }
 
@@ -1007,16 +1008,12 @@ where
     }
 }
 
-// Staged homogeneous array values share one staging implementation. Their static shapes let the operation infer its
-// result type, whereas composite values stage explicit result extents (see the array IR implementation above).
-impl<C: Context> ParallelAllToAll<ArrayType> for Tracer<C>
+// Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+impl<V> ParallelAllToAll<ArrayType> for V
 where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
-        > + ParallelVary,
+    V: ShapeChangingCollectiveValue + ParallelVary,
+    V::DispatchDomain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
 {
-    #[inline]
     fn parallel_all_to_all_with_options(
         &self,
         axis_name: &str,
@@ -1024,88 +1021,25 @@ where
         concat_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C>> ParallelAllToAll<ArrayType> for BatchingTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_all_to_all_with_options(
-        &self,
-        axis_name: &str,
-        split_axis: usize,
-        concat_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
-    }
-}
-
-impl<C: Context, P: DifferentiationPolicy<C>> ParallelAllToAll<ArrayType> for DifferentiationTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_all_to_all_with_options(
-        &self,
-        axis_name: &str,
-        split_axis: usize,
-        concat_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
-    }
-}
-
-/// Stages a [`ParallelAllToAllOperation`] for the homogeneous array `value` through its dispatch domain. This is the
-/// shared implementation of [`ParallelAllToAll<ArrayType>`] for staged array values (e.g., [`Tracer`],
-/// [`BatchingTracer`], and [`DifferentiationTracer`]) and is public so that backend array values can delegate to it as
-/// well. Over a manual mesh axis, the operation records the mesh, and an input that does not vary over the axis is
-/// first made varying through [`ParallelVary`].
-///
-/// # Errors
-///
-/// Returns the errors documented on [`ParallelAllToAll::parallel_all_to_all_with_options`].
-pub fn array_parallel_all_to_all<V>(
-    value: &V,
-    axis_name: &str,
-    split_axis: usize,
-    concat_axis: usize,
-    options: CollectiveOptions,
-) -> Result<V, ProgramError>
-where
-    V: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    let context = value.dispatch_domain();
-    let axis_size = resolve_named_axis_size(&context, axis_name)?;
-    options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
-    let mut input = value.clone();
-    let mut operation =
-        ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options);
-    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-        if input.r#type().unreduced_axes().contains(axis_name) {
-            return Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs").into());
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
+        let mut input = self.clone();
+        let mut operation =
+            ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options);
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            if input.r#type().unreduced_axes().contains(axis_name) {
+                return Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs").into());
+            }
+            if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+                input = input.parallel_vary(axis_name)?;
+            }
+            operation = operation.with_mesh(mesh);
         }
-        if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
-            input = input.parallel_vary(axis_name)?;
-        }
-        operation = operation.with_mesh(mesh);
+        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
-    let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 /// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.

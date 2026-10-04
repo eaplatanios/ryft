@@ -482,7 +482,8 @@ fn infer_array_ir_shape_changing_collective_output_type(
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
-// TODO(eaplatanios): Move this to right after `impl Debug for CollectiveOptions`.
+// TODO(eaplatanios): Move this to right after `ShapeChangingCollectiveValue` and its impl blocks,
+//  **after** `ShapeChangingCollectiveValue` is moved right after `impl Debug for CollectiveOptions`.
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
 /// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
@@ -659,18 +660,17 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     }
 }
 
-// TODO(eaplatanios): Review form here onwards.
-
-/// [`LinearCollectiveOperation`] that resizes an array axis (i.e., [`ParallelAllGatherOperation`],
-/// [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Its output shape depends on the participant
+// TODO(eaplatanios): Move this together with `LinearCollectiveOperation` so that it is always right after it.
+/// [`LinearCollectiveOperation`] that resizes an array axis (e.g., [`ParallelAllGatherOperation`],
+/// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Its output shape depends on the participant
 /// count and its [`CollectiveMode`], so in the composite array/dimension family it is staged with one explicit extent
 /// input per output axis. This trait captures the hooks that differ between these collectives (i.e., their options and
 /// their composite type inference) and provides the composite interpretation and forward-mode differentiation rules,
 /// together with the batching rules of both array families, on top of them and of their
 /// [`ShapeChangingCollectiveBatching`] implementations.
 trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
-    /// Returns the shared rank and participant-group semantics of this collective.
-    fn options(&self) -> &CollectiveOptions;
+    /// Returns the [`CollectiveOptions`] of this [`ShapeChangingCollectiveOperation`].
+    fn collective_options(&self) -> &CollectiveOptions;
 
     /// Infers the output type of this collective in the composite array/dimension family, whose array input is followed
     /// by one explicit extent per output axis. Statically known extents are checked here, while dynamic extents are
@@ -682,9 +682,9 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     fn infer_array_ir_output_types(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError>;
 
     /// Returns the error that the provided batching rules raise for a bounded ragged `dimension` on input
-    /// `input_index`, which these collectives cannot route because one extent per item does not describe how the
-    /// participants partition their live elements.
-    fn ragged_input_error(&self, dimension: &DimensionVariable, input_index: usize) -> BatchingError {
+    /// `input_index`, which these collectives cannot route because one extent per item does not describe how
+    /// the participants partition their live elements.
+    fn unsupported_ragged_input_error(&self, dimension: &DimensionVariable, input_index: usize) -> BatchingError {
         BatchingError::UnsupportedOperation {
             message: format!(
                 "`{}` does not support bounded ragged dimension `{}` on input {}",
@@ -695,20 +695,22 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         }
     }
 
-    /// Implements [`interpret_in_parent`](crate::interpretation::MemberInterpretableOperation::interpret_in_parent) for
-    /// this collective. Outside any binder, only a collective whose instances each combine a single participant has
-    /// defined semantics: a tiled one leaves the array unchanged, and an untiled one only removes or inserts a size-one
-    /// axis. The explicit result extents must match the shape that the observed input implies.
-    fn shape_changing_collective_interpret<C>(&self, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
-    where
+    /// Implements [`interpret_in_parent`](crate::MemberInterpretableOperation::interpret_in_parent) for this
+    /// collective. Outside any binder, only a collective whose instances each combine a single participant has defined
+    /// semantics: a tiled one leaves the array unchanged, and an untiled one only removes or inserts a size-one axis.
+    /// The explicit result extents must match the shape that the observed input implies.
+    fn shape_changing_collective_interpret_in_parent<
         C: Domain<
                 Type = ArrayIrType,
                 Value: ValueProjection<
                     ArrayType,
-                    Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape,
+                    Projected: Value<Type = ArrayType> + Reshape + DimensionSize<usize>,
                 > + ValueProjection<DimensionType, Projected = DimensionValue>,
             >,
-    {
+    >(
+        &self,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         // The composite collective consumes one array followed by a dimension value for each result axis.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
@@ -743,8 +745,11 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             if actual != *expected {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "`{}` output axis {axis} extent must equal observed result extent {expected} but got {actual}",
+                        "`{}` output axis {} extent must equal observed result extent {} but got {}",
                         self.name(),
+                        axis,
+                        expected,
+                        actual,
                     ),
                 });
             }
@@ -753,32 +758,32 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         // A degenerate tiled collective leaves the array unchanged, and its untiled form only removes or inserts a
         // size-one axis, so reshaping to the validated result shape is sufficient and preserves element order.
         self.check_degenerate_interpretation()?;
-        let output = match self.options().mode() {
+        let output = match self.collective_options().mode() {
             CollectiveMode::Tiled => input,
             CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
         };
+
         Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
     }
 
-    /// Implements [`jvp_in_parent`](crate::differentiation::MemberDifferentiableOperation::jvp_in_parent) for this
-    /// collective. The explicit output extents and the exact input shape become ordinary residuals of one linear call,
-    /// whose transpose applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the
-    /// output cotangent.
-    fn shape_changing_collective_jvp<C, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-    where
+    /// Implements [`jvp_in_parent`](crate::MemberDifferentiableOperation::jvp_in_parent) for this collective. The
+    /// explicit output extents and the exact input shape become ordinary residuals of one linear call, whose transpose
+    /// applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the output cotangent.
+    fn shape_changing_collective_jvp_in_parent<
         C: Context<
                 Type = ArrayIrType,
                 Operation: From<Self>
                                + From<Self::Adjoint>
+                               + From<ConstantOperation<DimensionValue>>
                                + From<DimensionSizeOperation>
-                               + From<LinearCallOperation<ArrayIrType>>
-                               + From<ConstantOperation<DimensionValue>>,
+                               + From<LinearCallOperation<ArrayIrType>>,
             >,
-    {
+        P: DifferentiationPolicy<C>,
+    >(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let Some((array, _)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -827,17 +832,19 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 
-    /// Implements [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) for this collective in the
+    /// Implements [`BatchableOperation::batch`](crate::BatchableOperation::batch) for this collective in the
     /// homogeneous array family. Bounded ragged inputs are rejected. A `batch` level that does not bind the
     /// collective's axis forwards it to its parent with its array axes moved past the mapped axis, while a level that
     /// binds the axis consumes it through [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis).
-    fn shape_changing_collective_batch<C, P: CollectiveArrayExtentBatchingPolicy<C>>(
+    fn shape_changing_collective_batch<
+        C: Context<Type = ArrayType, Operation: From<Self>>,
+        P: CollectiveArrayExtentBatchingPolicy<C>,
+    >(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
     where
-        C: Context<Type = ArrayType, Operation: From<Self>>,
         Self: ShapeChangingCollectiveBatching<C>,
     {
         if let Some((index, ragged_axis)) = inputs
@@ -845,7 +852,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             .enumerate()
             .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
         {
-            return Err(self.ragged_input_error(ragged_axis.dimension(), index));
+            return Err(self.unsupported_ragged_input_error(ragged_axis.dimension(), index));
         }
 
         if context.axis_name() != Some(self.axis_name()) {
@@ -861,19 +868,14 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         Ok(vec![self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?].into())
     }
 
-    /// Implements [`batch_in_parent`](crate::batching::MemberBatchableOperation::batch_in_parent) for this collective
-    /// in the composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
+    /// Implements [`batch_in_parent`](crate::MemberBatchableOperation::batch_in_parent) for this collective in the
+    /// composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
     /// geometry. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
     /// batch item, must be replicated. A `batch` level that does not bind the collective's axis forwards it to its
     /// parent, while a level that binds the axis consumes it through
-    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis) over the array projection of its
-    /// parent.
-    fn shape_changing_collective_batch_in_parent<C>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError>
-    where
+    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis)
+    /// over the array projection of its parent.
+    fn shape_changing_collective_batch_in_parent<
         C: Context<
                 Type = ArrayIrType,
                 Value: Assert
@@ -882,16 +884,22 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                            + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
                            + ValueProjection<
                     DimensionType,
-                    Projected: Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
+                    Projected: Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
                 >,
                 Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
                 Operation: From<Self>
-                               + From<DynamicBroadcastOperation>
                                + From<ConstantOperation<DimensionValue>>
-                               + From<DimensionSizeOperation>
+                               + From<DynamicBroadcastOperation>
                                + From<DynamicReshapeOperation>
+                               + From<DimensionSizeOperation>
                                + OperationProjection<ArrayType>,
             >,
+    >(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError>
+    where
         Self: ShapeChangingCollectiveBatching<ProjectedContext<C, ArrayType>>,
     {
         let Some((array, output_extents)) = inputs.split_first() else {
@@ -903,15 +911,15 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             .enumerate()
             .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
         {
-            return Err(self.ragged_input_error(ragged_axis.dimension(), index));
+            return Err(self.unsupported_ragged_input_error(ragged_axis.dimension(), index));
         }
 
         for output_extent in output_extents {
             output_extent.validate_replicated_dimension()?;
         }
 
-        // Infer the per-item result type before lifting physical axes. This also supplies the sharding metadata used by
-        // the matching-axis kernel.
+        // Infer the per-item result type before lifting physical axes. This also supplies the sharding metadata
+        // used by the matching-axis kernel.
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = self.infer_array_ir_output_types(logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
@@ -922,8 +930,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
         self.reject_mesh_form()?;
 
-        // Project the composite values onto their array and dimension domains, so that the homogeneous kernel can use
-        // the explicit dimension values directly for dynamic reshape geometry.
+        // Project the composite values onto their array and dimension domains, so that the homogeneous kernel
+        // can use the explicit dimension values directly for dynamic reshape geometry.
         let array = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
@@ -947,6 +955,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     }
 }
 
+// TODO(eaplatanios): Move this together with `ShapeChangingCollectiveOperation` so that it is always right after it.
 /// Context-specific batching capability of a [`ShapeChangingCollectiveOperation`] for `batch` levels whose parent is
 /// `C`. Its function consumes a level that binds the collective's named axis; the shared batching rules use it after
 /// validating the inputs and determining the output geometry.
@@ -975,9 +984,9 @@ trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangi
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
-/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain.
-///
-/// This marker opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
+// TODO(eaplatanios): Move this right after `impl Debug for CollectiveOptions`.
+/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain. This marker
+/// opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
 /// implementations. Each implementation separately requires its operation to be supported by the dispatch domain,
 /// named-axis resolution through [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait
 /// alone does not require support for every collective. Backend array types implement it to reuse these staging rules
@@ -999,6 +1008,8 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
     Self: Value<Type = ArrayType>
 {
 }
+
+// TODO(eaplatanios): Review form here onwards.
 
 /// Representation boundary used only by shape-changing collective batching rules.
 ///
@@ -1876,7 +1887,7 @@ mod tests {
             [ArrayIrValue::Array(input.clone()), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
         assert_eq!(
             ParallelSumScatterOperation::new("x".to_string(), 2, 0, singleton_groups)
-                .shape_changing_collective_interpret::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(
+                .shape_changing_collective_interpret_in_parent::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(
                     &composite_inputs,
                 ),
             Ok(vec![ArrayIrValue::Array(input)]),

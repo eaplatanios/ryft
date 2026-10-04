@@ -14,14 +14,14 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    BatchingTracer, MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -51,7 +51,7 @@ use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
-    collective_input_extents, collective_output_extents, forward_linear_collective,
+    ShapeChangingCollectiveValue, collective_input_extents, collective_output_extents, forward_linear_collective,
     infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
     resolve_named_axis_size, validate_manual_mesh_input,
 };
@@ -304,16 +304,16 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
     }
 
     #[inline]
-    fn forwarded(&self, batch_axis: usize) -> (Self, usize) {
+    fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize) {
         let (concat_axis, output_batch_axis) =
-            self.options.mode.forwarded_concatenation_axes(self.concat_axis, batch_axis);
+            self.options.mode.forwarded_concatenation_axes(self.concat_axis, input_batch_axis);
         (Self { concat_axis, ..self.clone() }, output_batch_axis)
     }
 }
 
 impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
     #[inline]
-    fn options(&self) -> &CollectiveOptions {
+    fn collective_options(&self) -> &CollectiveOptions {
         &self.options
     }
 
@@ -687,7 +687,7 @@ impl<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        self.shape_changing_collective_interpret::<C>(inputs)
+        self.shape_changing_collective_interpret_in_parent::<C>(inputs)
     }
 }
 
@@ -953,7 +953,7 @@ where
         if self.output_variance() == ParallelAllGatherOutputVariance::Invariant {
             return jvp_invariant_parallel_all_gather(self, context, inputs);
         }
-        self.shape_changing_collective_jvp(context, inputs)
+        self.shape_changing_collective_jvp_in_parent(context, inputs)
     }
 }
 
@@ -1099,16 +1099,12 @@ where
     }
 }
 
-// Staged homogeneous array values share one staging implementation. Their static shapes let the operation infer its
-// result type, whereas composite values stage explicit result extents (see the array IR implementation above).
-impl<C: Context> ParallelAllGather<ArrayType> for Tracer<C>
+// Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+impl<V> ParallelAllGather<ArrayType> for V
 where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
-        > + ParallelVary,
+    V: ShapeChangingCollectiveValue + ParallelVary,
+    V::DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
 {
-    #[inline]
     fn parallel_all_gather_with_options(
         &self,
         axis_name: &str,
@@ -1116,98 +1112,35 @@ where
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
-        array_parallel_all_gather(self, axis_name, concat_axis, options, output_variance)
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C>> ParallelAllGather<ArrayType> for BatchingTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_all_gather_with_options(
-        &self,
-        axis_name: &str,
-        concat_axis: usize,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_all_gather(self, axis_name, concat_axis, options, output_variance)
-    }
-}
-
-impl<C: Context, P: DifferentiationPolicy<C>> ParallelAllGather<ArrayType> for DifferentiationTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_all_gather_with_options(
-        &self,
-        axis_name: &str,
-        concat_axis: usize,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_all_gather(self, axis_name, concat_axis, options, output_variance)
-    }
-}
-
-/// Stages a [`ParallelAllGatherOperation`] for the homogeneous array `value` through its dispatch domain. This is the
-/// shared implementation of [`ParallelAllGather<ArrayType>`] for staged array values (e.g., [`Tracer`],
-/// [`BatchingTracer`], and [`DifferentiationTracer`]) and is public so that backend array values can delegate to it as
-/// well. Over a manual mesh axis, the operation records the mesh, and an input that does not vary over the axis is
-/// first made varying through [`ParallelVary`].
-///
-/// # Errors
-///
-/// Returns the errors documented on [`ParallelAllGather::parallel_all_gather_with_options`].
-pub fn array_parallel_all_gather<V>(
-    value: &V,
-    axis_name: &str,
-    concat_axis: usize,
-    options: CollectiveOptions,
-    output_variance: ParallelAllGatherOutputVariance,
-) -> Result<V, ProgramError>
-where
-    V: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    let context = value.dispatch_domain();
-    let axis_size = resolve_named_axis_size(&context, axis_name)?;
-    options.effective_axis_size(PARALLEL_ALL_GATHER_OPERATION_NAME, axis_size)?;
-    if output_variance != ParallelAllGatherOutputVariance::Varying && options.axis_index_groups.is_some() {
-        return Err(TypeError::invalid(
-            "`parallel_all_gather` axis index groups are not supported with invariant or reduced output variance"
-                .to_string(),
-        )
-        .into());
-    }
-    let mut input = value.clone();
-    let mut operation =
-        ParallelAllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options, output_variance);
-    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-        if input.r#type().unreduced_axes().contains(axis_name) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
-            ))
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        options.effective_axis_size(PARALLEL_ALL_GATHER_OPERATION_NAME, axis_size)?;
+        if output_variance != ParallelAllGatherOutputVariance::Varying && options.axis_index_groups.is_some() {
+            return Err(TypeError::invalid(
+                "`parallel_all_gather` axis index groups are not supported with invariant or reduced output variance"
+                    .to_string(),
+            )
             .into());
         }
-        if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
-            input = input.parallel_vary(axis_name)?;
+        let mut input = self.clone();
+        let mut operation =
+            ParallelAllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options, output_variance);
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            if input.r#type().unreduced_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
+            }
+            if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+                input = input.parallel_vary(axis_name)?;
+            }
+            operation = operation.with_mesh(mesh);
         }
-        operation = operation.with_mesh(mesh);
+        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
-    let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 /// Applies the mixed array IR JVP for invariant all-gather. Its transpose selects the current participant's

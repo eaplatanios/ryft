@@ -7,14 +7,14 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    BatchingTracer, MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -26,9 +26,9 @@ use crate::operations::collectives::parallel_all_gather::{
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
-    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, collective_input_extents,
-    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_named_axis_size, validate_manual_mesh_input,
+    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
+    collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -269,7 +269,53 @@ impl ParallelSumScatterOperation {
     }
 }
 
-// TODO(eaplatanios): Review this.
+impl Display for ParallelSumScatterOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ParallelSumScatterOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        PARALLEL_SUM_SCATTER_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        let input_type = self.check_input(input_types, region_interfaces)?;
+
+        // Result-shape arithmetic in the homogeneous array family requires static extents.
+        // Dynamic geometry uses explicit result extents in the composite array/dimension family.
+        let Some(shape) = input_type.static_shape() else {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
+            )));
+        };
+
+        Ok(vec![self.infer_static_output_type(input_type, shape.dimensions().to_vec())?])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            operation.field("axis_size", self.axis_size)?;
+            operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
+            operation.field("options", format_args!("{:?}", &self.options))?;
+            if let Some(mesh) = &self.mesh {
+                operation.field("mesh", mesh)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl LinearCollectiveOperation for ParallelSumScatterOperation {
     type Adjoint = ParallelAllGatherOperation;
 
@@ -315,16 +361,16 @@ impl LinearCollectiveOperation for ParallelSumScatterOperation {
     }
 
     #[inline]
-    fn forwarded(&self, batch_axis: usize) -> (Self, usize) {
-        let (scatter_axis, output_batch_axis) = self.options.mode.forwarded_split_axes(self.scatter_axis, batch_axis);
+    fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize) {
+        let (scatter_axis, output_batch_axis) =
+            self.options.mode.forwarded_split_axes(self.scatter_axis, input_batch_axis);
         (Self { scatter_axis, ..self.clone() }, output_batch_axis)
     }
 }
 
 impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
-    // TODO(eaplatanios): Review this.
     #[inline]
-    fn options(&self) -> &CollectiveOptions {
+    fn collective_options(&self) -> &CollectiveOptions {
         &self.options
     }
 
@@ -440,7 +486,6 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingCollectiveBatching<C>
     for ParallelSumScatterOperation
 {
@@ -493,53 +538,6 @@ impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingColle
         let output =
             P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
         ArrayBatch::new(output, BatchAxis::from_position(0))
-    }
-}
-
-impl Display for ParallelSumScatterOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl Operation for ParallelSumScatterOperation {
-    type Type = ArrayType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        PARALLEL_SUM_SCATTER_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        let input_type = self.check_input(input_types, region_interfaces)?;
-
-        // Result-shape arithmetic in the homogeneous array family requires static extents.
-        // Dynamic geometry uses explicit result extents in the composite array/dimension family.
-        let Some(shape) = input_type.static_shape() else {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
-            )));
-        };
-
-        Ok(vec![self.infer_static_output_type(input_type, shape.dimensions().to_vec())?])
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
-            operation.field("axis_size", self.axis_size)?;
-            operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
-            operation.field("options", format_args!("{:?}", &self.options))?;
-            if let Some(mesh) = &self.mesh {
-                operation.field("mesh", mesh)?;
-            }
-            Ok(())
-        })
     }
 }
 
@@ -672,7 +670,7 @@ impl<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        self.shape_changing_collective_interpret::<C>(inputs)
+        self.shape_changing_collective_interpret_in_parent::<C>(inputs)
     }
 }
 
@@ -729,7 +727,7 @@ impl<
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The transposed linear region restores the input cotangent's reduction state, so completing a pending sum
         // uses a reduced, rather than varying, all-gather.
-        self.shape_changing_collective_jvp(context, inputs)
+        self.shape_changing_collective_jvp_in_parent(context, inputs)
     }
 }
 
@@ -946,99 +944,35 @@ where
     }
 }
 
-// Staged homogeneous array values share one staging implementation. Their static shapes let the operation infer its
-// result type, whereas composite values stage explicit result extents (see the array IR implementation above).
-impl<C: Context> ParallelSumScatter<ArrayType> for Tracer<C>
+// Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+impl<V> ParallelSumScatter<ArrayType> for V
 where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
-        > + ParallelVary,
+    V: ShapeChangingCollectiveValue + ParallelVary,
+    V::DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
 {
-    #[inline]
     fn parallel_sum_scatter_with_options(
         &self,
         axis_name: &str,
         scatter_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
-        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
-    }
-}
-
-impl<C: Context, P: BatchingPolicy<C>> ParallelSumScatter<ArrayType> for BatchingTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
-    }
-}
-
-impl<C: Context, P: DifferentiationPolicy<C>> ParallelSumScatter<ArrayType> for DifferentiationTracer<C, P>
-where
-    Self: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    #[inline]
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
-    }
-}
-
-/// Stages a [`ParallelSumScatterOperation`] for the homogeneous array `value` through its dispatch domain. This is the
-/// shared implementation of [`ParallelSumScatter<ArrayType>`] for staged array values (e.g., [`Tracer`],
-/// [`BatchingTracer`], and [`DifferentiationTracer`]) and is public so that backend array values can delegate to it as
-/// well. Over a manual mesh axis, the operation records the mesh, and an input that neither varies over the axis nor
-/// carries a pending sum over it is first made varying through [`ParallelVary`].
-///
-/// # Errors
-///
-/// Returns the errors documented on [`ParallelSumScatter::parallel_sum_scatter_with_options`].
-pub fn array_parallel_sum_scatter<V>(
-    value: &V,
-    axis_name: &str,
-    scatter_axis: usize,
-    options: CollectiveOptions,
-) -> Result<V, ProgramError>
-where
-    V: Value<
-            Type = ArrayType,
-            DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
-        > + ParallelVary,
-{
-    let context = value.dispatch_domain();
-    let axis_size = resolve_named_axis_size(&context, axis_name)?;
-    options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
-    let mut input = value.clone();
-    let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
-    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-        if !input.r#type().sharding().is_some_and(|sharding| {
-            sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
-        }) {
-            input = input.parallel_vary(axis_name)?;
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let mut input = self.clone();
+        let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            if !input.r#type().sharding().is_some_and(|sharding| {
+                sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
+            }) {
+                input = input.parallel_vary(axis_name)?;
+            }
+            operation = operation.with_mesh(mesh);
         }
-        operation = operation.with_mesh(mesh);
+        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
-    let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
 }
 
 #[cfg(test)]

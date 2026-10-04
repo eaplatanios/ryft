@@ -131,42 +131,6 @@ impl ParallelPermuteOperation {
     }
 }
 
-impl LinearCollectiveOperation for ParallelPermuteOperation {
-    type Adjoint = ParallelPermuteOperation;
-
-    #[inline]
-    fn axis_name(&self) -> &str {
-        &self.axis_name
-    }
-
-    #[inline]
-    fn axis_size(&self) -> usize {
-        self.axis_size
-    }
-
-    #[inline]
-    fn mesh(&self) -> Option<&LogicalMesh> {
-        self.mesh.as_ref()
-    }
-
-    #[inline]
-    fn adjoint(&self, _input_type: &ArrayType) -> Result<ParallelPermuteOperation, ProgramError> {
-        // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
-        // is the permutation with every pair inverted, over the same axis and mesh.
-        Ok(ParallelPermuteOperation {
-            source_target_pairs: self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect(),
-            ..self.clone()
-        })
-    }
-
-    #[inline]
-    fn forwarded(&self, batch_axis: usize) -> (Self, usize) {
-        // A permutation preserves the shape of its input, so it applies to the packed values of a mapped input
-        // unchanged and leaves the mapped axis where it is.
-        (self.clone(), batch_axis)
-    }
-}
-
 impl Display for ParallelPermuteOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -252,6 +216,42 @@ impl Operation for ParallelPermuteOperation {
             }
             Ok(())
         })
+    }
+}
+
+impl LinearCollectiveOperation for ParallelPermuteOperation {
+    type Adjoint = ParallelPermuteOperation;
+
+    #[inline]
+    fn axis_name(&self) -> &str {
+        &self.axis_name
+    }
+
+    #[inline]
+    fn axis_size(&self) -> usize {
+        self.axis_size
+    }
+
+    #[inline]
+    fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
+    }
+
+    #[inline]
+    fn adjoint(&self, _input_type: &ArrayType) -> Result<ParallelPermuteOperation, ProgramError> {
+        // Sending along `(source, target)` pulls cotangents back along `(target, source)`, so the input cotangent
+        // is the permutation with every pair inverted, over the same axis and mesh.
+        Ok(ParallelPermuteOperation {
+            source_target_pairs: self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect(),
+            ..self.clone()
+        })
+    }
+
+    #[inline]
+    fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize) {
+        // A permutation preserves the shape of its input, so it applies to the packed values of a mapped input
+        // unchanged and leaves the mapped axis where it is.
+        (self.clone(), input_batch_axis)
     }
 }
 
