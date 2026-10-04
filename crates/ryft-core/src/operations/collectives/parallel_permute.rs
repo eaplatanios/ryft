@@ -176,15 +176,9 @@ impl Operation for ParallelPermuteOperation {
             )));
         }
 
-        // Every linear collective has exactly one statically shaped input.
+        // The permutation preserves its single input's type, including dynamic dimensions.
         check_count!("input", input_types, 1, TypeError);
         check_types!(@no_unreduced, PARALLEL_PERMUTE_OPERATION_NAME, input_types);
-        let Some(shape) = input_types[0].static_shape() else {
-            return Err(TypeError::invalid(format!(
-                "`{}` does not support dynamically shaped inputs",
-                PARALLEL_PERMUTE_OPERATION_NAME,
-            )));
-        };
 
         let operation = self;
         let input_type = &input_types[0];
@@ -700,8 +694,8 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, DimensionBounds, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, Sharding, StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, Shape, Sharding, StridedLayout,
     };
     use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
@@ -817,6 +811,24 @@ mod tests {
             operation = ParallelPermuteOperation::new("x".to_string(), 2, Vec::new()),
             cases = [{ input_types = [vector.clone()], output_types = [vector.clone()] }],
         );
+
+        // Bounded and unbounded dynamic dimensions are preserved for ordinary and manual-mesh permutations.
+        for bounds in [DimensionBounds::new(0, Some(8)).unwrap(), DimensionBounds::unbounded()] {
+            let dynamic = ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", bounds))]),
+            );
+            let dynamic_varying =
+                dynamic.clone().with_sharding(sharding.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap();
+            check_operation_type_inference!(
+                operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]),
+                cases = [{ input_types = [dynamic.clone()], output_types = [dynamic.clone()] }],
+            );
+            check_operation_type_inference!(
+                operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).with_mesh(mesh.clone()),
+                cases = [{ input_types = [dynamic_varying.clone()], output_types = [dynamic_varying.clone()] }],
+            );
+        }
 
         // Every pair must reference participants of the axis, and no two pairs may share a source or a target.
         for (pairs, message) in [
