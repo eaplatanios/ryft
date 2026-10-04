@@ -1,14 +1,15 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh,
-    MeshAxisType, Shape, Sharding,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, Shape,
+    Sharding,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
+use crate::operations::collectives::check_manual_mesh_axis;
 use crate::operations::constants::iota::IotaOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -109,12 +110,7 @@ impl Operation for AxisIndexOperation {
         check_count!("input", input_types, 0, TypeError);
         let mut output = ArrayType::scalar(DataType::U64);
         if let Some(mesh) = &self.mesh {
-            if mesh.axis_type(&self.axis_name) != Some(MeshAxisType::Manual) {
-                return Err(TypeError::invalid(format!(
-                    "`{}` mesh axis `{}` must be manual",
-                    AXIS_INDEX_OPERATION_NAME, self.axis_name,
-                )));
-            }
+            check_manual_mesh_axis(AXIS_INDEX_OPERATION_NAME, &self.axis_name, None, mesh)?;
             output = output
                 .with_sharding(
                     Sharding::replicated(mesh.clone(), 0)

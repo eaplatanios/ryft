@@ -10,11 +10,11 @@
 //! shared machinery of the single-input linear collectives ([`ParallelPermuteOperation`],
 //! [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Each carries
 //! the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment, consumes one
-//! statically shaped array input, and has only degenerate single-participant semantics outside a binder. Its tangent
-//! rides the same collective, and its transpose is another collective over the same axis. The private
-//! `define_linear_collective_operation!` macro generates their common operation structure and the private
-//! `impl_differentiable_linear_collective_operation!` macro their differentiation rules, while shared functions support
-//! the generated code and hand-written rules.
+//! array input, and has only degenerate single-participant semantics outside a binder. Its tangent rides the same
+//! collective, and its transpose is another collective over the same axis. The crate-private
+//! `LinearCollectiveOperation` trait captures the hooks that their transformation rules need (e.g., the adjoint
+//! collective and the forwarding of a collective past an unrelated mapped batch axis) and provides those rules, to
+//! which each operation's explicit trait implementations delegate.
 //!
 //! The collectives that resize an array axis ([`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and
 //! [`ParallelAllToAllOperation`]) share additional machinery. Their output shapes depend
@@ -26,7 +26,8 @@
 //!     first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well),
 //!   - the first-class extent arithmetic that computes and validates result extents at staging time, and
 //!   - the [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
-//!     its type inference, interpretation, batching, and forward-mode differentiation rules.
+//!     its type inference, interpretation, batching, and forward-mode differentiation rules, which the crate-private
+//!     `ShapeChangingCollectiveOperation` trait provides on top of each collective's matching-axis batching kernel.
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
 //! [`NamedAxes`] environment at staging time. A name bound by an enclosing `batch` level is
@@ -41,17 +42,18 @@ use std::fmt::Debug;
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
-    StaticArrayExtentBatchingPolicy,
+    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, LogicalMesh, MeshAxisType,
+    Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError};
-use crate::contexts::{Context, ProjectedContext};
+use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    CotangentAccumulator, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, TranspositionContext,
 };
 use crate::macros::check_count;
-use crate::operations::arithmetic::{Div, Mul, Rem};
+use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -61,9 +63,11 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
+use crate::tracing::{Tracer, TracingContext};
 
 pub mod axis_index;
 pub mod parallel_all_gather;
@@ -92,9 +96,10 @@ pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, 
 /// Shape semantics of the collectives that resize an array axis (e.g., [`ParallelAllGatherOperation`],
 /// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]), which determine where the `n` participants of
 /// the named axis appear in the shape of the result. In [`Untiled`](Self::Untiled) mode, the participants get an array
-/// dimension of their own with extent `n`, which an all-gather inserts, a sum-scatter consumes, and an all-to-all
-/// moves, so the rank changes. In [`Tiled`](Self::Tiled) mode, the participants are instead folded into an existing
-/// array dimension, whose extent is multiplied or divided by `n`, so the rank is preserved. These are the analogues of
+/// dimension of their own with extent `n`, which an all-gather inserts and a sum-scatter consumes, so their rank
+/// changes, while an all-to-all consumes one such dimension and inserts another, so its rank is preserved. In
+/// [`Tiled`](Self::Tiled) mode, the participants are instead folded into an existing array dimension, whose
+/// extent is multiplied or divided by `n`, so the rank is always preserved. These are the analogues of
 /// the `tiled=False` (the default) and `tiled=True` settings of JAX's
 /// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html),
 /// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html), and
@@ -127,7 +132,7 @@ pub enum CollectiveMode {
     /// Gives the participants an array dimension of their own with extent `n`: an all-gather inserts it at its
     /// concatenation axis, a sum-scatter consumes its scatter axis (whose extent must be exactly `n`), and an
     /// all-to-all consumes its split axis (whose extent must be exactly `n`) and inserts a sender dimension at
-    /// its concatenation axis,.
+    /// its concatenation axis.
     #[default]
     Untiled,
 
@@ -425,368 +430,542 @@ fn infer_array_ir_shape_changing_collective_output_type(
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Defines the structural implementations shared by the single-input linear collectives (e.g., `parallel_all_gather`
-/// and `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its
-/// `axis_name` and `axis_size` accessors, together with its [`Display`](std::fmt::Display), [`Operation`],
-/// [`InterpretableOperation`](crate::InterpretableOperation), and
-/// [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations:
+/// Checks that `axis_name` is a manual axis of `mesh` and, when `axis_size` is provided, that the size the collective
+/// recorded at staging time matches the size of that mesh axis. Collectives that carry a mesh use it to validate the
+/// manual axis they exchange values over (e.g., [`AxisIndexOperation`], which has no input).
 ///
-///   - Type inference validates the shared input contract (a nonzero axis size and exactly one statically shaped input
-///     that satisfies the requested array-type checks) and then delegates the payload-dependent output type.
-///   - Interpretation outside any binder is defined only over a degenerate single-participant axis, where it is the
-///     identity unless the invocation provides its own `interpret` rule. Any larger axis is an error, because the other
-///     participants do not exist per item.
-///   - Partial evaluation uses the default fold-or-residualize behavior of `Program::partially_evaluate`.
+/// # Errors
 ///
-/// Batching rules and value-level capabilities are written next to each invocation, because every collective consumes
-/// the mapped batch axis, and exposes its named axis to users, differently.
-/// [`impl_differentiable_linear_collective_operation!`] generates the differentiation rules.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// /// Canonical operation name for [`ParallelAllToAllOperation`].
-/// pub const PARALLEL_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_all_to_all";
-///
-/// define_linear_collective_operation!(
-///     /// [`Operation`] that exchanges chunks between the participants along the named axis.
-///     ParallelAllToAllOperation,
-///     PARALLEL_ALL_TO_ALL_OPERATION_NAME,
-///     fields = {
-///         /// Axis of the input that is split into one chunk per participant.
-///         split_axis: usize,
-///     },
-///     check_array_types = [@no_unreduced],
-///     infer_output_type = |operation, input_type, dimensions| {
-///         parallel_all_to_all_output_type(operation, input_type, dimensions)
-///     },
-/// );
-/// ```
-///
-/// # Parameters
-///
-///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
-///   - `$operation`: Identifier of the generated operation struct (e.g., `ParallelAllToAllOperation`).
-///   - `$name`: Identifier of an existing operation-name constant (e.g., `PARALLEL_ALL_TO_ALL_OPERATION_NAME`).
-///   - `fields = { ... }`: Documented payload fields that follow the shared `axis_name` and `axis_size` fields, in the
-///     order in which the generated `new` function takes them and the operation renders them.
-///   - `optional_fields = { ... }`: Optional documented payload fields whose declared types are wrapped in [`Option`].
-///     The generated `new` function initializes them to [`None`], invocations provide their own builder and accessor
-///     functions, and the operation renders each one through its [`Display`](std::fmt::Display) implementation only
-///     when it is present (e.g., the manual mesh of a `parallel_permute` over a mesh axis).
-///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types) selectors
-///     applied to the input type (e.g., `@no_unreduced` for collectives that cannot complete a pending cross-device
-///     sum as part of their exchange).
-///   - `infer_output_type`: Closure-like rule that returns the output type as a `Result<ArrayType, TypeError>`. It
-///     binds the operation, the validated input type, and the input's static dimensions to the provided names. The
-///     closure-like syntax only names these values; it does not create a runtime closure.
-///   - `interpret<$context> where $bounds { |operation, input| ... }`: Optional closure-like rule that returns the
-///     output of a degenerate single-participant collective as a `Result<C::Value, ProgramError>`, for collectives
-///     whose single participant does not simply keep its value (e.g., an untargeted `parallel_permute` participant,
-///     which receives zeros). Its `where` predicates (e.g., `C::Value: ZeroLike`) bound the generated
-///     [`InterpretableOperation`](crate::InterpretableOperation) implementation. When it is omitted, the single
-///     participant keeps its value.
-macro_rules! define_linear_collective_operation {
-    // This branch generates the default interpretation, under which the single participant of a degenerate axis keeps
-    // its value, by forwarding an identity rule to the custom interpretation branch.
-    (@interpret $operation:ident, $name:ident) => {
-        define_linear_collective_operation!(
-            @interpret $operation,
-            $name,
-            C,
-            [C::Value: ::std::clone::Clone],
-            _operation,
-            input,
-            { Ok::<_, $crate::ProgramError>(input.clone()) },
-        );
-    };
+/// Returns a [`TypeError`] naming `operation_name` if the axis is not a manual axis of `mesh` or if its size differs.
+fn check_manual_mesh_axis(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+) -> Result<(), TypeError> {
+    if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+        return Err(TypeError::invalid(format!("`{operation_name}` mesh axis `{axis_name}` must be manual")));
+    }
 
-    // This branch generates the interpretation of a collective outside any binder from its degenerate-axis rule.
-    (
-        @interpret $operation:ident,
-        $name:ident,
-        $context:ident,
-        [$($bounded:ty: $bound:path),+],
-        $interpret_operation:ident,
-        $interpret_input:ident,
-        $interpret:block $(,)?
-    ) => {
-        impl<$context: $crate::Domain<Type = $crate::ArrayType>> $crate::InterpretableOperation<$context> for $operation
-        where
-            $($bounded: $bound),+
-        {
-            fn interpret<D: $crate::InterpretationDriver<$context>>(
-                &self,
-                _context: &$context,
-                _driver: &D,
-                inputs: &[<$context as $crate::Domain>::Value],
-            ) -> Result<Vec<<$context as $crate::Domain>::Value>, $crate::ProgramError> {
-                use $crate::{Operation as _, Typed as _};
+    if let Some(axis_size) = axis_size
+        && mesh.axis_size(axis_name) != Some(axis_size)
+    {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis size {axis_size} does not match the size of manual mesh axis `{axis_name}`",
+        )));
+    }
 
-                // Eager binding does not infer output types, so interpretation validates the shared input contract
-                // and the operation payload before applying either degenerate-axis rule.
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                // Outside any binder, only the degenerate single-participant axis has defined per-item semantics. Any
-                // larger axis is an error because the other participants do not exist per item.
-                if self.axis_size > 1 {
-                    return Err($crate::ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                            $name, self.axis_name, self.axis_size,
-                        ),
-                    });
-                }
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                self.infer_output_types(&input_types, &[])?;
-                let $interpret_operation = self;
-                let $interpret_input = &inputs[0];
-                Ok(vec![$interpret?])
-            }
-        }
-    };
-
-    // This branch accepts the public form and generates the operation struct together with its base implementations.
-    (
-        $(#[$documentation:meta])*
-        $operation:ident,
-        $name:ident,
-        fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
-        $(
-            optional_fields = {
-                $($(#[$optional_field_documentation:meta])* $optional_field:ident: $optional_field_type:ty),* $(,)?
-            },
-        )?
-        $(check_array_types = [$(@$array_type_check:ident),* $(,)?],)?
-        infer_output_type = |$operation_binding:ident, $input_type:ident, $dimensions:ident| $infer:block,
-        $(
-            interpret<$context:ident> where $($bounded:ty: $bound:path),+ {
-                |$interpret_operation:ident, $interpret_input:ident| $interpret:block
-            } $(,)?
-        )?
-    ) => {
-        $(#[$documentation])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-        pub struct $operation {
-            /// Axis name referenced by this collective.
-            axis_name: String,
-
-            /// Number of participants along the named axis, resolved from the active
-            /// [`NamedAxes`](crate::NamedAxes) environment when the operation is staged.
-            axis_size: usize,
-
-            $($(#[$field_documentation])* $field: $field_type,)*
-
-            $($($(#[$optional_field_documentation])* $optional_field: Option<$optional_field_type>,)*)?
-        }
-
-        impl $operation {
-            /// Creates a new operation over the named axis with the provided resolved axis size.
-            #[inline]
-            pub fn new(axis_name: String, axis_size: usize, $($field: $field_type),*) -> Self {
-                Self { axis_name, axis_size, $($field,)* $($($optional_field: None,)*)? }
-            }
-
-            /// Returns the axis name referenced by this collective.
-            #[inline]
-            pub fn axis_name(&self) -> &str {
-                &self.axis_name
-            }
-
-            /// Returns the number of participants along the named axis.
-            #[inline]
-            pub fn axis_size(&self) -> usize {
-                self.axis_size
-            }
-        }
-
-        impl ::std::fmt::Display for $operation {
-            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                $crate::Operation::render(self, formatter, 0)
-            }
-        }
-
-        impl $crate::Operation for $operation {
-            type Type = $crate::ArrayType;
-
-            #[inline]
-            fn name(&self) -> &'static str {
-                $name
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[$crate::ArrayType],
-                region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
-                $crate::check_count!("region", region_interfaces, 0, TypeError);
-                // A zero-participant collective is rejected before any extent arithmetic divides by its size.
-                if self.axis_size == 0 {
-                    return Err($crate::TypeError::invalid(format!("`{}` axis size must be greater than zero", $name)));
-                }
-                // Every linear collective has exactly one statically shaped input.
-                $crate::check_count!("input", input_types, 1, TypeError);
-                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                let Some(shape) = input_types[0].static_shape() else {
-                    return Err($crate::TypeError::invalid(format!(
-                        "`{}` does not support dynamically shaped inputs",
-                        $name,
-                    )));
-                };
-                let $dimensions = shape.dimensions().to_vec();
-                let $operation_binding = self;
-                let $input_type = &input_types[0];
-                Ok(vec![$infer?])
-            }
-
-            fn render(&self, formatter: &mut ::std::fmt::Formatter<'_>, indentation: usize) -> ::std::fmt::Result {
-                $crate::OperationFormatter::new(formatter, indentation, $name)?.bracketed(|operation| {
-                    operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
-                    operation.field("axis_size", &self.axis_size)?;
-                    $(operation.field(stringify!($field), format_args!("{:?}", &self.$field))?;)*
-                    $($(
-                        if let Some(value) = &self.$optional_field {
-                            operation.field(stringify!($optional_field), value)?;
-                        }
-                    )*)?
-                    Ok(())
-                })
-            }
-        }
-
-        define_linear_collective_operation!(
-            @interpret $operation,
-            $name
-            $(, $context, [$($bounded: $bound),+], $interpret_operation, $interpret_input, $interpret)?
-        );
-
-        // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
-        impl<C: $crate::Context<Type = $crate::ArrayType>> $crate::PartiallyEvaluatableOperation<C> for $operation where
-            C::Operation: From<$operation>
-        {
-        }
-    };
+    Ok(())
 }
 
-/// Implements the forward-mode differentiation (i.e., Jacobian-Vector Product, or JVP) and primitive transposition
-/// rules of a collective defined by [`define_linear_collective_operation!`]. Linear collectives need only declare their
-/// adjoint collective, and the macro generates the rest:
+/// Checks the manual mesh axis of a collective that carries a mesh, as [`check_manual_mesh_axis`] does, and then that
+/// `input_type` carries that same mesh. Returns the input sharding so that each collective can apply its own manual
+/// variation and pending-sum contract to it.
 ///
-///   - The JVP stages the same collective on the input tangent, because the collective is linear. A structural-zero
-///     tangent stays symbolic, retyped to the output tangent type because the collective can change shapes.
-///   - Transposition stages the adjoint collective on the output cotangent. A known input and a structural-zero output
-///     cotangent contribute nothing, which leaves the input cotangent a structural zero.
-///   - A private `adjoint` function returns the adjoint collective, so that other rules can stage it as well (e.g., the
-///     array IR forward-mode rules of the shape-changing collectives, which call it inside a linear call).
+/// # Errors
 ///
-/// Reverse-mode differentiation needs no separate rule because it is derived by linearizing and then transposing the
-/// staged tangent program. The closure-like syntax only names the operation and the adjoint type, which the generated
-/// transposition bounds require; it does not allocate or dynamically dispatch a runtime closure. The body becomes the
-/// body of the generated `adjoint` function, so it may use `?` or return an error early for configurations that have
-/// no adjoint collective, and its final expression is the adjoint operation.
-///
-/// # Examples
-///
-/// The transpose of a permutation is the permutation with every pair inverted:
-///
-/// ```rust,ignore
-/// impl_differentiable_linear_collective_operation! {
-///     ParallelPermuteOperation,
-///     transpose = |operation| -> ParallelPermuteOperation {
-///         let pairs = operation.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect();
-///         ParallelPermuteOperation::new(operation.axis_name.clone(), operation.axis_size, pairs)
-///     },
-/// }
-/// ```
-///
-/// # Parameters
-///
-///   - `$operation`: Linear collective type for which the rules are generated.
-///   - `$operation_binding`: Name bound to the operation whose adjoint is being constructed.
-///   - `$adjoint`: Type of the adjoint collective that the transposition rule stages.
-///   - `$adjoint_body`: Block that evaluates to the adjoint collective, or returns a [`ProgramError`] early.
-macro_rules! impl_differentiable_linear_collective_operation {
-    // This branch generates the adjoint function together with the JVP and transposition rules of one collective.
-    (
-        $operation:ident,
-        transpose = |$operation_binding:ident| -> $adjoint:ty $adjoint_body:block $(,)?
-    ) => {
-        impl $operation {
-            /// Returns the adjoint collective that transposition stages on the output cotangent.
-            fn adjoint(&self) -> Result<$adjoint, $crate::ProgramError> {
-                let $operation_binding = self;
-                Ok($adjoint_body)
-            }
-        }
-
-        impl<C: $crate::Context<Type = $crate::ArrayType>> $crate::DifferentiableOperation<C> for $operation
-        where
-            C::Operation: From<$operation>,
-        {
-            fn jvp<D: $crate::DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(
-                &self,
-                context: &$crate::DifferentiationContext<C, P>,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<C::Value>],
-            ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
-                use $crate::{DifferentiableType as _, Typed as _};
-
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                let mut primals =
-                    context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
-                $crate::check_count!("output", primals, 1, ProgramError);
-                let primal = primals.remove(0);
-                let tangent = match inputs[0].tangent() {
-                    $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(primal.r#type().tangent()?),
-                    $crate::MaybeZero::Value(tangent) => {
-                        let mut tangents =
-                            context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
-                        $crate::check_count!("output", tangents, 1, ProgramError);
-                        $crate::MaybeZero::Value(tangents.remove(0))
-                    }
-                };
-                Ok(vec![$crate::DifferentiationDual::new(primal, tangent)?])
-            }
-        }
-
-        impl<V, O> $crate::TransposableOperation<V, O> for $operation
-        where
-            V: $crate::Value<Type = $crate::ArrayType>,
-            O: $crate::Operation<Type = $crate::ArrayType>
-                + From<$crate::AddOperation<$crate::ArrayType>>
-                + From<$adjoint>,
-        {
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
-                &self,
-                context: &mut $crate::TranspositionContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                accumulators: &[$crate::CotangentAccumulator],
-            ) -> Result<(), $crate::DifferentiationError> {
-                use $crate::Context as _;
-
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
-                // The adjoint is resolved first, so that a configuration without one is rejected regardless of the
-                // cotangent, and only a live output cotangent of an unknown input then stages it.
-                let adjoint = self.adjoint()?;
-                let $crate::MaybeZero::Value(cotangent) = &outputs[0] else {
-                    return Ok(());
-                };
-                if inputs[0].is_known() {
-                    return Ok(());
-                }
-                let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
-                $crate::check_count!("output", contributions, 1, ProgramError);
-                accumulators[0].accumulate(context, $crate::MaybeZero::Value(contributions.remove(0)))?;
-                Ok(())
-            }
-        }
+/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
+/// a sharding over a different mesh.
+fn check_manual_mesh_input<'o>(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+    input_type: &'o ArrayType,
+) -> Result<&'o Sharding, TypeError> {
+    check_manual_mesh_axis(operation_name, axis_name, axis_size, mesh)?;
+    let Some(sharding) = input_type.sharding() else {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
+        )));
     };
+
+    if sharding.mesh() != mesh {
+        return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
+    }
+
+    Ok(sharding)
 }
 
-use {define_linear_collective_operation, impl_differentiable_linear_collective_operation};
+/// Single-input linear collective over a named axis (i.e., [`ParallelPermuteOperation`],
+/// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
+/// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
+/// exchanges values over a manual mesh axis, that axis's mesh. Its tangent rides the same collective, and its transpose
+/// is another collective over the same axis, so this trait captures the hooks that the transformation rules of every
+/// such collective need and provides those rules on top of them. The collectives keep explicit trait implementations
+/// that delegate to the provided functions, so that every operation module reads the same way.
+///
+/// The hooks named after a public accessor of the operation (e.g., [`axis_name`](Self::axis_name)) return the same
+/// values. They are repeated here because this trait is crate-private, while the accessors are public API.
+pub(crate) trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
+    /// Collective that transposition stages on the output cotangent.
+    type Adjoint: Clone + Operation<Type = ArrayType>;
+
+    /// Returns the name of the axis that this collective exchanges values over.
+    fn axis_name(&self) -> &str;
+
+    /// Returns the number of participants along the named axis, resolved when the collective was staged.
+    fn axis_size(&self) -> usize;
+
+    /// Returns the mesh whose manual axis this collective exchanges values over, or [`None`] for an ordinary
+    /// collective, whose named axis may be bound by any enclosing binder.
+    fn mesh(&self) -> Option<&LogicalMesh>;
+
+    /// Returns the number of participants that each instance of this collective combines. Collectives with participant
+    /// groups return the common group size; every other collective combines all participants of its axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the participant groups of this collective are invalid.
+    #[inline]
+    fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        Ok(self.axis_size())
+    }
+
+    /// Returns the adjoint collective that transposition stages on the output cotangent of a collective whose array
+    /// input has type `input_type`. Most collectives ignore `input_type`, but a sum-scatter that completes a pending
+    /// sum over its manual axis needs a reduced, rather than varying, all-gather to restore its input cotangent's
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for configurations that have no adjoint collective (e.g., an invariant all-gather,
+    /// whose transpose selects a participant-indexed chunk instead).
+    fn adjoint(&self, input_type: &ArrayType) -> Result<Self::Adjoint, ProgramError>;
+
+    /// Returns this collective with its array axes moved past the mapped batch axis at position `batch_axis` of the
+    /// physical input of a `batch` level that does not bind its named axis, together with the position of the mapped
+    /// batch axis in the physical result.
+    fn forwarded(&self, batch_axis: usize) -> (Self, usize);
+
+    /// Validates the input contract that every linear collective shares (i.e., no regions, a nonzero axis size, and
+    /// exactly one input) and returns that input's type.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if any part of that contract is violated.
+    fn check_input<'o>(
+        &self,
+        input_types: &'o [ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<&'o ArrayType, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+
+        // A zero-participant collective is rejected before any extent arithmetic divides by its size.
+        if self.axis_size() == 0 {
+            return Err(TypeError::invalid(format!("`{}` axis size must be greater than zero", self.name())));
+        }
+
+        check_count!("input", input_types, 1, TypeError);
+        Ok(&input_types[0])
+    }
+
+    /// Checks that this collective has defined semantics outside any binder. Only a collective whose instances each
+    /// combine a single participant does, because the other participants do not exist per item.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the participant groups are invalid or combine more than one participant.
+    fn check_degenerate_interpretation(&self) -> Result<(), ProgramError> {
+        let effective_axis_size = self.effective_axis_size()?;
+        if effective_axis_size > 1 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                    self.name(),
+                    self.axis_name(),
+                    effective_axis_size,
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rejects consuming this collective at a `batch` level that binds its axis name when the collective exchanges
+    /// values over a manual mesh axis, because a mesh exchange requires devices, even when the batch axis shadows the
+    /// mesh axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] if this collective carries a mesh.
+    fn reject_mesh_form(&self) -> Result<(), BatchingError> {
+        if self.mesh().is_some() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("`{}` over a manual mesh axis cannot bind a named batch axis", self.name()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Implements [`DifferentiableOperation::jvp`](crate::differentiation::DifferentiableOperation::jvp) for this
+    /// collective. The collective is linear, so its tangent rides the same collective as its primal, while a
+    /// structural-zero tangent stays symbolic, retyped to the output tangent type because the collective may change
+    /// shapes.
+    fn linear_collective_jvp<C: Context<Type = ArrayType, Operation: From<Self>>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let mut primals = context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
+        check_count!("output", primals, 1, ProgramError);
+        let primal = primals.remove(0);
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+            MaybeZero::Value(tangent) => {
+                let mut tangents = context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
+                check_count!("output", tangents, 1, ProgramError);
+                MaybeZero::Value(tangents.remove(0))
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+
+    /// Implements [`TransposableOperation::transpose`](crate::differentiation::TransposableOperation::transpose) for
+    /// this collective by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input and a
+    /// structural-zero output cotangent contribute nothing, which leaves the input cotangent a structural zero.
+    fn linear_collective_transpose<
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<Self::Adjoint>,
+    >(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+
+        // The adjoint is resolved first, so that a configuration without one is rejected regardless of the cotangent,
+        // and only a live output cotangent of an unknown input then stages it.
+        let adjoint = self.adjoint(inputs[0].r#type().as_ref())?;
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return Ok(());
+        };
+
+        if inputs[0].is_known() {
+            return Ok(());
+        }
+
+        let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
+        check_count!("output", contributions, 1, ProgramError);
+        accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
+        Ok(())
+    }
+}
+
+/// [`LinearCollectiveOperation`] that resizes an array axis (i.e., [`ParallelAllGatherOperation`],
+/// [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Its output shape depends on the participant
+/// count and its [`CollectiveMode`], so in the composite array/dimension family it is staged with one explicit extent
+/// input per output axis. This trait captures the hooks that differ between these collectives (i.e., their options and
+/// their composite type inference) and provides the composite interpretation and forward-mode differentiation rules,
+/// together with the batching rules of both array families, on top of them and of their
+/// [`ShapeChangingCollectiveKernel`] implementations.
+pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
+    /// Returns the shared rank and participant-group semantics of this collective.
+    fn options(&self) -> &CollectiveOptions;
+
+    /// Infers the output type of this collective in the composite array/dimension family, whose array input is followed
+    /// by one explicit extent per output axis. Statically known extents are checked here, while dynamic extents are
+    /// checked by the runtime assertions that the collective's capability stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the inputs violate the collective's shape, extent, or mesh contract.
+    fn infer_array_ir_output_types(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError>;
+
+    /// Returns the error that the provided batching rules raise for a bounded ragged `dimension` on input
+    /// `input_index`, which these collectives cannot route because one extent per item does not describe how the
+    /// participants partition their live elements.
+    fn ragged_input_error(&self, dimension: &DimensionVariable, input_index: usize) -> BatchingError {
+        BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{}` does not support bounded ragged dimension `{}` on input {}",
+                self.name(),
+                dimension,
+                input_index,
+            ),
+        }
+    }
+
+    /// Implements [`interpret_in_parent`](crate::interpretation::MemberInterpretableOperation::interpret_in_parent) for
+    /// this collective. Outside any binder, only a collective whose instances each combine a single participant has
+    /// defined semantics: a tiled one leaves the array unchanged, and an untiled one only removes or inserts a size-one
+    /// axis. The explicit result extents must match the shape that the observed input implies.
+    fn shape_changing_collective_interpret<C>(&self, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
+    where
+        C: Domain<
+                Type = ArrayIrType,
+                Value: ValueProjection<
+                    ArrayType,
+                    Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape,
+                > + ValueProjection<DimensionType, Projected = DimensionValue>,
+            >,
+    {
+        // The composite collective consumes one array followed by a dimension value for each result axis.
+        let Some((input, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        };
+        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+
+        // Resolve symbolic input dimensions from the actual array, then reuse homogeneous type inference to validate
+        // the collective's geometry and compute the concrete result shape while retaining the input metadata.
+        let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
+            (0..input.r#type().rank())
+                .map(|axis| input.dimension_size(axis).map(Dimension::Static))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&concrete_input_type), &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = output_types.remove(0);
+        let expected_extents = output_type.static_shape().ok_or_else(|| {
+            TypeError::invalid(format!("`{}` could not resolve its concrete output shape", self.name()))
+        })?;
+
+        // Explicit result extents must agree with the shape implied by the observed input and the collective options,
+        // because accepting arbitrary extents here would let dynamic shape inputs change the collective's semantics.
+        if output_extents.len() != expected_extents.rank() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: 1 + expected_extents.rank(),
+                actual: inputs.len(),
+            });
+        }
+
+        for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
+            let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
+            if actual != *expected {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{}` output axis {axis} extent must equal observed result extent {expected} but got {actual}",
+                        self.name(),
+                    ),
+                });
+            }
+        }
+
+        // A degenerate tiled collective leaves the array unchanged, and its untiled form only removes or inserts a
+        // size-one axis, so reshaping to the validated result shape is sufficient and preserves element order.
+        self.check_degenerate_interpretation()?;
+        let output = match self.options().mode() {
+            CollectiveMode::Tiled => input,
+            CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
+        };
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
+    }
+
+    /// Implements [`jvp_in_parent`](crate::differentiation::MemberDifferentiableOperation::jvp_in_parent) for this
+    /// collective. The explicit output extents and the exact input shape become ordinary residuals of one linear call,
+    /// whose transpose applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the
+    /// output cotangent.
+    fn shape_changing_collective_jvp<C, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Operation: From<Self>
+                               + From<Self::Adjoint>
+                               + From<DimensionSizeOperation>
+                               + From<LinearCallOperation<ArrayIrType>>
+                               + From<ConstantOperation<DimensionValue>>,
+            >,
+    {
+        let Some((array, _)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        let input_type = array.primal().r#type();
+        let adjoint = self.adjoint(<&ArrayType>::try_from(input_type.as_ref())?)?;
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let tangent = match array.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+            MaybeZero::Value(array_tangent) => {
+                let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
+                let (array, output_extents) = tangent_inputs.split_first().unwrap();
+                let context = context.tangent();
+                let mut residuals = LinearResiduals::new();
+                let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                let input_shape = residuals.retain_shape(context, array.primal())?;
+                let forward_operation = self.clone();
+                let forward_output_extents = output_extents.clone();
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    vec![array_tangent.clone()],
+                    move |residuals, linear_inputs| {
+                        let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                        collective_inputs.push(linear_inputs[0].clone());
+                        collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                        linear_inputs[0].dispatch_domain().bind(
+                            forward_operation,
+                            Vec::new(),
+                            collective_inputs.as_slice(),
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
+                        let mut adjoint_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                        adjoint_inputs.push(output_cotangents[0].clone());
+                        adjoint_inputs.extend(input_dimensions);
+                        transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())
+                    },
+                )?
+                .remove(0);
+                MaybeZero::Value(tangent)
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+
+    /// Implements [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) for this collective in the
+    /// homogeneous array family. Bounded ragged inputs are rejected. A `batch` level that does not bind the
+    /// collective's axis forwards it to its parent with its array axes moved past the mapped axis, while a level that
+    /// binds the axis consumes it through [`batch_matching_axis`](ShapeChangingCollectiveKernel::batch_matching_axis).
+    fn shape_changing_collective_batch<C, P: CollectiveArrayExtentBatchingPolicy<C>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
+    where
+        C: Context<Type = ArrayType, Operation: From<Self>>,
+        Self: ShapeChangingCollectiveKernel<C>,
+    {
+        if let Some((index, ragged_axis)) = inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
+        {
+            return Err(self.ragged_input_error(ragged_axis.dimension(), index));
+        }
+
+        if context.axis_name() != Some(self.axis_name()) {
+            return forward_linear_collective(context, self, inputs);
+        }
+
+        self.reject_mesh_form()?;
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+
+        let (output_type, output_extents) = collective_output_extents(context, self, &input.unbatched_type())?;
+        Ok(vec![self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?].into())
+    }
+
+    /// Implements [`batch_in_parent`](crate::batching::MemberBatchableOperation::batch_in_parent) for this collective
+    /// in the composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
+    /// geometry. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
+    /// batch item, must be replicated. A `batch` level that does not bind the collective's axis forwards it to its
+    /// parent, while a level that binds the axis consumes it through
+    /// [`batch_matching_axis`](ShapeChangingCollectiveKernel::batch_matching_axis) over the array projection of its
+    /// parent.
+    fn shape_changing_collective_batch_in_parent<C>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Value: Assert
+                           + DimensionSize
+                           + DynamicBroadcast
+                           + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+                           + ValueProjection<
+                    DimensionType,
+                    Projected: Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
+                >,
+                Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Operation: From<Self>
+                               + From<DynamicBroadcastOperation>
+                               + From<ConstantOperation<DimensionValue>>
+                               + From<DimensionSizeOperation>
+                               + From<DynamicReshapeOperation>
+                               + OperationProjection<ArrayType>,
+            >,
+        Self: ShapeChangingCollectiveKernel<ProjectedContext<C, ArrayType>>,
+    {
+        let Some((array, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        <&ArrayType>::try_from(&array.unbatched_type())?;
+        if let Some((index, ragged_axis)) = inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
+        {
+            return Err(self.ragged_input_error(ragged_axis.dimension(), index));
+        }
+
+        for output_extent in output_extents {
+            output_extent.validate_replicated_dimension()?;
+        }
+
+        // Infer the per-item result type before lifting physical axes. This also supplies the sharding metadata used by
+        // the matching-axis kernel.
+        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
+        let mut logical_output_types = self.infer_array_ir_output_types(logical_input_types.as_slice())?;
+        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
+
+        if context.axis_name() != Some(self.axis_name()) {
+            return Ok(context.forward_collective(self, array, output_extents)?.into());
+        }
+
+        self.reject_mesh_form()?;
+
+        // Project the composite values onto their array and dimension domains, so that the homogeneous kernel can use
+        // the explicit dimension values directly for dynamic reshape geometry.
+        let array = ArrayBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
+            array.batch_axis(),
+        )?;
+        let output_extents = output_extents
+            .iter()
+            .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = self.batch_matching_axis::<DynamicArrayExtentBatchingPolicy>(
+            &context.array_projection(),
+            &array,
+            output_extents,
+            logical_output_type.sharding().cloned(),
+        )?;
+
+        // Embed the array result back into the composite family without changing the batch axis that the kernel chose.
+        let batch_axis = output.batch_axis();
+        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])?
+            .into())
+    }
+}
+
+/// Matching-axis batching kernel of a [`ShapeChangingCollectiveOperation`] over the `batch` levels whose parent is the
+/// context `C`. Each collective implements this trait only for the contexts whose values provide the capabilities that
+/// its own kernel needs (e.g., a sum-scatter needs reductions, while an all-gather and an all-to-all only rearrange
+/// axes), so the provided batching rules require exactly those capabilities rather than the union over all collectives.
+pub(crate) trait ShapeChangingCollectiveKernel<C: Context<Type = ArrayType>>:
+    ShapeChangingCollectiveOperation
+{
+    /// Consumes the mapped batch axis of a `batch` level that binds this collective's named axis, given the per-item
+    /// output extents and sharding in the batching policy's representation, and returns the result together with the
+    /// output batch axis that the collective chooses (e.g., replicated for an all-gather, whose items all receive the
+    /// same value).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] if the collective cannot be consumed by the binding level (e.g., because it has
+    /// participant groups) or if staging the exchange fails.
+    fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        input: &ArrayBatch<C::Value>,
+        output_extents: Vec<P::ShapeExtent>,
+        output_sharding: Option<Sharding>,
+    ) -> Result<ArrayBatch<C::Value>, BatchingError>;
+}
 
 /// Representation boundary used only by shape-changing collective batching rules.
 ///
@@ -1044,21 +1223,20 @@ where
     }
 }
 
-/// Forwards a shape-changing collective over an axis that the active batching level does not bind to the parent
-/// context. An input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the
-/// collective that `remap` returns for the input's mapped axis position, because the collective's own axes shift
-/// around the mapped axis, and `remap` also returns the position of the mapped axis in the forwarded result.
-fn forward_shape_changing_collective<C, P, O>(
+/// Forwards a linear collective over an axis that the active batching level does not bind to the parent context. An
+/// input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the collective
+/// that [`LinearCollectiveOperation::forwarded`] returns for the input's mapped axis position, because the collective's
+/// own axes shift around the mapped axis, together with the position of the mapped axis in the forwarded result.
+fn forward_linear_collective<C, P, O>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],
-    remap: impl FnOnce(usize) -> (O, usize),
 ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<O>,
     P: ArrayExtentBatchingPolicy<C>,
-    O: Clone,
+    O: LinearCollectiveOperation,
 {
     let [input] = inputs else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -1066,7 +1244,7 @@ where
     let Some(batch_axis) = input.batch_axis_position() else {
         return Ok(context.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
     };
-    let (operation, output_batch_axis) = remap(batch_axis);
+    let (operation, output_batch_axis) = operation.forwarded(batch_axis);
     let mut outputs =
         context
             .parent()
@@ -1098,103 +1276,6 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     Ok((output_type, output_extents))
 }
-
-macro_rules! impl_shape_changing_collective_member_operation {
-    // Implements the array IR boundary shared by the three shape-changing collective payloads.
-    ($operation:ty, $infer_output_types:ident) => {
-        impl MemberOperation<ArrayIrType> for $operation {
-            fn infer_parent_region_input_types(
-                &self,
-                _input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
-                Ok(vec![None; region_interfaces.len()])
-            }
-
-            fn infer_parent_output_types(
-                &self,
-                input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<ArrayIrType>, TypeError> {
-                check_count!("region", region_interfaces, 0, TypeError);
-                $infer_output_types(self, input_types)
-            }
-
-            fn rename_parent_type_identities(
-                &self,
-                renaming: &TypeIdentityRenaming<DimensionVariable>,
-            ) -> Result<Self, TypeError> {
-                self.rename_type_identities(renaming)
-            }
-        }
-
-        impl<C> MemberInterpretableOperation<C> for $operation
-        where
-            C: Domain<Type = ArrayIrType>,
-            C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
-                + ValueProjection<DimensionType, Projected = DimensionValue>,
-        {
-            fn interpret_in_parent<D: InterpretationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, ProgramError> {
-                let Some((input, output_extents)) = inputs.split_first() else {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-                };
-                let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
-                let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
-                    (0..input.r#type().rank())
-                        .map(|axis| input.dimension_size(axis).map(Dimension::Static))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ));
-                let mut output_types = self.infer_output_types(std::slice::from_ref(&concrete_input_type), &[])?;
-                check_count!("output", output_types, 1, ProgramError);
-                let output_type = output_types.remove(0);
-                let expected_extents = output_type.static_shape().ok_or_else(|| {
-                    TypeError::invalid(format!("`{}` could not resolve its concrete output shape", self.name()))
-                })?;
-                if output_extents.len() != expected_extents.rank() {
-                    return Err(ProgramError::InvalidInputCount {
-                        expected: 1 + expected_extents.rank(),
-                        actual: inputs.len(),
-                    });
-                }
-                for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
-                    let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
-                    if actual != *expected {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "`{}` output axis {axis} extent must equal observed result extent {expected} but got \
-                                 {actual}",
-                                self.name(),
-                            ),
-                        });
-                    }
-                }
-                let effective_axis_size = self.effective_axis_size()?;
-                if effective_axis_size != 1 {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                            self.name(),
-                            self.axis_name(),
-                            effective_axis_size,
-                        ),
-                    });
-                }
-                let output = match self.options().mode() {
-                    CollectiveMode::Tiled => input,
-                    CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
-                };
-                Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
-            }
-        }
-    };
-}
-
-use impl_shape_changing_collective_member_operation;
 
 /// Result extent of a shape-changing collective, which the collective capabilities assemble before they stage the
 /// collective with one explicit extent per output axis. Statically known extents stay on the host until
@@ -1356,95 +1437,41 @@ where
         .collect()
 }
 
-/// Applies forward-mode differentiation (JVP) in the mixed array IR for shape-changing collectives whose transpose
-/// is another collective. Explicit output extents and the exact input shape become ordinary residuals of one linear
-/// call, whose transpose applies the supplied adjoint collective.
-fn differentiate_shape_changing_collective_with_adjoint<C, Forward, Adjoint, P: DifferentiationPolicy<C>>(
-    operation: &Forward,
-    adjoint: Adjoint,
-    context: &DifferentiationContext<C, P>,
-    inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<Forward>
-        + From<Adjoint>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ConstantOperation<DimensionValue>>,
-    Forward: Clone + Operation<Type = ArrayType>,
-    Adjoint: Operation<Type = ArrayType>,
-{
-    let Some((array, _)) = inputs.split_first() else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-    };
-    let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let primal = context.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-    let tangent = match array.tangent() {
-        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-        MaybeZero::Value(array_tangent) => {
-            let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
-            let (array, output_extents) = tangent_inputs.split_first().unwrap();
-            let context = context.tangent();
-            let mut residuals = LinearResiduals::new();
-            let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-            let input_shape = residuals.retain_shape(context, array.primal())?;
-            let forward_operation = operation.clone();
-            let forward_output_extents = output_extents.clone();
-            let tangent = LinearCallOperation::stage(
-                context,
-                residuals.into_values(),
-                vec![array_tangent.clone()],
-                move |residuals, linear_inputs| {
-                    let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
-                    collective_inputs.push(linear_inputs[0].clone());
-                    collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                    linear_inputs[0].dispatch_domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
-                },
-                move |residuals, output_cotangents| {
-                    let transpose_context = output_cotangents[0].dispatch_domain();
-                    let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
-                    let mut adjoint_inputs = Vec::with_capacity(1 + input_dimensions.len());
-                    adjoint_inputs.push(output_cotangents[0].clone());
-                    adjoint_inputs.extend(input_dimensions);
-                    transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())
-                },
-            )?
-            .remove(0);
-            MaybeZero::Value(tangent)
-        }
-    };
-    Ok(vec![DifferentiationDual::new(primal, tangent)?])
-}
-
 impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
-    /// Binds an array IR collective over a non-matching named axis in the parent context. When the array is mapped,
-    /// inserts this context's batch extent into the result extent inputs at `output_batch_axis` and marks the result
-    /// mapped at that position. Replicated arrays require no lifting and remain replicated.
+    /// Binds an array IR linear collective over a non-matching named axis in the parent context. A replicated array
+    /// requires no lifting, so the collective is forwarded unchanged and its result stays replicated. A mapped array
+    /// instead forwards the collective that [`LinearCollectiveOperation::forwarded`] returns for the array's mapped
+    /// axis position, inserts this context's batch extent into the result extent inputs at the mapped axis position of
+    /// the result, and marks the result mapped at that position.
     ///
     /// Unlike homogeneous array forwarding, the input dimension values describe one array result and are not
     /// separate result-producing inputs. The collective may also move the mapped axis when it changes the rank.
     ///
     /// # Parameters
     ///
-    ///   - `operation`: Collective with physical array axes already adjusted around this context's mapped axis.
+    ///   - `operation`: Collective over the logical (i.e., unbatched) array.
     ///   - `array`: Array input whose ragged axes have already been rejected by the caller.
     ///   - `output_extents`: Validated replicated dimension inputs describing the per-item result shape.
-    ///   - `output_batch_axis`: Physical result position of the mapped axis, or `None` for a replicated input.
     ///
     /// # Errors
     ///
     /// Returns a [`BatchingError`] if the parent cannot bind the collective or a result cannot carry its batch axis.
-    fn forward_collective<O>(
+    fn forward_collective<O: LinearCollectiveOperation>(
         &self,
-        operation: O,
+        operation: &O,
         array: &ArrayIrBatch<C::Value>,
         output_extents: &[ArrayIrBatch<C::Value>],
-        output_batch_axis: Option<usize>,
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
     where
         C::Operation: From<O>,
     {
+        let (operation, output_batch_axis) = match array.batch_axis_position() {
+            None => (operation.clone(), None),
+            Some(batch_axis) => {
+                let (operation, output_batch_axis) = operation.forwarded(batch_axis);
+                (operation, Some(output_batch_axis))
+            }
+        };
         let mut physical_output_extents =
             output_extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
         if let Some(output_batch_axis) = output_batch_axis {
@@ -1460,6 +1487,24 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
             })
             .collect()
     }
+
+    /// Returns this `batch` level re-expressed over the array projection of its parent with the dynamic extent
+    /// batching policy, keeping its axis name, extent, and sharding, so that the matching-axis kernels of the
+    /// shape-changing collectives, which operate on homogeneous arrays, can consume this level's mapped axis while
+    /// reading their reshape geometry from the explicit dimension values of composite programs.
+    fn array_projection(
+        &self,
+    ) -> BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
+    where
+        C: DomainProjection<ArrayType>,
+    {
+        BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(self.parent().clone()),
+            self.axis_extent().clone(),
+        )
+        .with_axis_name(self.axis_name().map(str::to_string))
+        .with_axis_sharding(self.axis_sharding().clone())
+    }
 }
 
 #[cfg(test)]
@@ -1470,16 +1515,14 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable,
         Layout, Memory, Shape, StridedLayout,
     };
-    use crate::batching::{BatchableOperation, BatchingTracer};
+    use crate::batching::{BatchableOperation, BatchingPolicy, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::MemberDifferentiableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::parallel_all_gather::{
-        ParallelAllGatherOperation, ParallelAllGatherOutputVariance, infer_array_ir_parallel_all_gather_output_types,
+        ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
     };
-    use crate::operations::collectives::parallel_all_to_all::{
-        ParallelAllToAllOperation, infer_array_ir_parallel_all_to_all_output_types,
-    };
+    use crate::operations::collectives::parallel_all_to_all::ParallelAllToAllOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder};
     use crate::tracing::TracingContext;
@@ -1669,16 +1712,8 @@ mod tests {
         let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    4,
-                    0,
-                    grouped,
-                    ParallelAllGatherOutputVariance::Varying,
-                ),
-                &[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into(),],
-            ),
+            ParallelAllGatherOperation::new("x".to_string(), 4, 0, grouped, ParallelAllGatherOutputVariance::Varying)
+                .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into()]),
             Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
         );
     }
@@ -1699,7 +1734,27 @@ mod tests {
     }
 
     #[test]
-    fn test_define_linear_collective_operation_interpretation() {
+    fn test_shape_changing_collective_kernel_capabilities() {
+        // The batching rules of each shape-changing collective require only the capabilities of its own kernel, so a
+        // context whose values can transpose but not reduce still batches all-gathers and all-to-alls. This compiles
+        // only if those rules hold under exactly these bounds.
+        fn requires_batching<C: Context, P: BatchingPolicy<C>, O: BatchableOperation<C, P>>() {}
+        fn rearranging_collectives_batch<
+            C: Context<
+                    Type = ArrayType,
+                    Value: Transpose,
+                    Operation: From<ParallelAllGatherOperation> + From<ParallelAllToAllOperation>,
+                >,
+            P: CollectiveArrayExtentBatchingPolicy<C>,
+        >() {
+            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllGatherOperation>();
+            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllToAllOperation>();
+        }
+        rearranging_collectives_batch::<EagerContext<Array, ArrayOperation<Array>>, StaticArrayExtentBatchingPolicy>();
+    }
+
+    #[test]
+    fn test_linear_collective_operation_degenerate_interpretation() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
 
@@ -1713,7 +1768,7 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` axis size must be greater than zero"))),
         );
 
-        // The custom tiled identity rule must also honor its operation-specific axis validation.
+        // The tiled identity rule must also honor the operation-specific axis validation.
         assert_eq!(
             context.bind(
                 ParallelAllToAllOperation::new("x".to_string(), 1, 1, 0, CollectiveOptions::tiled()),
@@ -1730,7 +1785,40 @@ mod tests {
                 Vec::new(),
                 std::slice::from_ref(&input),
             ),
-            Ok(vec![input]),
+            Ok(vec![input.clone()]),
+        );
+
+        // Outside any binder, only collectives whose instances each combine a single participant are defined. Groups
+        // with one participant each qualify even over a larger axis, in both array families, while ungrouped
+        // collectives over that axis do not.
+        let singleton_groups = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]);
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, singleton_groups.clone()),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
+                    .to_string(),
+            }),
+        );
+        let composite_inputs =
+            [ArrayIrValue::Array(input.clone()), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
+        assert_eq!(
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, singleton_groups)
+                .shape_changing_collective_interpret::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(
+                    &composite_inputs,
+                ),
+            Ok(vec![ArrayIrValue::Array(input)]),
         );
     }
 
@@ -1781,45 +1869,39 @@ mod tests {
         let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
 
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    4,
-                    1,
-                    CollectiveOptions::default(),
-                    ParallelAllGatherOutputVariance::Varying,
-                ),
-                &[
-                    shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                4,
+                1,
+                CollectiveOptions::default(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .infer_array_ir_output_types(&[
+                shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
+                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ]),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_to_all_output_types(
-                &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
-                &[
+            ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default())
+                .infer_array_ir_output_types(&[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
                     DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
+                ]),
             Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_to_all_output_types(
-                &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
-                &[
+            ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default())
+                .infer_array_ir_output_types(&[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
+                ]),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
     }
@@ -1835,20 +1917,18 @@ mod tests {
         );
 
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying
-                ),
-                &[
-                    input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying
+            )
+            .infer_array_ir_output_types(&[
+                input_type.clone().into(),
+                ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
@@ -1858,14 +1938,12 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_to_all_output_types(
-                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
-                &[
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
+                .infer_array_ir_output_types(&[
                     input_type.clone().into(),
                     ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
                     ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
-                ],
-            ),
+                ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
@@ -1875,42 +1953,37 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_to_all_output_types(
-                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
-                &[
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled())
+                .infer_array_ir_output_types(&[
                     ArrayIrType::Array(input_type.clone()),
                     ArrayIrType::Dimension(DimensionType::from(input_axis)),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],
-            ),
+                ]),
             Ok(vec![input_type.into()]),
         );
 
         let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying
-                ),
-                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()],
-            ),
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying
+            )
+            .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()]),
             Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
         );
         let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new(
+            ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
                     0,
                     CollectiveOptions::tiled(),
                     ParallelAllGatherOutputVariance::Varying
-                ),
-                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()],
+                ).infer_array_ir_output_types(
+                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()]
             ),
             Err(TypeError::invalid(
                 "`parallel_all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
@@ -1937,27 +2010,21 @@ mod tests {
             ParallelAllGatherOutputVariance::Varying,
         );
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &gather,
-                &[
-                    ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                    exact_three.clone().into(),
-                    exact_two.clone().into(),
-                    exact_four.clone().into(),
-                ],
-            ),
+            gather.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                exact_three.clone().into(),
+                exact_two.clone().into(),
+                exact_four.clone().into(),
+            ]),
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_gather_output_types(
-                &gather,
-                &[
-                    ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                    exact_three.clone().into(),
-                    exact_two.clone().into(),
-                    exact_five.into(),
-                ],
-            ),
+            gather.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                exact_three.clone().into(),
+                exact_two.clone().into(),
+                exact_five.into(),
+            ]),
             Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
         );
 
@@ -1975,15 +2042,13 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
         );
         assert_eq!(
-            infer_array_ir_parallel_all_to_all_output_types(
-                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default()),
-                &[
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default())
+                .infer_array_ir_output_types(&[
                     ArrayType::new_static(DataType::F32, [2, 3, 4]).into(),
                     exact_three.into(),
                     exact_four.into(),
                     exact_two.into(),
-                ],
-            ),
+                ]),
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4, 2]).into()]),
         );
     }

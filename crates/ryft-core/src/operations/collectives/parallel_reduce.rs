@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayType, LogicalMesh, MeshAxisType, RaggedArrayExtentBatchingPolicy,
-    RaggedAxis, RaggedMaskIdentity,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayType, LogicalMesh, RaggedArrayExtentBatchingPolicy, RaggedAxis,
+    RaggedMaskIdentity,
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -12,7 +12,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
-use crate::operations::collectives::{effective_collective_axis_size, resolve_named_axis_size};
+use crate::operations::collectives::{
+    check_manual_mesh_input, effective_collective_axis_size, resolve_named_axis_size,
+};
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::{Complex, Real};
 use crate::operations::constants::constant::ConstantOperation;
@@ -222,24 +224,7 @@ impl Operation for ParallelReduceOperation {
                     )));
                 }
 
-                if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_REDUCE_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
-                    )));
-                }
-
-                let Some(sharding) = input.sharding() else {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_REDUCE_OPERATION_NAME}` input must carry a mesh containing manual axis \
-                         `{axis_name}`",
-                    )));
-                };
-
-                if sharding.mesh() != mesh {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_REDUCE_OPERATION_NAME}` input mesh does not match the operation mesh",
-                    )));
-                }
+                let sharding = check_manual_mesh_input(PARALLEL_REDUCE_OPERATION_NAME, axis_name, None, mesh, input)?;
 
                 if sharding.unreduced_axes().contains(axis_name) || sharding.reduced_axes().contains(axis_name) {
                     return Err(TypeError::invalid(format!(
@@ -755,13 +740,12 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, MeshAxis, Shape, Sharding,
+        DimensionType, DimensionValue, DimensionVariable, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
-        TranspositionContext, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, DifferentiationError, TranspositionContext, differentiate_at,
     };
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;

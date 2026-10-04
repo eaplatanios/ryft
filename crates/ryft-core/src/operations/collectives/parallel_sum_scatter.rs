@@ -1,20 +1,19 @@
 use std::fmt::Display;
 
-use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, Shape, Sharding,
+    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -25,8 +24,8 @@ use crate::operations::collectives::parallel_all_gather::{
 };
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    differentiate_shape_changing_collective_with_adjoint, forward_shape_changing_collective,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
+    ShapeChangingCollectiveKernel, ShapeChangingCollectiveOperation, check_manual_mesh_input, collective_input_extents,
     infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
     resolve_named_axis_size,
 };
@@ -152,16 +151,6 @@ impl ParallelSumScatterOperation {
         self.mesh.as_ref()
     }
 
-    /// Returns the participant count used for result-shape arithmetic.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] if the axis size or participant groups violate [`CollectiveOptions`] requirements.
-    #[inline]
-    pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
-        self.options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size)
-    }
-
     /// Infers the statically shaped output, applying mesh-axis reduction and variance semantics to a sum-scatter
     /// over a manual mesh axis.
     fn infer_static_output_type(&self, input_type: &ArrayType, dimensions: Vec<usize>) -> Result<ArrayType, TypeError> {
@@ -232,30 +221,13 @@ impl ParallelSumScatterOperation {
         };
 
         let axis_name = self.axis_name();
-        if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` mesh axis `{axis_name}` must be manual",
-            )));
-        }
-
-        if mesh.axis_size(axis_name) != Some(self.axis_size) {
-            return Err(TypeError::invalid(format!(
-                "`{}` axis size {} does not match the size of manual mesh axis `{}`",
-                PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size, axis_name,
-            )));
-        }
-
-        let Some(sharding) = input_type.sharding() else {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` input must carry a mesh containing manual axis `{axis_name}`",
-            )));
-        };
-
-        if sharding.mesh() != mesh {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` input mesh does not match the operation mesh",
-            )));
-        }
+        let sharding = check_manual_mesh_input(
+            PARALLEL_SUM_SCATTER_OPERATION_NAME,
+            axis_name,
+            Some(self.axis_size),
+            mesh,
+            input_type,
+        )?;
 
         if !input_type.unreduced_axes().contains(axis_name) {
             // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant
@@ -281,8 +253,7 @@ impl ParallelSumScatterOperation {
 
         // Complete only the participating axis's pending sum. Independent pending sums commute with this exchange
         // and stay pending; the shape-only output type already preserves their sharding state.
-        let input_sharding = input_type.sharding().unwrap();
-        let mut varying_axes = input_sharding.varying_manual_axes().clone();
+        let mut varying_axes = sharding.varying_manual_axes().clone();
         varying_axes.insert(self.axis_name().to_string());
         let output_sharding = output_type.sharding().unwrap().clone();
         Ok(output_type.with_sharding(
@@ -294,11 +265,67 @@ impl ParallelSumScatterOperation {
                 .map_err(TypeError::from)?,
         )?)
     }
+}
 
-    /// Infers the output type of a sum-scatter in the composite array/dimension family, whose array input is followed
-    /// by one explicit extent per output axis. It applies the same contract as static type inference, checking the
-    /// extents that are statically known and leaving dynamic extents to the runtime assertions that the capability
-    /// stages.
+// TODO(eaplatanios): Review this.
+impl LinearCollectiveOperation for ParallelSumScatterOperation {
+    type Adjoint = ParallelAllGatherOperation;
+
+    #[inline]
+    fn axis_name(&self) -> &str {
+        &self.axis_name
+    }
+
+    #[inline]
+    fn axis_size(&self) -> usize {
+        self.axis_size
+    }
+
+    #[inline]
+    fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
+    }
+
+    #[inline]
+    fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        self.options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size)
+    }
+
+    fn adjoint(&self, input_type: &ArrayType) -> Result<ParallelAllGatherOperation, ProgramError> {
+        // Completing a pending sum has a reduced cotangent, whereas varying inputs keep varying cotangents.
+        // Ordinary batch-bound collectives preserve mesh state even when their name shadows a manual mesh axis.
+        let output_variance = if self.mesh.is_some() && input_type.unreduced_axes().contains(self.axis_name()) {
+            ParallelAllGatherOutputVariance::Reduced
+        } else {
+            ParallelAllGatherOutputVariance::Varying
+        };
+        let adjoint = ParallelAllGatherOperation::new(
+            self.axis_name.clone(),
+            self.axis_size,
+            self.scatter_axis,
+            self.options.clone(),
+            output_variance,
+        );
+        Ok(match &self.mesh {
+            Some(mesh) => adjoint.with_mesh(mesh.clone()),
+            None => adjoint,
+        })
+    }
+
+    #[inline]
+    fn forwarded(&self, batch_axis: usize) -> (Self, usize) {
+        let (scatter_axis, output_batch_axis) = self.options.mode.forwarded_split_axes(self.scatter_axis, batch_axis);
+        (Self { scatter_axis, ..self.clone() }, output_batch_axis)
+    }
+}
+
+impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
+    // TODO(eaplatanios): Review this.
+    #[inline]
+    fn options(&self) -> &CollectiveOptions {
+        &self.options
+    }
+
     fn infer_array_ir_output_types(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError> {
         let effective_axis_size = self.effective_axis_size()?;
         let Some(input_type) = input_types.first() else {
@@ -409,20 +436,20 @@ impl ParallelSumScatterOperation {
 
         Ok(vec![self.finalize_output_type(input_type, output_type)?.into()])
     }
+}
 
-    /// Applies the matching-axis sum-scatter batching semantics over the provided policy-selected extent
-    /// representation.
-    fn batch_matching_axis<
-        C: Context<Type = ArrayType, Value: Reduce + Transpose>,
-        P: CollectiveArrayExtentBatchingPolicy<C>,
-    >(
+// TODO(eaplatanios): Review this.
+impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingCollectiveKernel<C>
+    for ParallelSumScatterOperation
+{
+    fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         input: &ArrayBatch<C::Value>,
         output_extents: Vec<P::ShapeExtent>,
         output_sharding: Option<Sharding>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
-        // Both callers infer the output type first, so the scatter axis is known to be within the input rank here.
+        // The batching rules infer the output type first, so the scatter axis is known to be within the input rank.
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -465,28 +492,6 @@ impl ParallelSumScatterOperation {
             P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
         ArrayBatch::new(output, BatchAxis::from_position(0))
     }
-
-    /// Returns the adjoint collective that transposition stages on the output cotangent.
-    fn adjoint(&self, input_type: &ArrayType) -> Result<ParallelAllGatherOperation, ProgramError> {
-        // Completing a pending sum has a reduced cotangent, whereas varying inputs keep varying cotangents.
-        // Ordinary batch-bound collectives preserve mesh state even when their name shadows a manual mesh axis.
-        let output_variance = if self.mesh.is_some() && input_type.unreduced_axes().contains(self.axis_name()) {
-            ParallelAllGatherOutputVariance::Reduced
-        } else {
-            ParallelAllGatherOutputVariance::Varying
-        };
-        let adjoint = ParallelAllGatherOperation::new(
-            self.axis_name.clone(),
-            self.axis_size,
-            self.scatter_axis,
-            self.options.clone(),
-            output_variance,
-        );
-        Ok(match &self.mesh {
-            Some(mesh) => adjoint.with_mesh(mesh.clone()),
-            None => adjoint,
-        })
-    }
 }
 
 impl Display for ParallelSumScatterOperation {
@@ -509,32 +514,23 @@ impl Operation for ParallelSumScatterOperation {
         input_types: &[ArrayType],
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("region", region_interfaces, 0, TypeError);
-        check_count!("input", input_types, 1, TypeError);
-
-        // A zero-participant collective is rejected before any extent arithmetic divides by its size.
-        if self.axis_size == 0 {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` axis size must be greater than zero",
-            )));
-        }
+        let input_type = self.check_input(input_types, region_interfaces)?;
 
         // Result-shape arithmetic in the homogeneous array family requires static extents.
         // Dynamic geometry uses explicit result extents in the composite array/dimension family.
-        let Some(shape) = input_types[0].static_shape() else {
+        let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
             )));
         };
 
-        let dimensions = shape.dimensions().to_vec();
-        Ok(vec![self.infer_static_output_type(&input_types[0], dimensions)?])
+        Ok(vec![self.infer_static_output_type(input_type, shape.dimensions().to_vec())?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
-            operation.field("axis_size", &self.axis_size)?;
+            operation.field("axis_size", self.axis_size)?;
             operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
             operation.field("options", format_args!("{:?}", &self.options))?;
             if let Some(mesh) = &self.mesh {
@@ -552,21 +548,10 @@ impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for 
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Eager binding does not infer output types, so interpretation validates the shared input contract
-        // and the operation payload before applying either degenerate-axis rule.
+        // Eager binding does not infer output types, so interpretation validates the shared input contract and the
+        // operation payload before applying the degenerate-axis rule.
         check_count!("input", inputs, 1, ProgramError);
-
-        // Outside any binder, only the degenerate single-participant axis has defined per-item semantics.
-        // Any larger axis is an error because the other participants do not exist per item.
-        if self.axis_size > 1 {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_name, self.axis_size,
-                ),
-            });
-        }
-
+        self.check_degenerate_interpretation()?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
         let input = &inputs[0];
@@ -592,6 +577,7 @@ impl<
     P: CollectiveArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelSumScatterOperation
 {
+    #[inline]
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -601,70 +587,23 @@ impl<
         // A matching `batch` level consumes the mapped batch axis by summing over it and re-mapping the chunks of the
         // per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into `(b, d_s / b)` chunks and the new
         // chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of the sum. A non-matching
-        // level forwards the collective to the parent context, unchanged for a replicated input (through
-        // `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
-        ArrayBatch::reject_ragged_inputs(self, inputs)?;
-        if context.axis_name() != Some(self.axis_name.as_str()) {
-            return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
-                let (scatter_axis, output_batch_axis) =
-                    self.options.mode.forwarded_split_axes(self.scatter_axis, batch_axis);
-                (Self { scatter_axis, ..self.clone() }, output_batch_axis)
-            });
-        }
-
-        if self.mesh.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` over a manual mesh axis cannot bind a named batch axis",
-                ),
-            });
-        }
-
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
-
-        let input_type = input.unbatched_type();
-        let dimensions = input_type.static_shape().ok_or_else(|| {
-            TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
-            ))
-        })?;
-
-        let output_type = self.infer_static_output_type(&input_type, dimensions.dimensions().to_vec())?;
-        let output_extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(vec![self.batch_matching_axis::<C, P>(context, input, output_extents, output_type.sharding().cloned())?]
-            .into())
+        // level forwards the collective to the parent context, unchanged for a replicated input and with its array axes
+        // shifted past the batch axis for a mapped one.
+        self.shape_changing_collective_batch(context, inputs)
     }
 }
 
 impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>> DifferentiableOperation<C>
     for ParallelSumScatterOperation
 {
+    #[inline]
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let mut primals = context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
-        check_count!("output", primals, 1, ProgramError);
-        let primal = primals.remove(0);
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => {
-                let mut tangents = context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
-                check_count!("output", tangents, 1, ProgramError);
-                MaybeZero::Value(tangents.remove(0))
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        self.linear_collective_jvp(context, inputs)
     }
 }
 
@@ -673,6 +612,7 @@ impl<
     O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllGatherOperation>,
 > TransposableOperation<V, O> for ParallelSumScatterOperation
 {
+    #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -681,25 +621,8 @@ impl<
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // Restore the input cotangent's reduction state with a reduced or varying all-gather over the same axis.
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-
-        // Only a live output cotangent of an unknown input stages the adjoint collective.
-        let adjoint = self.adjoint(inputs[0].r#type().as_ref())?;
-        let MaybeZero::Value(cotangent) = &outputs[0] else {
-            return Ok(());
-        };
-
-        if inputs[0].is_known() {
-            return Ok(());
-        }
-
-        let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
-        check_count!("output", contributions, 1, ProgramError);
-        accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
-        Ok(())
+        // The adjoint all-gather is reduced or varying so that it restores the input cotangent's reduction state.
+        self.linear_collective_transpose(context, inputs, outputs, accumulators)
     }
 }
 
@@ -740,77 +663,14 @@ impl<
         >,
 > MemberInterpretableOperation<C> for ParallelSumScatterOperation
 {
+    #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // The mixed operation consumes one array followed by a dimension value for each result axis.
-        let Some((input, output_extents)) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-        };
-        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
-
-        // Resolve symbolic input dimensions from the actual array, then reuse homogeneous type inference to
-        // validate the scatter geometry and compute the concrete result shape while retaining the input metadata.
-        let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
-            (0..input.r#type().rank())
-                .map(|axis| input.dimension_size(axis).map(Dimension::Static))
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
-        let mut output_types = self.infer_output_types(std::slice::from_ref(&concrete_input_type), &[])?;
-        check_count!("output", output_types, 1, ProgramError);
-        let output_type = output_types.remove(0);
-        let expected_extents = output_type.static_shape().ok_or_else(|| {
-            TypeError::invalid(format!("`{}` could not resolve its concrete output shape", self.name()))
-        })?;
-
-        // Explicit result extents must agree with the shape implied by the observed input and collective options;
-        // accepting arbitrary extents here would let dynamic shape inputs change the sum-scatter semantics.
-        if output_extents.len() != expected_extents.rank() {
-            return Err(ProgramError::InvalidInputCount {
-                expected: 1 + expected_extents.rank(),
-                actual: inputs.len(),
-            });
-        }
-
-        for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
-            let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
-            if actual != *expected {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "`{}` output axis {} extent must equal observed result extent {} but got {}",
-                        self.name(),
-                        axis,
-                        expected,
-                        actual,
-                    ),
-                });
-            }
-        }
-
-        // Direct interpretation has no participant exchange mechanism. Only singleton participant groups can run
-        // locally; larger groups need an enclosing named-axis binder to handle the collective.
-        let effective_axis_size = self.effective_axis_size()?;
-        if effective_axis_size != 1 {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
-                    self.name(),
-                    self.axis_name(),
-                    effective_axis_size,
-                ),
-            });
-        }
-
-        // A singleton tiled sum-scatter leaves the array unchanged. Its untiled form removes the size-one scatter
-        // axis, so reshaping to the validated result shape is sufficient and preserves element order.
-        let output = match self.options().mode() {
-            CollectiveMode::Tiled => input,
-            CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
-        };
-        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
+        self.shape_changing_collective_interpret::<C>(inputs)
     }
 }
 
@@ -835,86 +695,14 @@ impl<
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelSumScatterOperation
 {
+    #[inline]
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        // The explicit result extents remain the only source for dynamic reshape geometry while matching-axis array
-        // mechanics reuse the homogeneous collective kernel.
-        let Some((array, output_extents)) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        <&ArrayType>::try_from(&array.unbatched_type())?;
-        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
-
-        // A result extent describes the shape shared by every batch item, so it must be replicated.
-        for output_extent in output_extents {
-            output_extent.validate_replicated_dimension()?;
-        }
-
-        // Infer the per-item result type before lifting physical axes. This also supplies the sharding metadata
-        // used by the matching-axis kernel.
-        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
-        let mut logical_output_types = self.infer_array_ir_output_types(logical_input_types.as_slice())?;
-        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
-
-        // An unrelated batch level forwards the collective to its parent. Replicated arrays need no axis changes.
-        // Mapped arrays shift the scatter axis around the batch axis and, when untiled, remove the scatter axis.
-        // Forwarding also inserts the mapped extent into the explicit result shape at its resulting position.
-        if context.axis_name() != Some(self.axis_name()) {
-            if array.batch_axis().is_replicated() {
-                return Ok(context.forward_collective(self.clone(), array, output_extents, None)?.into());
-            }
-            let input_batch_axis = array.batch_axis_position().unwrap();
-            let (scatter_axis, output_batch_axis) =
-                self.options().mode().forwarded_split_axes(self.scatter_axis(), input_batch_axis);
-            let operation = Self { scatter_axis, ..self.clone() };
-            return Ok(context.forward_collective(operation, array, output_extents, Some(output_batch_axis))?.into());
-        }
-
-        // A mesh-bound collective requires device exchange and cannot be consumed by a local batch binder,
-        // even when the mesh axis and batch axis have the same name.
-        if self.mesh.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` over a manual mesh axis cannot bind a named batch axis",
-                ),
-            });
-        }
-
-        // Project the mixed values onto their array and dimension domains so the homogeneous array kernel
-        // can use the explicit dimension values directly for dynamic reshape geometry.
-        let array = ArrayBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
-            array.batch_axis(),
-        )?;
-        let output_extents = output_extents
-            .iter()
-            .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Keep the same parent, named-axis binding, extent, and sharding while selecting the dynamic-extent policy.
-        let projected_context =
-            BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-                ProjectedContext::new(context.parent().clone()),
-                context.axis_extent().clone(),
-            )
-            .with_axis_name(context.axis_name().map(str::to_string))
-            .with_axis_sharding(context.axis_sharding().clone());
-        let output = self.batch_matching_axis::<_, DynamicArrayExtentBatchingPolicy>(
-            &projected_context,
-            &array,
-            output_extents,
-            logical_output_type.sharding().cloned(),
-        )?;
-
-        // Embed the array result back into the mixed domain without changing the batch axis chosen by the kernel.
-        let batch_axis = output.batch_axis();
-        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
-            .map(|output| vec![output])?
-            .into())
+        self.shape_changing_collective_batch_in_parent(context, inputs)
     }
 }
 
@@ -937,14 +725,9 @@ impl<
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Output extents are ordinary residual values. The transposed linear region must restore the input
-        // cotangent's reduction state, so completing a pending sum uses reduced rather than varying all-gather.
-        let Some(array) = inputs.first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let input_type = array.primal().r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-        differentiate_shape_changing_collective_with_adjoint(self, self.adjoint(input_type)?, context, inputs)
+        // The transposed linear region restores the input cotangent's reduction state, so completing a pending sum
+        // uses a reduced, rather than varying, all-gather.
+        self.shape_changing_collective_jvp(context, inputs)
     }
 }
 
@@ -1134,11 +917,13 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis,
-        RaggedAxis, ShardingDimension, StridedLayout,
+        MeshAxisType, RaggedAxis, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, TranspositionContext, transpose_mixed_operation};
+    use crate::differentiation::{
+        DifferentiableType, DifferentiationTracer, TranspositionContext, transpose_mixed_operation,
+    };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_gradient, check_operation_type_inference};
     use crate::operations::manipulation::slicing::Slice;
@@ -1510,8 +1295,10 @@ mod tests {
 
     #[test]
     fn test_parallel_sum_scatter_interpretation() {
-        // A single participant sums only its own value: tiled mode is the identity, while untiled mode removes the
-        // size-one scatter axis. Any larger axis has no per-item semantics outside an enclosing binder.
+        // Outside any binder, a sum-scatter whose instances each combine a single participant sums only its own value:
+        // tiled mode is the identity, while untiled mode removes the size-one scatter axis. Participant groups that
+        // hold one participant each qualify even over a larger axis, whereas an ungrouped larger axis has no per-item
+        // semantics outside an enclosing binder.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         assert_eq!(
@@ -1528,6 +1315,27 @@ mod tests {
                 &EmptyRegionDriver,
                 std::slice::from_ref(&input),
             ),
+            Ok(vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()]),
+        );
+        let singleton_groups = vec![vec![0], vec![1]];
+        assert_eq!(
+            ParallelSumScatterOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled().with_axis_index_groups(singleton_groups.clone()),
+            )
+            .interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            ParallelSumScatterOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::default().with_axis_index_groups(singleton_groups),
+            )
+            .interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
             Ok(vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()]),
         );
         assert_eq!(
