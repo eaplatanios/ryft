@@ -28,7 +28,7 @@ use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
     explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
     infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size, validate_explicit_collective_output_extents,
+    jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -805,14 +805,19 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Batching rule for explicit-extent [`ParallelSumScatterOperation`]. The explicit result extents remain the only
-// source for dynamic reshape geometry while matching-axis array mechanics reuse the homogeneous collective kernel.
 impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelSumScatterOperation
 where
     C: Context<
             Type = ArrayIrType,
+            Value: Assert
+                       + DimensionSize
+                       + DynamicBroadcast
+                       + ValueProjection<ArrayType, Projected: Reduce + Transpose + Value<Type = ArrayType>>
+                       + ValueProjection<
+                DimensionType,
+                Projected: Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
+            >,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: From<ParallelSumScatterOperation>
                            + From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
@@ -820,14 +825,6 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: Assert
-        + DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Reduce + Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -835,13 +832,25 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // The explicit result extents remain the only source for dynamic reshape geometry while matching-axis array
+        // mechanics reuse the homogeneous collective kernel.
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
-        validate_explicit_collective_output_extents(output_extents)?;
+
+        // A result extent describes the shape shared by every batch item, so it must be replicated.
+        for output_extent in output_extents {
+            output_extent.validate_replicated_dimension()?;
+        }
+
+        // Infer the per-item result type before lifting physical axes. This also supplies the sharding metadata
+        // used by the matching-axis kernel.
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = self.infer_explicit_output_types(logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
+        // An unrelated batch level forwards the collective to its parent. Replicated arrays need no axis changes.
+        // Mapped arrays shift the scatter axis around the batch axis and, when untiled, remove the scatter axis.
+        // Forwarding also inserts the mapped extent into the explicit result shape at its resulting position.
         if context.axis_name() != Some(self.axis_name()) {
             if array.batch_axis().is_replicated() {
                 return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
@@ -860,6 +869,8 @@ where
             .into());
         }
 
+        // A mesh-bound collective requires device exchange and cannot be consumed by a local batch binder,
+        // even when the mesh axis and batch axis have the same name.
         if self.mesh.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -868,6 +879,8 @@ where
             });
         }
 
+        // Project the mixed values onto their array and dimension domains so the homogeneous array kernel
+        // can use the explicit dimension values directly for dynamic reshape geometry.
         let array = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
@@ -876,6 +889,8 @@ where
             .iter()
             .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Keep the same parent, named-axis binding, extent, and sharding while selecting the dynamic-extent policy.
         let projected_context =
             BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
                 ProjectedContext::new(context.parent().clone()),
@@ -889,12 +904,16 @@ where
             output_extents,
             logical_output_type.sharding().cloned(),
         )?;
+
+        // Embed the array result back into the mixed domain without changing the batch axis chosen by the kernel.
         let batch_axis = output.batch_axis();
         Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
             .map(|output| vec![output])?
             .into())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Mixed array IR JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
 // the transposed linear region applies varying all-gather to the output cotangent.
