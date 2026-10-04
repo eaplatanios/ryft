@@ -723,8 +723,6 @@ impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     C: Domain<
             Type = ArrayIrType,
@@ -739,10 +737,14 @@ impl<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // The mixed operation consumes one array followed by a dimension value for each result axis.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         };
         let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+
+        // Resolve symbolic input dimensions from the actual array, then reuse homogeneous type inference to
+        // validate the scatter geometry and compute the concrete result shape while retaining the input metadata.
         let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
             (0..input.r#type().rank())
                 .map(|axis| input.dimension_size(axis).map(Dimension::Static))
@@ -754,12 +756,16 @@ impl<
         let expected_extents = output_type.static_shape().ok_or_else(|| {
             TypeError::invalid(format!("`{}` could not resolve its concrete output shape", self.name()))
         })?;
+
+        // Explicit result extents must agree with the shape implied by the observed input and collective options;
+        // accepting arbitrary extents here would let dynamic shape inputs change the sum-scatter semantics.
         if output_extents.len() != expected_extents.rank() {
             return Err(ProgramError::InvalidInputCount {
                 expected: 1 + expected_extents.rank(),
                 actual: inputs.len(),
             });
         }
+
         for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
             let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
             if actual != *expected {
@@ -774,6 +780,9 @@ impl<
                 });
             }
         }
+
+        // Direct interpretation has no participant exchange mechanism. Only singleton participant groups can run
+        // locally; larger groups need an enclosing named-axis binder to handle the collective.
         let effective_axis_size = self.effective_axis_size()?;
         if effective_axis_size != 1 {
             return Err(ProgramError::UnsupportedOperation {
@@ -785,6 +794,9 @@ impl<
                 ),
             });
         }
+
+        // A singleton tiled sum-scatter leaves the array unchanged. Its untiled form removes the size-one scatter
+        // axis, so reshaping to the validated result shape is sufficient and preserves element order.
         let output = match self.options().mode() {
             CollectiveMode::Tiled => input,
             CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
@@ -792,6 +804,8 @@ impl<
         Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Batching rule for explicit-extent [`ParallelSumScatterOperation`]. The explicit result extents remain the only
 // source for dynamic reshape geometry while matching-axis array mechanics reuse the homogeneous collective kernel.
