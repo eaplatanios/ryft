@@ -1,0 +1,124 @@
+diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
+--- a/jaxlib/mosaic/gpu/BUILD
++++ b/jaxlib/mosaic/gpu/BUILD
+@@ -253,6 +253,7 @@
+ cc_library(
+     name = "runtime",
+     srcs = ["runtime.cc"],
++    hdrs = ["runtime.h"],
+     # Linker may prune these symbols if they are not explicitly exported.
+     linkopts = [
+         "-Wl,--export-dynamic-symbol='mosaic_gpu_*'",
+@@ -296,6 +297,7 @@
+         ":mosaic_gpu_cc_proto",
+         ":nvshmem",
+         ":passes",
++        ":runtime",
+         ":serde",
+         ":target",
+         "//jaxlib/cuda:cuda_vendor",
+@@ -447,7 +449,7 @@
+ 
+ cc_binary(
+     name = "libmosaic_gpu_runtime.so",
+-    srcs = ["runtime.cc"],
++    srcs = ["runtime.cc", "runtime.h"],
+     copts = ["-fvisibility=default"],
+     linkshared = 1,
+     tags = [
+diff --git a/jaxlib/mosaic/gpu/runtime.cc b/jaxlib/mosaic/gpu/runtime.cc
+--- a/jaxlib/mosaic/gpu/runtime.cc
++++ b/jaxlib/mosaic/gpu/runtime.cc
+@@ -13,12 +13,12 @@
+ limitations under the License.
+ ==============================================================================*/
+ 
++#include "jaxlib/mosaic/gpu/runtime.h"
++
+ #include <cassert>
+ #include <cstdint>
+ #include <cstdio>
+ #include <utility>
+-
+-#include "third_party/gpus/cuda/include/cuda.h"
+ 
+ namespace {
+ template <typename... Args>
+diff --git a/jaxlib/mosaic/gpu/custom_call.cc b/jaxlib/mosaic/gpu/custom_call.cc
+--- a/jaxlib/mosaic/gpu/custom_call.cc
++++ b/jaxlib/mosaic/gpu/custom_call.cc
+@@ -136,6 +136,7 @@
+ #include "jaxlib/mosaic/gpu/mosaic_gpu.pb.h"
+ #include "jaxlib/mosaic/gpu/nvshmem.h"
+ #include "jaxlib/mosaic/gpu/passes.h"
++#include "jaxlib/mosaic/gpu/runtime.h"
+ #include "jaxlib/mosaic/gpu/serde.h"
+ #include "jaxlib/mosaic/gpu/target.h"
+ #include "xla/backends/cpu/target_machine_options.h"
+@@ -663,6 +664,23 @@
+                                                llvm::toString(std::move(err))));
+   }
+   std::unique_ptr<llvm::orc::LLJIT> lljit = std::move(*lljit_or_error);
++
++  // Built-in runtime functions may be hidden in a locally loaded PJRT plugin.
++  // Bind their addresses in this JIT only, without exporting plugin internals or
++  // relying on process-wide dynamic-loader visibility.
++  llvm::orc::SymbolMap runtime_symbols;
++  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_init_tma_desc")] =
++      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_init_tma_desc,
++                                          llvm::JITSymbolFlags::Exported);
++  runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_launch_kernel")] =
++      llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_launch_kernel,
++                                          llvm::JITSymbolFlags::Exported);
++  if (auto err = lljit->getMainJITDylib().define(
++          llvm::orc::absoluteSymbols(std::move(runtime_symbols)))) {
++    return absl::InternalError(absl::StrFormat(
++        "failed to register Mosaic GPU runtime symbols: %s",
++        llvm::toString(std::move(err))));
++  }
+ 
+   // Resolve symbols that are linked in the current process. This is necessary
+   // to find the host and init functions and resolve all library calls.
+diff --git a/jaxlib/mosaic/gpu/runtime.h b/jaxlib/mosaic/gpu/runtime.h
+--- /dev/null
++++ b/jaxlib/mosaic/gpu/runtime.h
+@@ -0,0 +1,39 @@
++/* Copyright 2024 The JAX Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef JAXLIB_MOSAIC_GPU_RUNTIME_H_
++#define JAXLIB_MOSAIC_GPU_RUNTIME_H_
++
++#include <cstdint>
++
++#include "third_party/gpus/cuda/include/cuda.h"
++
++// Host functions called by generated Mosaic GPU code. Keep declarations shared
++// with their definitions so JIT-local registration preserves the exact ABI.
++extern "C" {
++void mosaic_gpu_init_tma_desc(CUtensorMap* tma_desc, void* base_addr,
++                             int64_t elem_type, int64_t rank, int64_t* sizes,
++                             int64_t* strides, int64_t swizzle_bytes,
++                             int64_t* window_shape);
++CUresult mosaic_gpu_launch_kernel(CUfunction function, uint32_t grid_x,
++                                 uint32_t grid_y, uint32_t grid_z,
++                                 uint32_t cluster_x, uint32_t cluster_y,
++                                 uint32_t cluster_z, uint32_t block_x,
++                                 uint32_t block_y, uint32_t block_z,
++                                 uint32_t smem_bytes, int32_t uses_pdl,
++                                 CUstream stream, void** params);
++}  // extern "C"
++
++#endif  // JAXLIB_MOSAIC_GPU_RUNTIME_H_

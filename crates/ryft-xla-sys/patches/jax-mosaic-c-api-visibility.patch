@@ -1,24 +1,45 @@
 diff --git a/jaxlib/mosaic/dialect/gpu/BUILD b/jaxlib/mosaic/dialect/gpu/BUILD
-index c82cb8dfc8..7ea30d6152 100644
 --- a/jaxlib/mosaic/dialect/gpu/BUILD
 +++ b/jaxlib/mosaic/dialect/gpu/BUILD
-@@ -24,6 +24,6 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
- package(
-     default_applicable_licenses = [],
--    default_visibility = ["//jax/experimental:mosaic_gpu_users"],
-+    default_visibility = ["//visibility:public"],
- )
-
+@@ -28,6 +28,7 @@
+ 
  td_library(
-diff --git a/jaxlib/mosaic/BUILD b/jaxlib/mosaic/BUILD
-index 8f8f6999af..0e43b53468 100644
---- a/jaxlib/mosaic/BUILD
-+++ b/jaxlib/mosaic/BUILD
-@@ -23,6 +23,4 @@ licenses(["notice"])
- package(
-     default_applicable_licenses = [],
--    default_visibility = [
--        "//jax/experimental:mosaic_users",
--    ],
-+    default_visibility = ["//visibility:public"],
- )
+     name = "mosaic_gpu_td_files",
++    visibility = ["//visibility:public"],
+     srcs = ["mosaic_gpu.td"],
+     includes = ["."],
+     deps = [
+@@ -194,5 +195,6 @@
+ cc_library(
+     name = "gpu_dialect_capi",
++    visibility = ["//visibility:public"],
+     srcs = DIALECT_CAPI_SOURCES,
+     hdrs = DIALECT_CAPI_HEADERS,
+     deps = [
+diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
+--- a/jaxlib/mosaic/gpu/BUILD
++++ b/jaxlib/mosaic/gpu/BUILD
+@@ -43,6 +43,7 @@
+ 
+ cc_library(
+     name = "mosaic_gpu_support",
++    visibility = ["//visibility:public"],
+     deps = [
+         ":custom_call",
+         ":runtime",
+@@ -219,6 +220,7 @@
+ # from Python.
+ cc_library(
+     name = "mlir_capi",
++    visibility = ["//visibility:public"],
+     srcs = CAPI_SOURCES,
+     hdrs = CAPI_HEADERS,
+     deps = [
+@@ -393,6 +395,7 @@
+ 
+ cc_test(
+     name = "custom_call_test",
++    visibility = ["//visibility:public"],
+     srcs = ["custom_call_test.cc"],
+     args = ["--heap_check="],  # TODO(b/452513034): Enable heapcheck once the bug is fixed.
+     local_defines = [

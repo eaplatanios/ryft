@@ -75,7 +75,6 @@ RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGet(
 RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGetPadLow(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicTpuElementWindowAttrGetPadHigh(MlirAttribute attribute);
 
-RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuVectorLayoutAttr(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuTiledLayoutAttr(MlirAttribute attribute);
 
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicTpuMemorySpaceAttr(MlirAttribute attribute);

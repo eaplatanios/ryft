@@ -86,7 +86,7 @@ unsafe extern "C" {
     pub fn mlirAttributeIsALlvmUwTableKindAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirAttributeIsALlvmMdStringAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirAttributeIsALlvmMdConstantAttr(attribute: MlirAttribute) -> bool;
-    pub fn mlirAttributeIsALlvmMdFuncAttr(attribute: MlirAttribute) -> bool;
+    pub fn mlirAttributeIsALlvmMdGlobalValueAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirAttributeIsALlvmMdNodeAttr(attribute: MlirAttribute) -> bool;
 
     pub fn mlirLlvmAddressSpaceAttrGet(context: MlirContext, address_space: u32) -> MlirAttribute;
@@ -107,8 +107,8 @@ unsafe extern "C" {
     pub fn mlirLLVMMDStringAttrGetValue(attribute: MlirAttribute) -> MlirStringRef;
     pub fn mlirLLVMMDConstantAttrGet(context: MlirContext, value_attribute: MlirAttribute) -> MlirAttribute;
     pub fn mlirLLVMMDConstantAttrGetValue(attribute: MlirAttribute) -> MlirAttribute;
-    pub fn mlirLLVMMDFuncAttrGet(context: MlirContext, name: MlirAttribute) -> MlirAttribute;
-    pub fn mlirLLVMMDFuncAttrGetName(attribute: MlirAttribute) -> MlirAttribute;
+    pub fn mlirLLVMMDGlobalValueAttrGet(context: MlirContext, name: MlirAttribute) -> MlirAttribute;
+    pub fn mlirLLVMMDGlobalValueAttrGetName(attribute: MlirAttribute) -> MlirAttribute;
     pub fn mlirLLVMMDNodeAttrGet(
         context: MlirContext,
         operand_count: isize,

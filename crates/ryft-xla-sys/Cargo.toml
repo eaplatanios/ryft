@@ -6,7 +6,10 @@ description = "Ryft bindings for XLA."
 keywords = ["ryft", "xla", "pjrt", "mlir", "gpu"]
 include = [
     "bazel/**/*",
+    "patches/**/*",
     "src/**/*",
+    "tests/**/*",
+    "tools/**/*",
     ".bazelrc",
     ".bazelversion",
     "build.rs",
@@ -111,3 +114,6 @@ reqwest.workspace = true
 sha2.workspace = true
 tar.workspace = true
 zip.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
