@@ -19,6 +19,7 @@ enum MlirMosaicGpuEnumAttribute {
   RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_OOB_FILL_MODE = 3,
   RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_MULTIMEM_LOAD_REDUCTION_TYPE = 4,
   RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE = 5,
+  RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION = 6,
 };
 
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicGpuEnumAttr(
@@ -31,6 +32,9 @@ RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicGpuEnumAttrGet(
 RYFT_XLA_SYS_EXPORT MlirStringRef mlirMosaicGpuEnumAttrGetValue(
     MlirAttribute attribute,
     enum MlirMosaicGpuEnumAttribute kind);
+
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicGpuSmemClusterAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicGpuSmemClusterAttrGet(MlirContext context);
 
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsAMosaicGpuTmemAttr(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT MlirAttribute mlirMosaicGpuTmemAttrGet(MlirContext context);

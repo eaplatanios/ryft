@@ -78,7 +78,6 @@ unsafe extern "C" {
     pub fn mlirMosaicTpuElementWindowAttrGetPadLow(attribute: MlirAttribute) -> MlirAttribute;
     pub fn mlirMosaicTpuElementWindowAttrGetPadHigh(attribute: MlirAttribute) -> MlirAttribute;
 
-    pub fn mlirAttributeIsAMosaicTpuVectorLayoutAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirAttributeIsAMosaicTpuTiledLayoutAttr(attribute: MlirAttribute) -> bool;
 
     pub fn mlirAttributeIsAMosaicTpuMemorySpaceAttr(attribute: MlirAttribute) -> bool;

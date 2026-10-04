@@ -13,14 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added native bindings for converting XProf `XSpace` traces into XLA feedback-directed optimization profiles and
   aggregating multiple instruction profiles at a configurable percentile.
 - Added support for Linux AArch64.
-- Added C++ bindings for the `affine`, `arith`, `builtin`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
-  `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
-- Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
+- Added C++ bindings for the `affine`, `arith`, `bufferization`, `builtin`, `complex`, `gpu`, `llvm`, `mosaic_gpu`,
+  `mosaic_tpu`, `nvgpu`, `shape`, `sparse_tensor`, `transform`, Triton `tt`, and `ub` MLIR dialects.
+- Added the `mps` feature for loading the `jax-mps` PJRT plugin (version `0.10.10`) on macOS AArch64.
+- Added the `cuda` module for launching precompiled CUDA kernels through `ryft-cuda` using PJRT clients and XLA FFI
+  buffers and streams. Includes client CUDA version queries and launcher construction, plus unsafe buffer and stream
+  adapters, behind the `cuda-12` and `cuda-13` features.
+- Added Mosaic GPU type ID and serde-pass bindings, versioned bytecode/resource constants, CUDA-only `mosaic_gpu_v2`
+  runtime registration, upstream Complex attribute bindings, and a source-owned UB poison attribute C API bridge.
+- Added a native C ABI and Rust bindings for direct verified Triton module compilation in GPU-configured archives,
+  with typed resource metadata, owned outputs, and explicit compiler availability on CPU archives.
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `f16a4aeb435b2896ab96b605f004f982f6c97eb8`, which also upgraded the
-  LLVM, StableHLO (v1.18.0), Shardy, and Triton pins.
+- Upgraded the OpenXLA dependency pin to commit `eb6b90ed013f511eca088c52f541f3c0819f919e` and the JAX dependency pin
+  to commit `a7606f995e1a92707cbeb257e487fa53e7abe84b`, which also upgraded the LLVM, StableHLO (v1.20.0), Shardy, and
+  Triton pins. This also required updating the Bazel dependency for building the native library to version 8.7.0.
 - Replaced the LLVM dialect token type C++ bindings (`mlirTypeIsALlvmTokenType` and `mlirLlvmTokenTypeGet`) with
   builtin dialect token type bindings (`mlirTypeIsAToken` and `mlirTokenTypeGet`) following the upstream MLIR
   replacement of `!llvm.token` with the builtin `token` type.
@@ -32,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tags are now reserved upstream.
 - Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies, including bumping
   `rules_ml_toolchain` and the hermetic ROCm distribution to `rocm_7.13.0_gfx908`.
-- Updated the PJRT TPU plugin to `libtpu` version `0.0.41`.
-- Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.2891.0+e2a4b1f5`.
+- Updated the PJRT TPU plugin to `libtpu` version `0.0.47`.
+- Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.5356.0+c743c3ec`.
 - Synchronized mirrored XLA protobuf definitions for command buffer command types, autotune backends, debug options,
   and GPU deviceless CUB mode.
 - Synchronized StableHLO C API bindings with upstream mesh and sub-axis attributes.

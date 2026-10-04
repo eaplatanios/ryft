@@ -998,6 +998,44 @@ pub enum AutoTuneCacheMode {
 
     /// Read-only access to cached auto-tuning results without writing new entries.
     Read = 2,
+
+    /// Write auto-tuning results without reading cached entries.
+    WriteOnly = 3,
+}
+
+/// Collective operations eligible for custom GPU collective kernels.
+///
+/// This type corresponds to `DebugOptions.CollectiveKernelType` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CollectiveKernelType {
+    /// No custom collective kernel.
+    Invalid = 0,
+
+    /// All-reduce kernel.
+    AllReduce = 1,
+
+    /// All-gather kernel.
+    AllGather = 2,
+}
+
+/// Controls whether a collective operation is pipelined.
+///
+/// This type corresponds to `DebugOptions.CollectivePipeliningMode` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CollectivePipeliningMode {
+    /// Select pipelining based on optimization effort.
+    Default = 0,
+
+    /// Disable collective pipelining.
+    Off = 1,
+
+    /// Enable collective pipelining.
+    On = 2,
+
+    /// Pipeline only collectives with a true `is_pipelineable` frontend attribute.
+    Explicit = 3,
 }
 
 /// Type of collective communication operation supported by XLA. Collective operations are communication primitives
@@ -1375,6 +1413,9 @@ pub enum XnnGraphFusionMode {
 ///
 /// This type corresponds to `DebugOptions` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
+#[prost(
+    reserved = "5, 63, 80, 93, 94, 98, 117, 130, 133, 134, 139, 141, 143, 152, 156, 158, 160, 161, 162, 165, 167, 168, 169, 171, 172, 173, 176, 177, 178, 179, 180, 183, 184, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 204, 206, 207, 211, 214, 217, 218, 220, 221, 226, 227, 229, 230, 231, 233, 234, 235, 238, 239, 241, 242, 243, 249, 263, 264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 298, 299, 300, 302, 303, 309, 313, 314, 319, 320, 325, 326, 332, 346, 352, 354, 355, 358, 361, 367, 369, 371, 376, 385, 388, 389, 394, 396, 398, 402, 413, 420, 423, 430, 435, 443, 446, 450, 458, 464, 477, 480"
+)]
 pub struct DebugOptions {
     /// If `true`, host-to-host copies will be allowed even when automatic host compute offloading is disabled.
     #[prost(bool, optional, tag = "439")]
@@ -1515,10 +1556,6 @@ pub struct DebugOptions {
     /// Preferred vector width value passed to the LLVM backend. Defaults to `256`.
     #[prost(int32, optional, tag = "308")]
     pub xla_cpu_prefer_vector_width: Option<i32>,
-
-    /// If `true`, the XLA CPU backend will use fusion emitters for code generation.
-    #[prost(bool, optional, tag = "376")]
-    pub xla_cpu_use_fusion_emitters: Option<bool>,
 
     /// If `true`, the XLA CPU backend will use XNNPACK to execute supported operations.
     #[prost(bool, optional, tag = "359")]
@@ -1807,14 +1844,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "504")]
     pub xla_gpu_enable_pdl_launch: Option<bool>,
 
-    /// If `true`, pipelined all-gather operations will be enabled.
-    #[prost(bool, optional, tag = "227")]
-    pub xla_gpu_enable_pipelined_all_gather: Option<bool>,
-
-    /// If `true`, pipelined all-reduce operations will be enabled.
-    #[prost(bool, optional, tag = "217")]
-    pub xla_gpu_enable_pipelined_all_reduce: Option<bool>,
-
     /// If `true`, pipelined host offloading will be enabled.
     #[prost(bool, optional, tag = "440")]
     pub xla_gpu_enable_pipelined_host_offloading: Option<bool>,
@@ -1822,10 +1851,6 @@ pub struct DebugOptions {
     /// If `true`, pipelined point-to-point communication will be enabled.
     #[prost(bool, optional, tag = "246")]
     pub xla_gpu_enable_pipelined_p2p: Option<bool>,
-
-    /// If `true`, pipelined reduce-scatter operations will be enabled.
-    #[prost(bool, optional, tag = "231")]
-    pub xla_gpu_enable_pipelined_reduce_scatter: Option<bool>,
 
     /// If `true`, all-reduce reassociation will be enabled on all-reduce operations converted to a wider type.
     #[prost(bool, optional, tag = "209")]
@@ -1839,10 +1864,6 @@ pub struct DebugOptions {
     /// If `true`, the scatter determinism expander will rewrite scatter operations to be deterministic.
     #[prost(bool, optional, tag = "345")]
     pub xla_gpu_enable_scatter_determinism_expander: Option<bool>,
-
-    /// If `true`, large constants will be shared among multiple GPU executables.
-    #[prost(bool, optional, tag = "165")]
-    pub xla_gpu_enable_shared_constants: Option<bool>,
 
     /// If `true`, Triton GEMM will be enabled.
     #[prost(bool, optional, tag = "188")]
@@ -1893,11 +1914,6 @@ pub struct DebugOptions {
     /// If `true`, an exhaustive tiling search will be performed.
     #[prost(bool, optional, tag = "219")]
     pub xla_gpu_exhaustive_tiling_search: Option<bool>,
-
-    /// If `true`, Ahead-of-Time (AOT) compilation flow will be enabled with generated thunks
-    /// included in the compiled binary.
-    #[prost(bool, optional, tag = "435")]
-    pub xla_gpu_experimental_aot_compiled_thunks: Option<bool>,
 
     /// List of auto-tuner backends to enable. If empty, all backends are enabled.
     #[prost(enumeration = "AutoTuneBackend", repeated, tag = "442")]
@@ -2006,11 +2022,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "362")]
     pub xla_gpu_experimental_pack_dot_operands_along_k_dimension: Option<bool>,
 
-    /// Deprecated option that used to enable experimental zero-copy ragged all-to-all and is now a no-op.
-    #[deprecated]
-    #[prost(bool, optional, tag = "480")]
-    pub xla_gpu_experimental_ragged_all_to_all_zero_copy: Option<bool>,
-
     /// If `true`, the GXL (GPU Collective Library) backend will be enabled for collective operations.
     #[prost(bool, optional, tag = "513")]
     pub xla_gpu_enable_gxl_ragged_all_to_all: Option<bool>,
@@ -2075,10 +2086,6 @@ pub struct DebugOptions {
     /// If `true`, flush-to-zero semantics will be enabled in the GPU backend.
     #[prost(bool, optional, tag = "62")]
     pub xla_gpu_ftz: Option<bool>,
-
-    /// If `true`, cuDNN RNG will be used for fused attention.
-    #[prost(bool, optional, tag = "235")]
-    pub xla_gpu_fused_attention_use_cudnn_rng: Option<bool>,
 
     /// Number of top fusion autotune configurations to keep.
     #[prost(int32, optional, tag = "476")]
@@ -2473,10 +2480,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "253")]
     pub xla_enable_dumping: Option<bool>,
 
-    /// If `true`, LLVM will be forced to inline functions before splitting the module.
-    #[prost(bool, optional, tag = "300")]
-    pub xla_llvm_force_inline_before_split: Option<bool>,
-
     /// If `true`, metadata will be excluded from HLO dumps.
     #[prost(bool, optional, tag = "153")]
     pub xla_dump_disable_metadata: Option<bool>,
@@ -2578,10 +2581,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "462")]
     pub xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl: Option<bool>,
 
-    /// If `true`, the RAFT library will be used for TopK operations on GPU.
-    #[prost(bool, optional, tag = "413")]
-    pub xla_gpu_experimental_use_raft_select_k: Option<bool>,
-
     /// If `true`, experimental tiling propagation will be enabled in GPU compiler passes.
     #[prost(bool, optional, tag = "456")]
     pub xla_gpu_experimental_enable_tiling_propagation: Option<bool>,
@@ -2593,6 +2592,161 @@ pub struct DebugOptions {
     /// Extra backend-specific options as key-value pairs.
     #[prost(map = "string, string", tag = "500")]
     pub xla_backend_extra_options: HashMap<String, String>,
+
+    /// Whether to use the new protos for the autotune cache xla.autotuner.AutotuneCache rather than
+    /// xla.AutotuneResults.
+    #[prost(bool, optional, tag = "515")]
+    pub xla_gpu_use_new_autotune_cache_format: Option<bool>,
+
+    /// Experimental: filter specifying which collective operations should use custom kernels (e.g. Triton one-shot /
+    /// two-shot) instead of NCCL. Accepted values: "all-reduce", "all-gather". For legacy support, the deprecated
+    /// --xla_gpu_unsupported_use_all_reduce_one_shot_kernel flag also adds all-reduce to this filter.
+    #[prost(enumeration = "CollectiveKernelType", repeated, tag = "516")]
+    pub xla_gpu_experimental_use_collective_kernels: Vec<i32>,
+
+    /// Controls all-gather pipelining.
+    #[prost(enumeration = "CollectivePipeliningMode", optional, tag = "517")]
+    pub xla_gpu_pipeline_all_gather: Option<i32>,
+
+    /// Controls all-reduce pipelining.
+    #[prost(enumeration = "CollectivePipeliningMode", optional, tag = "518")]
+    pub xla_gpu_pipeline_all_reduce: Option<i32>,
+
+    /// Controls reduce-scatter pipelining.
+    #[prost(enumeration = "CollectivePipeliningMode", optional, tag = "519")]
+    pub xla_gpu_pipeline_reduce_scatter: Option<i32>,
+
+    /// If true, enables the SPMD dynamic-slice collective-broadcast lowering. When a replicated dynamic-slice result is
+    /// sliced from an operand tiled only along the sliced dimension, the partitioner emits a per-owner
+    /// collective-broadcast inside a conditional instead of all-gathering the full operand first. Disabled by default;
+    /// GPU-only (requires kCollectiveBroadcast hardware support).
+    #[prost(bool, optional, tag = "520")]
+    pub xla_spmd_enable_dynamic_slice_collective_broadcast: Option<bool>,
+
+    /// If true, use the device-initiated (NCCL GIN + LSA) kernel for ragged-all-to-all. Requires NCCL >= 2.29.
+    #[prost(bool, optional, tag = "521")]
+    pub xla_gpu_experimental_ragged_all_to_all_use_device_kernel: Option<bool>,
+
+    /// Minimum transfer size (in bytes) for a device-to-device copy to be converted to an async copy-start/copy-done
+    /// pair by GpuCopyAsyncWrapper. Smaller copies remain synchronous to avoid stream-synchronization overhead. Set to
+    /// -1 to disable async device-to-device copies.
+    #[prost(int64, optional, tag = "522")]
+    pub xla_gpu_async_copy_min_bytes: Option<i64>,
+
+    /// Maximum number of BLAS library algorithms to evaluate during autotuning. Setting this to a lower value (e.g., 16
+    /// or 32) speeds up compilation at the cost of potentially missing the optimal algorithm. Setting to 0 uses the
+    /// default (128 for most BLAS libraries). Default: 0 (use library default).
+    #[prost(int64, optional, tag = "523")]
+    pub xla_gpu_blas_max_algorithms: Option<i64>,
+
+    /// If true, the GPU latency hiding scheduler selectively overlaps async device-to-device memcpys with compute-bound
+    /// kernels.
+    #[prost(bool, optional, tag = "524")]
+    pub xla_gpu_experimental_enable_selective_memcpy_overlap: Option<bool>,
+
+    /// Enable experimental support for multi-output block-level emitter fusions where all roots share the same shape.
+    #[prost(bool, optional, tag = "525")]
+    pub xla_gpu_experimental_enable_same_shape_multi_output_fusion: Option<bool>,
+
+    /// Controls SchedulerMemoryFencing before the latency-hiding scheduler. Negative values disable the pass. 0 derives
+    /// the threshold automatically as 1% of the scheduler memory limit. Positive values fence buffers of at least the
+    /// specified size in bytes, capped at the scheduler memory limit. The pass adds control dependencies from every
+    /// user of a large buffer to a later async operation start so LHS cannot defer those users across many async
+    /// windows and inflate peak memory.
+    #[prost(int64, optional, tag = "526")]
+    pub xla_gpu_experimental_scheduler_memory_fencing_threshold_bytes: Option<i64>,
+
+    /// How many async operation windows a fenced buffer's users may be deferred past the buffer's last-use window in
+    /// the pre-LHS schedule. Larger values give the latency-hiding scheduler more reordering freedom at the cost of a
+    /// higher peak-memory bound.
+    #[prost(int32, optional, tag = "527")]
+    pub xla_gpu_experimental_scheduler_memory_fencing_slack_windows: Option<i32>,
+
+    /// Maximum size (in bytes) of an all-reduce that the while-loop all-reduce code motion pass is allowed to hoist out
+    /// of a loop.
+    #[prost(int64, optional, tag = "528")]
+    pub xla_while_loop_all_reduce_dus_code_motion_max_size_bytes: Option<i64>,
+
+    /// If true, XLA:CPU uses the new xtile lowering.
+    #[prost(bool, optional, tag = "529")]
+    pub xla_cpu_use_new_xtile_lowering: Option<bool>,
+
+    /// GPU trace annotation detail level. Level 0 emits compact instruction names and basic structured payloads. Level
+    /// 1 additionally emits detailed HLO and collective metadata in XProf annotation names and structured payloads.
+    /// NVTX names remain compact.
+    #[prost(int32, optional, tag = "530")]
+    pub xla_gpu_trace_annotation_level: Option<i32>,
+
+    /// If true, uses the cost model to suggest default GEMM tilings instead of autotuning where possible.
+    #[prost(bool, optional, tag = "531")]
+    pub xla_gpu_experimental_cost_model_gemm_tiling_default: Option<bool>,
+
+    /// If true, allow fallback to NCCL (Send/Recv or Put/Signal) path for ragged-all-to-all.
+    #[prost(bool, optional, tag = "532")]
+    pub xla_gpu_allow_ragged_all_to_all_nccl_send_recv_fallback: Option<bool>,
+
+    /// If true, AllReduceSplitter rewrites AR+DS patterns even when the profitability heuristic does not find an
+    /// existing all-reduce that shares either of the post-split replica group topologies (so the combiner can fuse
+    /// them). Default: false.
+    #[prost(bool, optional, tag = "533")]
+    pub xla_gpu_all_reduce_splitter_ignore_profitability_check: Option<bool>,
+
+    /// Enables CUPTI V2 multi-subscriber APIs for GPU profiling when available. Allows XLA profiling to coexist with
+    /// tools such as Nsight Systems.
+    #[prost(bool, optional, tag = "534")]
+    pub xla_gpu_enable_cupti_multi_subscriber: Option<bool>,
+
+    /// Google: Enables uploads of HLO to a repository. Can be disabled for dynamic/eager workloads where the overhead
+    /// is undesirable.
+    #[prost(bool, optional, tag = "535")]
+    pub xla_enable_hlo_modules_upload: Option<bool>,
+
+    /// Comma-separated list of collective communication domains to assign automatically. scale_up_fabric: uses the
+    /// fast-interconnect partition size from GpuTopology and assigns the domain when every participant group is
+    /// contained in one topology partition. An empty string disables automatic assignment.
+    #[prost(string, optional, tag = "536")]
+    pub xla_gpu_collective_domain_assignment: Option<String>,
+
+    /// Opt-in allowlist of FFI custom-call target names permitted for this module. When non-empty, creating an FFI
+    /// CustomCallThunk for a custom-call target that is not on this list fails compilation.Empty (the default) disables
+    /// the check. Scope is FFI-only: legacy custom calls and custom calls lowered to custom kernels (e.g. PTX) are not
+    /// gated.
+    #[prost(string, repeated, tag = "537")]
+    pub xla_gpu_hlo_custom_call_allowlist: Vec<String>,
+
+    /// Controls how many scale-up-fabric collectives the latency-hiding scheduler can keep in flight. A value of 0
+    /// means unlimited.
+    #[prost(int32, optional, tag = "538")]
+    pub xla_gpu_experimental_parallel_scale_up_collective_overlap_limit: Option<i32>,
+
+    /// Is this flag is set and autotuning is disabled, the config assigner still compiles all supported configs for
+    /// each instruction before assigning the first successful one. Gives more compilation test coverage but might
+    /// increase compilation time.
+    #[prost(bool, optional, tag = "539")]
+    pub xla_compile_all_supported_configs: Option<bool>,
+
+    /// File to write cost model top-k candidates to.
+    #[prost(string, optional, tag = "540")]
+    pub xla_gpu_dump_cost_model_top_k_candidates_to: Option<String>,
+
+    /// Internal debug/testing flag to enable cross-host one-shot kernel for collective operations.
+    #[prost(enumeration = "CollectiveOperationType", repeated, tag = "541")]
+    pub xla_gpu_unsupported_use_cross_host_one_shot_kernel: Vec<i32>,
+
+    /// Minimum backend_config size (in bytes) to be eligible for deduplication into payloads during serialization.
+    /// Configs smaller than this threshold are kept inline. Default is MAX_INT (deduplication disabled).
+    #[prost(int64, optional, tag = "542")]
+    pub xla_deduplicate_backend_configs_min_size: Option<i64>,
+
+    /// Single serialized config to override config of all instructions, bypassing cache and autotuning. Accepts
+    /// textproto of autotuner.Config.
+    #[prost(string, optional, tag = "543")]
+    pub xla_force_config: Option<String>,
+
+    /// File containing a list of serialized configs to override candidate configs for all instructions. Accepts
+    /// textproto of autotuner.CandidateConfigs.
+    #[prost(string, optional, tag = "544")]
+    pub xla_candidate_configs_file: Option<String>,
 }
 
 /// Represents the device IDs assigned to replicas for a single computation. In XLA's device assignment model, each
@@ -2667,6 +2821,7 @@ pub enum EffortLevel {
 ///
 /// This type corresponds to `ExecutableBuildOptionsProto` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "26, 20, 21")]
 pub struct ExecutableCompilationOptions {
     /// Ordinal ID of the device for which to compile the program. Valid values are `0` to `<number of devices> - 1`.
     /// These values are identical to the device ordinal IDs used by the XLA stream executor. The built executable will
@@ -2704,26 +2859,6 @@ pub struct ExecutableCompilationOptions {
     /// If `true`, automatically generate shardings for the _Single Program Multiple Data (SPMD)_ partitioner.
     #[prost(bool, tag = "7")]
     pub use_auto_spmd_partitioning: bool,
-
-    /// Amount of effort to spend on optimizing for minimizing program execution time, specified as a value in
-    /// `[-1.0, +1.0]`. The baseline is `0.0`, which strongly prioritizes execution time at the cost of longer
-    /// compile times and is suitable for production workloads. A value of `-0.5` would be appropriate for
-    /// research use cases where faster compilation time is preferred to improve iteration speed. Positive values,
-    /// on the other hand, might enable costly optimizations that are disabled by default.
-    ///
-    /// Refer to [`Self::optimization_level`] for a discrete [`EffortLevel`]-based alternative.
-    #[prost(float, tag = "20")]
-    pub optimization_effort: f32,
-
-    /// Amount of effort to spend on reducing the memory requirements of the program, specified as a value in
-    /// `[-1.0, +1.0]`. The baseline is `0.0`, which expends significant effort on attempting to reduce the memory
-    /// requirements of the program. A value of `-1.0` would be appropriate for use cases that wish to spend minimal
-    /// effort here and fail as quickly as possible instead. Positive values, on the other hand, might enable costly
-    /// algorithms to reduce memory usage that are disabled by default.
-    ///
-    /// Refer to [`Self::memory_fitting_level`] for a discrete [`EffortLevel`]-based alternative.
-    #[prost(float, tag = "21")]
-    pub memory_fitting_effort: f32,
 
     /// Amount of effort to spend on optimizing for minimizing program execution time, specified as an [`EffortLevel`].
     ///
@@ -2835,9 +2970,9 @@ pub struct ExecutableCompilationOptions {
     #[prost(int64, optional, tag = "23")]
     pub process_count: Option<i64>,
 
-    /// Slice size for distributed execution. Used for multi-process compilation and execution.
-    #[prost(int64, optional, tag = "26")]
-    pub slice_size: Option<i64>,
+    /// Gpu topology.
+    #[prost(message, optional, tag = "27")]
+    pub gpu_topology: Option<GpuTopology>,
 }
 
 /// Value of an [`OptionOverride`] in an XLA compilation confirmation.
@@ -2968,6 +3103,11 @@ pub struct AutoTuneTritonGemmKey {
     /// If `true`, warp specialization optimizations are allowed.
     #[prost(bool, tag = "9")]
     pub is_warp_specialization_allowed: bool,
+
+    /// The `group_size` used for L2 tile reordering (grouping) in ragged-dot fusions. A value <= 1 disables the
+    /// reordering.
+    #[prost(int64, tag = "11")]
+    pub group_size: i64,
 }
 
 /// Auto-tuning configuration key for a custom fused kernel.
@@ -3559,6 +3699,7 @@ pub struct GpuRuntimeVersion {
 /// This type corresponds to `stream_executor.GpuTargetConfigProto`
 /// in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "2, 3, 5")]
 pub struct GpuTargetConfiguration {
     /// [`GpuDeviceInformation`] about the target GPU device.
     #[prost(message, optional, tag = "1")]
@@ -3567,10 +3708,6 @@ pub struct GpuTargetConfiguration {
     /// Name of the GPU platform (e.g., `"CUDA"` or `"ROCm"`).
     #[prost(string, tag = "4")]
     pub platform_name: String,
-
-    /// [`GpuDnnVersionInformation`] for the library that is available on the target system.
-    #[prost(message, optional, tag = "5")]
-    pub dnn_version_information: Option<GpuDnnVersionInformation>,
 
     /// [`GpuRuntimeVersion`] for the runtime that is available on the target system.
     #[prost(message, optional, tag = "8")]
@@ -3638,6 +3775,10 @@ pub struct CompilationOptions {
     /// [`Precision`] used for hardware-accelerated matrix operations.
     #[prost(enumeration = "Precision", tag = "10")]
     pub matrix_unit_operand_precision: i32,
+
+    /// Individually defined output indices.
+    #[prost(int32, repeated, tag = "12")]
+    pub individually_defined_output_indices: Vec<i32>,
 }
 
 /// Statistics about the memory consumption of an executable (i.e., a compiled program).

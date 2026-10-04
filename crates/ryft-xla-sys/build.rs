@@ -56,6 +56,40 @@ static JAX_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
         .expect("failed to parse `JAX_COMMIT` from `WORKSPACE`")
 });
 
+/// Crate-relative files and directories required by the Bazel native build. Directory entries are copied recursively.
+/// Keeping one inventory for copying and Cargo change tracking prevents clean source builds from silently missing
+/// native sources that are referenced by `BUILD.bazel`.
+static BAZEL_BUILD_PATHS: &[&str] = &[
+    ".bazelrc",
+    ".bazelversion",
+    "bazel",
+    "BUILD.bazel",
+    "patches",
+    "pjrt_plugin.def",
+    "pjrt_plugin_exported_symbols.txt",
+    "pjrt_plugin_version_script.lds",
+    "src/c++",
+    "tests",
+    "tools",
+    "WORKSPACE",
+];
+
+/// Copies `source` recursively to `target` while preserving its relative directory structure.
+fn copy_build_path(source: &Path, target: &Path) -> Result<()> {
+    if source.is_dir() {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_build_path(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else {
+        let target_directory = target.parent().unwrap();
+        fs::create_dir_all(target_directory)?;
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UrlWithChecksum {
@@ -305,8 +339,9 @@ impl BuildConfiguration {
         let library_directory = ryft_xla_sys_directory.join("lib");
         let library_directory = library_directory.canonicalize().unwrap_or(library_directory);
 
-        // Configure static linking for the native library.
-        println!("cargo::rustc-link-lib=static=ryft-xla-sys");
+        // The merged archive contains registration-only objects from upstream `alwayslink` libraries.
+        // Preserve their initializers when linking outside Bazel, including the PJRT CPU compiler registration.
+        println!("cargo::rustc-link-lib=static:+whole-archive=ryft-xla-sys");
         match &self.operating_system {
             OperatingSystem::Linux => {
                 println!("cargo::rustc-link-lib=stdc++");
@@ -322,6 +357,7 @@ impl BuildConfiguration {
                 println!("cargo::rustc-link-arg=-Wl,-rpath,{}", library_directory.display());
             }
             OperatingSystem::Windows => {
+                println!("cargo::rustc-link-lib=winhttp");
                 println!("cargo::rustc-link-arg=/DEBUG");
                 println!("cargo::rustc-link-search=native={}", library_directory.display());
                 println!("cargo::rustc-env=RUSTFLAGS=-C target-feature=+crt-static");
@@ -445,8 +481,12 @@ impl BuildConfiguration {
     /// to the path of the resulting shared library such that it can be loaded by `ryft-pjrt`.
     fn configure_pjrt_plugin(&self, device: Device) {
         let build_configuration = Self { device, ..*self };
-        let plugin_directory = build_configuration.artifact_directory(Artifact::PjrtPlugin).unwrap();
-        let plugin_path = plugin_directory.join(build_configuration.pjrt_plugin_library_file_name());
+        let plugin_path = build_configuration.artifact_directory(Artifact::PjrtPlugin).unwrap();
+        let plugin_path = if plugin_path.is_file() {
+            plugin_path
+        } else {
+            plugin_path.join(build_configuration.pjrt_plugin_library_file_name())
+        };
         println!(
             "cargo:rustc-env=RYFT_PJRT_PLUGIN_{}={}",
             device.to_string().to_uppercase().replace("-", "_"),
@@ -567,18 +607,34 @@ impl BuildConfiguration {
             }
 
             // Create a directory for the extracted files.
-            fs::create_dir_all(&extracted_path)?;
+            fs::create_dir_all(&extracted_path)
+                .with_context(|| format!("failed to create extraction directory `{}`", extracted_path.display()))?;
 
             // Extract the artifact archive.
             if extension == Some("gz") {
-                let tar_gz = File::open(artifact_path)?;
+                let tar_gz = File::open(&artifact_path)
+                    .with_context(|| format!("failed to open artifact archive `{}`", artifact_path.display()))?;
                 let tar = flate2::read::GzDecoder::new(tar_gz);
                 let mut archive = tar::Archive::new(tar);
-                archive.unpack(&extracted_path)?;
+                archive.unpack(&extracted_path).with_context(|| {
+                    format!(
+                        "failed to extract artifact archive `{}` into `{}`",
+                        artifact_path.display(),
+                        extracted_path.display(),
+                    )
+                })?;
             } else if extension == Some("whl") {
-                let archive_file = File::open(artifact_path)?;
-                let mut archive = ZipArchive::new(archive_file)?;
-                archive.extract(&extracted_path)?;
+                let archive_file = File::open(&artifact_path)
+                    .with_context(|| format!("failed to open artifact archive `{}`", artifact_path.display()))?;
+                let mut archive = ZipArchive::new(archive_file)
+                    .with_context(|| format!("failed to read wheel archive `{}`", artifact_path.display()))?;
+                archive.extract(&extracted_path).with_context(|| {
+                    format!(
+                        "failed to extract artifact archive `{}` into `{}`",
+                        artifact_path.display(),
+                        extracted_path.display(),
+                    )
+                })?;
             }
 
             // Make any file renames that are necessary for downstream code to function as expected.
@@ -706,57 +762,13 @@ impl BuildConfiguration {
         let current_path = env::current_dir().with_context(|| "Failed to get the current directory.")?;
         let output_path = PathBuf::from(env::var("OUT_DIR").with_context(|| "`OUT_DIR` not set")?);
 
-        // Copy the Bazel workspace files to the output directory.
-        // Also, monitor when they change to determine when a rebuild is necessary.
-        let bazel_files = vec![
-            PathBuf::from("bazel").join("archive.bzl"),
-            PathBuf::from("bazel").join("BUILD.bazel"),
-            PathBuf::from(".bazelrc"),
-            PathBuf::from(".bazelversion"),
-            PathBuf::from("BUILD.bazel"),
-            PathBuf::from("patches").join("BUILD.bazel"),
-            PathBuf::from("patches").join("jax-mosaic-c-api-visibility.patch"),
-            PathBuf::from("pjrt_plugin.def"),
-            PathBuf::from("pjrt_plugin_exported_symbols.txt"),
-            PathBuf::from("pjrt_plugin_version_script.lds"),
-            PathBuf::from("src").join("c++").join("common.h"),
-            PathBuf::from("src").join("c++").join("distributed.cc"),
-            PathBuf::from("src").join("c++").join("distributed.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
-            PathBuf::from("src").join("c++").join("profiler.cc"),
-            PathBuf::from("src").join("c++").join("profiler.h"),
-            PathBuf::from("WORKSPACE"),
-        ];
-
-        for file_name in bazel_files {
-            let source_file = current_path.join(&file_name);
-            let target_file = output_path.join(&file_name);
-            let target_directory = target_file.parent().unwrap();
-            if let Err(error) = fs::create_dir_all(target_directory) {
-                bail!("failed to create {}; {error}", target_directory.display());
-            }
-            if let Err(error) = fs::copy(&source_file, &target_file) {
-                bail!("failed to copy {} to {}; {error}", source_file.display(), target_file.display());
-            }
+        // Copy the complete, scoped Bazel source inventory to the output directory. This is the workspace
+        // used when Cargo must build a native archive from source rather than consume a precompiled one.
+        for path in BAZEL_BUILD_PATHS {
+            let source = current_path.join(path);
+            let target = output_path.join(path);
+            copy_build_path(&source, &target)
+                .with_context(|| format!("failed to copy {} to {}", source.display(), target.display()))?;
         }
 
         let bazel_configs = match (self.operating_system, self.architecture, self.device) {
@@ -858,10 +870,10 @@ impl BuildConfiguration {
         match artifact {
             Artifact::RyftXlaSys => format!("ryft-xla-sys-{self}.tar.gz"),
             Artifact::PjrtPlugin => match self.device {
-                Device::Tpu => "libtpu-0.0.41-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
-                Device::Neuron => "libneuronxla-3.0.2891.0%2Be2a4b1f5-py3-none-linux_x86_64.whl".to_string(),
+                Device::Tpu => "libtpu-0.0.47-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
+                Device::Neuron => "libneuronxla-3.0.5356.0%2Bc743c3ec-py3-none-linux_x86_64.whl".to_string(),
                 Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
-                Device::Mps => "jax_mps-0.10.1-cp313-cp313-macosx_14_0_arm64.whl".to_string(),
+                Device::Mps => "jax_mps-0.10.10-py3-none-macosx_14_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
         }
@@ -872,7 +884,7 @@ impl BuildConfiguration {
     fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> String {
         match (artifact, self.device) {
             (Artifact::PjrtPlugin, Device::Tpu) => {
-                "https://files.pythonhosted.org/packages/51/76/24f89a712006681479f03590386c247923b14943ccbc3e4b1253fbbf4269"
+                "https://files.pythonhosted.org/packages/63/5e/d50adfd4e24d87eed40dfcea9fff89e780e87df738f0f24cce3a66d2cec4"
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
@@ -881,7 +893,7 @@ impl BuildConfiguration {
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Mps) => {
-                "https://files.pythonhosted.org/packages/c2/df/ae7e8d15a46712e011057e79ffe7ab8128495171b95314acb36162e0cb20"
+                "https://files.pythonhosted.org/packages/2d/cc/d055fc820b97f234d975044a30118eadec0f009c4e5cec55af9d677f8bc0"
                     .to_string()
             }
             _ => format!(
@@ -896,43 +908,43 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("ad528de56485d9774e7ae1b02285b407641b643551180fd67bf5141098a1c512")
+                Some("e792efda0b0bf8f6bbd67f30afcf724dd3367987376d660554e056580b1ea3ba")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
-                Some("45c1788c3d35eded03e676f39253b34779d93f798d46965fcd6135bbb9598454")
+                Some("e027738cc7d11768c2288042eca16d63d5d2e5570d9298b6866a00e828bddb42")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("75702b0d0b51469ba8ba6a7152c9b2178810968ff85fe0c23791b9a710f0fa80")
+                Some("aa6e0838c8c643ad5fbc6da7f398135f072adc811f7de507a6aeedcc4fd46615")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("f30758e734cfb7e3bc12c0468b8eceda4e7385c154bf1503d4e3f292bf7a8639")
+                Some("4ae70987f9c6c15ae4e11cb2dc12c3dbf4d1f35280966bf275e683460095751a")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("ff1acb5229b0c9462897c31818c9454ebf9bffc728bdc4ca4735676a933b2205")
+                Some("8463a199c4e57d09fb019f44fec39823a9dc52b1fc6a10b33619f375eafe2bd4")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
-                Some("1ed69a6b0168f256741201454f40da65183f2c18f029ce7df0b369e8fed1f799")
+                Some("a5f016e67e320d972dd9f89a81149102453293de61198f78dca6ddf330e7cd88")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("99fd677febc114b28e4a22c28fe4bd9c222adb3a599d382de54b211f79a8e5d4")
+                Some("8869be93a84b0d72228b68f7dc374bfded30dfa3f26387e3ee1db11ebb4a4efa")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
-                Some("8d1859318598a2aaa2437078adb7898319d76a4efb46ea6300dd75bd6dfbcf96")
+                Some("8fedb2a644812b34d61aee9b3b00d8d578d205fb020295b18178e8eec71113a6")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("4937b8477296ae6fa6c413beeb88c8a37aa0d5f382114d3648c9db21bfc120a5")
+                Some("837b2918fecbdc08a2c6b3263ef1c708afebc10b40597518d1b90951162dc303")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
-                Some("62dd05e942de8f1379eff9a1b2ada33e1a99d0fbddf52ffce57b18268a0413e6")
+                Some("5029587aa7f8cf5c4030857276abe0a9457ec684efd222c6128d681db781137d")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Neuron) => {
-                Some("b453709b37565902acc85bcfb4011d55e99381b81d831a5559847bba71f9cec3")
+                Some("5daa25f3ce54c562c104276b0a9f57192f3cc584445f32225c1617df5e3b0569")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
                 Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Mps) => {
-                Some("fb7854a18a9d52949674d6633c940ad87e8c531d4dd98446f2044b564cd753fa")
+                Some("029f29b00c4abfbb942fc5a9b57308879e209e94c99a94f5069fd87055157fc1")
             }
             _ => None,
         }
@@ -954,15 +966,10 @@ fn main() {
         return;
     }
 
-    println!("cargo::rerun-if-changed=bazel/archive.bzl");
-    println!("cargo::rerun-if-changed=bazel/BUILD.bazel");
-    println!("cargo::rerun-if-changed=.bazelrc");
-    println!("cargo::rerun-if-changed=.bazelversion");
-    println!("cargo::rerun-if-changed=BUILD.bazel");
-    println!("cargo::rerun-if-changed=pjrt_plugin.def");
-    println!("cargo::rerun-if-changed=pjrt_plugin_exported_symbols.txt");
-    println!("cargo::rerun-if-changed=pjrt_plugin_version_script.lds");
-    println!("cargo::rerun-if-changed=WORKSPACE");
+    for path in BAZEL_BUILD_PATHS {
+        println!("cargo::rerun-if-changed={path}");
+    }
+
     println!("cargo::rerun-if-env-changed={RYFT_XLA_SYS_ARCHIVE}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_12_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_13_LIB}");

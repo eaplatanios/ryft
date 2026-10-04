@@ -16,6 +16,11 @@ Act like a high-performing senior engineer, always being concise, direct, decisi
   fix issues.
 - **Minimize Impact**: Changes should only touch what is necessary. You must always avoid introducing bugs.
 
+## General Instructions
+
+- When moving or reordering code, preserve existing `TODO` comments exactly and keep each one attached to the code it
+  annotated unless the user explicitly asks to resolve or remove it. Audit marker counts after broad mechanical moves.
+
 ## Workflow
 
 When asked to implement a change or add a new feature, you must always follow the following steps:
@@ -49,7 +54,16 @@ When asked to implement a change or add a new feature, you must always follow th
    throwaway crate outside the workspace that depends only on the crates you changed). More generally, never run
    `git checkout <path>`, `git restore <path>`, or `git reset` on tracked files during a session. Large refactors live
    uncommitted in the working tree for hours, and such commands silently destroy that work. To inspect the committed
-   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead.
+   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead. The
+   sole exception is a clean, dedicated staging worktree used by a reviewed extraction plan after the complete source
+   tree has been committed and pushed to an immutable archive branch. In that worktree only, `git restore
+   --source=<immutable-archive-or-reviewed-integration-ref> -- <explicit-paths>` may restore a documented increment's
+   explicit paths. Verify the staging worktree is clean first; restore a whole path only when the reviewed plan assigns
+   its complete delta to that increment, and use patch mode for paths shared with later work. Never target the worktree
+   root, a directory broader than the increment, a glob, or an unresolved variable. This exception never applies in
+   the owner checkout and does not permit `git checkout <path>`, `git reset`, `git clean`, or `git stash`. Never stage
+   or unstage paths either (e.g., `git add`, `git rm`, or `git rm --cached`); the user curates the index and commits
+   pieces as they go, so delete files with a plain `rm` and leave staging to them.
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.
@@ -69,6 +83,9 @@ update this file so that they do not need to remind you again in the future.
 
 - Prioritize correctness and clarity first. Optimize performance only when needed and explicit.
 - Prefer extending existing modules over creating new small files.
+- Order inherent functions as constructors, field accessors, mutators, extraction or consuming functions, then private
+  helpers. Keep private constructors with constructors, merge adjacent inherent impl blocks with identical bounds,
+  and order the corresponding tests by the public functions while keeping edge cases together.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
@@ -95,6 +112,21 @@ update this file so that they do not need to remind you again in the future.
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
+- In `ryft-core` operation modules, group each operation as its `*_OPERATION_NAME` constant, operation type and
+  inherent/formatting implementations, then `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`
+  using the appropriate capability, `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`,
+  `TransposableOperation`, `MemberOperation`, and `MemberInterpretableOperation` implementations where applicable.
+  Follow these with the operation provider trait and its implementations, then the capability trait and its
+  implementations. Order explicit capability context implementations as `EagerContext` for `Array`, `EagerContext` for
+  `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`,
+  `DifferentiationContext`, and `TranspositionContext`. Keep shared blanket implementations and substantial helper
+  submodules shared rather than duplicating them to reproduce this ordering at each call site.
+- Keep domain-specific construction and transform-specific execution policy out of the central `Operation` trait.
+  Prefer existing operation providers and the owning transform's validated execution path; add a core hook only when
+  a general operation contract requires it, rather than to simplify one domain's dispatch.
+- Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
+  diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
+  differentiation.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -112,8 +144,14 @@ update this file so that they do not need to remind you again in the future.
   `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
   `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
   `SupportsMul`, `SupportsDiv`, etc.
+- Place lifetime bounds before trait bounds within a bound list (e.g., `T: 'static + Send + Sync`, not
+  `T: Send + Sync + 'static`).
 - `Type` requires `Clone + Debug + Display + PartialEq + Parameter`, so a `T: Type` bound already implies all of those.
   Never write `T: Parameter + PartialEq + Type` (or any subset). Just write `T: Type`.
+- Do not add inherent type accessors that duplicate `Typed::r#type` (e.g., an inherent `r#type()` or `array_type()`
+  returning `&T` on a concrete `Value`): call the `Typed`-provided `r#type()` directly. It returns `Cow::Borrowed`
+  for concrete values, so it is a zero-cost borrow wrap; expression-position uses work through `Deref`, and a
+  longer-lived reference is obtained by binding the `Cow` and calling `.as_ref()`.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
@@ -122,17 +160,57 @@ update this file so that they do not need to remind you again in the future.
 
 #### Formatting & Naming
 
-- Follow workspace formatting (`rustfmt.toml`): `max_width = 120`.
+- Follow workspace formatting (i.e., `rustfmt.toml`): `max_width = 120`.
+- Write numeric type suffixes without a separating underscore (e.g., `0f32`, `1.0f64`, and `2usize`, instead of
+  `0_f32`, `1.0_f64`, or `2_usize`). Keep underscores used as digit separators where useful.
 - Use import grouping in this order:
   - `std` imports
   - third-party crate imports
   - `crate::...` imports
   - `super::...` imports
+- For imports from the current crate, use the first module segment after `crate` as the ownership boundary:
+  - Import items owned by a different top-level module through the shortest path that re-exports them, measured in
+    path segments. Both named and glob `pub use` re-exports in module `mod.rs` files count as intentional facades:
+    prefer `crate::arrays::ArrayType` and `crate::programs::Typed` to their deeper defining paths, and fall back to
+    the defining path only when no facade re-exports the item (e.g.,
+    `crate::programs::types::visit_type_signature_pairs`). The one exclusion is crate-root re-exports: in
+    `ryft-core`, never import through `crate::<Item>` (the `lib.rs` re-exports exist for downstream crates); in
+    crates whose root re-exports are the intentional named public API, such as `ryft-xla`, `use crate::{...}` root
+    imports are the shortest facade and are correct.
+  - Import items owned by the same top-level module through their full accessible defining submodule paths, even when
+    an ancestor re-exports them through a shorter facade path. For example, `crate::arrays::addressing` must import
+    `ArrayType` from `crate::arrays::types::arrays::ArrayType`, not from `crate::arrays::ArrayType`. Items defined
+    directly in the shared top-level module remain imported from that module. When the defining module is private to
+    a sibling, use its nearest accessible intentional facade instead of widening module visibility solely for imports.
+  - Group compatible leaf imports from the same exact module path into one brace group (aliased items such as
+    `Complex as ComplexNumber` participate in the group). Keep imports that descend into nested module paths in
+    separate `use` statements, and never merge imports across different `#[cfg]`, visibility, or other attribute
+    boundaries.
+  - Apply the same shortest-path rule to imports from other workspace crates, including their crate roots: when the
+    foreign crate re-exports an item at its root (by name or by glob), import it directly from the root (e.g.,
+    `ryft_core::Typed`, `ryft_core::ArrayType`, `ryft_pjrt::Event`); otherwise import through the shortest module
+    facade that re-exports it. The prohibition on `crate::<Item>` root imports applies only inside the defining
+    crate itself, never to downstream consumers.
+  - When two facades expose an item at the same shortest length, import from the module that owns the item (e.g.,
+    `Tag` from `crate::operations`, not through another module's incidental re-export of it).
+  - Enum-variant imports such as `use crate::arrays::DataType::{F32, F64};` keep their own statement beside the
+    owning type's group, because merging them would require nested brace groups, which are never used.
+  - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
+    inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
+    re-export statements that define the facades.
+  - Test modules follow the same rules for their `crate::...` imports; `use super::*` remains the standard way to
+    bring in the owning module's items.
+  - `rustfmt.toml` sets `imports_granularity = "Module"`, which enforces the grouping rule under nightly `rustfmt`
+    but is inert on stable; it cannot choose the semantically correct facade or defining descendant path, so treat it
+    as grouping assistance only. Do not add `group_imports = "StdExternalCrate"`: it merges `crate` and `super`
+    imports into one group, which conflicts with the import group order above.
 - At in-crate declarative macro call sites, import macros from `crate::macros` (grouping related macros where useful)
   and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
 - Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
   function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
-  preferred over spelled-out variants such as `absolute_value`.
+  preferred over spelled-out variants such as `absolute_value`. This also applies to names borrowed from external
+  APIs: spell out abbreviations such as JAX's `prevent_cse` (e.g., as `optimization_barrier`, named for the mechanism,
+  or `prevent_common_subexpression_elimination`), and mention the external name only in documentation.
 - When a function-like call or macro invocation argument list spans multiple lines, include a trailing comma after the
   final argument.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
@@ -149,9 +227,14 @@ update this file so that they do not need to remind you again in the future.
   any other derived traits.
 - When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
   crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
+- Precede every non-trivial declarative-macro branch with a concise code comment explaining the accepted public form
+  or the internal generation role.
 
 ### Error Handling
 
+- For ordinary error enums with declarative variant messages, derive `thiserror::Error` instead of writing manual
+  `Display` and `std::error::Error` implementations. Keep manual formatting only when the message requires genuinely
+  procedural rendering.
 - Do not silently discard fallible operations (e.g., `let _ = ...` on `Result`-returning code is disallowed).
 - Use `?` for error propagation when the caller should decide what to do with the error.
 - Use explicit `match`/`if let` when mapping to domain-specific errors.
@@ -160,6 +243,9 @@ update this file so that they do not need to remind you again in the future.
 - Colocate domain-specific error types with the module that owns the corresponding API and define those error enums
   immediately after the imports in that file. Use crate-level umbrella error types only for aggregation/wrapping.
 - Error messages must start with lowercase text and must not end with trailing punctuation.
+- In diagnostics, surround operation names, identifiers, types, attributes, command-line flags, and other literal code
+  fragments with backticks, following Rust compiler conventions. Do not use single quotes for code references; reserve
+  them for syntax that actually contains single quotes, such as character literals, lifetimes, or serialized formats.
 - Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
 - `unwrap()`/`expect()` are allowed only:
   - in tests, or
@@ -176,6 +262,9 @@ update this file so that they do not need to remind you again in the future.
   - `'c`: context/client lifetime in `ryft-mlir` and `ryft-pjrt`,
   - `'t`: thread pool lifetime in `ryft-mlir`, and
   - `'s`: store lifetime in `ryft-pjrt`.
+- Name the lifetime of a borrow of an operation, object, or other owner `'o` (e.g., `ResidualProducer<'o, T>`, which
+  borrows its producing operation), including in the types and higher-ranked bounds that carry it along. Do not use a
+  generic `'a`.
 - Non-owning wrapper types in `ryft-mlir` are typically `Copy + Clone` and often end with `Ref`.
 - Owning wrapper types in `ryft-mlir` are not `Copy` and implement `Drop` to release C resources.
 - Owning wrapper types in `ryft-pjrt` are not `Copy` and implement `Drop` to release C resources.
@@ -225,7 +314,13 @@ update this file so that they do not need to remind you again in the future.
   add documentation for all variants in that enum.
 - When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
   unit variants or small enums.
+- Keep an empty line between adjacent documented struct fields, including fields of private implementation structs.
+- Do not attach rustdoc comments (i.e., `///`) to trait implementation blocks. Put reusable public contract
+  documentation on the trait or implementing type, and explain implementation mechanics and invariants with ordinary
+  code comments (i.e., `//`) at the beginning of the implementation or relevant method body.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
+- When simplifying existing documentation, preserve its architectural rationale, invariants, and relevant API links.
+  Improve wording without discarding useful information merely to shorten the text.
 - When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
   "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
 - Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).
@@ -246,6 +341,17 @@ update this file so that they do not need to remind you again in the future.
   - what handle/representation is being exposed,
   - why it is unsafe, and
   - why it is still exposed (e.g., extensibility/interoperability).
+- Public items that other workspace crates need (e.g., backend hooks that `ryft-xla` calls on `ryft-core` types) are
+  documented public API: explain why callers need them, the invariants callers must uphold, and any caveats (e.g.,
+  locking order or reentrancy), and include `# Errors` where applicable. Do not use `#[doc(hidden)]` to avoid
+  documenting them. Reserve `#[doc(hidden)]` for macro-expansion support and for items that are public only for
+  type-system reasons (e.g., the payload of an uninhabited variant). Make items that are only used within their own
+  crate `pub(crate)` or private instead of hiding them, and never make a type public solely to name it as a `Deref`
+  target or in another public signature when the owning type can expose the needed functions directly.
+- Do not mark in-repo types `#[non_exhaustive]`. Workspace crates evolve together, and the attribute forces wildcard
+  `_` arms in other crates, which hide newly added variants that those crates should handle (e.g., a backend lowering
+  that must cover every `ArrayReferenceTransform`). Match exhaustively instead, and use the attribute only for a
+  published-API compatibility reason that the user explicitly asks for.
 - For callback- and threading-heavy code, explain the lifetime/ownership invariants in comments. You can refer to
   documentation strings in the core traits of the `ryft-pjrt` crate for examples of this.
 - When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
@@ -262,17 +368,20 @@ update this file so that they do not need to remind you again in the future.
 - When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.
+- In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
+  from free functions in prose.
+- In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
+  diagnostics, and tests), following `Instruction::inputs`, `Operation::infer_output_types(.., input_types)`, and
+  `InputRegionProvenance::Input`, rather than "operands". Write "region input", "instruction input", or "program
+  input" wherever more than one kind appears nearby. Keep "operand" only where a specification uses it as the role
+  name of one particular input or inside an attribute name (e.g., the `operand` of StableHLO `gather`, `scatter`, and
+  `ragged_all_to_all`, and attributes such as `operand_batching_dims`), and in `ryft-xla` MLIR code. A specification
+  that calls every input an operand (e.g., most StableHLO operations or XLA custom calls) is not a reason to keep it.
 
 ## Testing Guidelines
 
-- All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
-  Consult that file before writing or revising unit tests.
-- When changing what `ryft-core` transforms (batching, differentiation, tracing) stage into programs — operand
-  shapes, inserted or elided operations — also run the backend crate test suites (at least
-  `cargo test -p ryft-xla --lib`), not just `ryft-core`. Backend lowerings impose stricter contracts than
-  `ryft-core` type inference; for example, StableHLO elementwise operations require shape-congruent operands with no
-  implicit broadcasting, so an "optimization" that elides a staged `BroadcastInDim` can pass every `ryft-core` test
-  and still break XLA lowering.
+All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
+Consult that file before writing or revising unit tests.
 
 ## Crate-Specific Conventions
 
@@ -283,7 +392,10 @@ update this file so that they do not need to remind you again in the future.
 - Keep dialect-loading calls before constructing dialect-specific entities when required for safety.
 - Keep paired owned/reference operation types (e.g., `Detached...Operation` and `...OperationRef`) consistent.
 - For operation constructor APIs, pass `location` as the last parameter and use generic `L: Location<'c, 't>`.
-- For operation documentation strings, avoid Markdown tables for operands/results; prefer clear Markdown lists.
+- For operation documentation strings, follow the StableHLO style: explain semantics, include a `# Example` with MLIR
+  rendering, and link to the operation's official documentation. Constructor docstrings link back to the operation
+  semantics and describe non-obvious parameters using the standard `# Parameters` format. Avoid Markdown tables for
+  operands/results; prefer clear Markdown lists instead.
 - For operation constructor documentation strings, avoid boilerplate Rust call examples unless usage is non-obvious.
 
 ### `ryft-pjrt`

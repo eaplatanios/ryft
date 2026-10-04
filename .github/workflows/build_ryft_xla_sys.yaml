@@ -66,11 +66,22 @@ jobs:
       xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
     steps:
       - uses: runs-on/action@v2
+
       - name: Check Out Repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.ref }}
           path: "ryft"
+
+      # `rules_python` creates virtual environments with DLL symlink targets longer than `MAX_PATH`.
+      # Set this before launching Python or Bazel. Windows caches the setting per process.
+      - name: Enable Windows Long Paths
+        if: ${{ matrix.config.os == 'windows' }}
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -Value 1 -Type DWord -ErrorAction Stop
+
       - name: Install Chocolatey, Git, Visual Studio 2019 Build Tools, and LLVM 18
         if: ${{ matrix.config.os == 'windows' }}
         run: |
@@ -91,34 +102,95 @@ jobs:
           # Install LLVM 18
           choco install llvm --version 18.1.8 -y
           echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install LLVM 18 & NUMA
         if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-7' }}
         run: |
           sudo apt purge llvm* clang* lld* -y
           sudo apt autoremove -y
+          # The LLVM apt script requires these tools, which the runner image no longer ships (and the purge above can
+          # remove as orphaned dependencies).
+          sudo apt-get update -qq
+          sudo apt-get install -y lsb-release wget software-properties-common gnupg
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo apt-get install libnuma-dev -y
+
       - name: Install CUDA 12
         if: ${{ matrix.config.device == 'cuda-12' }}
         run: |
           CUDA_ARCHIVE=$([[ "${{ matrix.config.architecture }}" == "arm64" ]] && echo "sbsa" || echo "x86_64")
           wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_ARCHIVE}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
+          # Retry inconsistent NVIDIA mirror metadata without relaxing signature or hash checks.
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update -qq -o APT::Update::Error-Mode=any; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then exit 1; fi
+            sleep 30
+          done
           sudo apt install -y --no-install-recommends cuda-12-9 cuda-toolkit-12-9 cuda-nvcc-12-9 cuda-nvrtc-dev-12-9
+
       - name: Install CUDA 13
         if: ${{ matrix.config.device == 'cuda-13' }}
         run: |
           CUDA_ARCHIVE=$([[ "${{ matrix.config.architecture }}" == "arm64" ]] && echo "sbsa" || echo "x86_64")
           wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_ARCHIVE}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
+          # Retry inconsistent NVIDIA mirror metadata without relaxing signature or hash checks.
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update -qq -o APT::Update::Error-Mode=any; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then exit 1; fi
+            sleep 30
+          done
           sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0 cuda-nvcc-13-0 cuda-nvrtc-dev-13-0
+
       - name: Install Python
         uses: actions/setup-python@v5
         if: ${{ matrix.config.os == 'windows' }}
         with:
           python-version: "3.11.9"
+
+      # Defensive check to rule out this as the cause of failure of subsequent steps.
+      - name: Check Windows Long-Path Symlinks
+        if: ${{ matrix.config.os == 'windows' }}
+        shell: python {0}
+        run: |
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          with TemporaryDirectory() as directory:
+              root = Path(directory)
+              source = root.joinpath(*(["long_path_" * 7] * 4), "vcruntime140.dll")
+              assert len(str(source)) > 260
+              source.parent.mkdir(parents=True)
+              source.write_bytes(b"long-path symlink check")
+              link = root / "vcruntime140.dll"
+              link.symlink_to(source)
+              assert link.read_bytes() == source.read_bytes()
+          print("Windows long-path file creation and symlinks work")
+
+      - name: Install Rust Toolchain
+        if: ${{ matrix.config.os == 'windows' }}
+        shell: powershell
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+          Invoke-WebRequest -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' `
+            -OutFile $installer -UseBasicParsing
+          & $installer -y --profile minimal --default-toolchain none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cargoDirectory = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          Join-Path $cargoDirectory 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify Rust Toolchain
+        working-directory: ./ryft
+        shell: bash
+        run: |
+          # `rustup` selects and installs the version in `rust-toolchain.toml` before the expensive native build.
+          cargo --version
+          rustc --version
+
       - name: Install Bazel
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
@@ -127,6 +199,7 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
+
       - name: Extract XLA Commit ID
         id: extract_xla_commit_id
         shell: bash
@@ -134,6 +207,7 @@ jobs:
           XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
           echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
           echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
+
       - name: Build `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -144,12 +218,61 @@ jobs:
           bazel build --config=${{ matrix.config.platform }} //:ryft-xla-sys-archive
           cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+
+      - name: Test `ryft-xla-sys` Library / Check Archive Contents and Reproducibility
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        env:
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+        run: |
+          # Check the exact upload artifact without asking Bazel to rebuild its native dependencies.
+          python tests/archive_contract_test.py "$RYFT_XLA_SYS_ARCHIVE"
+          bazel test --config=${{ matrix.config.platform }} --test_output=errors \
+            //:ryft-xla-sys-archive-reproducibility-test
+
+      - name: Test `ryft-xla-sys` Library / Run Rust Binding and MLIR Tests
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        env:
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+        run: |
+          # GNU ld can overflow AArch64 branch relocations when linking the whole native archive.
+          if [[ "${{ matrix.config.os }}" == "linux" && "${{ matrix.config.architecture }}" == "arm64" ]]; then
+            export PATH="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+          fi
+          cargo test --manifest-path ../../Cargo.toml -p ryft-xla-sys --lib
+          cargo test --manifest-path ../../Cargo.toml -p ryft-mlir --lib
+
+      - name: Test `ryft-xla-sys` Library / Check Upstream API Coverage and Archive Symbols
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        env:
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          python tests/symbol_contract_test.py \
+            --archive "$RYFT_XLA_SYS_ARCHIVE" \
+            --jax-root "$OUTPUT_BASE/external/jax" \
+            --xla-root "$OUTPUT_BASE/external/xla" \
+            --llvm-root "$OUTPUT_BASE/external/llvm-project" \
+            --ryft-xla-sys-root . \
+            --ryft-mlir-root ../ryft-mlir
+          python -m unittest tests/symbol_contract_test.py
+
       - name: Upload `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
           path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+
       - name: Build PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -162,6 +285,27 @@ jobs:
           bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-7' && '--config=rocm-7' || '' }} //:pjrt-gpu-plugin
           cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+
+      # The CUDA plugins link JAX's Mosaic GPU runtime with static registration of the `mosaic_gpu_v2` XLA FFI target.
+      # The version script hides every symbol except `GetPjrtApi`, so retention is proven through the registration
+      # string that `XLA_FFI_REGISTER_HANDLER` embeds; the exported-symbol table must still contain only the PJRT entry.
+      - name: Test PJRT Plugin / Check Mosaic GPU Registration and Exported Symbols
+        if: ${{ matrix.config.os == 'linux' && startsWith(matrix.config.device, 'cuda') }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        run: |
+          python3 - "${{ steps.build_pjrt_plugin.outputs.library }}" << 'PY'
+          import pathlib
+          import sys
+          library = pathlib.Path(sys.argv[1]).read_bytes()
+          if library.count(b"mosaic_gpu_v2") == 0:
+              raise SystemExit(f"{sys.argv[1]} does not retain the `mosaic_gpu_v2` XLA FFI registration")
+          print(f"{sys.argv[1]} retains the `mosaic_gpu_v2` registration")
+          PY
+          LIBRARY="${{ steps.build_pjrt_plugin.outputs.library }}"
+          EXPORTED=$(nm -D --defined-only "$LIBRARY" | awk '{sub(/@.*/, "", $NF); print $NF}' | sort -u)
+          test "$EXPORTED" = "GetPjrtApi" || { echo "unexpected exported symbols: $EXPORTED"; exit 1; }
+
       - name: Create PJRT Plugin Archive
         if: ${{ matrix.config.device != 'cpu' }}
         uses: a7ul/tar-action@v1.2.0
@@ -170,6 +314,7 @@ jobs:
           cwd: ./ryft/crates/ryft-xla-sys/
           files: ${{ steps.build_pjrt_plugin.outputs.library }}
           outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+
       - name: Upload PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         uses: actions/upload-artifact@v7
