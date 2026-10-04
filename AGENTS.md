@@ -83,8 +83,9 @@ update this file so that they do not need to remind you again in the future.
 
 - Prioritize correctness and clarity first. Optimize performance only when needed and explicit.
 - Prefer extending existing modules over creating new small files.
-- Order inherent functions as constructors, field accessors, mutators, extraction or consuming functions, then private
-  helpers. Keep private constructors with constructors, merge adjacent inherent impl blocks with identical bounds,
+- Order inherent functions as constructors, `with_*` builder functions, field accessors, mutators, extraction or
+  consuming functions, then private helpers. Place `with_*` functions immediately after constructors. Keep private
+  constructors with constructors, merge adjacent inherent impl blocks with identical bounds,
   and order the corresponding tests by the public functions while keeping edge cases together.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
@@ -136,10 +137,12 @@ update this file so that they do not need to remind you again in the future.
   into `where` clauses.
 - Declare the type-descriptor parameter before the value parameter in generic parameter lists (e.g.,
   `<T: Type, V: Value<Type = T>>`, not `<V, T>`).
-- Use `C` for generic parameters whose semantic role is a context (i.e., `Context`, `StagingContext`, `BatchingContext`,
-  `DifferentiationContext`, etc.) and `D` for generic parameters whose semantic role is a domain (i.e., `Domain`,
-  `CompilationDomain`, etc.). If `C` or `D` would collide with an existing payload, constant, or capture parameter,
-  rename that non-context/non-domain parameter to a specific name such as `Constant`, `Capture`, or `Payload`.
+- Use `C` for generic parameters whose semantic role is a context or domain (e.g., `Context`, `StagingContext`,
+  `BatchingContext`, `DifferentiationContext`, `Domain`, or `CompilationDomain`), and `D` for driver parameters. When a
+  function accepts a driver, reserve `D` for that driver and use `C` for its context or domain; do not rename the driver
+  to `Driver` to free `D` for a domain. If `C` or `D` would collide with an existing payload, constant, or capture
+  parameter, rename that payload, constant, or capture parameter to a specific name such as `Constant`, `Capture`,
+  or `Payload`.
 - Order type bounds preferably as follows: `Clone`, `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
   `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
   `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
