@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
@@ -19,7 +21,7 @@ use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::all_gather::{AllGatherOperation, AllGatherOutputVariance};
-use crate::operations::collectives::parallel_vary::ParallelVary;
+use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
     explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
@@ -41,8 +43,6 @@ use crate::programs::{
     RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use ryft::PARALLEL_VARY_OPERATION_NAME;
-use std::fmt::Display;
 
 /// Canonical operation name for [`ParallelSumScatterOperation`].
 pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
