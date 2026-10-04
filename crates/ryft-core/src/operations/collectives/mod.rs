@@ -11,7 +11,7 @@
 //! [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Each carries
 //! the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment, consumes one
 //! array input, and has only degenerate single-participant semantics outside a binder. Its tangent rides the same
-//! collective, and its transpose is another collective over the same axis. The crate-private
+//! collective, and its transpose is another collective over the same axis. The private
 //! `LinearCollectiveOperation` trait captures the hooks that their transformation rules need (e.g., the adjoint
 //! collective and the forwarding of a collective past an unrelated mapped batch axis) and provides those rules, to
 //! which each operation's explicit trait implementations delegate.
@@ -26,7 +26,7 @@
 //!     first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well),
 //!   - the first-class extent arithmetic that computes and validates result extents at staging time, and
 //!   - the [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
-//!     its type inference, interpretation, batching, and forward-mode differentiation rules, which the crate-private
+//!     its type inference, interpretation, batching, and forward-mode differentiation rules, which the private
 //!     `ShapeChangingCollectiveOperation` trait provides on top of each collective's matching-axis batching kernel.
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
@@ -82,16 +82,20 @@ pub mod parallel_vary;
 pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
 pub use parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+    array_parallel_all_gather,
 };
 pub use parallel_all_to_all::{
     PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation, ParallelSwapAxes,
+    array_parallel_all_to_all,
 };
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
 };
 pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
-pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
+pub use parallel_sum_scatter::{
+    PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation, array_parallel_sum_scatter,
+};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 
 /// Shape semantics of the collectives that resize an array axis (e.g., [`ParallelAllGatherOperation`],
@@ -248,6 +252,59 @@ impl Debug for CollectiveOptions {
                 .finish(),
         }
     }
+}
+
+/// Validates that `axis_name` is a manual axis of `mesh` and, when `axis_size` is provided, that the size the collective
+/// recorded at staging time matches the size of that mesh axis. Collectives that carry a mesh use it to validate the
+/// manual axis they exchange values over (e.g., [`AxisIndexOperation`], which has no input).
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name` if the axis is not a manual axis of `mesh` or if its size differs.
+fn validate_manual_mesh_axis(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+) -> Result<(), TypeError> {
+    if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+        return Err(TypeError::invalid(format!("`{operation_name}` mesh axis `{axis_name}` must be manual")));
+    }
+    if let Some(axis_size) = axis_size
+        && mesh.axis_size(axis_name) != Some(axis_size)
+    {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis size {axis_size} does not match the size of manual mesh axis `{axis_name}`",
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the manual mesh axis of a collective that carries a mesh, as [`validate_manual_mesh_axis`] does, and that
+/// `input_type` carries sharding over that same mesh. After successful validation, callers can retrieve the input
+/// sharding to apply their collective-specific manual variation and pending-sum contracts.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
+/// a sharding over a different mesh.
+fn validate_manual_mesh_input(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+    input_type: &ArrayType,
+) -> Result<(), TypeError> {
+    validate_manual_mesh_axis(operation_name, axis_name, axis_size, mesh)?;
+    let Some(sharding) = input_type.sharding() else {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
+        )));
+    };
+    if sharding.mesh() != mesh {
+        return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
+    }
+    Ok(())
 }
 
 /// Validates the participant grouping of a collective over a named axis of size `axis_size` and returns its _effective
@@ -431,63 +488,6 @@ fn infer_array_ir_shape_changing_collective_output_type(
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Checks that `axis_name` is a manual axis of `mesh` and, when `axis_size` is provided, that the size the collective
-/// recorded at staging time matches the size of that mesh axis. Collectives that carry a mesh use it to validate the
-/// manual axis they exchange values over (e.g., [`AxisIndexOperation`], which has no input).
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming `operation_name` if the axis is not a manual axis of `mesh` or if its size differs.
-fn check_manual_mesh_axis(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: Option<usize>,
-    mesh: &LogicalMesh,
-) -> Result<(), TypeError> {
-    if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-        return Err(TypeError::invalid(format!("`{operation_name}` mesh axis `{axis_name}` must be manual")));
-    }
-
-    if let Some(axis_size) = axis_size
-        && mesh.axis_size(axis_name) != Some(axis_size)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` axis size {axis_size} does not match the size of manual mesh axis `{axis_name}`",
-        )));
-    }
-
-    Ok(())
-}
-
-/// Checks the manual mesh axis of a collective that carries a mesh, as [`check_manual_mesh_axis`] does, and then that
-/// `input_type` carries that same mesh. Returns the input sharding so that each collective can apply its own manual
-/// variation and pending-sum contract to it.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
-/// a sharding over a different mesh.
-fn check_manual_mesh_input<'o>(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: Option<usize>,
-    mesh: &LogicalMesh,
-    input_type: &'o ArrayType,
-) -> Result<&'o Sharding, TypeError> {
-    check_manual_mesh_axis(operation_name, axis_name, axis_size, mesh)?;
-    let Some(sharding) = input_type.sharding() else {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
-        )));
-    };
-
-    if sharding.mesh() != mesh {
-        return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
-    }
-
-    Ok(sharding)
-}
-
 /// Single-input linear collective over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
 /// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
@@ -497,8 +497,8 @@ fn check_manual_mesh_input<'o>(
 /// that delegate to the provided functions, so that every operation module reads the same way.
 ///
 /// The hooks named after a public accessor of the operation (e.g., [`axis_name`](Self::axis_name)) return the same
-/// values. They are repeated here because this trait is crate-private, while the accessors are public API.
-pub(crate) trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
+/// values. They are repeated here because this trait is private, while the accessors are public API.
+trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     /// Collective that transposition stages on the output cotangent.
     type Adjoint: Clone + Operation<Type = ArrayType>;
 
@@ -663,8 +663,8 @@ pub(crate) trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> 
 /// input per output axis. This trait captures the hooks that differ between these collectives (i.e., their options and
 /// their composite type inference) and provides the composite interpretation and forward-mode differentiation rules,
 /// together with the batching rules of both array families, on top of them and of their
-/// [`ShapeChangingCollectiveKernel`] implementations.
-pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
+/// [`ShapeChangingCollectiveBatching`] implementations.
+trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// Returns the shared rank and participant-group semantics of this collective.
     fn options(&self) -> &CollectiveOptions;
 
@@ -826,7 +826,7 @@ pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// Implements [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) for this collective in the
     /// homogeneous array family. Bounded ragged inputs are rejected. A `batch` level that does not bind the
     /// collective's axis forwards it to its parent with its array axes moved past the mapped axis, while a level that
-    /// binds the axis consumes it through [`batch_matching_axis`](ShapeChangingCollectiveKernel::batch_matching_axis).
+    /// binds the axis consumes it through [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis).
     fn shape_changing_collective_batch<C, P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -834,7 +834,7 @@ pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
     where
         C: Context<Type = ArrayType, Operation: From<Self>>,
-        Self: ShapeChangingCollectiveKernel<C>,
+        Self: ShapeChangingCollectiveBatching<C>,
     {
         if let Some((index, ragged_axis)) = inputs
             .iter()
@@ -862,7 +862,7 @@ pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// geometry. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
     /// batch item, must be replicated. A `batch` level that does not bind the collective's axis forwards it to its
     /// parent, while a level that binds the axis consumes it through
-    /// [`batch_matching_axis`](ShapeChangingCollectiveKernel::batch_matching_axis) over the array projection of its
+    /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis) over the array projection of its
     /// parent.
     fn shape_changing_collective_batch_in_parent<C>(
         &self,
@@ -888,7 +888,7 @@ pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                                + From<DynamicReshapeOperation>
                                + OperationProjection<ArrayType>,
             >,
-        Self: ShapeChangingCollectiveKernel<ProjectedContext<C, ArrayType>>,
+        Self: ShapeChangingCollectiveBatching<ProjectedContext<C, ArrayType>>,
     {
         let Some((array, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -943,13 +943,16 @@ pub(crate) trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     }
 }
 
-/// Matching-axis batching kernel of a [`ShapeChangingCollectiveOperation`] over the `batch` levels whose parent is the
-/// context `C`. Each collective implements this trait only for the contexts whose values provide the capabilities that
-/// its own kernel needs (e.g., a sum-scatter needs reductions, while an all-gather and an all-to-all only rearrange
-/// axes), so the provided batching rules require exactly those capabilities rather than the union over all collectives.
-pub(crate) trait ShapeChangingCollectiveKernel<C: Context<Type = ArrayType>>:
-    ShapeChangingCollectiveOperation
-{
+/// Context-specific batching capability of a [`ShapeChangingCollectiveOperation`] for `batch` levels whose parent is
+/// `C`. Its function consumes a level that binds the collective's named axis; the shared batching rules use it after
+/// validating the inputs and determining the output geometry.
+///
+/// The context parameter belongs to this trait so that each collective's implementation can require exactly the value
+/// capabilities it uses: all-gather and all-to-all require [`Transpose`], while sum-scatter also requires [`Reduce`].
+/// Keeping this capability separate from [`ShapeChangingCollectiveOperation`] leaves type inference, interpretation,
+/// and differentiation independent of batching contexts. A generic function on that operation trait would give every
+/// implementation the same context bounds and prevent sum-scatter from adding its reduction requirement separately.
+trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangingCollectiveOperation {
     /// Consumes the mapped batch axis of a `batch` level that binds this collective's named axis, given the per-item
     /// output extents and sharding in the batching policy's representation, and returns the result together with the
     /// output batch axis that the collective chooses (e.g., replicated for an all-gather, whose items all receive the
@@ -972,9 +975,7 @@ pub(crate) trait ShapeChangingCollectiveKernel<C: Context<Type = ArrayType>>:
 ///
 /// The collective kernels own every formula. This trait exposes only the extent representation and the alignment and
 /// reshape encodings that differ between homogeneous arrays and composite array/dimension programs.
-pub(crate) trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>:
-    ArrayExtentBatchingPolicy<C>
-{
+trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayExtentBatchingPolicy<C> {
     /// Extent representation consumed by the shared collective kernels.
     type ShapeExtent: Clone + Debug + Div + Mul;
 
@@ -1511,15 +1512,15 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
 /// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
 /// automatically for every type that implements all of its members. The group is parameterized by the [`Type`] universe
-/// `T` of its values because [`ParallelPermute`] and [`ParallelRaggedAllToAll`] are. The context-side [`AxisIndex`] is implemented by contexts rather
-/// than values and is therefore not a member.
+/// `T` of its values because several of its members are. The context-side [`AxisIndex`] is implemented by contexts
+/// rather than values and is therefore not a member.
 pub trait CollectiveOperations<T: Type>:
     ParallelReduce
     + ParallelVary
-    + ParallelAllGather
-    + ParallelSumScatter
+    + ParallelAllGather<T>
+    + ParallelSumScatter<T>
     + ParallelPermute<T>
-    + ParallelAllToAll
+    + ParallelAllToAll<T>
     + ParallelRaggedAllToAll<T>
 {
 }
@@ -1528,10 +1529,10 @@ impl<
     T: Type,
     V: ParallelReduce
         + ParallelVary
-        + ParallelAllGather
-        + ParallelSumScatter
+        + ParallelAllGather<T>
+        + ParallelSumScatter<T>
         + ParallelPermute<T>
-        + ParallelAllToAll
+        + ParallelAllToAll<T>
         + ParallelRaggedAllToAll<T>,
 > CollectiveOperations<T> for V
 {

@@ -9,7 +9,7 @@ use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, Batch
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::collectives::check_manual_mesh_axis;
+use crate::operations::collectives::validate_manual_mesh_axis;
 use crate::operations::constants::iota::IotaOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -110,7 +110,7 @@ impl Operation for AxisIndexOperation {
         check_count!("input", input_types, 0, TypeError);
         let mut output = ArrayType::scalar(DataType::U64);
         if let Some(mesh) = &self.mesh {
-            check_manual_mesh_axis(AXIS_INDEX_OPERATION_NAME, &self.axis_name, None, mesh)?;
+            validate_manual_mesh_axis(AXIS_INDEX_OPERATION_NAME, &self.axis_name, None, mesh)?;
             output = output
                 .with_sharding(
                     Sharding::replicated(mesh.clone(), 0)
