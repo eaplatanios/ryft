@@ -161,26 +161,11 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value-level capability bundle that groups every operation Ryft supports on arrays, so that generic array code can
 /// state one bound instead of listing each capability it uses. Its members are the capability groups and individual
 /// capabilities through which values stage or execute [`ArrayOperation`] variants, listed in variant order. It is
 /// implemented automatically for every value that implements all of its members, and so it must never be implemented
 /// manually.
-///
-/// Variants without a value-level capability are necessarily absent. These are the context-side constructors
-/// [`Zero`], [`One`](crate::operations::constants::One), [`Constant`](crate::operations::constants::Constant),
-/// [`Iota`](crate::operations::constants::Iota), and [`AxisIndex`](crate::operations::collectives::AxisIndex), and
-/// the variants that function-level APIs and transforms stage on behalf of values, namely control flow,
-/// rematerialization, linear calls, custom functions, and [`ArrayOperation::DotProductAttentionBackward`].
-///
-/// # Tracers
-///
-/// This bundle implies nothing about the tracers derived from an implementing value. Generic code that traces (e.g.,
-/// to differentiate) states that requirement as a separate bound, such as
-/// `LinearizationTracer<A::ExecutionDomain>: ArrayOperations`, because implying it here would make the trait solver
-/// chase an unbounded tower of nested tracer types.
 pub trait ArrayOperations:
     Value<Type = ArrayType>
     + ConstantOperations
@@ -249,8 +234,8 @@ impl<
 #[ryft(identity)]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
-    Min(DimensionMinOperation),
     Max(DimensionMaxOperation),
+    Min(DimensionMinOperation),
     Add(DimensionAddOperation),
     Sub(DimensionSubOperation),
     SaturatingSub(DimensionSaturatingSubOperation),
@@ -260,17 +245,21 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Pow(DimensionPowOperation),
 }
 
+// TODO(eaplatanios): Is this not supported by our `Operation` derive macro in some way?
 // Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
-// dimension is rejected by [`ReplicatedDimensionBatchingPolicy`] before this rule is called because representing one
-// extent per batch item would require a ragged value model.
-impl<C: Context<Type = ArrayIrType>>
-    BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
+// dimension is rejected by `ReplicatedDimensionBatchingPolicy` before this rule is called because representing
+// one extent per batch item would require a ragged value model.
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+            Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+            Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        >,
+> BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
     for DimensionOperation<DimensionValue>
-where
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
+    #[inline]
     fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
         &self,
         context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
@@ -288,22 +277,14 @@ where
 /// Checked arithmetic reuses the shared [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`]
 /// capabilities alongside the dedicated [`DimensionMin`], [`DimensionMax`], [`DimensionSaturatingSub`], and
 /// [`DimensionPow`]. It is implemented automatically for every value that implements all of its members, and so it
-/// must never be implemented manually. [`ArrayIrOperations`] requires it of the first-class-dimension projections of
-/// composite values.
-///
-/// [`DimensionOperation::Constant`] is necessarily absent, because
-/// [`DimensionConstant`](crate::operations::constants::DimensionConstant) is implemented by contexts rather than
-/// values. The conversions [`DimensionSize`], [`DimensionFromScalar`], and [`DimensionToScalar`] belong to
-/// [`ArrayIrOperations`] instead, because their signatures cross the array and first-class-dimension member kinds.
-///
-/// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value, and
-/// a tracer requirement stays a separate bound.
+/// must never be implemented manually.
 pub trait DimensionOperations:
     Value<Type = DimensionType>
-    + DimensionMin
     + DimensionMax
+    + DimensionMin
     + Add
     + Sub
+    // TODO(eaplatanios): Do we need a more general `SaturatingSub` operation type and capability trait as well?
     + DimensionSaturatingSub
     + Mul
     + Div
@@ -326,6 +307,8 @@ impl<
 > DimensionOperations for V
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Closed [`Operation`] family for Ryft's array IR, whose values include ordinary arrays,
 /// first-class runtime dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of
