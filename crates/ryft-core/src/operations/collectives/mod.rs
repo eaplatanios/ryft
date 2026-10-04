@@ -46,11 +46,11 @@ use crate::arrays::{
     Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes};
-use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError};
+use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
 use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, TranspositionContext,
+    DifferentiationPolicy, DifferentiationTracer, TranspositionContext,
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
@@ -82,20 +82,16 @@ pub mod parallel_vary;
 pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
 pub use parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
-    array_parallel_all_gather,
 };
 pub use parallel_all_to_all::{
     PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation, ParallelSwapAxes,
-    array_parallel_all_to_all,
 };
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
 };
 pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
-pub use parallel_sum_scatter::{
-    PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation, array_parallel_sum_scatter,
-};
+pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 
 /// Shape semantics of the collectives that resize an array axis (e.g., [`ParallelAllGatherOperation`],
@@ -488,7 +484,7 @@ fn infer_array_ir_shape_changing_collective_output_type(
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Single-input linear collective over a named axis (i.e., [`ParallelPermuteOperation`],
+/// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
 /// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
 /// exchanges values over a manual mesh axis, that axis's mesh. Its tangent rides the same collective, and its transpose
@@ -497,9 +493,9 @@ fn infer_array_ir_shape_changing_collective_output_type(
 /// that delegate to the provided functions, so that every operation module reads the same way.
 ///
 /// The hooks named after a public accessor of the operation (e.g., [`axis_name`](Self::axis_name)) return the same
-/// values. They are repeated here because this trait is private, while the accessors are public API.
+/// values. They are repeated here because this trait is private, while the accessors are part of the public API.
 trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
-    /// Collective that transposition stages on the output cotangent.
+    /// Collective operation type that transposition stages on the output cotangent.
     type Adjoint: Clone + Operation<Type = ArrayType>;
 
     /// Returns the name of the axis that this collective exchanges values over.
@@ -513,7 +509,7 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     fn mesh(&self) -> Option<&LogicalMesh>;
 
     /// Returns the number of participants that each instance of this collective combines. Collectives with participant
-    /// groups return the common group size; every other collective combines all participants of its axis.
+    /// groups return the common group size while every other collective combines all participants of its axis.
     ///
     /// # Errors
     ///
@@ -969,6 +965,31 @@ trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangi
         output_extents: Vec<P::ShapeExtent>,
         output_sharding: Option<Sharding>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
+}
+
+/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain.
+///
+/// This marker opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
+/// implementations. Each implementation separately requires its operation to be supported by the dispatch domain,
+/// named-axis resolution through [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait
+/// alone does not require support for every collective. Backend array types implement it to reuse these staging rules
+/// without defining their own collective capability implementations.
+///
+/// Homogeneous [`Tracer`], [`BatchingTracer`], and [`DifferentiationTracer`] values opt in. Projected array values
+/// instead delegate through their composite value so that runtime output extents remain explicit inputs; they must
+/// not implement this trait. Concrete host arrays retain their own unbound-axis diagnostics and do not opt in either.
+pub trait ShapeChangingCollectiveValue: Value<Type = ArrayType> {}
+
+impl<C: Context> ShapeChangingCollectiveValue for Tracer<C> where Self: Value<Type = ArrayType> {}
+
+impl<C: Context, P: BatchingPolicy<C>> ShapeChangingCollectiveValue for BatchingTracer<C, P> where
+    Self: Value<Type = ArrayType>
+{
+}
+
+impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for DifferentiationTracer<C, P> where
+    Self: Value<Type = ArrayType>
+{
 }
 
 /// Representation boundary used only by shape-changing collective batching rules.
