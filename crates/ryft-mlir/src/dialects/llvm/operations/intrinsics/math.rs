@@ -41,10 +41,10 @@ pub fn intr_acos<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ACOS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_acos`"))
@@ -89,10 +89,10 @@ pub fn intr_asin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ASIN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_asin`"))
@@ -151,11 +151,11 @@ pub fn intr_atan2<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATAN2_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_atan2`"))
@@ -200,10 +200,10 @@ pub fn intr_atan<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATAN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_atan`"))
@@ -254,9 +254,9 @@ pub fn intr_abs<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ABS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("is_int_min_poison", is_int_min_poison);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("is_int_min_poison", is_int_min_poison)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_abs`"))
     })
@@ -288,8 +288,8 @@ pub fn intr_assume<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ASSUME_OPERATION_NAME, location);
-    builder = builder.add_operand(condition);
-    builder = builder.add_attribute("op_bundle_sizes", context.dense_i32_array_attribute(&[])?);
+    builder = builder.add_operand(condition)?;
+    builder = builder.add_attribute("op_bundle_sizes", context.dense_i32_array_attribute(&[])?)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_assume`"))
     })
@@ -327,8 +327,8 @@ pub fn intr_bit_reverse<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(BIT_REVERSE_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -368,8 +368,8 @@ pub fn intr_bswap<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(BYTE_SWAP_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_bswap`"))
     })
@@ -427,11 +427,11 @@ pub fn intr_copy_sign<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COPY_SIGN_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -478,10 +478,10 @@ pub fn intr_cos<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_cos`"))
@@ -526,10 +526,10 @@ pub fn intr_cosh<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COSH_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_cosh`"))
@@ -580,9 +580,9 @@ pub fn intr_ctlz<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COUNT_LEADING_ZEROS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("is_zero_poison", is_zero_poison);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("is_zero_poison", is_zero_poison)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ctlz`"))
     })
@@ -632,9 +632,9 @@ pub fn intr_count_trailing_zeros<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COUNT_TRAILING_ZEROS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("is_zero_poison", is_zero_poison);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("is_zero_poison", is_zero_poison)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -674,8 +674,8 @@ pub fn intr_ct_pop<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CT_POP_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ct_pop`"))
     })
@@ -719,10 +719,10 @@ pub fn intr_exp10<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXP10_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_exp10`"))
@@ -767,10 +767,10 @@ pub fn intr_exp2<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXP2_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_exp2`"))
@@ -815,10 +815,10 @@ pub fn intr_exp<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXP_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_exp`"))
@@ -871,9 +871,9 @@ pub fn intr_expect<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXPECT_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(expected);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(expected)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_expect`"))
     })
@@ -937,10 +937,10 @@ pub fn intr_expect_with_probability<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXPECT_WITH_PROBABILITY_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(expected);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("prob", prob);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(expected)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("prob", prob)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -986,10 +986,10 @@ pub fn intr_fabs<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FABS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_fabs`"))
@@ -1034,10 +1034,10 @@ pub fn intr_ceil<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FCEIL_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ceil`"))
@@ -1082,10 +1082,10 @@ pub fn intr_floor<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FFLOOR_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_floor`"))
@@ -1151,12 +1151,12 @@ pub fn intr_fma<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FMA_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_fma`"))
@@ -1222,12 +1222,12 @@ pub fn intr_fmuladd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FMUL_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_fmuladd`"))
@@ -1272,10 +1272,10 @@ pub fn intr_trunc<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FTRUNC_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_trunc`"))
@@ -1320,10 +1320,10 @@ pub fn intr_frexp<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FRACTION_EXP_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_frexp`"))
@@ -1383,10 +1383,10 @@ pub fn intr_fshl<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FSHL_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_fshl`"))
     })
@@ -1445,10 +1445,10 @@ pub fn intr_fshr<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FSHR_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_fshr`"))
     })
@@ -1486,8 +1486,8 @@ pub fn intr_is_constant<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(IS_CONSTANT_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1539,9 +1539,9 @@ pub fn intr_is_fpclass<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(IS_FPCLASS_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("bit", bit);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("bit", bit)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1581,8 +1581,8 @@ pub fn intr_llrint<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LLRINT_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_llrint`"))
     })
@@ -1620,8 +1620,8 @@ pub fn intr_llround<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>,
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LLROUND_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_llround`"))
     })
@@ -1679,11 +1679,11 @@ pub fn intr_ldexp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LOAD_EXP_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(power);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(power)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ldexp`"))
@@ -1728,10 +1728,10 @@ pub fn intr_log10<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LOG10_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_log10`"))
@@ -1776,10 +1776,10 @@ pub fn intr_log2<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LOG2_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_log2`"))
@@ -1824,10 +1824,10 @@ pub fn intr_log<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LOG_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_log`"))
@@ -1866,8 +1866,8 @@ pub fn intr_lrint<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LRINT_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_lrint`"))
     })
@@ -1905,8 +1905,8 @@ pub fn intr_lround<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LROUND_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_lround`"))
     })
@@ -1964,11 +1964,11 @@ pub fn intr_maxnum<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MAX_NUM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_maxnum`"))
@@ -2027,11 +2027,11 @@ pub fn intr_maximum<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MAXIMUM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_maximum`"))
@@ -2090,11 +2090,11 @@ pub fn intr_min_num<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MIN_NUM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_min_num`"))
@@ -2153,11 +2153,11 @@ pub fn intr_minimum<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MINIMUM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_minimum`"))
@@ -2202,10 +2202,10 @@ pub fn intr_nearby_int<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(NEARBY_INT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2266,11 +2266,11 @@ pub fn intr_powi<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(POW_I_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(power);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(power)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_powi`"))
@@ -2329,11 +2329,11 @@ pub fn intr_pow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(POW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_pow`"))
@@ -2378,10 +2378,10 @@ pub fn intr_rint<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(RINT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_rint`"))
@@ -2426,10 +2426,10 @@ pub fn intr_round_even<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ROUND_EVEN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2476,10 +2476,10 @@ pub fn intr_round<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ROUND_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_round`"))
@@ -2532,9 +2532,9 @@ pub fn intr_sadd_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SADD_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2588,9 +2588,9 @@ pub fn intr_sadd_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SADD_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2644,9 +2644,9 @@ pub fn intr_scmp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SCMP_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_scmp`"))
     })
@@ -2698,9 +2698,9 @@ pub fn intr_smax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_smax`"))
     })
@@ -2752,9 +2752,9 @@ pub fn intr_smin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_smin`"))
     })
@@ -2806,9 +2806,9 @@ pub fn intr_smul_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SMUL_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2848,8 +2848,8 @@ pub fn intr_ssa_copy<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SSA_COPY_OPERATION_NAME, location);
-    builder = builder.add_operand(operand);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(operand)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2903,9 +2903,9 @@ pub fn intr_sshl_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SSHL_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2959,9 +2959,9 @@ pub fn intr_ssub_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SSUB_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3015,9 +3015,9 @@ pub fn intr_ssub_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SSUB_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3063,10 +3063,10 @@ pub fn intr_sin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SIN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_sin`"))
@@ -3111,10 +3111,10 @@ pub fn intr_sincos<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SINCOS_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_sincos`"))
@@ -3159,10 +3159,10 @@ pub fn intr_sinh<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SINH_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_sinh`"))
@@ -3207,10 +3207,10 @@ pub fn intr_sqrt<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SQRT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_sqrt`"))
@@ -3243,7 +3243,7 @@ pub fn intr_stepvector<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(STEP_VECTOR_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3289,10 +3289,10 @@ pub fn intr_tan<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(TAN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_tan`"))
@@ -3337,10 +3337,10 @@ pub fn intr_tanh<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(TANH_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_tanh`"))
@@ -3393,9 +3393,9 @@ pub fn intr_uadd_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UADD_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3449,9 +3449,9 @@ pub fn intr_uadd_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UADD_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3505,9 +3505,9 @@ pub fn intr_ucmp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UCMP_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ucmp`"))
     })
@@ -3559,9 +3559,9 @@ pub fn intr_umax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_umax`"))
     })
@@ -3613,9 +3613,9 @@ pub fn intr_umin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_umin`"))
     })
@@ -3667,9 +3667,9 @@ pub fn intr_umul_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UMUL_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3723,9 +3723,9 @@ pub fn intr_ushl_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(USHL_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3779,9 +3779,9 @@ pub fn intr_usub_sat<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(USUB_SAT_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3835,9 +3835,9 @@ pub fn intr_usub_with_overflow<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(USUB_WITH_OVERFLOW_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

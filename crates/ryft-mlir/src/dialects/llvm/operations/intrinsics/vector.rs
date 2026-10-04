@@ -35,8 +35,8 @@ pub fn intr_vector_deinterleave2<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_DEINTERLEAVE2_OPERATION_NAME, location);
-    builder = builder.add_operand(vector);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(vector)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -88,9 +88,9 @@ pub fn intr_vector_extract<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_EXTRACT_OPERATION_NAME, location);
-    builder = builder.add_operand(source_vector);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("pos", pos);
+    builder = builder.add_operand(source_vector)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("pos", pos)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -156,10 +156,10 @@ pub fn intr_vector_insert<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_INSERT_OPERATION_NAME, location);
-    builder = builder.add_operand(destination_vector);
-    builder = builder.add_operand(source_vector);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("pos", pos);
+    builder = builder.add_operand(destination_vector)?;
+    builder = builder.add_operand(source_vector)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("pos", pos)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -213,9 +213,9 @@ pub fn intr_vector_interleave2<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_INTERLEAVE2_OPERATION_NAME, location);
-    builder = builder.add_operand(first_vector);
-    builder = builder.add_operand(second_vector);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first_vector)?;
+    builder = builder.add_operand(second_vector)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -255,8 +255,8 @@ pub fn intr_vector_reduce_add<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -296,8 +296,8 @@ pub fn intr_vector_reduce_and<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_AND_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -357,11 +357,11 @@ pub fn intr_vector_reduce_fadd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FADD_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -408,10 +408,10 @@ pub fn intr_vector_reduce_fmax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -458,10 +458,10 @@ pub fn intr_vector_reduce_fmaximum<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMAXIMUM_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -508,10 +508,10 @@ pub fn intr_vector_reduce_fmin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -558,10 +558,10 @@ pub fn intr_vector_reduce_fminimum<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMINIMUM_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -622,11 +622,11 @@ pub fn intr_vector_reduce_fmul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_FMUL_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmathFlags", fastmath_flags);
+        builder = builder.add_attribute("fastmathFlags", fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -667,8 +667,8 @@ pub fn intr_vector_reduce_mul<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_MUL_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -708,8 +708,8 @@ pub fn intr_vector_reduce_or<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_OR_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -749,8 +749,8 @@ pub fn intr_vector_reduce_smax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_SMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -790,8 +790,8 @@ pub fn intr_vector_reduce_smin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_SMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -831,8 +831,8 @@ pub fn intr_vector_reduce_umax<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_UMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -872,8 +872,8 @@ pub fn intr_vector_reduce_umin<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Ty
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_UMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -913,8 +913,8 @@ pub fn intr_vector_reduce_xor<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Typ
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VECTOR_REDUCE_XOR_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -948,7 +948,7 @@ pub fn intr_vscale<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VSCALE_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vscale`"))
     })

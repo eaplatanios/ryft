@@ -1,7 +1,7 @@
 use ryft_xla_sys::bindings::{
     MlirType, mlirComplexTypeGet, mlirFloatTypeGetWidth, mlirTypeIsAFloat8E3M4, mlirTypeIsAFloat8E4M3,
     mlirTypeIsAFloat8E4M3B11FNUZ, mlirTypeIsAFloat8E4M3FN, mlirTypeIsAFloat8E4M3FNUZ, mlirTypeIsAFloat8E5M2,
-    mlirTypeIsAFloat8E5M2FNUZ, mlirTypeIsAFloat8E8M0FNU,
+    mlirTypeIsAFloat8E5M2FNUZ, mlirTypeIsAFloat8E5M3FNU, mlirTypeIsAFloat8E8M0FNU,
 };
 
 use crate::{Context, Error, Type, mlir_subtype_trait_impls};
@@ -106,6 +106,7 @@ mlir_float_type!(Float8E4M3, url = "https://mlir.llvm.org/docs/Dialects/Builtin/
 mlir_float_type!(Float8E4M3B11FNUZ, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e4m3b11fnuztype");
 mlir_float_type!(Float8E4M3FN, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e4m3fntype");
 mlir_float_type!(Float8E4M3FNUZ, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e4m3fnuztype");
+mlir_float_type!(Float8E5M3FNU, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e5m3fnutype");
 mlir_float_type!(Float8E5M2, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e5m2type");
 mlir_float_type!(Float8E5M2FNUZ, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e5m2fnuztype");
 mlir_float_type!(Float8E8M0FNU, url = "https://mlir.llvm.org/docs/Dialects/Builtin/#float8e8m0fnutype");
@@ -145,6 +146,7 @@ impl<'c, 't> Type<'c, 't> for Float8TypeRef<'c, 't> {
                 || mlirTypeIsAFloat8E4M3B11FNUZ(handle)
                 || mlirTypeIsAFloat8E4M3FN(handle)
                 || mlirTypeIsAFloat8E4M3FNUZ(handle)
+                || mlirTypeIsAFloat8E5M3FNU(handle)
                 || mlirTypeIsAFloat8E5M2(handle)
                 || mlirTypeIsAFloat8E5M2FNUZ(handle)
                 || mlirTypeIsAFloat8E8M0FNU(handle)
@@ -174,6 +176,7 @@ impl<'c, 't> Float8Type<'c, 't> for Float8E4M3TypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E4M3B11FNUZTypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E4M3FNTypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E4M3FNUZTypeRef<'c, 't> {}
+impl<'c, 't> Float8Type<'c, 't> for Float8E5M3FNUTypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E5M2TypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E5M2FNUZTypeRef<'c, 't> {}
 impl<'c, 't> Float8Type<'c, 't> for Float8E8M0FNUTypeRef<'c, 't> {}
@@ -232,6 +235,7 @@ mlir_float_type_constructor!(
 );
 mlir_float_type_constructor!(Float8E4M3FN, "Creates a new [`Float8E4M3FNTypeRef`] owned by this [`Context`].");
 mlir_float_type_constructor!(Float8E4M3FNUZ, "Creates a new [`Float8E4M3FNUZTypeRef`] owned by this [`Context`].");
+mlir_float_type_constructor!(Float8E5M3FNU, "Creates a new [`Float8E5M3FNUTypeRef`] owned by this [`Context`].");
 mlir_float_type_constructor!(Float8E5M2, "Creates a new [`Float8E5M2TypeRef`] owned by this [`Context`].");
 mlir_float_type_constructor!(Float8E5M2FNUZ, "Creates a new [`Float8E5M2FNUZTypeRef`] owned by this [`Context`].");
 mlir_float_type_constructor!(Float8E8M0FNU, "Creates a new [`Float8E8M0FNUTypeRef`] owned by this [`Context`].");

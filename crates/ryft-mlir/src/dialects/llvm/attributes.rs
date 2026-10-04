@@ -51,7 +51,7 @@ use ryft_xla_sys::mlir::dialects::llvm::{
     mlirAttributeIsALlvmLoopDistributeAttr, mlirAttributeIsALlvmLoopInterleaveAttr, mlirAttributeIsALlvmLoopLicmAttr,
     mlirAttributeIsALlvmLoopPeeledAttr, mlirAttributeIsALlvmLoopPipelineAttr, mlirAttributeIsALlvmLoopUnrollAndJamAttr,
     mlirAttributeIsALlvmLoopUnrollAttr, mlirAttributeIsALlvmLoopUnswitchAttr, mlirAttributeIsALlvmLoopVectorizeAttr,
-    mlirAttributeIsALlvmMdConstantAttr, mlirAttributeIsALlvmMdFuncAttr, mlirAttributeIsALlvmMdNodeAttr,
+    mlirAttributeIsALlvmMdConstantAttr, mlirAttributeIsALlvmMdGlobalValueAttr, mlirAttributeIsALlvmMdNodeAttr,
     mlirAttributeIsALlvmMdStringAttr, mlirAttributeIsALlvmMemoryEffectsAttr, mlirAttributeIsALlvmMmraTagAttr,
     mlirAttributeIsALlvmModuleFlagAttr, mlirAttributeIsALlvmModuleFlagCgProfileEntryAttr,
     mlirAttributeIsALlvmModuleFlagProfileSummaryAttr, mlirAttributeIsALlvmModuleFlagProfileSummaryDetailedAttr,
@@ -60,8 +60,8 @@ use ryft_xla_sys::mlir::dialects::llvm::{
     mlirAttributeIsALlvmTbaaTagAttr, mlirAttributeIsALlvmTbaaTypeDescriptorAttr, mlirAttributeIsALlvmUndefAttr,
     mlirAttributeIsALlvmUwTableKindAttr, mlirAttributeIsALlvmVScaleRangeAttr, mlirAttributeIsALlvmVecTypeHintAttr,
     mlirAttributeIsALlvmWorkgroupAttributionAttr, mlirAttributeIsALlvmZeroAttr, mlirLLVMMDConstantAttrGet,
-    mlirLLVMMDConstantAttrGetValue, mlirLLVMMDFuncAttrGet, mlirLLVMMDFuncAttrGetName, mlirLLVMMDNodeAttrGet,
-    mlirLLVMMDNodeAttrGetNumOperands, mlirLLVMMDNodeAttrGetOperand, mlirLLVMMDStringAttrGet,
+    mlirLLVMMDConstantAttrGetValue, mlirLLVMMDGlobalValueAttrGet, mlirLLVMMDGlobalValueAttrGetName,
+    mlirLLVMMDNodeAttrGet, mlirLLVMMDNodeAttrGetNumOperands, mlirLLVMMDNodeAttrGetOperand, mlirLLVMMDStringAttrGet,
     mlirLLVMMDStringAttrGetValue, mlirLlvmAddressSpaceAttrGet, mlirLlvmAddressSpaceAttrGetAddressSpace,
     mlirLlvmCConvAttrGetValue, mlirLlvmComdatAttrGetValue, mlirLlvmFramePointerKindAttrGet,
     mlirLlvmFramePointerKindAttrGetValue, mlirLlvmLinkageAttrGetValue, mlirLlvmPoisonAttrGet, mlirLlvmUndefAttrGet,
@@ -706,7 +706,7 @@ llvm_attribute!(DependentLibrariesAttributeRef, mlirAttributeIsALlvmDependentLib
 llvm_attribute!(UwTableKindAttributeRef, mlirAttributeIsALlvmUwTableKindAttr, "unwind table kind");
 llvm_attribute!(MdStringAttributeRef, mlirAttributeIsALlvmMdStringAttr, "metadata string");
 llvm_attribute!(MdConstantAttributeRef, mlirAttributeIsALlvmMdConstantAttr, "metadata constant");
-llvm_attribute!(MdFuncAttributeRef, mlirAttributeIsALlvmMdFuncAttr, "metadata function");
+llvm_attribute!(MdGlobalValueAttributeRef, mlirAttributeIsALlvmMdGlobalValueAttr, "metadata global value");
 llvm_attribute!(MdNodeAttributeRef, mlirAttributeIsALlvmMdNodeAttr, "metadata node");
 
 impl AddressSpaceAttributeRef<'_, '_> {
@@ -783,12 +783,12 @@ impl<'c, 't> MdConstantAttributeRef<'c, 't> {
     }
 }
 
-impl<'c, 't> MdFuncAttributeRef<'c, 't> {
-    /// Returns the referenced metadata function symbol.
+impl<'c, 't> MdGlobalValueAttributeRef<'c, 't> {
+    /// Returns the referenced metadata global value symbol.
     pub fn name(&self) -> Result<FlatSymbolRefAttributeRef<'c, 't>, Error> {
         unsafe {
-            FlatSymbolRefAttributeRef::from_c_api(mlirLLVMMDFuncAttrGetName(self.handle), self.context)
-                .map_err(|_| Error::internal("expected non-null LLVM metadata function symbol attribute"))
+            FlatSymbolRefAttributeRef::from_c_api(mlirLLVMMDGlobalValueAttrGetName(self.handle), self.context)
+                .map_err(|_| Error::internal("expected non-null LLVM metadata global value symbol attribute"))
         }
     }
 }
@@ -956,16 +956,19 @@ impl<'t> Context<'t> {
         }
     }
 
-    /// Creates a new LLVM [`MdFuncAttributeRef`] owned by this [`Context`].
-    pub fn llvm_md_func_attribute<'c, 's, S: Into<StringRef<'s>>>(
+    /// Creates a new LLVM [`MdGlobalValueAttributeRef`] owned by this [`Context`].
+    pub fn llvm_md_global_value_attribute<'c, 's, S: Into<StringRef<'s>>>(
         &'c self,
         name: S,
-    ) -> Result<MdFuncAttributeRef<'c, 't>, Error> {
+    ) -> Result<MdGlobalValueAttributeRef<'c, 't>, Error> {
         self.load_dialect(DialectHandle::llvm()?)?;
         let name = self.flat_symbol_ref_attribute(name);
         unsafe {
-            MdFuncAttributeRef::from_c_api(mlirLLVMMDFuncAttrGet(*self.handle.borrow(), name.to_c_api()), self)
-                .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_func_attribute`"))
+            MdGlobalValueAttributeRef::from_c_api(
+                mlirLLVMMDGlobalValueAttrGet(*self.handle.borrow(), name.to_c_api()),
+                self,
+            )
+            .map_err(|_| Error::invalid_argument("invalid arguments to `Context::llvm_md_global_value_attribute`"))
         }
     }
 
@@ -2313,49 +2316,56 @@ mod tests {
     }
 
     #[test]
-    fn test_md_func_attribute() {
+    fn test_md_global_value_attribute() {
         let context = Context::new();
-        let attribute = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute = context.llvm_md_global_value_attribute("callee").unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.dialect().unwrap().namespace().unwrap(), "llvm");
         assert_eq!(attribute.name().unwrap().reference().as_str().unwrap(), "callee");
     }
 
     #[test]
-    fn test_md_func_attribute_equality() {
+    fn test_md_global_value_attribute_equality() {
         let context = Context::new();
-        let attribute_1 = context.llvm_md_func_attribute("callee").unwrap();
-        let attribute_2 = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute_1 = context.llvm_md_global_value_attribute("callee").unwrap();
+        let attribute_2 = context.llvm_md_global_value_attribute("callee").unwrap();
         assert_eq!(attribute_1, attribute_2);
 
-        let attribute_2 = context.llvm_md_func_attribute("other").unwrap();
+        let attribute_2 = context.llvm_md_global_value_attribute("other").unwrap();
         assert_ne!(attribute_1, attribute_2);
 
         let context = Context::new();
-        let attribute_2 = context.llvm_md_func_attribute("callee").unwrap();
+        let attribute_2 = context.llvm_md_global_value_attribute("callee").unwrap();
         assert_ne!(attribute_1, attribute_2);
     }
 
     #[test]
-    fn test_md_func_attribute_display_and_debug() {
+    fn test_md_global_value_attribute_display_and_debug() {
         let context = Context::new();
-        test_attribute_display_and_debug(context.llvm_md_func_attribute("callee").unwrap(), "#llvm.md_func<@callee>");
-    }
-
-    #[test]
-    fn test_md_func_attribute_parsing() {
-        let context = Context::new();
-        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
-        assert_eq!(
-            context.parse_attribute("#llvm.md_func<@callee>").unwrap().cast::<MdFuncAttributeRef>().unwrap(),
-            context.llvm_md_func_attribute("callee").unwrap(),
+        test_attribute_display_and_debug(
+            context.llvm_md_global_value_attribute("callee").unwrap(),
+            "#llvm.md_global_value<@callee>",
         );
     }
 
     #[test]
-    fn test_md_func_attribute_casting() {
+    fn test_md_global_value_attribute_parsing() {
         let context = Context::new();
-        test_attribute_casting(context.llvm_md_func_attribute("callee").unwrap());
+        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
+        assert_eq!(
+            context
+                .parse_attribute("#llvm.md_global_value<@callee>")
+                .unwrap()
+                .cast::<MdGlobalValueAttributeRef>()
+                .unwrap(),
+            context.llvm_md_global_value_attribute("callee").unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_md_global_value_attribute_casting() {
+        let context = Context::new();
+        test_attribute_casting(context.llvm_md_global_value_attribute("callee").unwrap());
     }
 
     #[test]
@@ -2365,7 +2375,7 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         let attribute =
             context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         assert_eq!(&context, attribute.context());
@@ -2383,7 +2393,7 @@ mod tests {
                 .into_iter()
                 .map(|operand| operand.to_string())
                 .collect::<Vec<_>>(),
-            vec!["#llvm.md_const<42 : i32>", "#llvm.md_string<\"foo.buffer\">", "#llvm.md_func<@callee>"],
+            vec!["#llvm.md_const<42 : i32>", "#llvm.md_string<\"foo.buffer\">", "#llvm.md_global_value<@callee>"],
         );
     }
 
@@ -2394,7 +2404,7 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         let attribute_1 =
             context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         let attribute_2 =
@@ -2409,7 +2419,7 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         let attribute_2 =
             context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap();
         assert_ne!(attribute_1, attribute_2);
@@ -2422,10 +2432,10 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         test_attribute_display_and_debug(
             context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap(),
-            "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_func<@callee>>",
+            "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_global_value<@callee>>",
         );
     }
 
@@ -2436,11 +2446,11 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         assert_eq!(
             context
                 .parse_attribute(
-                    "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_func<@callee>>"
+                    "#llvm.md_node<#llvm.md_const<42 : i32>, #llvm.md_string<\"foo.buffer\">, #llvm.md_global_value<@callee>>"
                 )
                 .unwrap()
                 .cast::<MdNodeAttributeRef>()
@@ -2456,7 +2466,7 @@ mod tests {
             .llvm_md_constant_attribute(context.integer_attribute(context.signless_integer_type(32), 42))
             .unwrap();
         let string = context.llvm_md_string_attribute("foo.buffer").unwrap();
-        let function = context.llvm_md_func_attribute("callee").unwrap();
+        let function = context.llvm_md_global_value_attribute("callee").unwrap();
         test_attribute_casting(
             context.llvm_md_node_attribute(&[constant.as_ref(), string.as_ref(), function.as_ref()]).unwrap(),
         );

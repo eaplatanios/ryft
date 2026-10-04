@@ -102,23 +102,23 @@ pub fn cmp_xchg<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATOMIC_CMP_XCHG_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(compare_value);
-    builder = builder.add_operand(new_value);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("success_ordering", success_ordering);
-    builder = builder.add_attribute("failure_ordering", failure_ordering);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(compare_value)?;
+    builder = builder.add_operand(new_value)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("success_ordering", success_ordering)?;
+    builder = builder.add_attribute("failure_ordering", failure_ordering)?;
     if let Some(syncscope) = syncscope {
-        builder = builder.add_attribute("syncscope", syncscope);
+        builder = builder.add_attribute("syncscope", syncscope)?;
     }
     if let Some(alignment) = alignment {
-        builder = builder.add_attribute("alignment", alignment);
+        builder = builder.add_attribute("alignment", alignment)?;
     }
     if weak {
-        builder = builder.add_attribute("weak", context.unit_attribute());
+        builder = builder.add_attribute("weak", context.unit_attribute())?;
     }
     if is_volatile {
-        builder = builder.add_attribute("volatile_", context.unit_attribute());
+        builder = builder.add_attribute("volatile_", context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::cmp_xchg`"))
@@ -205,19 +205,19 @@ pub fn atomic_rmw<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L: L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ATOMIC_RMW_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("bin_op", bin_op);
-    builder = builder.add_attribute("ordering", ordering);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("bin_op", bin_op)?;
+    builder = builder.add_attribute("ordering", ordering)?;
     if let Some(syncscope) = syncscope {
-        builder = builder.add_attribute("syncscope", syncscope);
+        builder = builder.add_attribute("syncscope", syncscope)?;
     }
     if let Some(alignment) = alignment {
-        builder = builder.add_attribute("alignment", alignment);
+        builder = builder.add_attribute("alignment", alignment)?;
     }
     if is_volatile {
-        builder = builder.add_attribute("volatile_", context.unit_attribute());
+        builder = builder.add_attribute("volatile_", context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::atomic_rmw`"))
@@ -262,9 +262,9 @@ pub fn fence<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FENCE_OPERATION_NAME, location);
-    builder = builder.add_attribute("ordering", ordering);
+    builder = builder.add_attribute("ordering", ordering)?;
     if let Some(syncscope) = syncscope {
-        builder = builder.add_attribute("syncscope", syncscope);
+        builder = builder.add_attribute("syncscope", syncscope)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::fence`"))

@@ -723,8 +723,8 @@ macro_rules! mlir_generic_unary_op {
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[input])
-                    .add_result(output_type)
+                    .add_operands(&[input])?
+                    .add_result(output_type)?
                     .build()
                     .and_then(|operation| unsafe {
                         $crate::DetachedOp::cast(operation).ok_or_else(|| {
@@ -782,12 +782,12 @@ macro_rules! mlir_unary_op {
             pub fn $op<'v, 'c: 'v, 't: 'c, V: $crate::Value<'v, 'c, 't>, L: $crate::Location<'c, 't>>(
                 input: V,
                 location: L,
-            ) -> Result<[<Detached $op:camel Operation>]<'c, 'c>, $crate::errors::Error> {
+            ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[input])
+                    .add_operands(&[input])?
                     .enable_result_type_inference()
                     .build()
                     .and_then(|operation| unsafe {
@@ -871,7 +871,7 @@ macro_rules! mlir_binary_op {
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+                    .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
                     .enable_result_type_inference()
                     .build()
                     .and_then(|operation| unsafe {
@@ -915,8 +915,13 @@ macro_rules! mlir_binary_op {
 /// ```
 #[macro_export]
 macro_rules! mlir_pass {
-    ($rust_name:ident, $mlir_name:ident) => {
+    ($rust_name:ident, $mlir_name:ident $(, $documentation:literal)? $(,)?) => {
         paste::paste! {
+            #[doc = concat!(
+                "Creates a new [`Pass`](crate::Pass) for insertion into a ",
+                "[`PassManager`](crate::PassManager).",
+                $("\n\n", $documentation,)?
+            )]
             pub fn [<create_ $rust_name>]() -> Result<$crate::Pass, $crate::errors::Error> {
                 unsafe {
                     $crate::Pass::from_c_api(ryft_xla_sys::bindings::[<mlirCreate $mlir_name>]())
@@ -928,6 +933,7 @@ macro_rules! mlir_pass {
                 }
             }
 
+            #[doc = concat!("Registers this pass once. Repeated calls are safe.", $("\n\n", $documentation,)?)]
             pub fn [<register_ $rust_name>]() {
                 // Use `OnceLock` to ensure that the pass registration function is called at most once.
                 static INITIALIZED: OnceLock<()> = OnceLock::new();
@@ -939,3 +945,7 @@ macro_rules! mlir_pass {
         }
     };
 }
+
+pub(crate) use crate::{
+    mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_pass, mlir_subtype_trait_impls,
+};

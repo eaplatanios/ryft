@@ -3,8 +3,8 @@ use ryft_xla_sys::mlir::dialects::mosaic::tpu::{
     MlirMosaicTpuEnumAttribute, mlirAttributeIsAMosaicTpuDotDimensionNumbersAttr,
     mlirAttributeIsAMosaicTpuElementWindowAttr, mlirAttributeIsAMosaicTpuEnumAttr,
     mlirAttributeIsAMosaicTpuMemorySpaceAttr, mlirAttributeIsAMosaicTpuTiledLayoutAttr,
-    mlirAttributeIsAMosaicTpuVectorLayoutAttr, mlirMosaicTpuDotDimensionNumbersAttrGet,
-    mlirMosaicTpuDotDimensionNumbersAttrGetLhsBatchDims, mlirMosaicTpuDotDimensionNumbersAttrGetLhsContractingDims,
+    mlirMosaicTpuDotDimensionNumbersAttrGet, mlirMosaicTpuDotDimensionNumbersAttrGetLhsBatchDims,
+    mlirMosaicTpuDotDimensionNumbersAttrGetLhsContractingDims,
     mlirMosaicTpuDotDimensionNumbersAttrGetLhsNonContractingDims,
     mlirMosaicTpuDotDimensionNumbersAttrGetOutputDimOrder, mlirMosaicTpuDotDimensionNumbersAttrGetRhsBatchDims,
     mlirMosaicTpuDotDimensionNumbersAttrGetRhsContractingDims,
@@ -403,36 +403,6 @@ impl<'c, 't> Attribute<'c, 't> for ElementWindowAttributeRef<'c, 't> {
 }
 
 mlir_subtype_trait_impls!(ElementWindowAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
-
-/// Mosaic TPU vector-layout [`Attribute`].
-#[derive(Copy, Clone)]
-pub struct VectorLayoutAttributeRef<'c, 't> {
-    /// Handle that represents this [`Attribute`] in the MLIR C API.
-    handle: MlirAttribute,
-
-    /// [`Context`] that owns this [`Attribute`].
-    context: &'c Context<'t>,
-}
-
-impl<'c, 't> Attribute<'c, 't> for VectorLayoutAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
-        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicTpuVectorLayoutAttr(handle) } {
-            Ok(Self { handle, context })
-        } else {
-            Err(Error::invalid_argument("expected MLIR attribute handle"))
-        }
-    }
-
-    unsafe fn to_c_api(&self) -> MlirAttribute {
-        self.handle
-    }
-
-    fn context(&self) -> &'c Context<'t> {
-        self.context
-    }
-}
-
-mlir_subtype_trait_impls!(VectorLayoutAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
 /// Mosaic TPU tiled-layout [`Attribute`].
 #[derive(Copy, Clone)]

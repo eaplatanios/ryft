@@ -1,9 +1,11 @@
 pub mod affine;
 pub mod arith;
 pub mod r#async;
+pub mod bufferization;
 pub mod builtin;
 pub mod cf;
 pub mod chlo;
+pub mod complex;
 pub mod dialect;
 pub mod emit_c;
 pub mod func;
@@ -12,6 +14,7 @@ pub mod handle;
 pub mod index;
 pub mod linalg;
 pub mod llvm;
+pub mod math;
 pub mod memref;
 pub mod mhlo;
 pub mod mosaic;
@@ -28,6 +31,8 @@ pub mod stable_hlo;
 pub mod tensor;
 pub mod transform;
 pub mod triton;
+pub mod ub;
+pub mod vector;
 pub mod versioned_hlo;
 
 pub use dialect::*;

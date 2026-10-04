@@ -50,7 +50,7 @@ pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     OperationBuilder::new("builtin.module", location)
-        .add_region(region)
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `builtin::module`"))
@@ -66,11 +66,12 @@ pub fn named_module<'c, 't: 'c, S: TryIntoWithContext<'c, 't, StringAttributeRef
 ) -> Result<DetachedModuleOperation<'c, 't>, Error> {
     let context = location.context();
     let mut builder = OperationBuilder::new("builtin.module", location);
-    builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
+    builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?;
     if visibility != SymbolVisibility::default() {
-        builder = builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(visibility));
+        builder =
+            builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(visibility))?;
     }
-    builder.add_region(region).build().and_then(|operation| unsafe {
+    builder.add_region(region)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `builtin::named_module`"))
@@ -121,8 +122,8 @@ pub fn unrealized_conversion_cast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: T
     location: L,
 ) -> Result<DetachedUnrealizedConversionCastOperation<'c, 't>, Error> {
     OperationBuilder::new("builtin.unrealized_conversion_cast", location)
-        .add_operands(arguments)
-        .add_results(result_types)
+        .add_operands(arguments)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation

@@ -43,8 +43,8 @@ pub fn assert<
     let context = location.context();
     context.load_dialect(DialectHandle::cf()?)?;
     OperationBuilder::new("cf.assert", location)
-        .add_operand(argument)
-        .add_attribute(ASSERT_MESSAGE_ATTRIBUTE, message.try_into_with_context(context)?)
+        .add_operand(argument)?
+        .add_attribute(ASSERT_MESSAGE_ATTRIBUTE, message.try_into_with_context(context)?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `cf::assert`"))
@@ -84,8 +84,8 @@ pub fn br<'b, 'v, 'c: 'b + 'v, 't: 'c, B: Block<'b, 'c, 't>, V: Value<'v, 'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::cf()?)?;
     OperationBuilder::new("cf.br", location)
-        .add_operands(operands)
-        .add_successor(successor)
+        .add_operands(operands)?
+        .add_successor(successor)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `cf::br`"))
@@ -180,11 +180,11 @@ pub fn cond_br<
     let context = location.context();
     context.load_dialect(DialectHandle::cf()?)?;
     let mut builder = OperationBuilder::new("cf.cond_br", location)
-        .add_operand(predicate)
-        .add_operands(on_true_successor_operands)
-        .add_operands(on_false_successor_operands)
-        .add_successor(on_true_successor)
-        .add_successor(on_false_successor)
+        .add_operand(predicate)?
+        .add_operands(on_true_successor_operands)?
+        .add_operands(on_false_successor_operands)?
+        .add_successor(on_true_successor)?
+        .add_successor(on_false_successor)?
         .add_attribute(
             CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -192,10 +192,10 @@ pub fn cond_br<
                 on_true_successor_operands.len() as i32,
                 on_false_successor_operands.len() as i32,
             ])?,
-        );
+        )?;
     if !branch_weights.is_empty() {
         builder = builder
-            .add_attribute(CONDITIONAL_BRANCH_WEIGHTS_ATTRIBUTE, context.dense_i32_array_attribute(branch_weights)?);
+            .add_attribute(CONDITIONAL_BRANCH_WEIGHTS_ATTRIBUTE, context.dense_i32_array_attribute(branch_weights)?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `cf::cond_br`"))
@@ -342,17 +342,17 @@ pub fn switch<
     let context = location.context();
     context.load_dialect(DialectHandle::cf()?)?;
     let mut builder = OperationBuilder::new("cf.switch", location)
-        .add_operand(flag)
-        .add_operands(default.successor_operands.as_slice())
+        .add_operand(flag)?
+        .add_operands(default.successor_operands.as_slice())?
         .add_operands(
             cases
                 .iter()
                 .flat_map(|branch| branch.successor_operands.iter().copied())
                 .collect::<Vec<_>>()
                 .as_slice(),
-        )
-        .add_successor(&default.successor)
-        .add_successors(cases.iter().map(|branch| &branch.successor).collect::<Vec<_>>().as_slice());
+        )?
+        .add_successor(&default.successor)?
+        .add_successors(cases.iter().map(|branch| &branch.successor).collect::<Vec<_>>().as_slice())?;
     if !cases.is_empty() {
         builder = builder.add_attribute(
             SWITCH_CASE_VALUES_ATTRIBUTE,
@@ -360,7 +360,7 @@ pub fn switch<
                 context.tensor_type(flag_type, &[Size::Static(cases.len())], None, location)?,
                 &cases.iter().map(|branch| branch.value).collect::<Vec<_>>(),
             )?,
-        );
+        )?;
     }
     builder
         .add_attribute(
@@ -368,7 +368,7 @@ pub fn switch<
             context.dense_i32_array_attribute(
                 &cases.iter().map(|branch| branch.successor_operands.len() as i32).collect::<Vec<_>>(),
             )?,
-        )
+        )?
         .add_attribute(
             SWITCH_OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -376,7 +376,7 @@ pub fn switch<
                 default.successor_operands.len() as i32,
                 cases.iter().map(|branch| branch.successor_operands.len() as i32).sum(),
             ])?,
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `cf::switch`"))

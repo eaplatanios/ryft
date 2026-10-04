@@ -3,16 +3,19 @@
 //! The wrappers in this module target the Mosaic GPU dialect version pinned by the `ryft-xla-sys` JAX dependency.
 //! Refer to the [JAX Pallas Mosaic GPU documentation](https://docs.jax.dev/en/latest/pallas/gpu/index.html) for more
 //! information.
+
 use ryft_xla_sys::mlir::dialects::mosaic::gpu::mlirGetDialectHandle__mosaic_gpu__;
 
 use crate::{DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
+pub mod passes;
 pub mod types;
 
 pub use attributes::*;
 pub use operations::*;
+pub use passes::*;
 pub use types::*;
 
 impl DialectHandle<'_, '_> {

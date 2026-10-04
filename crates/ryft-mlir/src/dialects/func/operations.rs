@@ -93,9 +93,9 @@ pub fn call<
     let context = location.context();
     context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
-        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
-        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>());
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)?
+        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())?
+        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>())?;
 
     if properties.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedCallOperation::<'c, 't>::add_callable_argument_attributes(
@@ -112,7 +112,7 @@ pub fn call<
     }
 
     if properties.no_inline {
-        builder = builder.add_attribute(FUNCTION_NO_INLINE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FUNCTION_NO_INLINE_ATTRIBUTE, context.unit_attribute())?;
     }
 
     builder.build().and_then(|operation| unsafe {
@@ -190,9 +190,9 @@ pub fn call_indirect<'f, 'v, 'c: 'f + 'v, 't: 'c, 's, C: Value<'f, 'c, 't>, L: L
     let context = location.context();
     context.load_dialect(DialectHandle::func()?)?;
     let mut builder = OperationBuilder::new("func.call_indirect", location)
-        .add_operand(callee)
-        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
-        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>());
+        .add_operand(callee)?
+        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())?
+        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>())?;
 
     if properties.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedCallIndirectOperation::<'c, 't>::add_callable_argument_attributes(
@@ -279,8 +279,8 @@ pub fn constant<
     let context = location.context();
     context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.constant", location)
-        .add_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE, function.try_into_with_context(context)?)
-        .add_result(function_type.try_into_with_context(context)?)
+        .add_attribute(FUNCTION_CONSTANT_VALUE_ATTRIBUTE, function.try_into_with_context(context)?)?
+        .add_result(function_type.try_into_with_context(context)?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::constant`"))
@@ -412,7 +412,7 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     context.load_dialect(DialectHandle::func()?)?;
 
     let mut builder = OperationBuilder::new("func.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?;
 
     builder = builder.add_attribute(
         FUNCTION_TYPE_ATTRIBUTE,
@@ -420,7 +420,7 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
             &attributes.arguments.iter().map(|argument| argument.r#type).collect::<Vec<_>>(),
             &attributes.results.iter().map(|result| result.r#type).collect::<Vec<_>>(),
         )),
-    );
+    )?;
 
     if attributes.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedFuncOperation::<'c, 't>::add_callable_argument_attributes(
@@ -438,22 +438,22 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
 
     if attributes.visibility != SymbolVisibility::default() {
         builder = builder
-            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility));
+            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility))?;
     }
 
     if attributes.no_inline {
-        builder = builder.add_attribute(FUNCTION_NO_INLINE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FUNCTION_NO_INLINE_ATTRIBUTE, context.unit_attribute())?;
     }
 
     if attributes.llvm_emit_c_interface {
-        builder = builder.add_attribute(FUNCTION_LLVM_EMIT_C_INTERFACE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FUNCTION_LLVM_EMIT_C_INTERFACE_ATTRIBUTE, context.unit_attribute())?;
     }
 
     for (attribute_name, attribute) in &attributes.other_attributes {
-        builder = builder.add_attribute(*attribute_name, *attribute)
+        builder = builder.add_attribute(*attribute_name, *attribute)?
     }
 
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::func`"))
     })
 }
@@ -503,7 +503,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::func()?)?;
     OperationBuilder::new("func.return", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `func::return`"))

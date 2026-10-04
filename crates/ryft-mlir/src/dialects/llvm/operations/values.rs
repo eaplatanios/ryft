@@ -34,8 +34,8 @@ pub fn freeze<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FREEZE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::freeze`"))
     })
@@ -67,7 +67,7 @@ pub fn none<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(NONE_TOKEN_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::none`"))
     })

@@ -1223,13 +1223,27 @@ impl<'t> Context<'t> {
         source: &str,
         filename: &str,
     ) -> Result<DetachedOperation<'c, 't>, Error> {
+        self.parse_operation_from_bytes(source.as_bytes(), filename)
+    }
+
+    /// Parses a [`DetachedOperation`] directly from the provided bytes. The bytes may contain either textual MLIR or
+    /// MLIR bytecode and are passed to the native parser without UTF-8 validation or `nul` termination.
+    ///
+    /// Returns an [`Error`] if MLIR fails to parse the provided bytes. MLIR will also emit structured diagnostics to
+    /// handlers attached with [`Context::attach_diagnostics_handler`]. The provided `filename` is used as the source
+    /// name for those diagnostics and for parsed locations.
+    pub fn parse_operation_from_bytes<'o, 'c: 'o, B: AsRef<[u8]>>(
+        &'c self,
+        source: B,
+        filename: &str,
+    ) -> Result<DetachedOperation<'c, 't>, Error> {
         unsafe {
             let handle = mlirOperationCreateParse(
                 // The following context borrow ensures that access to the underlying MLIR data structures is done
                 // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
                 // limited exposure to MLIR internals that we have when working with the MLIR C API.
                 *self.handle.borrow(),
-                StringRef::from(source).to_c_api(),
+                StringRef::from(source.as_ref()).to_c_api(),
                 StringRef::from(filename).to_c_api(),
             );
             if handle.ptr.is_null() {
@@ -1382,14 +1396,16 @@ impl WalkResult {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
     use crate::{
-        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Size, SymbolVisibility, Type,
-        Value, ValueRef,
+        Block, Context, DetachedModuleOperation, DiagnosticSeverity, DialectHandle, OperationBuilder, Region, Size,
+        SymbolVisibility, Type, Value, ValueRef,
     };
 
     use super::*;
@@ -1478,6 +1494,7 @@ mod tests {
         let location = context.unknown_location();
         let mut op = OperationBuilder::new("foo", location)
             .add_attribute("foo", context.string_attribute("bar"))
+            .unwrap()
             .build()
             .unwrap();
         assert!(op.attribute("foo").unwrap().is_some());
@@ -1689,8 +1706,11 @@ mod tests {
         let argument_0 = block.argument(0).unwrap().as_ref();
         let op = OperationBuilder::new("foo", context.unknown_location())
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_0);
@@ -1737,8 +1757,11 @@ mod tests {
         // Try replacing all uses of one value inside an operation.
         let mut op = OperationBuilder::new("foo", context.unknown_location())
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_2)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .build()
             .unwrap();
         unsafe { op.replace_uses_of_with(argument_0, argument_2) };
@@ -1760,7 +1783,11 @@ mod tests {
         assert!(op.result(0).is_err());
 
         // Operation with two results.
-        let op = OperationBuilder::new("test.op", location).add_results(&[i32_type, i64_type]).build().unwrap();
+        let op = OperationBuilder::new("test.op", location)
+            .add_results(&[i32_type, i64_type])
+            .unwrap()
+            .build()
+            .unwrap();
         assert_eq!(op.result_count(), 2);
         assert!(op.result(0).is_ok());
         assert!(op.result(1).is_ok());
@@ -1791,8 +1818,11 @@ mod tests {
         let region_2 = context.region();
         let op = OperationBuilder::new("foo", location)
             .add_region(region_0)
+            .unwrap()
             .add_region(region_1)
+            .unwrap()
             .add_region(region_2)
+            .unwrap()
             .build()
             .unwrap();
         assert!(!op.is_empty());
@@ -1812,7 +1842,11 @@ mod tests {
         let block_0 = context.block_with_no_arguments();
         let block_1 = context.block_with_no_arguments();
         let block_2 = context.block_with_no_arguments();
-        let op = OperationBuilder::new("test.op", location).add_successors(&[&block_0, &block_1]).build().unwrap();
+        let op = OperationBuilder::new("test.op", location)
+            .add_successors(&[&block_0, &block_1])
+            .unwrap()
+            .build()
+            .unwrap();
         assert_eq!(op.successor_count(), 2);
         assert!(op.successor(0).is_ok());
         assert!(op.successor(1).is_ok());
@@ -1844,11 +1878,13 @@ mod tests {
         let mut block = context.block_with_no_arguments();
         let op = OperationBuilder::new("foo", location)
             .add_results(&[context.index_type()])
+            .unwrap()
             .add_region({
                 let mut block = context.block_with_no_arguments();
                 block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
                 block.try_into().unwrap()
             })
+            .unwrap()
             .build()
             .unwrap();
         let op = block.append_operation(op).unwrap();
@@ -1929,12 +1965,14 @@ mod tests {
             .append_operation(
                 OperationBuilder::new("parent", location)
                     .add_results(&[context.index_type()])
+                    .unwrap()
                     .add_region({
                         let mut block = context.block_with_no_arguments();
                         block.append_operation(OperationBuilder::new("child_0", location).build().unwrap()).unwrap();
                         block.append_operation(OperationBuilder::new("child_1", location).build().unwrap()).unwrap();
                         block.try_into().unwrap()
                     })
+                    .unwrap()
                     .build()
                     .unwrap(),
             )
@@ -1990,12 +2028,14 @@ mod tests {
                                             .unwrap();
                                         block.try_into().unwrap()
                                     })
+                                    .unwrap()
                                     .build()
                                     .unwrap(),
                             )
                             .unwrap();
                         block.try_into().unwrap()
                     })
+                    .unwrap()
                     .build()
                     .unwrap(),
             )
@@ -2119,6 +2159,7 @@ mod tests {
         let location = context.unknown_location();
         let op_0 = OperationBuilder::new("test.op", location)
             .add_attribute("key", context.string_attribute("value"))
+            .unwrap()
             .build()
             .unwrap();
         let op_1 = op_0.clone();
@@ -2200,7 +2241,37 @@ mod tests {
         assert!(op.verify());
         assert_eq!(op.name().as_str(), Ok("func.func"));
 
-        // Trying parsing a bad operation.
+        // Parse the operation's bytecode directly without interpreting it as UTF-8.
+        let bytecode = op.bytecode();
+        assert!(bytecode.starts_with(b"ML\xefR"));
+        let parsed = context.parse_operation_from_bytes(&bytecode, "test.mlir").unwrap();
+        assert!(parsed.verify());
+        assert_eq!(parsed.to_string(), op.to_string());
+        assert_eq!(parsed.bytecode(), bytecode);
+
+        // Parse invalid bytes and retain the caller-provided filename in both the error and structured diagnostic.
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let diagnostics_clone = diagnostics.clone();
+        let handler = context.attach_diagnostics_handler(move |diagnostic| {
+            diagnostics_clone.borrow_mut().push((
+                diagnostic.severity(),
+                diagnostic.location().unwrap().to_string(),
+                diagnostic.to_string(),
+            ));
+            true
+        });
+        assert!(matches!(
+            context.parse_operation_from_bytes([0, 255], "invalid-bytes.mlir"),
+            Err(Error::ParsingError { message, .. })
+                if message == "failed to parse MLIR operation from `invalid-bytes.mlir`",
+        ));
+        assert_eq!(diagnostics.borrow().len(), 1);
+        assert_eq!(diagnostics.borrow()[0].0, DiagnosticSeverity::Error);
+        assert!(diagnostics.borrow()[0].1.contains("invalid-bytes.mlir"));
+        assert!(!diagnostics.borrow()[0].2.is_empty());
+        context.detach_diagnostics_handler(handler);
+
+        // Try parsing a bad operation.
         let op = context.parse_operation("invalid syntax", "invalid.mlir");
         assert!(op.is_err());
     }

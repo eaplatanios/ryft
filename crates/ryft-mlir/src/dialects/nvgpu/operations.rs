@@ -56,14 +56,14 @@ pub fn ldmatrix<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.ldmatrix", location)
-        .add_operand(src_memref)
-        .add_operands(indices)
-        .add_attribute(TRANSPOSE_ATTRIBUTE, context.boolean_attribute(transpose))
+        .add_operand(src_memref)?
+        .add_operands(indices)?
+        .add_attribute(TRANSPOSE_ATTRIBUTE, context.boolean_attribute(transpose))?
         .add_attribute(
             NUM_TILES_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), num_tiles as i64),
-        )
-        .add_result(result_type)
+        )?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::ldmatrix`"))
@@ -138,12 +138,12 @@ pub fn mma_sync<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let mma_shape_elements =
         mma_shape.iter().map(|value| context.integer_attribute(mma_shape_type, *value)).collect::<Vec<_>>();
     let mut builder = OperationBuilder::new("nvgpu.mma.sync", location)
-        .add_operands(&[matrix_a, matrix_b, matrix_c])
-        .add_attribute(MMA_SHAPE_ATTRIBUTE, context.array_attribute(&mma_shape_elements));
+        .add_operands(&[matrix_a, matrix_b, matrix_c])?
+        .add_attribute(MMA_SHAPE_ATTRIBUTE, context.array_attribute(&mma_shape_elements))?;
     if tf32_enabled {
-        builder = builder.add_attribute(TF32_ENABLED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TF32_ENABLED_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::mma_sync`"))
     })
 }
@@ -225,16 +225,16 @@ pub fn mma_sparse_sync<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let mma_shape_elements =
         mma_shape.iter().map(|value| context.integer_attribute(mma_shape_type, *value)).collect::<Vec<_>>();
     let mut builder = OperationBuilder::new("nvgpu.mma.sp.sync", location)
-        .add_operands(&[matrix_a, matrix_b, matrix_c, sparse_metadata])
-        .add_attribute(MMA_SHAPE_ATTRIBUTE, context.array_attribute(&mma_shape_elements))
+        .add_operands(&[matrix_a, matrix_b, matrix_c, sparse_metadata])?
+        .add_attribute(MMA_SHAPE_ATTRIBUTE, context.array_attribute(&mma_shape_elements))?
         .add_attribute(
             SPARSITY_SELECTOR_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), sparsity_selector as i64),
-        );
+        )?;
     if tf32_enabled {
-        builder = builder.add_attribute(TF32_ENABLED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TF32_ENABLED_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::mma_sparse_sync`"))
@@ -345,19 +345,19 @@ pub fn device_async_copy<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::nvgpu()?)?;
     let segment_sizes = [1, dst_indices.len() as i32, 1, src_indices.len() as i32, i32::from(src_elements.is_some())];
     let mut builder = OperationBuilder::new("nvgpu.device_async_copy", location)
-        .add_operand(dst)
-        .add_operands(dst_indices)
-        .add_operand(src)
-        .add_operands(src_indices)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(DST_ELEMENTS_ATTRIBUTE, context.integer_attribute(context.index_type(), dst_elements));
+        .add_operand(dst)?
+        .add_operands(dst_indices)?
+        .add_operand(src)?
+        .add_operands(src_indices)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(DST_ELEMENTS_ATTRIBUTE, context.integer_attribute(context.index_type(), dst_elements))?;
     if let Some(src_elements) = src_elements {
-        builder = builder.add_operand(src_elements);
+        builder = builder.add_operand(src_elements)?;
     }
     if bypass_l1 {
-        builder = builder.add_attribute(BYPASS_L1_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(BYPASS_L1_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(context.nvgpu_device_async_token_type()?).build().and_then(|operation| unsafe {
+    builder.add_result(context.nvgpu_device_async_token_type()?)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::device_async_copy`"))
@@ -390,8 +390,8 @@ pub fn device_async_create_group<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.device_async_create_group", location)
-        .add_operands(input_tokens)
-        .add_result(context.nvgpu_device_async_token_type()?)
+        .add_operands(input_tokens)?
+        .add_result(context.nvgpu_device_async_token_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -432,12 +432,12 @@ pub fn device_async_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDeviceAsyncWaitOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
-    let mut builder = OperationBuilder::new("nvgpu.device_async_wait", location).add_operand(async_dependency);
+    let mut builder = OperationBuilder::new("nvgpu.device_async_wait", location).add_operand(async_dependency)?;
     if let Some(num_groups) = num_groups {
         builder = builder.add_attribute(
             NUM_GROUPS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), num_groups as i64),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -466,7 +466,7 @@ pub fn mbarrier_create<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMBarrierCreateOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
-    OperationBuilder::new("nvgpu.mbarrier.create", location).add_result(result_type).build().and_then(
+    OperationBuilder::new("nvgpu.mbarrier.create", location).add_result(result_type)?.build().and_then(
         |operation| unsafe {
             operation
                 .cast()
@@ -507,8 +507,8 @@ pub fn mbarrier_get<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMBarrierGetOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.mbarrier.get", location)
-        .add_operands(&[barriers, mbar_id])
-        .add_result(result_type)
+        .add_operands(&[barriers, mbar_id])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -553,9 +553,10 @@ pub fn mbarrier_init<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMBarrierInitOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
-    let mut builder = OperationBuilder::new("nvgpu.mbarrier.init", location).add_operands(&[barriers, count, mbar_id]);
+    let mut builder =
+        OperationBuilder::new("nvgpu.mbarrier.init", location).add_operands(&[barriers, count, mbar_id])?;
     if let Some(predicate) = predicate {
-        builder = builder.add_operand(predicate);
+        builder = builder.add_operand(predicate)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -602,8 +603,8 @@ pub fn mbarrier_test_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.mbarrier.test.wait", location)
-        .add_operands(&[barriers, token, mbar_id])
-        .add_result(context.signless_integer_type(1))
+        .add_operands(&[barriers, token, mbar_id])?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -644,8 +645,8 @@ pub fn mbarrier_arrive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.mbarrier.arrive", location)
-        .add_operands(&[barriers, mbar_id])
-        .add_result(context.nvgpu_mbarrier_token_type()?)
+        .add_operands(&[barriers, mbar_id])?
+        .add_result(context.nvgpu_mbarrier_token_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -692,8 +693,8 @@ pub fn mbarrier_arrive_nocomplete<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.mbarrier.arrive.nocomplete", location)
-        .add_operands(&[barriers, mbar_id, count])
-        .add_result(context.nvgpu_mbarrier_token_type()?)
+        .add_operands(&[barriers, mbar_id, count])?
+        .add_result(context.nvgpu_mbarrier_token_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -738,10 +739,10 @@ pub fn mbarrier_arrive_expect_tx<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMBarrierArriveExpectTxOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
-    let mut builder =
-        OperationBuilder::new("nvgpu.mbarrier.arrive.expect_tx", location).add_operands(&[barriers, tx_count, mbar_id]);
+    let mut builder = OperationBuilder::new("nvgpu.mbarrier.arrive.expect_tx", location)
+        .add_operands(&[barriers, tx_count, mbar_id])?;
     if let Some(predicate) = predicate {
-        builder = builder.add_operand(predicate);
+        builder = builder.add_operand(predicate)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -787,7 +788,7 @@ pub fn mbarrier_try_wait_parity<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMBarrierTryWaitParityOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.mbarrier.try_wait.parity", location)
-        .add_operands(&[barriers, phase_parity, ticks, mbar_id])
+        .add_operands(&[barriers, phase_parity, ticks, mbar_id])?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -815,7 +816,7 @@ pub fn tma_fence<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTmaFenceOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.tma.fence.descriptor", location)
-        .add_operand(tensor_map_descriptor)
+        .add_operand(tensor_map_descriptor)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::tma_fence`"))
@@ -847,9 +848,9 @@ pub fn tma_prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTmaPrefetchOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     let mut builder =
-        OperationBuilder::new("nvgpu.tma.prefetch.descriptor", location).add_operand(tensor_map_descriptor);
+        OperationBuilder::new("nvgpu.tma.prefetch.descriptor", location).add_operand(tensor_map_descriptor)?;
     if let Some(predicate) = predicate {
-        builder = builder.add_operand(predicate);
+        builder = builder.add_operand(predicate)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -963,15 +964,15 @@ pub fn tma_async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let segment_sizes =
         [1, 1, 1, coordinates.len() as i32, 1, i32::from(multicast_mask.is_some()), i32::from(predicate.is_some())];
     let mut builder = OperationBuilder::new("nvgpu.tma.async.load", location)
-        .add_operands(&[dst, barriers, tensor_map_descriptor])
-        .add_operands(coordinates)
-        .add_operand(mbar_id)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?);
+        .add_operands(&[dst, barriers, tensor_map_descriptor])?
+        .add_operands(coordinates)?
+        .add_operand(mbar_id)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?;
     if let Some(multicast_mask) = multicast_mask {
-        builder = builder.add_operand(multicast_mask);
+        builder = builder.add_operand(multicast_mask)?;
     }
     if let Some(predicate) = predicate {
-        builder = builder.add_operand(predicate);
+        builder = builder.add_operand(predicate)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1031,11 +1032,11 @@ pub fn tma_async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::nvgpu()?)?;
     let segment_sizes = [1, 1, coordinates.len() as i32, i32::from(predicate.is_some())];
     let mut builder = OperationBuilder::new("nvgpu.tma.async.store", location)
-        .add_operands(&[src, tensor_map_descriptor])
-        .add_operands(coordinates)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?);
+        .add_operands(&[src, tensor_map_descriptor])?
+        .add_operands(coordinates)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?;
     if let Some(predicate) = predicate {
-        builder = builder.add_operand(predicate);
+        builder = builder.add_operand(predicate)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1076,9 +1077,9 @@ pub fn tma_create_descriptor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTmaCreateDescriptorOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.tma.create.descriptor", location)
-        .add_operand(tensor)
-        .add_operands(box_dimensions)
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_operands(box_dimensions)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1119,8 +1120,8 @@ pub fn warpgroup_generate_descriptor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWarpgroupGenerateDescriptorOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.warpgroup.generate.descriptor", location)
-        .add_operands(&[tensor, tensor_map])
-        .add_result(result_type)
+        .add_operands(&[tensor, tensor_map])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1199,20 +1200,20 @@ pub fn warpgroup_mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::nvgpu()?)?;
     let mut builder =
-        OperationBuilder::new("nvgpu.warpgroup.mma", location).add_operands(&[descriptor_a, descriptor_b, matrix_c]);
+        OperationBuilder::new("nvgpu.warpgroup.mma", location).add_operands(&[descriptor_a, descriptor_b, matrix_c])?;
     if let Some(wait_group) = wait_group {
         builder = builder.add_attribute(
             WAIT_GROUP_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), wait_group),
-        );
+        )?;
     }
     if transpose_a {
-        builder = builder.add_attribute(TRANSPOSE_A_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TRANSPOSE_A_ATTRIBUTE, context.unit_attribute())?;
     }
     if transpose_b {
-        builder = builder.add_attribute(TRANSPOSE_B_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TRANSPOSE_B_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::warpgroup_mma`"))
@@ -1244,7 +1245,7 @@ pub fn warpgroup_mma_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWarpgroupMmaStoreOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.warpgroup.mma.store", location)
-        .add_operands(&[matrix_d, dst_memref])
+        .add_operands(&[matrix_d, dst_memref])?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1274,7 +1275,7 @@ pub fn warpgroup_mma_init_accumulator<'c, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWarpgroupMmaInitAccumulatorOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::nvgpu()?)?;
     OperationBuilder::new("nvgpu.warpgroup.mma.init.accumulator", location)
-        .add_result(result_type)
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1358,15 +1359,15 @@ pub fn rcp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::nvgpu()?)?;
     context.load_dialect(DialectHandle::nvvm()?)?;
     let mut builder = OperationBuilder::new("nvgpu.rcp", location)
-        .add_operand(input)
-        .add_attribute(ROUNDING_ATTRIBUTE, context.nvvm_floating_point_rounding_mode_attribute(rounding)?);
+        .add_operand(input)?
+        .add_attribute(ROUNDING_ATTRIBUTE, context.nvvm_floating_point_rounding_mode_attribute(rounding)?)?;
     if approx {
-        builder = builder.add_attribute(APPROX_ATTRIBUTE, context.boolean_attribute(true));
+        builder = builder.add_attribute(APPROX_ATTRIBUTE, context.boolean_attribute(true))?;
     }
     if ftz {
-        builder = builder.add_attribute(FTZ_ATTRIBUTE, context.boolean_attribute(true));
+        builder = builder.add_attribute(FTZ_ATTRIBUTE, context.boolean_attribute(true))?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `nvgpu::rcp`"))
     })
 }
@@ -2067,7 +2068,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @nvgpu_rcp(%arg0: vector<2xf32>) -> vector<2xf32> {
-                    %0 = nvgpu.rcp %arg0 {approx = true, ftz = true} : vector<2xf32>
+                    %0 = nvgpu.rcp %arg0 <approx = true, ftz = true> : vector<2xf32>
                     return %0 : vector<2xf32>
                   }
                 }
@@ -2406,12 +2407,12 @@ mod tests {
             indoc! {"
                 module {
                   func.func @nvgpu_operations(%arg0: memref<32x32xf16, 3>, %arg1: memref<64xf16>, %arg2: memref<32x32xf32, 3>, %arg3: memref<*xf32>, %arg4: index, %arg5: index, %arg6: index, %arg7: i1, %arg8: i16, %arg9: vector<4x2xf16>, %arg10: vector<2x2xf16>, %arg11: vector<2x2xf32>, %arg12: vector<2xi16>, %arg13: !nvgpu.device.async.token, %arg14: !nvgpu.mbarrier.group<memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>, %arg15: !nvgpu.mbarrier.token, %arg16: !nvgpu.tensormap.descriptor<tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>, %arg17: !nvgpu.warpgroup.descriptor<tensor = memref<64x64xf16, 3>>, %arg18: !nvgpu.warpgroup.descriptor<tensor = memref<64x128xf16, 3>>, %arg19: !nvgpu.warpgroup.accumulator<fragmented = vector<64x128xf32>>, %arg20: memref<64x128xf32, 3>) {
-                    %0 = nvgpu.ldmatrix %arg0[%arg4, %arg5] {numTiles = 4 : i32, transpose = true} : memref<32x32xf16, 3> -> vector<4x2xf16>
-                    %1 = nvgpu.mma.sync(%arg9, %arg10, %arg11) {mmaShape = [16, 8, 16]} : (vector<4x2xf16>, vector<2x2xf16>, vector<2x2xf32>) -> vector<2x2xf32>
-                    %2 = nvgpu.mma.sp.sync(%arg9, %arg9, %arg10) metadata(%arg12) {mmaShape = [16, 8, 32], sparsitySelector = 1 : i32} : (vector<4x2xf16>, vector<4x2xf16>, vector<2x2xf16>) -> vector<2x2xf16>
+                    %0 = nvgpu.ldmatrix %arg0[%arg4, %arg5] numTiles = 4 transpose = true : memref<32x32xf16, 3> -> vector<4x2xf16>
+                    %1 = nvgpu.mma.sync(%arg9, %arg10, %arg11) mmaShape = [16, 8, 16] : (vector<4x2xf16>, vector<2x2xf16>, vector<2x2xf32>) -> vector<2x2xf32>
+                    %2 = nvgpu.mma.sp.sync(%arg9, %arg9, %arg10) metadata(%arg12) mmaShape = [16, 8, 32] sparsitySelector = 1 : (vector<4x2xf16>, vector<4x2xf16>, vector<2x2xf16>) -> vector<2x2xf16>
                     %3 = nvgpu.device_async_copy %arg1[%arg6], %arg0[%arg4, %arg5], 4, %arg4 : memref<64xf16> to memref<32x32xf16, 3>
                     %4 = nvgpu.device_async_create_group %arg13
-                    nvgpu.device_async_wait %arg13 {numGroups = 2 : i32}
+                    nvgpu.device_async_wait %arg13 numGroups = 2
                     %5 = nvgpu.mbarrier.create -> <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>
                     %6 = nvgpu.mbarrier.get %arg14[%arg4] : <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4> -> i64
                     nvgpu.mbarrier.init %arg14[%arg4], %arg5, predicate = %arg7 : <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>
@@ -2426,10 +2427,10 @@ mod tests {
                     nvgpu.tma.async.store %arg2 to %arg16[%arg4, %arg5], predicate = %arg7 : memref<32x32xf32, 3> -> <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>
                     %10 = nvgpu.tma.create.descriptor %arg3 box[%arg4, %arg5] : memref<*xf32> -> <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>
                     %11 = nvgpu.warpgroup.generate.descriptor %arg0, %arg16 : memref<32x32xf16, 3>, <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none> -> <tensor = memref<64x64xf16, 3>>
-                    %12 = nvgpu.warpgroup.mma %arg17, %arg18, %arg19 {transposeA, transposeB, waitGroup = 2 : i64} : <tensor = memref<64x64xf16, 3>>, <tensor = memref<64x128xf16, 3>>, <fragmented = vector<64x128xf32>> -> <fragmented = vector<64x128xf32>>
+                    %12 = nvgpu.warpgroup.mma %arg17, %arg18, %arg19 waitGroup = 2 transposeA transposeB : <tensor = memref<64x64xf16, 3>>, <tensor = memref<64x128xf16, 3>>, <fragmented = vector<64x128xf32>> -> <fragmented = vector<64x128xf32>>
                     nvgpu.warpgroup.mma.store %arg19, %arg20 : <fragmented = vector<64x128xf32>> to memref<64x128xf32, 3>
                     %13 = nvgpu.warpgroup.mma.init.accumulator -> <fragmented = vector<64x128xf32>>
-                    %14 = nvgpu.rcp %arg11 {approx = true, ftz = true} : vector<2x2xf32>
+                    %14 = nvgpu.rcp %arg11 <approx = true, ftz = true> : vector<2x2xf32>
                     return
                   }
                 }

@@ -27,9 +27,9 @@ pub fn build_nvvm_operation<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::nvvm()?)?;
-    let mut builder = OperationBuilder::new(name, location).add_operands(operands).add_results(result_types);
+    let mut builder = OperationBuilder::new(name, location).add_operands(operands)?.add_results(result_types)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     if infer_result_types {
         builder = builder.enable_result_type_inference();

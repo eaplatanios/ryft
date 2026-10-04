@@ -44,7 +44,7 @@ pub fn tuple<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedTupleOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.tuple", location)
-        .add_operands(values)
+        .add_operands(values)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -106,11 +106,11 @@ pub fn get_tuple_element<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
 ) -> Result<DetachedGetTupleElementOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.get_tuple_element", location)
-        .add_operand(operand)
+        .add_operand(operand)?
         .add_attribute(
             GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE,
             location.context().integer_attribute(location.context().signless_integer_type(32), index as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
