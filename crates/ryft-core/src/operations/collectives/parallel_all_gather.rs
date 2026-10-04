@@ -51,8 +51,8 @@ use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelV
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
     ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
-    collective_output_extents, forward_linear_collective, infer_array_ir_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
+    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    resolve_named_axis_size, validate_manual_mesh_input,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -579,7 +579,7 @@ impl<
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
-            return forward_linear_collective(context, self, inputs);
+            return context.forward_collective(self, inputs);
         }
         self.reject_mesh_form()?;
         let [input] = inputs else {
@@ -597,7 +597,7 @@ impl<
         } else {
             input.value().r#type().unbatched(input.batch_axis())?
         };
-        let (output_type, output_extents) = collective_output_extents(context, self, &input_type)?;
+        let (output_type, output_extents) = context.infer_collective_output_type_and_extents(self, &input_type)?;
         let input_batch_axis = input.batch_axis_position();
         let ragged_axes = input.ragged_axes().to_vec();
         let mut output = self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?;

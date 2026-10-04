@@ -16,9 +16,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
-use crate::operations::collectives::{
-    LinearCollectiveOperation, forward_linear_collective, resolve_named_axis_size, validate_manual_mesh_input,
-};
+use crate::operations::collectives::{LinearCollectiveOperation, resolve_named_axis_size, validate_manual_mesh_input};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
@@ -301,7 +299,7 @@ impl<
         // when no pair targets `t`. A non-matching level forwards the collective untouched to the parent context.
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
-            return forward_linear_collective(context, self, inputs);
+            return context.forward_collective(self, inputs);
         }
 
         self.reject_mesh_form()?;

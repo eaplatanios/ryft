@@ -645,7 +645,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         }
 
         if context.axis_name() != Some(self.axis_name()) {
-            return forward_linear_collective(context, self, inputs);
+            return context.forward_collective(self, inputs);
         }
 
         self.reject_mesh_form()?;
@@ -653,7 +653,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
 
-        let (output_type, output_extents) = collective_output_extents(context, self, &input.unbatched_type())?;
+        let (output_type, output_extents) =
+            context.infer_collective_output_type_and_extents(self, &input.unbatched_type())?;
         Ok(vec![self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?].into())
     }
 
@@ -1260,59 +1261,56 @@ where
     }
 }
 
-/// Forwards a linear collective over an axis that the active batching level does not bind to the parent context. An
-/// input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the collective
-/// that [`LinearCollectiveOperation::adapt_to_batch_axis`] returns for the input's mapped axis position, because the
-/// collective's own axes shift around the mapped axis, together with the position of the mapped axis in the forwarded
-/// result.
-fn forward_linear_collective<C, P, O>(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation: &O,
-    inputs: &[ArrayBatch<C::Value>],
-) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<O>,
-    P: ArrayExtentBatchingPolicy<C>,
-    O: LinearCollectiveOperation,
-{
-    let [input] = inputs else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-    };
-    let Some(batch_axis) = input.batch_axis_position() else {
-        return Ok(context.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
-    };
-    let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
-    let mut outputs =
-        context
-            .parent()
-            .bind(C::Operation::from(operation), Vec::new(), std::slice::from_ref(input.value()))?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?].into())
-}
+// TODO(eaplatanios): Review up to here.
 
-/// Infers the output type of a shape-changing collective for the logical (i.e., unbatched) `input_type` of a level
-/// that binds its axis, and returns that type together with its extents in the batching policy's representation,
-/// which the collective's matching-axis kernel consumes.
-fn collective_output_extents<C, P, O>(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation: &O,
-    input_type: &ArrayType,
-) -> Result<(ArrayType, Vec<P::ShapeExtent>), BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    P: CollectiveArrayExtentBatchingPolicy<C>,
-    O: Operation<Type = ArrayType>,
-{
-    let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[])?;
-    let output_type = output_types.remove(0);
-    let output_extents = output_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| P::collective_extent_from_dimension(context, dimension))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((output_type, output_extents))
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {
+    /// Forwards a linear collective over an axis that the active batching level does not bind to the parent context.
+    /// An input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the
+    /// collective that [`LinearCollectiveOperation::adapt_to_batch_axis`] returns for the input's mapped axis position,
+    /// because the collective's own axes shift around the mapped axis, together with the position of the mapped axis in
+    /// the forwarded result.
+    fn forward_collective<O: LinearCollectiveOperation>(
+        &self,
+        operation: &O,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
+    where
+        C::Operation: From<O>,
+    {
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        let Some(batch_axis) = input.batch_axis_position() else {
+            return Ok(self.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
+        };
+        let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
+        let mut outputs =
+            self.parent().bind(C::Operation::from(operation), Vec::new(), std::slice::from_ref(input.value()))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?].into())
+    }
+
+    /// Infers the output type of a shape-changing collective for the logical (i.e., unbatched) `input_type` of a level
+    /// that binds its axis, and returns that type together with its extents in the batching policy's representation,
+    /// which the collective's matching-axis kernel consumes.
+    fn infer_collective_output_type_and_extents<O: Operation<Type = ArrayType>>(
+        &self,
+        operation: &O,
+        input_type: &ArrayType,
+    ) -> Result<(ArrayType, Vec<P::ShapeExtent>), BatchingError>
+    where
+        P: CollectiveArrayExtentBatchingPolicy<C>,
+    {
+        let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(self, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((output_type, output_extents))
+    }
 }
 
 impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
@@ -1366,10 +1364,10 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
             .collect()
     }
 
-    /// Returns this `batch` level re-expressed over the array projection of its parent with the dynamic extent
-    /// batching policy, keeping its axis name, extent, and sharding, so that the matching-axis kernels of the
-    /// shape-changing collectives, which operate on homogeneous arrays, can consume this level's mapped axis while
-    /// reading their reshape geometry from the explicit dimension values of composite programs.
+    /// Returns this `batch` level re-expressed over the array projection of its parent with the dynamic extent batching
+    /// policy, keeping its axis name, extent, and sharding, so that the matching-axis kernels of the shape-changing
+    /// collectives, which operate on homogeneous arrays, can consume this level's mapped axis while reading their
+    /// reshape geometry from the explicit dimension values of composite programs.
     fn array_projection(
         &self,
     ) -> BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
