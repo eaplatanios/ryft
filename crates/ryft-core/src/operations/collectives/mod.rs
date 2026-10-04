@@ -250,240 +250,30 @@ impl Debug for CollectiveOptions {
     }
 }
 
-/// Validates that `axis_name` is a manual axis of `mesh` and, when `axis_size` is provided, that the size the collective
-/// recorded at staging time matches the size of that mesh axis. Collectives that carry a mesh use it to validate the
-/// manual axis they exchange values over (e.g., [`AxisIndexOperation`], which has no input).
+/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain. This marker
+/// opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
+/// implementations. Each implementation separately requires its operation to be supported by the dispatch domain,
+/// named-axis resolution through [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait
+/// alone does not require support for every collective. Backend array types implement it to reuse these staging rules
+/// without defining their own collective capability implementations.
 ///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming `operation_name` if the axis is not a manual axis of `mesh` or if its size differs.
-fn validate_manual_mesh_axis(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: Option<usize>,
-    mesh: &LogicalMesh,
-) -> Result<(), TypeError> {
-    if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-        return Err(TypeError::invalid(format!("`{operation_name}` mesh axis `{axis_name}` must be manual")));
-    }
-    if let Some(axis_size) = axis_size
-        && mesh.axis_size(axis_name) != Some(axis_size)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` axis size {axis_size} does not match the size of manual mesh axis `{axis_name}`",
-        )));
-    }
-    Ok(())
+/// Homogeneous [`Tracer`], [`BatchingTracer`], and [`DifferentiationTracer`] values opt in. Projected array values
+/// instead delegate through their composite value so that runtime output extents remain explicit inputs; they must
+/// not implement this trait. Concrete host arrays retain their own unbound-axis diagnostics and do not opt in either.
+pub trait ShapeChangingCollectiveValue: Value<Type = ArrayType> {}
+
+impl<C: Context> ShapeChangingCollectiveValue for Tracer<C> where Self: Value<Type = ArrayType> {}
+
+impl<C: Context, P: BatchingPolicy<C>> ShapeChangingCollectiveValue for BatchingTracer<C, P> where
+    Self: Value<Type = ArrayType>
+{
 }
 
-/// Validates the manual mesh axis of a collective that carries a mesh, as [`validate_manual_mesh_axis`] does, and that
-/// `input_type` carries sharding over that same mesh. After successful validation, callers can retrieve the input
-/// sharding to apply their collective-specific manual variation and pending-sum contracts.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
-/// a sharding over a different mesh.
-fn validate_manual_mesh_input(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: Option<usize>,
-    mesh: &LogicalMesh,
-    input_type: &ArrayType,
-) -> Result<(), TypeError> {
-    validate_manual_mesh_axis(operation_name, axis_name, axis_size, mesh)?;
-    let Some(sharding) = input_type.sharding() else {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
-        )));
-    };
-    if sharding.mesh() != mesh {
-        return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
-    }
-    Ok(())
+impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for DifferentiationTracer<C, P> where
+    Self: Value<Type = ArrayType>
+{
 }
 
-/// Validates the participant grouping of a collective over a named axis of size `axis_size` and returns its _effective
-/// axis size_, which is the number of participants that each instance of the collective combines. Without `groups`,
-/// every participant along the axis takes part in one collective, so the effective axis size is `axis_size` itself.
-/// With `groups`, the axis is split into independent collectives, one per group, and the effective axis size is the
-/// common group size. Callers use it wherever shapes or values depend on the participant count (e.g., the gathered
-/// extent of a `parallel_all_gather` operation, the chunk extent of a `parallel_sum_scatter` operation, or the divisor
-/// of a mean operation).
-///
-/// For example, an axis of size 4 split into the groups `[[0, 2], [3, 1]]` runs two independent collectives over two
-/// participants each, so its effective axis size is 2:
-///
-/// ```text
-///   participant:   0   1   2   3
-///   group:         A   B   A   B      (A = [0, 2] and B = [3, 1])
-///   collectives:   A combines participants 0 and 2, and B combines participants 3 and 1
-/// ```
-///
-/// The groups must form an equal-sized exact partition of `0..axis_size`:
-///
-///   - `axis_size` must be positive, and there must be at least one group, whose size is at least one.
-///   - Every group must have the same size as the first one.
-///   - Every participant in `0..axis_size` must appear in exactly one group, which rules out out-of-bounds, repeated,
-///     and missing participants.
-///
-/// This function only validates the groups and borrows them without copying. The order of the groups and of the
-/// participants within each group is part of the collective's semantics and is preserved by its owner (e.g., the
-/// XLA backend's lowering emits replica groups in this order), even though this validation does not depend on it.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `axis_size`: Full size of the named axis, which every participant index must be smaller than.
-///   - `groups`: Optional ordered participant groups.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] that names `operation_name` and describes the first violated requirement, checking the
-/// requirements above in order and the groups and their participants in order.
-fn effective_collective_axis_size(
-    operation_name: &str,
-    axis_size: usize,
-    groups: Option<&[Vec<usize>]>,
-) -> Result<usize, TypeError> {
-    if axis_size == 0 {
-        return Err(TypeError::invalid(format!("`{operation_name}` axis size must be greater than zero")));
-    }
-
-    let Some(groups) = groups else {
-        return Ok(axis_size);
-    };
-
-    let Some(first_group) = groups.first() else {
-        return Err(TypeError::invalid(format!("`{operation_name}` axis index groups must not be empty")));
-    };
-
-    if first_group.is_empty() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` axis index groups must contain at least one participant",
-        )));
-    }
-
-    let group_size = first_group.len();
-    let mut seen = vec![false; axis_size];
-    for (group_index, group) in groups.iter().enumerate() {
-        if group.len() != group_size {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` axis index group {group_index} has size {} but every group must have size \
-                     {group_size}",
-                group.len(),
-            )));
-        }
-
-        for &participant in group {
-            let Some(participant_seen) = seen.get_mut(participant) else {
-                return Err(TypeError::invalid(format!(
-                    "`{operation_name}` axis index {participant} is out of bounds for axis size {axis_size}",
-                )));
-            };
-
-            if *participant_seen {
-                return Err(TypeError::invalid(format!(
-                    "`{operation_name}` axis index groups contain participant {participant} more than once",
-                )));
-            }
-
-            *participant_seen = true;
-        }
-    }
-
-    if let Some(missing) = seen.iter().position(|seen| !seen) {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` axis index groups do not contain participant {missing}",
-        )));
-    }
-
-    Ok(group_size)
-}
-
-/// Resolves the static, non-zero size of the named axis bound by the active [`NamedAxes`] environment, failing fast
-/// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake
-/// the resolved size into their operation payloads at staging time, because their output shapes and payload validation
-/// depend on it while [`Operation::infer_output_types`] only sees input types.
-fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
-    match context
-        .named_axis(axis_name)
-        .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?
-        .size()
-    {
-        Some(0) => {
-            Err(TypeError::invalid(format!("collective axis `{axis_name}` must contain at least one participant"))
-                .into())
-        }
-        Some(size) => Ok(size),
-        None => Err(BatchingError::UnsupportedOperation {
-            message: format!("collective axis `{axis_name}` has a dynamic extent that must remain a first-class input"),
-        }
-        .into()),
-    }
-}
-
-/// Infers a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
-/// sharding through with the same per-dimension placement (the dimension count never changes). An unchanged shape
-/// preserves the complete input type. Resizing clears explicit layout information because input strides and tiling
-/// do not generally describe storage for the resized shape; element type and memory are preserved.
-fn infer_linear_collective_operation_output_type(
-    operation_name: &'static str,
-    input_type: &ArrayType,
-    output_dimensions: Vec<usize>,
-) -> Result<ArrayType, TypeError> {
-    let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
-    let output_shape = Shape::new(output_sizes);
-    if &output_shape == input_type.shape() {
-        return Ok(input_type.clone());
-    }
-    let output_sharding = input_type.resized_sharding(output_shape.dimensions(), operation_name)?;
-    Ok(ArrayType::new(input_type.data_type(), output_shape)
-        .with_sharding(output_sharding)?
-        .with_memory(input_type.memory()))
-}
-
-/// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `input_types`: Array input type followed by one explicit extent type per output axis.
-///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
-///   - `changed_output_axes`: Output axes whose extents may differ from `base_output_type`. Every other axis must
-///     retain the extent already projected into `base_output_type` by the caller.
-///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit output extents.
-fn infer_array_ir_shape_changing_collective_output_type(
-    operation_name: &'static str,
-    input_types: &[ArrayIrType],
-    base_output_type: ArrayType,
-    changed_output_axes: &[usize],
-    validate_exact_extents_fn: impl FnOnce(&[Dimension]) -> Result<(), TypeError>,
-) -> Result<Vec<ArrayIrType>, TypeError> {
-    check_count!("input", input_types, 1 + base_output_type.rank(), TypeError);
-
-    // Only the kind of the first input is checked here. Each collective applies its own pending-sum contract, and
-    // the shape-only output type preserves every other piece of the input's mesh state.
-    <&ArrayType>::try_from(&input_types[0])?;
-
-    let output_extents = ArrayIrType::extents(&input_types[1..])?;
-    for (output_axis, (expected_extent, output_extent)) in
-        base_output_type.shape().dimensions().iter().zip(&output_extents).enumerate()
-    {
-        if !changed_output_axes.contains(&output_axis) && output_extent != expected_extent {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged extent \
-                 {expected_extent}",
-            )));
-        }
-    }
-
-    validate_exact_extents_fn(output_extents.as_slice())?;
-    Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
-}
-
-// TODO(eaplatanios): Move this to right after `ShapeChangingCollectiveValue` and its impl blocks,
-//  **after** `ShapeChangingCollectiveValue` is moved right after `impl Debug for CollectiveOptions`.
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
 /// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
@@ -660,7 +450,6 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     }
 }
 
-// TODO(eaplatanios): Move this together with `LinearCollectiveOperation` so that it is always right after it.
 /// [`LinearCollectiveOperation`] that resizes an array axis (e.g., [`ParallelAllGatherOperation`],
 /// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Its output shape depends on the participant
 /// count and its [`CollectiveMode`], so in the composite array/dimension family it is staged with one explicit extent
@@ -955,7 +744,6 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     }
 }
 
-// TODO(eaplatanios): Move this together with `ShapeChangingCollectiveOperation` so that it is always right after it.
 /// Context-specific batching capability of a [`ShapeChangingCollectiveOperation`] for `batch` levels whose parent is
 /// `C`. Its function consumes a level that binds the collective's named axis; the shared batching rules use it after
 /// validating the inputs and determining the output geometry.
@@ -984,29 +772,236 @@ trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangi
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
-// TODO(eaplatanios): Move this right after `impl Debug for CollectiveOptions`.
-/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain. This marker
-/// opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
-/// implementations. Each implementation separately requires its operation to be supported by the dispatch domain,
-/// named-axis resolution through [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait
-/// alone does not require support for every collective. Backend array types implement it to reuse these staging rules
-/// without defining their own collective capability implementations.
+/// Validates that `axis_name` is a manual axis of `mesh` and, when `axis_size` is provided, that the size the collective
+/// recorded at staging time matches the size of that mesh axis. Collectives that carry a mesh use it to validate the
+/// manual axis they exchange values over (e.g., [`AxisIndexOperation`], which has no input).
 ///
-/// Homogeneous [`Tracer`], [`BatchingTracer`], and [`DifferentiationTracer`] values opt in. Projected array values
-/// instead delegate through their composite value so that runtime output extents remain explicit inputs; they must
-/// not implement this trait. Concrete host arrays retain their own unbound-axis diagnostics and do not opt in either.
-pub trait ShapeChangingCollectiveValue: Value<Type = ArrayType> {}
-
-impl<C: Context> ShapeChangingCollectiveValue for Tracer<C> where Self: Value<Type = ArrayType> {}
-
-impl<C: Context, P: BatchingPolicy<C>> ShapeChangingCollectiveValue for BatchingTracer<C, P> where
-    Self: Value<Type = ArrayType>
-{
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name` if the axis is not a manual axis of `mesh` or if its size differs.
+fn validate_manual_mesh_axis(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+) -> Result<(), TypeError> {
+    if mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+        return Err(TypeError::invalid(format!("`{operation_name}` mesh axis `{axis_name}` must be manual")));
+    }
+    if let Some(axis_size) = axis_size
+        && mesh.axis_size(axis_name) != Some(axis_size)
+    {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis size {axis_size} does not match the size of manual mesh axis `{axis_name}`",
+        )));
+    }
+    Ok(())
 }
 
-impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for DifferentiationTracer<C, P> where
-    Self: Value<Type = ArrayType>
-{
+/// Validates the manual mesh axis of a collective that carries a mesh, as [`validate_manual_mesh_axis`] does, and that
+/// `input_type` carries sharding over that same mesh. After successful validation, callers can retrieve the input
+/// sharding to apply their collective-specific manual variation and pending-sum contracts.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming `operation_name` if the mesh axis is invalid, or if the input carries no sharding or
+/// a sharding over a different mesh.
+fn validate_manual_mesh_input(
+    operation_name: &str,
+    axis_name: &str,
+    axis_size: Option<usize>,
+    mesh: &LogicalMesh,
+    input_type: &ArrayType,
+) -> Result<(), TypeError> {
+    validate_manual_mesh_axis(operation_name, axis_name, axis_size, mesh)?;
+    let Some(sharding) = input_type.sharding() else {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` input must carry a mesh containing manual axis `{axis_name}`",
+        )));
+    };
+    if sharding.mesh() != mesh {
+        return Err(TypeError::invalid(format!("`{operation_name}` input mesh does not match the operation mesh")));
+    }
+    Ok(())
+}
+
+/// Validates the participant grouping of a collective over a named axis of size `axis_size` and returns its _effective
+/// axis size_, which is the number of participants that each instance of the collective combines. Without `groups`,
+/// every participant along the axis takes part in one collective, so the effective axis size is `axis_size` itself.
+/// With `groups`, the axis is split into independent collectives, one per group, and the effective axis size is the
+/// common group size. Callers use it wherever shapes or values depend on the participant count (e.g., the gathered
+/// extent of a `parallel_all_gather` operation, the chunk extent of a `parallel_sum_scatter` operation, or the divisor
+/// of a mean operation).
+///
+/// For example, an axis of size 4 split into the groups `[[0, 2], [3, 1]]` runs two independent collectives over two
+/// participants each, so its effective axis size is 2:
+///
+/// ```text
+///   participant:   0   1   2   3
+///   group:         A   B   A   B      (A = [0, 2] and B = [3, 1])
+///   collectives:   A combines participants 0 and 2, and B combines participants 3 and 1
+/// ```
+///
+/// The groups must form an equal-sized exact partition of `0..axis_size`:
+///
+///   - `axis_size` must be positive, and there must be at least one group, whose size is at least one.
+///   - Every group must have the same size as the first one.
+///   - Every participant in `0..axis_size` must appear in exactly one group, which rules out out-of-bounds, repeated,
+///     and missing participants.
+///
+/// This function only validates the groups and borrows them without copying. The order of the groups and of the
+/// participants within each group is part of the collective's semantics and is preserved by its owner (e.g., the
+/// XLA backend's lowering emits replica groups in this order), even though this validation does not depend on it.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the collective, used in diagnostics.
+///   - `axis_size`: Full size of the named axis, which every participant index must be smaller than.
+///   - `groups`: Optional ordered participant groups.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] that names `operation_name` and describes the first violated requirement, checking the
+/// requirements above in order and the groups and their participants in order.
+fn effective_collective_axis_size(
+    operation_name: &str,
+    axis_size: usize,
+    groups: Option<&[Vec<usize>]>,
+) -> Result<usize, TypeError> {
+    if axis_size == 0 {
+        return Err(TypeError::invalid(format!("`{operation_name}` axis size must be greater than zero")));
+    }
+
+    let Some(groups) = groups else {
+        return Ok(axis_size);
+    };
+
+    let Some(first_group) = groups.first() else {
+        return Err(TypeError::invalid(format!("`{operation_name}` axis index groups must not be empty")));
+    };
+
+    if first_group.is_empty() {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis index groups must contain at least one participant",
+        )));
+    }
+
+    let group_size = first_group.len();
+    let mut seen = vec![false; axis_size];
+    for (group_index, group) in groups.iter().enumerate() {
+        if group.len() != group_size {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` axis index group {group_index} has size {} but every group must have size \
+                     {group_size}",
+                group.len(),
+            )));
+        }
+
+        for &participant in group {
+            let Some(participant_seen) = seen.get_mut(participant) else {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` axis index {participant} is out of bounds for axis size {axis_size}",
+                )));
+            };
+
+            if *participant_seen {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` axis index groups contain participant {participant} more than once",
+                )));
+            }
+
+            *participant_seen = true;
+        }
+    }
+
+    if let Some(missing) = seen.iter().position(|seen| !seen) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` axis index groups do not contain participant {missing}",
+        )));
+    }
+
+    Ok(group_size)
+}
+
+/// Resolves the static, non-zero size of the named axis bound by the active [`NamedAxes`] environment, failing fast
+/// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake
+/// the resolved size into their operation payloads at staging time, because their output shapes and payload validation
+/// depend on it while [`Operation::infer_output_types`] only sees input types.
+fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
+    match context
+        .named_axis(axis_name)
+        .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?
+        .size()
+    {
+        Some(0) => {
+            Err(TypeError::invalid(format!("collective axis `{axis_name}` must contain at least one participant"))
+                .into())
+        }
+        Some(size) => Ok(size),
+        None => Err(BatchingError::UnsupportedOperation {
+            message: format!("collective axis `{axis_name}` has a dynamic extent that must remain a first-class input"),
+        }
+        .into()),
+    }
+}
+
+/// Infers a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
+/// sharding through with the same per-dimension placement (the dimension count never changes). An unchanged shape
+/// preserves the complete input type. Resizing clears explicit layout information because input strides and tiling
+/// do not generally describe storage for the resized shape; element type and memory are preserved.
+fn infer_linear_collective_operation_output_type(
+    operation_name: &'static str,
+    input_type: &ArrayType,
+    output_dimensions: Vec<usize>,
+) -> Result<ArrayType, TypeError> {
+    let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
+    let output_shape = Shape::new(output_sizes);
+    if &output_shape == input_type.shape() {
+        return Ok(input_type.clone());
+    }
+    let output_sharding = input_type.resized_sharding(output_shape.dimensions(), operation_name)?;
+    Ok(ArrayType::new(input_type.data_type(), output_shape)
+        .with_sharding(output_sharding)?
+        .with_memory(input_type.memory()))
+}
+
+/// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the collective, used in diagnostics.
+///   - `input_types`: Array input type followed by one explicit extent type per output axis.
+///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
+///   - `changed_output_axes`: Output axes whose extents may differ from `base_output_type`. Every other axis must
+///     retain the extent already projected into `base_output_type` by the caller.
+///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit output extents.
+fn infer_array_ir_shape_changing_collective_output_type(
+    operation_name: &'static str,
+    input_types: &[ArrayIrType],
+    base_output_type: ArrayType,
+    changed_output_axes: &[usize],
+    validate_exact_extents_fn: impl FnOnce(&[Dimension]) -> Result<(), TypeError>,
+) -> Result<Vec<ArrayIrType>, TypeError> {
+    check_count!("input", input_types, 1 + base_output_type.rank(), TypeError);
+
+    // Only the kind of the first input is checked here. Each collective applies its own pending-sum contract, and
+    // the shape-only output type preserves every other piece of the input's mesh state.
+    <&ArrayType>::try_from(&input_types[0])?;
+
+    let output_extents = ArrayIrType::extents(&input_types[1..])?;
+    for (output_axis, (expected_extent, output_extent)) in
+        base_output_type.shape().dimensions().iter().zip(&output_extents).enumerate()
+    {
+        if !changed_output_axes.contains(&output_axis) && output_extent != expected_extent {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged extent \
+                 {expected_extent}",
+            )));
+        }
+    }
+
+    validate_exact_extents_fn(output_extents.as_slice())?;
+    Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
 // TODO(eaplatanios): Review form here onwards.
