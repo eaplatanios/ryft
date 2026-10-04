@@ -805,8 +805,7 @@ impl<
     }
 }
 
-impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelSumScatterOperation
-where
+impl<
     C: Context<
             Type = ArrayIrType,
             Value: Assert
@@ -825,6 +824,7 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
+> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelSumScatterOperation
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -913,29 +913,32 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Mixed array IR JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
-// the transposed linear region applies varying all-gather to the output cotangent.
-impl<C> MemberDifferentiableOperation<C> for ParallelSumScatterOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<ParallelAllGatherOperation>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ParallelSumScatterOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<ParallelAllGatherOperation>
+                           + From<DimensionSizeOperation>
+                           + From<LinearCallOperation<ArrayIrType>>
+                           + From<ParallelSumScatterOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        >,
+> MemberDifferentiableOperation<C> for ParallelSumScatterOperation
 {
+    #[inline]
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Explicit output extents are retained as ordinary residual values, and the
+        // transposed linear region applies varying all-gather to the output cotangent.
         jvp_shape_changing_collective_with_adjoint(self, self.adjoint()?, context, inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to sum values across the participants of a named axis and scatter the sum, so that every
 /// participant receives only its own chunk, by staging a [`ParallelSumScatterOperation`]. This is the analogue of
