@@ -45,11 +45,11 @@ use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions, collective_input_extents,
-    collective_output_extents, define_linear_collective_operation, explicit_collective_inputs,
-    forward_explicit_collective, forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
-    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
-    validate_explicit_collective_output_extents,
+    collective_output_extents, define_linear_collective_operation,
+    differentiate_shape_changing_collective_with_adjoint, forward_shape_changing_collective,
+    impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
+    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    resolve_named_axis_size,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -150,7 +150,7 @@ fn parallel_all_gather_output_type(
 }
 
 /// Infers the composite all-gather contract.
-pub(crate) fn infer_explicit_parallel_all_gather_output_types(
+pub(crate) fn infer_array_ir_parallel_all_gather_output_types(
     operation: &ParallelAllGatherOperation,
     input_types: &[ArrayIrType],
 ) -> Result<Vec<ArrayIrType>, TypeError> {
@@ -180,7 +180,7 @@ pub(crate) fn infer_explicit_parallel_all_gather_output_types(
             output_type
         }
     };
-    let mut output_types = infer_explicit_shape_changing_collective_output_type(
+    let mut output_types = infer_array_ir_shape_changing_collective_output_type(
         PARALLEL_ALL_GATHER_OPERATION_NAME,
         false,
         input_types,
@@ -453,10 +453,10 @@ impl_differentiable_linear_collective_operation! {
 
 impl_shape_changing_collective_member_operation!(
     ParallelAllGatherOperation,
-    infer_explicit_parallel_all_gather_output_types
+    infer_array_ir_parallel_all_gather_output_types
 );
 
-// Batching rule for explicit-extent [`ParallelAllGatherOperation`]. The logical result extents remain ordinary
+// Batching rule for array IR [`ParallelAllGatherOperation`]. The logical result extents remain ordinary
 // replicated dimension SSA inputs; matching-axis batching delegates its array mechanics to the homogeneous collective
 // kernel.
 impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllGatherOperation
@@ -485,30 +485,29 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        let Some((array, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        <&ArrayType>::try_from(&array.unbatched_type())?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types =
-            infer_explicit_parallel_all_gather_output_types(self, logical_input_types.as_slice())?;
+            infer_array_ir_parallel_all_gather_output_types(self, logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
         if context.axis_name() != Some(self.axis_name()) {
             ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
-            validate_explicit_collective_output_extents(output_extents)?;
+            // A result extent describes the shape shared by every batch item, so it must be replicated.
+            for output_extent in output_extents {
+                output_extent.validate_replicated_dimension()?;
+            }
             if array.batch_axis().is_replicated() {
-                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
+                return Ok(context.forward_collective(self.clone(), array, output_extents, None)?.into());
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (concat_axis, output_batch_axis) =
                 self.options().mode().forwarded_concatenation_axes(self.concat_axis(), input_batch_axis);
             let operation = Self { concat_axis, ..self.clone() };
-            return Ok(forward_explicit_collective(
-                operation,
-                context,
-                array,
-                output_extents,
-                Some(output_batch_axis),
-            )?
-            .into());
+            return Ok(context.forward_collective(operation, array, output_extents, Some(output_batch_axis))?.into());
         }
 
         if self.mesh.is_some() {
@@ -706,7 +705,7 @@ where
         if self.output_variance() == ParallelAllGatherOutputVariance::Invariant {
             return jvp_invariant_parallel_all_gather(self, context, inputs);
         }
-        jvp_shape_changing_collective_with_adjoint(self, self.adjoint()?, context, inputs)
+        differentiate_shape_changing_collective_with_adjoint(self, self.adjoint()?, context, inputs)
     }
 }
 
@@ -1112,7 +1111,7 @@ mod tests {
         let input = ArrayType::new_static(DataType::F32, [3]).with_sharding(varying_sharding).unwrap();
 
         let infer = |output_variance| {
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance)
                     .with_mesh(mesh.clone()),
                 &[
@@ -1172,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_explicit_collective_tracing_import_and_rendering() {
+    fn test_array_ir_collective_tracing_import_and_rendering() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
@@ -1219,7 +1218,7 @@ mod tests {
         let [imported_dimension_size, _, imported_multiplied_extent, imported_parallel_all_gather] =
             destination.instructions()
         else {
-            panic!("expected the imported explicit collective graph");
+            panic!("expected the imported array IR collective graph");
         };
         assert_eq!(imported_dimension_size.inputs(), &[imported_input]);
         assert_eq!(imported_parallel_all_gather.inputs(), &[imported_input, imported_multiplied_extent.outputs()[0]]);

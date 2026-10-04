@@ -21,11 +21,11 @@
 //! on the participant count and whether the named axis is materialized as a new array axis or tiled into an existing
 //! one, so they share:
 //!
-//!   - [`CollectiveArrayExtentBatchingPolicy`], the representation boundary that lets one batching kernel per
+//!   - `CollectiveArrayExtentBatchingPolicy`, the representation boundary that lets one batching kernel per
 //!     collective handle both homogeneous arrays with static extents and composite array/dimension programs with
 //!     first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well),
 //!   - the first-class extent arithmetic that computes and validates result extents at staging time, and
-//!   - the explicit [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
+//!   - the [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
 //!     its type inference, interpretation, batching, and forward-mode differentiation rules.
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
@@ -396,7 +396,7 @@ fn infer_linear_collective_operation_output_type(
 ///   - `changed_output_axes`: Output axes whose extents may differ from `base_output_type`. Every other axis must
 ///     retain the extent already projected into `base_output_type` by the caller.
 ///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit output extents.
-fn infer_explicit_shape_changing_collective_output_type(
+fn infer_array_ir_shape_changing_collective_output_type(
     operation_name: &'static str,
     accepts_unreduced: bool,
     input_types: &[ArrayIrType],
@@ -680,7 +680,7 @@ macro_rules! define_linear_collective_operation {
 ///   - Transposition stages the adjoint collective on the output cotangent. A known input and a structural-zero output
 ///     cotangent contribute nothing, which leaves the input cotangent a structural zero.
 ///   - A private `adjoint` function returns the adjoint collective, so that other rules can stage it as well (e.g., the
-///     explicit-extent forward-mode rules of the shape-changing collectives, which call it inside a linear call).
+///     array IR forward-mode rules of the shape-changing collectives, which call it inside a linear call).
 ///
 /// Reverse-mode differentiation needs no separate rule because it is derived by linearizing and then transposing the
 /// staged tangent program. The closure-like syntax only names the operation and the adjoint type, which the generated
@@ -1104,7 +1104,7 @@ where
 }
 
 macro_rules! impl_shape_changing_collective_member_operation {
-    // Implements the explicit array IR boundary shared by the three shape-changing collective payloads.
+    // Implements the array IR boundary shared by the three shape-changing collective payloads.
     ($operation:ty, $infer_output_types:ident) => {
         impl MemberOperation<ArrayIrType> for $operation {
             fn infer_parent_region_input_types(
@@ -1360,9 +1360,10 @@ where
         .collect()
 }
 
-/// Applies the mixed array IR JVP shared by shape-changing collectives whose transpose is another collective.
-/// Explicit output extents and the exact input shape become ordinary residuals of one linear call.
-fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint, P: DifferentiationPolicy<C>>(
+/// Applies forward-mode differentiation (JVP) in the mixed array IR for shape-changing collectives whose transpose
+/// is another collective. Explicit output extents and the exact input shape become ordinary residuals of one linear
+/// call, whose transpose applies the supplied adjoint collective.
+fn differentiate_shape_changing_collective_with_adjoint<C, Forward, Adjoint, P: DifferentiationPolicy<C>>(
     operation: &Forward,
     adjoint: Adjoint,
     context: &DifferentiationContext<C, P>,
@@ -1420,53 +1421,49 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Splits a mixed collective's inputs into its validated array input and unchecked explicit result extents.
-fn explicit_collective_inputs<'a, V: Value<Type = ArrayIrType>>(
-    inputs: &'a [ArrayIrBatch<V>],
-) -> Result<(&'a ArrayIrBatch<V>, &'a [ArrayIrBatch<V>]), BatchingError> {
-    let Some((array, output_extents)) = inputs.split_first() else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-    };
-    <&ArrayType>::try_from(&array.unbatched_type())?;
-    Ok((array, output_extents))
-}
-
-/// Validates that every explicit result extent of a mixed collective is replicated.
-fn validate_explicit_collective_output_extents<V: Value<Type = ArrayIrType>>(
-    output_extents: &[ArrayIrBatch<V>],
-) -> Result<(), BatchingError> {
-    for output_extent in output_extents {
-        output_extent.validate_replicated_dimension()?;
+impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
+    /// Binds an array IR collective over a non-matching named axis in the parent context. When the array is mapped,
+    /// inserts this context's batch extent into the result extent inputs at `output_batch_axis` and marks the result
+    /// mapped at that position. Replicated arrays require no lifting and remain replicated.
+    ///
+    /// Unlike homogeneous array forwarding, the input dimension values describe one array result and are not
+    /// separate result-producing inputs. The collective may also move the mapped axis when it changes the rank.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Collective with physical array axes already adjusted around this context's mapped axis.
+    ///   - `array`: Array input whose ragged axes have already been rejected by the caller.
+    ///   - `output_extents`: Validated replicated dimension inputs describing the per-item result shape.
+    ///   - `output_batch_axis`: Physical result position of the mapped axis, or `None` for a replicated input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] if the parent cannot bind the collective or a result cannot carry its batch axis.
+    fn forward_collective<O>(
+        &self,
+        operation: O,
+        array: &ArrayIrBatch<C::Value>,
+        output_extents: &[ArrayIrBatch<C::Value>],
+        output_batch_axis: Option<usize>,
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
+    where
+        C::Operation: From<O>,
+    {
+        let mut physical_output_extents =
+            output_extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
+        if let Some(output_batch_axis) = output_batch_axis {
+            physical_output_extents.insert(output_batch_axis, self.axis_extent().clone());
+        }
+        let physical_inputs = std::iter::once(array.value().clone()).chain(physical_output_extents).collect::<Vec<_>>();
+        self.parent()
+            .bind(operation, Vec::new(), physical_inputs.as_slice())?
+            .into_iter()
+            .map(|output| match output_batch_axis {
+                Some(output_batch_axis) => ArrayIrBatch::new(output, BatchAxis::from_position(output_batch_axis)),
+                None => Ok(ArrayIrBatch::replicated(output)),
+            })
+            .collect()
     }
-    Ok(())
-}
-
-/// Binds a mixed collective over a non-matching named axis after lifting the mapped axis into its explicit result
-/// extents. Replicated arrays require no lifting and remain replicated.
-fn forward_explicit_collective<C, O>(
-    operation: O,
-    context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-    array: &ArrayIrBatch<C::Value>,
-    output_extents: &[ArrayIrBatch<C::Value>],
-    output_batch_axis: Option<usize>,
-) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<O>>,
-{
-    let mut physical_output_extents = output_extents.iter().map(|extent| extent.value().clone()).collect::<Vec<_>>();
-    if let Some(output_batch_axis) = output_batch_axis {
-        physical_output_extents.insert(output_batch_axis, context.axis_extent().clone());
-    }
-    let physical_inputs = std::iter::once(array.value().clone()).chain(physical_output_extents).collect::<Vec<_>>();
-    context
-        .parent()
-        .bind(operation, Vec::new(), physical_inputs.as_slice())?
-        .into_iter()
-        .map(|output| match output_batch_axis {
-            Some(output_batch_axis) => ArrayIrBatch::new(output, BatchAxis::from_position(output_batch_axis)),
-            None => Ok(ArrayIrBatch::replicated(output)),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1477,15 +1474,15 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable,
         Layout, Memory, Shape, StridedLayout,
     };
-    use crate::batching::BatchableOperation;
+    use crate::batching::{BatchableOperation, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::MemberDifferentiableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::parallel_all_gather::{
-        ParallelAllGatherOperation, ParallelAllGatherOutputVariance, infer_explicit_parallel_all_gather_output_types,
+        ParallelAllGatherOperation, ParallelAllGatherOutputVariance, infer_array_ir_parallel_all_gather_output_types,
     };
     use crate::operations::collectives::parallel_all_to_all::{
-        ParallelAllToAllOperation, infer_explicit_parallel_all_to_all_output_types,
+        ParallelAllToAllOperation, infer_array_ir_parallel_all_to_all_output_types,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder};
@@ -1676,7 +1673,7 @@ mod tests {
         let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     4,
@@ -1742,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
+    fn test_array_ir_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
         type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
@@ -1788,7 +1785,7 @@ mod tests {
         let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
 
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     4,
@@ -1806,7 +1803,7 @@ mod tests {
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_to_all_output_types(
+            infer_array_ir_parallel_all_to_all_output_types(
                 &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
@@ -1818,7 +1815,7 @@ mod tests {
             Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_to_all_output_types(
+            infer_array_ir_parallel_all_to_all_output_types(
                 &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
@@ -1832,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_shape_changing_collective_type_inference() {
+    fn test_array_ir_shape_changing_collective_type_inference() {
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
         let split_result = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
         let concat_result = DimensionVariable::new("concat", DimensionBounds::new(2, Some(33)).unwrap());
@@ -1842,7 +1839,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
@@ -1865,7 +1862,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_to_all_output_types(
+            infer_array_ir_parallel_all_to_all_output_types(
                 &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
@@ -1882,7 +1879,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_to_all_output_types(
+            infer_array_ir_parallel_all_to_all_output_types(
                 &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
                 &[
                     ArrayIrType::Array(input_type.clone()),
@@ -1895,7 +1892,7 @@ mod tests {
 
         let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
@@ -1909,7 +1906,7 @@ mod tests {
         );
         let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
@@ -1929,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_shape_changing_collective_type_inference_untiled() {
+    fn test_array_ir_shape_changing_collective_type_inference_untiled() {
         let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
         let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
         let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
@@ -1944,7 +1941,7 @@ mod tests {
             ParallelAllGatherOutputVariance::Varying,
         );
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &gather,
                 &[
                     ArrayType::new_static(DataType::F32, [3, 4]).into(),
@@ -1956,7 +1953,7 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_gather_output_types(
+            infer_array_ir_parallel_all_gather_output_types(
                 &gather,
                 &[
                     ArrayType::new_static(DataType::F32, [3, 4]).into(),
@@ -1982,7 +1979,7 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
         );
         assert_eq!(
-            infer_explicit_parallel_all_to_all_output_types(
+            infer_array_ir_parallel_all_to_all_output_types(
                 &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default()),
                 &[
                     ArrayType::new_static(DataType::F32, [2, 3, 4]).into(),
@@ -2050,7 +2047,77 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_explicit_collective_eager_contracts() {
+    fn test_array_ir_collective_forwarding() -> Result<(), ProgramError> {
+        // A forwarded untiled collective can move the mapped axis, while its replicated form must not acquire one.
+        for (operation, output_shape, output_batch_axis) in [
+            (
+                ArrayIrOperation::<Array>::ParallelAllGather(ParallelAllGatherOperation::new(
+                    "inner".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::default(),
+                    ParallelAllGatherOutputVariance::Varying,
+                )),
+                vec![2, 2, 3],
+                2,
+            ),
+            (
+                ArrayIrOperation::ParallelSumScatter(ParallelSumScatterOperation::new(
+                    "inner".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::default(),
+                )),
+                vec![3],
+                0,
+            ),
+            (
+                ArrayIrOperation::ParallelAllToAll(ParallelAllToAllOperation::new(
+                    "inner".to_string(),
+                    2,
+                    0,
+                    1,
+                    CollectiveOptions::default(),
+                )),
+                vec![3, 2],
+                0,
+            ),
+        ] {
+            for mapped in [false, true] {
+                let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                let batch_extent = trace.input(DimensionValue::constant(5)?.r#type().into_owned().into());
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
+                    .with_axis_name("outer".to_string());
+                let input_shape = if mapped { vec![2, 5, 3] } else { vec![2, 3] };
+                let array = trace.input(ArrayType::new_static(DataType::F32, input_shape).into());
+                let batch_axis = if mapped { BatchAxis::new(1) } else { BatchAxis::replicated() };
+                let mut inputs = vec![BatchingTracer::new(context.clone(), ArrayIrBatch::new(array, batch_axis)?)];
+                for extent in &output_shape {
+                    let extent = trace.input(DimensionValue::constant(*extent)?.r#type().into_owned().into());
+                    inputs.push(BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)));
+                }
+                let outputs = context.bind(operation.clone(), Vec::new(), &inputs)?;
+                assert_eq!(outputs.len(), 1);
+                let output = outputs[0].batch();
+                let mut physical_output_shape = output_shape.clone();
+                let expected_batch_axis = if mapped {
+                    physical_output_shape.insert(output_batch_axis, 5);
+                    BatchAxis::new(output_batch_axis)
+                } else {
+                    BatchAxis::replicated()
+                };
+                assert_eq!(output.batch_axis(), expected_batch_axis);
+                assert_eq!(
+                    output.value().r#type().as_ref(),
+                    &ArrayIrType::Array(ArrayType::new_static(DataType::F32, physical_output_shape)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_collective_eager_contracts() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
