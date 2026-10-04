@@ -539,18 +539,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by summing
-// over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into
-// `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of
-// the sum. A non-matching level forwards the collective to the parent context, unchanged for a replicated input
-// (through `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
-impl<C: Context<Type = ArrayType>, P: CollectiveArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelSumScatterOperation
-where
-    C::Operation: From<ParallelSumScatterOperation>,
-    <C as Domain>::Value: Reduce + Transpose,
+impl<
+    C: Context<Type = ArrayType, Value: Reduce + Transpose, Operation: From<ParallelSumScatterOperation>>,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelSumScatterOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -558,6 +550,11 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A matching `batch` level consumes the mapped batch axis by summing over it and re-mapping the chunks of the
+        // per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into `(b, d_s / b)` chunks and the new
+        // chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of the sum. A non-matching
+        // level forwards the collective to the parent context, unchanged for a replicated input (through
+        // `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
         ArrayBatch::reject_ragged_inputs(self, inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
@@ -578,6 +575,7 @@ where
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
             ))
         })?;
+
         let output_type = self.infer_static_output_type(&input_type, dimensions.dimensions().to_vec(), false)?;
         let output_extents = output_type
             .shape()
@@ -615,12 +613,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
     }
 }
 
-// Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
-// same mode, axis, and participant groups, so the input cotangent is a [`ParallelAllGatherOperation`] of the output
-// cotangent.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ParallelSumScatterOperation
-where
+impl<
+    V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllGatherOperation>,
+> TransposableOperation<V, O> for ParallelSumScatterOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -630,23 +626,30 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // A sum-scatter is the adjoint of a varying all-gather with the same mode, axis, and participant groups,
+        // so the input cotangent is a `ParallelAllGatherOperation` of the output cotangent.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
+
         // Only a live output cotangent of an unknown input stages the adjoint collective.
         let adjoint = self.adjoint()?;
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
         };
+
         if inputs[0].is_known() {
             return Ok(());
         }
+
         let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
         check_count!("output", contributions, 1, ProgramError);
         accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
     fn infer_parent_region_input_types(
