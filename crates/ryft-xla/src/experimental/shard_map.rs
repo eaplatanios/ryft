@@ -6222,11 +6222,8 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %c = stablehlo.constant dense<2> : tensor<i64>
-                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
-                      %1 = stablehlo.multiply %c, %c_0 : tensor<i64>
-                      %2 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
-                      sdy.return %2 : tensor<4xf32>
+                      %1 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
+                      sdy.return %1 : tensor<4xf32>
                     } : (tensor<4xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -6604,15 +6601,12 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<4xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %c = stablehlo.constant dense<4> : tensor<i64>
-                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
-                      %1 = stablehlo.divide %c, %c_0 : tensor<i64>
-                      %2 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
+                      %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
-                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
-                        stablehlo.return %3 : tensor<f32>
+                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %2 : tensor<f32>
                       }) : (tensor<4xf32>) -> tensor<2xf32>
-                      sdy.return %2 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<4xf32>
                     return %0 : tensor<4xf32>
                   }
@@ -6689,7 +6683,7 @@ mod tests {
         .unwrap();
         let mesh = device_mesh.logical_mesh().clone();
         let input_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -6699,7 +6693,13 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::default()).unwrap()
+                            local_x
+                                .parallel_sum_scatter_with_options(
+                                    "x",
+                                    1,
+                                    CollectiveOptions::default().with_axis_index_groups(vec![vec![1, 0]]),
+                                )
+                                .unwrap()
                         },
                         x,
                         mesh.clone(),
@@ -6709,26 +6709,45 @@ mod tests {
                     .unwrap()
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])),
+            ArrayType::new_static(DataType::F32, [6, 2]),
         )
         .unwrap();
 
         let module = traced.to_mlir_module("main").unwrap();
-        assert!(module.contains("stablehlo.reduce_scatter"), "{module}");
-        assert!(module.contains("stablehlo.reshape"), "{module}");
-        assert!(module.contains("(tensor<2x3xf32>) -> tensor<1x3xf32>"), "{module}");
+        // Group order chooses the recipient of each column: device 1 receives column 0, and device 0 column 1.
+        // Untiled scatter removes dimension 1 after the native reduce-scatter leaves it with extent one.
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<6x2xf32>) -> tensor<6xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<3x2xf32>) {
+                      %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[1, 0]]> : tensor<1x2xi64>, scatter_dimension = 1 : i64, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<3x2xf32>) -> tensor<3x1xf32>
+                      %2 = stablehlo.reshape %1 : (tensor<3x1xf32>) -> tensor<3xf32>
+                      sdy.return %2 : tensor<3xf32>
+                    } : (tensor<6x2xf32>) -> tensor<6xf32>
+                    return %0 : tensor<6xf32>
+                  }
+                }
+            "#},
+        );
 
         let input_buffers = client_devices
             .iter()
             .enumerate()
             .map(|(device_index, device)| {
-                let scale = if device_index == 0 { 1.0_f32 } else { 10.0_f32 };
+                let scale = if device_index == 0 { 1.0f32 } else { 10.0f32 };
                 let values = [scale, scale * 2.0, scale * 3.0, scale * 4.0, scale * 5.0, scale * 6.0];
                 client
                     .buffer(
                         values_to_bytes(values.as_slice()).as_slice(),
                         BufferType::F32,
-                        [2u64, 3u64],
+                        [3u64, 2u64],
                         None,
                         device.clone(),
                         None,
@@ -6738,7 +6757,7 @@ mod tests {
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
             &domain,
-            static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
+            static_sharded_array_type(DataType::F32, &[6, 2], input_sharding),
             device_mesh,
             input_buffers,
         )
@@ -6759,8 +6778,10 @@ mod tests {
             .unwrap()
             .block_until_ready()
             .unwrap();
-        let expected = [vec![11.0_f32, 22.0, 33.0], vec![44.0_f32, 55.0, 66.0]];
+        assert_eq!(outputs.len(), 2);
+        let expected = [vec![22.0f32, 44.0, 66.0], vec![11.0f32, 33.0, 55.0]];
         for (output, expected) in outputs.into_iter().zip(expected) {
+            assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
         }
@@ -6846,8 +6867,8 @@ mod tests {
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
             &domain,
-            static_sharded_array_type(DataType::F32, &[4], sharding),
-            device_mesh,
+            static_sharded_array_type(DataType::F32, &[4], sharding.clone()),
+            device_mesh.clone(),
             input_buffers,
         )
         .unwrap();
@@ -6873,6 +6894,98 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
             assert_eq!(values, expected_values_by_device[device_index]);
+        }
+
+        // Partial and empty permutations give every untargeted participant a zero-filled shard.
+        for (pairs, expected_values_by_device) in [
+            (vec![(0, 1)], [[0.0f32, 0.0], [1.0, 2.0]]),
+            (Vec::new(), [[0.0f32, 0.0], [0.0, 0.0]]),
+        ] {
+            let mesh = device_mesh.logical_mesh().clone();
+            let sharding = sharding.clone();
+            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+                move |input: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_input: ShardMapTracer| local_input.parallel_permute("x", pairs.clone()).unwrap(),
+                        input,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                },
+                ArrayType::new_static(DataType::F32, [4]),
+            )
+            .unwrap();
+            let program = Program::Mlir { bytecode: traced.to_mlir_module("main").unwrap().into_bytes() };
+            let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+            assert_eq!(
+                executable
+                    .addressable_devices()
+                    .unwrap()
+                    .iter()
+                    .map(|device| device.id().unwrap())
+                    .collect::<Vec<_>>(),
+                execution_device_ids,
+            );
+            let outputs = executable
+                .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+                .unwrap()
+                .block_until_ready()
+                .unwrap();
+            assert_eq!(outputs.len(), expected_values_by_device.len());
+            for (output, expected) in outputs.into_iter().zip(expected_values_by_device) {
+                assert_eq!(output.outputs.len(), 1);
+                let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_map_parallel_permute_rejects_axis_size_mismatch() {
+        use ryft_core::ParallelPermuteOperation;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // Both operations are valid in isolation, but neither records the size of the enclosing manual axis.
+        // The larger size also exercises the pair that previously indexed beyond its replica group.
+        for (axis_size, pairs) in [(1, vec![(0, 0)]), (3, vec![(2, 0)])] {
+            let mesh = mesh.clone();
+            let sharding = sharding.clone();
+            let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+                move |input: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_input: ShardMapTracer| {
+                            local_input
+                                .dispatch_domain()
+                                .bind(
+                                    ParallelPermuteOperation::new("x".to_string(), axis_size, pairs.clone()),
+                                    Vec::new(),
+                                    &[local_input],
+                                )
+                                .unwrap()
+                                .remove(0)
+                        },
+                        input,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                },
+                ArrayType::new_static(DataType::F32, [4]),
+            )
+            .unwrap();
+            assert!(matches!(
+                traced.to_mlir_module("main"),
+                Err(ShardMapTraceError::LoweringFailure { message })
+                    if message == format!(
+                        "encountered malformed program: collective over axis `x` records size {axis_size}, \
+                         but the enclosing mesh axis has size 2",
+                    ),
+            ));
         }
     }
 
@@ -6930,7 +7043,6 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %c = stablehlo.constant dense<4> : tensor<i64>
                       %1 = "stablehlo.all_to_all"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 0 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<4xf32>) -> tensor<4xf32>
                       sdy.return %1 : tensor<4xf32>
                     } : (tensor<8xf32>) -> tensor<8xf32>

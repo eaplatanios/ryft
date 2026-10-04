@@ -142,6 +142,11 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
         let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
         self.referents.validate(declared, actual, closed_identities)
     }
+
+    #[inline]
+    fn refine(&self, declared: &ReferenceType<T>, symbolic: &[T::Identity]) -> Result<ReferenceType<T>, TypeError> {
+        Ok(ReferenceType::new(self.referents.refine(&declared.referent, symbolic)?))
+    }
 }
 
 /// Referent family of [`Type`] universes that contain no references. It has no values, so a function
@@ -419,6 +424,17 @@ mod tests {
             }
             Ok(())
         }
+
+        fn refine(&self, declared: &TestType, symbolic: &[TestIdentity]) -> Result<TestType, TypeError> {
+            Ok(match declared {
+                TestType::Dynamic(identity) if !symbolic.contains(identity) => self
+                    .values
+                    .iter()
+                    .find_map(|(candidate, value)| (candidate == identity).then_some(TestType::Static(*value)))
+                    .unwrap_or_else(|| declared.clone()),
+                _ => declared.clone(),
+            })
+        }
     }
 
     #[test]
@@ -475,5 +491,23 @@ mod tests {
         }
         assert_type::<NoReferent>();
         assert!(has_no_referent(&DataType::F32));
+    }
+
+    #[test]
+    fn test_reference_type_refinements_refine_the_referent() {
+        let identity = TestIdentity(0);
+        let refinements = ReferenceTypeRefinements::<TestType>::establish(
+            &[ReferenceType::new(TestType::Dynamic(identity))],
+            &[ReferenceType::new(TestType::Static(3))],
+        )
+        .unwrap();
+        assert_eq!(
+            refinements.refine(&ReferenceType::new(TestType::Dynamic(identity)), &[]),
+            Ok(ReferenceType::new(TestType::Static(3))),
+        );
+        assert_eq!(
+            refinements.refine(&ReferenceType::new(TestType::Dynamic(identity)), &[identity]),
+            Ok(ReferenceType::new(TestType::Dynamic(identity))),
+        );
     }
 }

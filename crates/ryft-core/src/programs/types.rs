@@ -256,6 +256,21 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
         A::IntoIter: ExactSizeIterator,
         D::Item: Borrow<T>,
         A::Item: Borrow<T>;
+
+    /// Returns `declared` with every identity that these refinement facts determine replaced by its refinement, except
+    /// the identities in `symbolic`, which stay symbolic. This applies the facts that [`Self::establish`] derived from
+    /// a complete input signature to a declared type (e.g., a declared output type of an operation whose inputs refine
+    /// its declared input types). Because the facts are established from the complete signature first, an identity in
+    /// `symbolic` still takes part in conflict detection and is only kept symbolic when the facts are applied.
+    /// Exclusion applies per identity, so a type that mentions both an excluded identity and a refinable one is still
+    /// refined at the latter. Refinements never add metadata that is not a fact about an identity (e.g., an array's
+    /// sharding or layout).
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Declared type to refine.
+    ///   - `symbolic`: Identities that must stay symbolic in the returned type.
+    fn refine(&self, declared: &T, symbolic: &[T::Identity]) -> Result<T, TypeError>;
 }
 
 impl<T: Type> TypeRefinements<T> for () {
@@ -288,6 +303,11 @@ impl<T: Type> TypeRefinements<T> for () {
             }
             Ok(())
         })
+    }
+
+    #[inline]
+    fn refine(&self, declared: &T, _symbolic: &[T::Identity]) -> Result<T, TypeError> {
+        Ok(declared.clone())
     }
 }
 
@@ -411,6 +431,7 @@ mod tests {
             ),
             Err(TypeError::invalid("type f64 does not refine declared type f32")),
         );
+        assert_eq!(<() as TypeRefinements<DataType>>::refine(&refinements, &DataType::F32, &[]), Ok(DataType::F32));
     }
 
     #[test]

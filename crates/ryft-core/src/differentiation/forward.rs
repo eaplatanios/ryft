@@ -226,7 +226,7 @@ pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input
     /// for each selected primal input, in selection order and omitting zero differential spaces. [`Self::new`] selects
     /// all inputs in source order. These tangent inputs are followed by the residuals `r`, and one SSA output for each
-    /// primal output with a nonzero differential space and a live tangent root. Inactive reference outputs have no
+    /// primal output with a non-zero differential space and a live tangent root. Inactive reference outputs have no
     /// tangent slot. Shared ownership lets callers retain this program independently of the primal program.
     tangent: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
@@ -335,7 +335,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         if tangent.output_ids().len() != differentiable_primal_outputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linearization tangent program produces {} outputs \
-                 while the primal program has {} nonzero differential outputs",
+                 while the primal program has {} non-zero differential outputs",
                 tangent.output_ids().len(),
                 differentiable_primal_outputs.len(),
             )));
@@ -566,8 +566,8 @@ impl<
     /// `primal_output_types` validates the compact program boundary and remains available to reverse-mode conversion.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
-    /// one leading input for every nonzero tangent in `primal_input_types`, followed by one input for every residual,
-    /// and must produce one output for every nonzero tangent in `primal_output_types`. A mismatch is reported as a
+    /// one leading input for every non-zero tangent in `primal_input_types`, followed by one input for every residual,
+    /// and must produce one output for every non-zero tangent in `primal_output_types`. A mismatch is reported as a
     /// [`MalformedProgram`](ProgramError::MalformedProgram) error.
     ///
     /// # Parameters
@@ -625,7 +625,7 @@ impl<
         if live_input_tangent_types.len() != tangent_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward program consumes {} tangent inputs but its public boundary has {} \
-                 nonzero differential inputs",
+                 non-zero differential inputs",
                 tangent_input_count,
                 live_input_tangent_types.len(),
             )));
@@ -649,7 +649,7 @@ impl<
             .collect::<Vec<_>>();
         if live_output_tangent_types.len() != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "pushforward program produces {} tangent outputs but its public boundary has {} nonzero differential \
+                "pushforward program produces {} tangent outputs but its public boundary has {} non-zero differential \
                  outputs",
                 program.output_ids().len(),
                 live_output_tangent_types.len(),
@@ -658,7 +658,7 @@ impl<
         for (index, (output, tangent_type)) in program.outputs().zip(&live_output_tangent_types).enumerate() {
             if output.r#type().as_ref() != tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "pushforward program tangent output {} has type {} but its public boundary requires tangent\
+                    "pushforward program tangent output {} has type {} but its public boundary requires tangent \
                      type {}",
                     index,
                     output.r#type().as_ref(),
@@ -782,7 +782,7 @@ impl<
         program_inputs.extend(self.residuals.iter().cloned());
         let tangent_outputs = self.program.interpret_in_context(&self.context, program_inputs)?.into_iter();
 
-        // Reconstruct the complete flattened public output boundary. Consume one program result for each nonzero
+        // Reconstruct the complete flattened public output boundary. Consume one program result for each non-zero
         // tangent space and materialize the uniquely determined typed zero for every omitted zero-space leaf.
         let outputs = self.tangent_reconstruction.rebuild(&self.context, tangent_outputs)?;
 
@@ -968,7 +968,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     ///
     /// For a nested region, callers derive this selection from incoming duals through
     /// [`DifferentiationDual::is_tangent_active`]; it need not match the user's original input selection. Selection
-    /// describes which tangent arguments the child receives, not whether their numerical values are nonzero. A live
+    /// describes which tangent arguments the child receives, not whether their numerical values are non-zero. A live
     /// tangent can contain zeros, and some structural zeros are classified as active because they can be materialized
     /// as tangent arguments from their types alone.
     ///
@@ -1013,7 +1013,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// For nested regions, callers derive the selected indices from incoming duals through
     /// [`DifferentiationDual::is_tangent_active`], rather than copying the user's original input selection. As with
     /// [`Self::jvp_program`], a selected tangent argument may contain zeros; selection records whether an argument is
-    /// supplied, not whether its value is numerically nonzero.
+    /// supplied, not whether its value is numerically non-zero.
     ///
     /// Unlike [`Self::jvp_program`], this hands back an owned [`Linearization`] because its consumers restructure the
     /// component programs instead of attaching them unchanged. The bounded `while` rule, for example, consumes the
@@ -1798,19 +1798,28 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             (!touches_references).then_some(Vec::new())
         } else {
             let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-            let mut reusable_zero_outputs = Vec::new();
-            let mut can_materialize = true;
-            for (output_index, output_type) in output_types.iter().enumerate() {
-                let tangent_type = output_type.tangent()?;
-                if operation.is_zero(output_index) && output_type == &tangent_type {
-                    reusable_zero_outputs.push(output_index);
-                } else if !can_materialize_zero_tangent_from_type(output_type, &tangent_type) {
-                    can_materialize = false;
-                    break;
+
+            // This inference only establishes shortcut eligibility. A named batch may shadow a mesh axis, so standalone
+            // inference can reject an operation that the parent binder legitimately implements with different mesh
+            // semantics. Defer failed probes to the ordinary rule, whose parent dispatch validates the operation in
+            // its actual context, just as it does when the inputs have non-zero tangents.
+            match operation.infer_output_types(input_types.as_slice(), &[]) {
+                Ok(output_types) => {
+                    let mut reusable_zero_outputs = Vec::new();
+                    let mut can_materialize = true;
+                    for (output_index, output_type) in output_types.iter().enumerate() {
+                        let tangent_type = output_type.tangent()?;
+                        if operation.is_zero(output_index) && output_type == &tangent_type {
+                            reusable_zero_outputs.push(output_index);
+                        } else if !can_materialize_zero_tangent_from_type(output_type, &tangent_type) {
+                            can_materialize = false;
+                            break;
+                        }
+                    }
+                    can_materialize.then_some(reusable_zero_outputs)
                 }
+                Err(_) => None,
             }
-            can_materialize.then_some(reusable_zero_outputs)
         };
 
         let outputs = if let Some(reusable_zero_outputs) = reusable_zero_outputs {
@@ -2673,9 +2682,9 @@ where
     /// `[x_1, …, x_n]` and outputs `[y_1, …, y_m]` (so that `y = f(x)`), the returned program has:
     ///
     ///   - inputs `[x_1, …, x_n, live(ẋ_1, …, ẋ_n)]`, which correspond to the primal inputs followed by one fresh
-    ///     tangent input for each nonzero differential input, and
+    ///     tangent input for each non-zero differential input, and
     ///   - outputs `[y_1, …, y_m, live(ẏ_1, …, ẏ_m)]`, which correspond to the primal outputs followed by the
-    ///     tangents of nonzero differential outputs.
+    ///     tangents of non-zero differential outputs.
     ///
     /// More precisely, `live(ẋ_1, …, ẋ_n)` is the subsequence containing only tangents whose types are not zero
     /// differential spaces. A tangent in a zero differential space has exactly one possible value, so the transformed
@@ -2697,7 +2706,7 @@ where
     /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
     /// inputs (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
     /// with a typed structural zero tangent. Structural zeros are materialized as typed
-    /// [`ZeroOperation`](crate::ZeroOperation) instructions only when a nonzero differential output requires a real
+    /// [`ZeroOperation`](crate::ZeroOperation) instructions only when a non-zero differential output requires a real
     /// value, preserving a compact `(primal_outputs ++ live_tangent_outputs)` program contract.
     ///
     /// Reference-typed inputs are differentiated directly, without discharging the program first. A reference type is
@@ -2745,7 +2754,7 @@ where
     /// binds only its primal operation and propagates typed structural zeros.
     ///
     /// The resulting [`Linearization`] has the boundary `x -> (y, r)` and `(live(dx), r) -> live(dy)`. Every source
-    /// input is seeded eagerly as one known primal tracer and, for a nonzero differential space, one leading unknown
+    /// input is seeded eagerly as one known primal tracer and, for a non-zero differential space, one leading unknown
     /// tangent input. When tangent work first consumes a known primal value, partial evaluation materializes that value
     /// as a residual and its shared materialization slot deduplicates later uses; literal constants instead remain
     /// inline tangent-program constants. Residual feeder tracers are appended to the primal outputs in exactly the
@@ -4433,7 +4442,7 @@ pub(crate) mod tests {
         assert!(matches!(
             Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64).unwrap()]), boundary_program(&[], &[]), 0),
             Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent program produces 0 \
-                outputs while the primal program has 1 nonzero differential outputs",
+                outputs while the primal program has 1 non-zero differential outputs",
         ));
     }
 
@@ -4532,7 +4541,7 @@ pub(crate) mod tests {
         assert!(matches!(
             pushforward_with_boundary(boundary_program(&[], &[]), vec![], &[Array::scalar(1.0_f64).unwrap()], &[]),
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program consumes 0 tangent inputs \
-                but its public boundary has 1 nonzero differential inputs",
+                but its public boundary has 1 non-zero differential inputs",
         ));
     }
 
@@ -4550,7 +4559,7 @@ pub(crate) mod tests {
         assert!(matches!(
             pushforward_with_boundary(boundary_program(&[], &[]), vec![], &[], &[Array::scalar(1.0_f64).unwrap()]),
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program produces 0 tangent \
-                outputs but its public boundary has 1 nonzero differential outputs",
+                outputs but its public boundary has 1 non-zero differential outputs",
         ));
     }
 
@@ -5458,6 +5467,20 @@ pub(crate) mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(-0.0_f64).unwrap());
         assert_eq!(outputs[0].tangent().as_value(), Some(&Array::scalar(-3.0_f64).unwrap()));
+    }
+
+    #[test]
+    fn test_differentiation_context_bind_invalid_symbolic_zero_inputs() {
+        // A failed shortcut-eligibility probe defers to the ordinary rule; that rule still rejects malformed inputs.
+        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(1f64).unwrap()).unwrap(),
+            context.clone(),
+        );
+        assert_eq!(
+            context.bind(NegOperation::new(), Vec::new(), &[input.clone(), input]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
+        );
     }
 
     #[test]

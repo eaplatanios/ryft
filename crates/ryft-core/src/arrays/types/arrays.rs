@@ -932,6 +932,23 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
             })
         })
     }
+
+    fn refine(&self, declared: &ArrayType, symbolic: &[DimensionVariable]) -> Result<ArrayType, TypeError> {
+        let dimensions = declared
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                Dimension::Dynamic(variable) if !symbolic.contains(variable) => self
+                    .bindings
+                    .iter()
+                    .find_map(|(candidate, extent)| (candidate == variable).then_some(Dimension::Static(*extent)))
+                    .unwrap_or_else(|| dimension.clone()),
+                _ => dimension.clone(),
+            })
+            .collect::<Vec<_>>();
+        Ok(declared.clone().with_shape(Shape::new(dimensions)))
+    }
 }
 
 #[cfg(test)]
@@ -1668,6 +1685,67 @@ mod tests {
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_refinements_refine_declared_types() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let cols = DimensionVariable::new("cols", DimensionBounds::non_negative(Some(8)).unwrap());
+        let depth = DimensionVariable::new("depth", DimensionBounds::non_negative(Some(8)).unwrap());
+        let refinements = ArrayTypeRefinements::establish(
+            &[ArrayType::new(F32, Shape::new(vec![rows.clone().into(), cols.clone().into()]))],
+            &[ArrayType::new(F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]))],
+        )
+        .unwrap();
+
+        // Every established identity is replaced by its extent, while an identity without a fact stays symbolic.
+        let declared = ArrayType::new(F32, Shape::new(vec![rows.clone().into(), cols.clone().into(), depth.into()]));
+        assert_eq!(
+            refinements.refine(&declared, &[]),
+            Ok(declared.clone().with_shape(Shape::new(vec![
+                Dimension::Static(3),
+                Dimension::Static(4),
+                declared.shape().dimensions()[2].clone(),
+            ]))),
+        );
+
+        // Exclusion applies per identity, so a partially excluded type is still refined at its other identities.
+        assert_eq!(
+            refinements.refine(&declared, std::slice::from_ref(&rows)),
+            Ok(declared.clone().with_shape(Shape::new(vec![
+                rows.clone().into(),
+                Dimension::Static(4),
+                declared.shape().dimensions()[2].clone(),
+            ]))),
+        );
+
+        // Refinement only substitutes extents, so metadata such as a sharding is kept exactly as declared.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded = ArrayType::new(F32, Shape::new(vec![rows.clone().into()]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        assert_eq!(
+            refinements.refine(&sharded, &[]),
+            Ok(sharded.clone().with_shape(Shape::new(vec![Dimension::Static(3)]))),
+        );
+
+        // Facts are established from the complete signature, so an identity that a caller excludes when refining still
+        // takes part in conflict detection.
+        assert_eq!(
+            ArrayTypeRefinements::establish(
+                &[
+                    ArrayType::new(F32, Shape::new(vec![rows.clone().into()])),
+                    ArrayType::new(F32, Shape::new(vec![rows.into()])),
+                ],
+                &[
+                    ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)])),
+                    ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)])),
+                ],
+            )
+            .unwrap_err()
+            .downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "rows".to_string(), expected: 3, actual: 4 }),
         );
     }
 }

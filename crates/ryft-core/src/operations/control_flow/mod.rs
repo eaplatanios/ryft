@@ -1,7 +1,7 @@
 use crate::arrays::{ArrayIrType, ArrayType};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
-use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition};
+use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeRefinements};
 
 // TODO(eaplatanios): Review this module and also add a module docstring that follows our established conventions.
 
@@ -104,13 +104,45 @@ where
     }
 }
 
+/// Returns the output types of a control-flow operation whose `input_types` refine the `declared_input_types` of its
+/// regions, by applying the refinement facts that those inputs establish (e.g., `rows = 3` for an `f32[3]` input that
+/// a region declares as `f32[rows]`) to the `declared_output_types`. The facts are established from the complete input
+/// signature, so conflicting facts are rejected, but identities that an output type defines stay symbolic: a loop's
+/// first-class dimension carry may change its extent across iterations, and a branch produces the identities that its
+/// outputs define. A reference output whose aliased input is known (i.e., for which `aliased_input` returns that
+/// input's index) takes exactly that input's type, so an alias family never mixes refined and declared reference
+/// types, while any other reference output keeps its declared type. Metadata that is not a fact about an identity
+/// (e.g., a sharding or layout that only the inputs carry) is never propagated to the outputs.
+pub(crate) fn refine_output_types<T: Type>(
+    declared_input_types: &[T],
+    input_types: &[T],
+    declared_output_types: &[T],
+    aliased_input: impl Fn(usize) -> Option<usize>,
+) -> Result<Vec<T>, TypeError> {
+    let refinements = T::Refinements::establish(declared_input_types, input_types)?;
+    let symbolic_identities = declared_output_types
+        .iter()
+        .flat_map(Type::identities)
+        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then(|| identity.clone()))
+        .collect::<Vec<_>>();
+    declared_output_types
+        .iter()
+        .enumerate()
+        .map(|(index, declared_output_type)| {
+            if declared_output_type.is_reference() {
+                return Ok(aliased_input(index)
+                    .map_or_else(|| declared_output_type.clone(), |input_index| input_types[input_index].clone()));
+            }
+            refinements.refine(declared_output_type, symbolic_identities.as_slice())
+        })
+        .collect()
+}
+
 /// Validates that every type identity that one of the `output_types` of a control-flow operation refers to is either
 /// carried by one of its `input_types` or defined by one of its `output_types`, so that the instruction only produces
-/// types whose identities it consumes or defines. The outputs of `while`, `scan`, and `condition` keep the declared
-/// types of their regions while their inputs only need to refine the declared region input types, so an input that
-/// refines a dynamic dimension to a static extent removes that dimension's identity from the instruction boundary
-/// unless another input still carries it or an output defines it (e.g., a first-class dimension carry). Checking this
-/// during type inference reports such a refinement at the operation instead of when its enclosing program is built.
+/// types whose identities it consumes or defines. [`refine_output_types`] replaces an identity that the inputs refine
+/// away with its static extent, unless an output defines that identity, so this holds for the refined output types by
+/// construction and is checked as a final invariant of `while`, `scan`, and `condition` type inference.
 pub(crate) fn validate_output_identities<T: Type>(
     operation_name: &str,
     input_types: &[T],

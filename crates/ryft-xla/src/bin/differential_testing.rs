@@ -21,7 +21,7 @@ use ryft_core::{
     ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType,
     Device, DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
     DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
-    MeshAxisType, ParallelShuffle, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind,
+    MeshAxisType, ParallelPermute, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind,
     ScaledDot, Shape, Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};

@@ -212,7 +212,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     [`RaggedAllToAll`](crate::operations::collectives::RaggedAllToAll),
 ///     [`ParallelSumScatter`](crate::operations::collectives::ParallelSumScatter),
 ///     [`ParallelSwapAxes`](crate::operations::collectives::ParallelSwapAxes),
-///     [`ParallelShuffle`](crate::operations::collectives::ParallelShuffle),
+///     [`ParallelPermute`](crate::operations::collectives::ParallelPermute),
 ///     [`Reshard`](crate::operations::sharding::Reshard),
 ///     [`ConstrainSharding`](crate::operations::sharding::ConstrainSharding),
 ///     [`ParallelReduce`](crate::operations::collectives::ParallelReduce), and

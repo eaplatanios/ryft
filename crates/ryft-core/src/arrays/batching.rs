@@ -2930,10 +2930,14 @@ where
     }
 
     fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
-        // The composite policy's extent is a first-class dimension value owned by the parent context, so its size is
-        // known statically only when the parent resolves that value to a concrete dimension constant (e.g., under eager
-        // batching), in which case it is projected to a `DimensionValue` and its extent is reported. A staged or opaque
-        // extent (e.g., under a trace with a symbolic batch dimension) has no static size.
+        // Exact dimension bounds establish the size even when the extent is a traced instruction. Otherwise, ask the
+        // parent to resolve the first-class extent to a concrete dimension constant (e.g., under eager batching).
+        // A symbolic staged or opaque extent without an exact type has no static size.
+        if let ArrayIrType::Dimension(axis_type) = context.axis_extent().r#type().as_ref()
+            && let Some(extent) = axis_type.extent()
+        {
+            return Some(extent);
+        }
         match context.parent().resolve(context.axis_extent()) {
             ValueResolution::Constant(axis_extent) => {
                 <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
@@ -7327,8 +7331,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_static_batch_axis_extent() -> Result<(), ProgramError> {
-        // The composite extent is a first-class value owned by the parent, so its size is known statically only when
-        // the parent resolves it to a dimension constant; a staged symbolic extent has no static size.
+        // Exact types and resolved dimension constants establish a static size; a symbolic extent remains dynamic.
         let eager = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             ArrayIrEagerContext::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2)?),
@@ -7341,6 +7344,14 @@ mod tests {
             trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(3)?)),
         );
         assert_eq!(ArrayIrBatchingPolicy::static_batch_axis_extent(&constant), Some(3));
+        let instruction = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), trace.dimension_constant(4)?);
+        assert_eq!(ArrayIrBatchingPolicy::static_batch_axis_extent(&instruction), Some(4));
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(5, Some(6))?);
+        let exact_input = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            trace.clone(),
+            trace.input(DimensionType::from(exact).into()),
+        );
+        assert_eq!(ArrayIrBatchingPolicy::static_batch_axis_extent(&exact_input), Some(5));
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
         let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             trace.clone(),

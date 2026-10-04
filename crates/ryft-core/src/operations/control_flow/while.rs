@@ -38,7 +38,9 @@ use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, validate_reference_carry_axis};
 use crate::operations::control_flow::select::SelectOperation;
-use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType, validate_output_identities};
+use crate::operations::control_flow::{
+    TemporalResidualOperation, TemporalResidualType, refine_output_types, validate_output_identities,
+};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
@@ -213,12 +215,11 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         // Inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather than
         // strict type equality, so actual inputs that carry metadata the state types leave unspecified (e.g., the
         // normalized shardings of concrete backend array types) or static extents within the bounds of dynamic state
-        // dimensions are accepted. The outputs keep the declared state types, because every iteration carries values of
-        // those types and the final state need not preserve the refinements of the initial state. An output may only
-        // refer to a type identity that its instruction consumes or defines, so every identity that the state types
-        // refer to must either be defined by a state type (e.g., by a first-class dimension carry) or still be carried
-        // by the inputs. A static input extent cannot stand in for a loop-invariant dynamic dimension that no state
-        // element defines.
+        // dimensions are accepted. The outputs are the state types refined by the facts that the inputs establish
+        // (refer to `refine_output_types`): an identity that the inputs fix to a static extent and that no state
+        // element defines is loop-invariant, so every iteration carries values of that extent, while an identity that a
+        // first-class dimension carry defines may change across iterations and stays symbolic. Metadata such as
+        // shardings is not propagated, because the body may change it.
         let (_, body_interface) = validated_while_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
         check_count!("input", input_types, state_types.len(), TypeError);
@@ -230,8 +231,11 @@ impl<T: WhileType> Operation for WhileOperation<T> {
                 )));
             }
         }
-        validate_output_identities(WHILE_OPERATION_NAME, input_types, state_types)?;
-        Ok(state_types.to_vec())
+        let output_types = refine_output_types(state_types, input_types, state_types, |index| {
+            self.reference_output_identity_input(index)
+        })?;
+        validate_output_identities(WHILE_OPERATION_NAME, input_types, output_types.as_slice())?;
+        Ok(output_types)
     }
 
     #[inline]
@@ -3444,8 +3448,9 @@ mod tests {
             )),
         );
 
-        // Without the first-class dimension state, nothing defines `extent`. The outputs keep the declared state types,
-        // so a static input extent cannot stand in for that loop-invariant dimension.
+        // Without the first-class dimension state, nothing defines `extent`, so it is loop-invariant and the output
+        // takes the static extent that the input establishes for it. A reference output takes exactly the type of the
+        // input that it aliases.
         let array_state_types = vec![state_types[1].clone()];
         let array_interfaces = vec![
             RegionInterface::new(
@@ -3460,10 +3465,24 @@ mod tests {
                 &[ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5]))],
                 array_interfaces.as_slice(),
             ),
-            Err(TypeError::invalid(
-                "`while` output 0 has type `f32[extent]`, which refers to the identity `extent` that no input carries \
-                 and no output defines",
-            )),
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5]))]),
+        );
+        let ArrayIrType::Array(referent_type) = &state_types[1] else { unreachable!() };
+        let reference_state_types = vec![ArrayIrType::Reference(ReferenceType::new(referent_type.clone()))];
+        let reference_interfaces = vec![
+            RegionInterface::new(
+                reference_state_types.clone(),
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                EffectClasses::NONE,
+            ),
+            RegionInterface::new(reference_state_types.clone(), reference_state_types, EffectClasses::NONE),
+        ];
+        let refined_reference_type =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [5])));
+        assert_eq!(
+            WhileOperation::new()
+                .infer_output_types(std::slice::from_ref(&refined_reference_type), reference_interfaces.as_slice()),
+            Ok(vec![refined_reference_type]),
         );
     }
 
@@ -3513,6 +3532,87 @@ mod tests {
                 "`reference_read` reads a reference whose alias family `reference_freeze` already consumed".to_string(),
             ),
         );
+    }
+
+    #[test]
+    fn test_while_staging_falls_back_to_declared_regions_when_specialization_drops_a_refinement() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // The body replaces its carry with an unsharded constant, so the carry is unsharded after every iteration even
+        // when it enters the loop with a sharding. The body specialized at the sharded carry no longer maps its carry to
+        // itself, so staging falls back to the declared body, and the carry keeps its declared, unsharded type.
+        let state_type = ArrayType::scalar(DataType::F32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(state_type.clone().into());
+        let predicate = condition_builder.add_constant(array(Array::scalar(false).unwrap()));
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(state_type.clone().into());
+        let replacement = body_builder.add_constant(array(Array::scalar(1f32).unwrap()));
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![replacement], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let (output_type, _) = TestContext::trace(
+            |input: TestTracer| {
+                let context = input.context().clone();
+                Ok(context
+                    .bind(WhileOperation::new(), vec![condition.clone(), body.clone()], std::slice::from_ref(&input))?
+                    .remove(0))
+            },
+            ArrayIrType::Array(sharded_type),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(state_type));
+    }
+
+    #[test]
+    fn test_while_differentiation_falls_back_to_declared_regions_when_specialization_drops_a_refinement() {
+        // Forward-mode differentiation specializes attached regions before applying the `while` rule. A body that
+        // replaces its sharded carry with an unsharded constant cannot be specialized usefully, so differentiation uses
+        // the declared regions, exactly like staging does.
+        let state_type = ArrayType::scalar(DataType::F32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(state_type.clone().into());
+        let predicate = condition_builder.add_constant(array(Array::scalar(false).unwrap()));
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(state_type.clone().into());
+        let replacement = body_builder.add_constant(array(Array::scalar(1f32).unwrap()));
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![replacement], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+        let (output_types, _) = TestContext::trace(
+            |input: TestTracer| {
+                let context = input.context().clone();
+                let (primal, tangent) = context.jvp(
+                    |state: DifferentiationTracer<TestContext>, ()| {
+                        let context = state.context().clone();
+                        Ok(context
+                            .bind(WhileOperation::new(), vec![condition.clone(), body.clone()], &[state])?
+                            .remove(0))
+                    },
+                    input.clone(),
+                    input,
+                    (),
+                )?;
+                Ok(vec![primal, tangent])
+            },
+            ArrayIrType::Array(sharded_type),
+        )
+        .unwrap();
+        assert_eq!(output_types, vec![ArrayIrType::Array(state_type); 2]);
     }
 
     #[test]

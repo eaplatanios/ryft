@@ -48,8 +48,7 @@ pub use assertions::{
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, ManualVariationAlignment,
     PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelPermute,
-    ParallelPermuteOperation, ParallelReduce, ParallelReduceOperation, ParallelShuffle, ParallelVary,
-    ParallelVaryOperation,
+    ParallelPermuteOperation, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use constants::{

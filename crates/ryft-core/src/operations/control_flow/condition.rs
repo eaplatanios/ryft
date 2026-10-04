@@ -31,7 +31,7 @@ use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
-use crate::operations::control_flow::validate_output_identities;
+use crate::operations::control_flow::{refine_output_types, validate_output_identities};
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{
@@ -190,8 +190,8 @@ where
         // Branch inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather
         // than strict type equality, as for `while` and `scan`, so actual inputs that carry metadata the branch input
         // types leave unspecified (e.g., the normalized shardings of concrete backend array types) or static extents
-        // within the bounds of dynamic branch input dimensions are accepted. The outputs keep the declared branch
-        // output types.
+        // within the bounds of dynamic branch input dimensions are accepted. The outputs are the branch output types
+        // refined by the facts that the inputs establish, except for identities that an output defines.
         for (index, (branch_input_type, input_type)) in
             true_interface.input_types().iter().zip(&input_types[1..]).enumerate()
         {
@@ -203,7 +203,14 @@ where
                 )));
             }
         }
-        let output_types = true_interface.output_types().to_vec();
+        // A branch may forward any of its reference inputs, and which one is only visible in its body, so reference
+        // outputs keep their declared types (refer to `refine_output_types`).
+        let output_types = refine_output_types(
+            true_interface.input_types(),
+            &input_types[1..],
+            true_interface.output_types(),
+            |_| None,
+        )?;
         validate_output_identities(CONDITION_OPERATION_NAME, input_types, output_types.as_slice())?;
         Ok(output_types)
     }
@@ -2444,8 +2451,9 @@ mod tests {
             Ok(vec![Some(vec![sharded_type.clone()]), Some(vec![sharded_type])]),
         );
 
-        // A static extent within the bounds of a dynamic branch input dimension refines it, as long as another input
-        // still carries the dimension's identity, which the outputs refer to.
+        // A static extent within the bounds of a dynamic branch input dimension refines it, and the outputs take the
+        // extent that the inputs establish for that dimension's identity. Inputs that share the identity share its
+        // extent, so this holds even when another input still carries the identity dynamically.
         let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type =
@@ -2462,7 +2470,7 @@ mod tests {
                 &[predicate_type.clone(), vector_type.clone(), static_type.clone()],
                 interfaces.as_slice(),
             ),
-            Ok(vec![vector_type.clone()]),
+            Ok(vec![static_type.clone()]),
         );
         assert_eq!(
             ConditionOperation::<TestValue>::new().infer_output_types(
@@ -2478,12 +2486,30 @@ mod tests {
             )),
         );
         assert_eq!(
-            ConditionOperation::<TestValue>::new()
-                .infer_output_types(&[predicate_type, static_type.clone(), static_type], interfaces.as_slice()),
-            Err(TypeError::invalid(
-                "`condition` output 0 has type `f32[extent]`, which refers to the identity `extent` that no input \
-                 carries and no output defines",
-            )),
+            ConditionOperation::<TestValue>::new().infer_output_types(
+                &[predicate_type.clone(), static_type.clone(), static_type.clone()],
+                interfaces.as_slice(),
+            ),
+            Ok(vec![static_type.clone()]),
+        );
+
+        // A branch may forward any of its reference inputs, which only its body shows, so a reference output keeps its
+        // declared type even when every reference input is refined.
+        let ArrayIrType::Array(referent_type) = &vector_type else { unreachable!() };
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let refined_reference_type =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [5])));
+        let interface = RegionInterface::new(
+            vec![reference_type.clone(), vector_type.clone()],
+            vec![reference_type.clone()],
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            ConditionOperation::<TestValue>::new().infer_output_types(
+                &[predicate_type, refined_reference_type, vector_type],
+                &[interface.clone(), interface],
+            ),
+            Ok(vec![reference_type]),
         );
     }
 
@@ -2611,6 +2637,51 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_boundary_pruning_keeps_inputs_that_refine_kept_outputs() {
+        // Neither branch reads `b`, but `b` is the only input that fixes `rows = 3`, which refines the output to
+        // `f64[3]`. Dropping it would change the type of the kept output, so pruning keeps the condition's boundary.
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)])));
+        let static_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let first = builder.add_input(vector_type.clone());
+            builder.add_input(vector_type.clone());
+            let output = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(SinOperation::new())),
+                    Vec::new(),
+                    vec![first],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let first = builder.add_input(vector_type);
+        let second = builder.add_input(static_type.clone());
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                vec![true_branch, false_branch],
+                vec![predicate, first, second],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.output_types(), vec![static_type.clone()]);
+        let pruned = program.clone().into_pruned().unwrap();
+        assert_eq!(pruned.to_string(), program.to_string());
+        assert_eq!(pruned.output_types(), vec![static_type]);
+    }
+
     fn test_condition_interprets_branch_local_reference_allocations() {
         // Only the taken branch allocates and reads its local reference, and that allocation never leaves the branch,
         // so both predicates interpret to the input value.

@@ -1058,7 +1058,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// region requires specialization (per [`region_requires_specialization`](Self::region_requires_specialization)).
     /// Regions are visited in application order, and the region input types are re-inferred after each specialization,
     /// because the signature of one region can depend on another (e.g., a linear call's transpose receives the
-    /// cotangent of its specialized forward output).
+    /// cotangent of its specialized forward output). Specialization is an optimization, so this also returns [`None`]
+    /// when a region cannot be specialized or when `operation` rejects the specialized regions (e.g., a loop body
+    /// specialized at a sharded carry that returns that carry unsharded), leaving the regions to be used as declared.
     ///
     /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example, a
     /// region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` has its extent
@@ -1068,7 +1070,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     /// # Errors
     ///
-    /// Returns the errors of inferring the region input types and of specializing the regions.
+    /// Returns the errors of inferring the region input types and of checking whether the regions require
+    /// specialization.
     pub(crate) fn specialize_attached_regions<'r, R: Iterator<Item = RegionRef<'r, V, O>>>(
         operation: &O,
         input_types: &[V::Type],
@@ -1087,17 +1090,33 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             let Some(Some(requested)) = region_input_types.get(index) else {
                 continue;
             };
+
             if !Self::region_requires_specialization(interfaces[index].input_types(), requested)? {
                 continue;
             }
+
             let programs = programs.get_or_insert_with(|| regions.iter().map(|region| region.to_program()).collect());
-            let specialized = programs[index].clone().specialize_to_region_input_types(requested)?;
+
+            // Specialization is an optimization, so a region that cannot be specialized leaves every region
+            // unspecialized, matching the staging fallback (refer to `TracingContext::stage_operation`).
+            let Ok(specialized) = programs[index].clone().specialize_to_region_input_types(requested) else {
+                return Ok(None);
+            };
+
             interfaces[index] = specialized.interface();
             programs[index] = specialized;
             if index + 1 < regions.len() {
                 region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
             }
         }
+
+        // Specialized regions can be unusable even though their declared counterparts are fine (e.g., a loop body
+        // specialized at a sharded carry that returns that carry unsharded), so they are kept only when the operation
+        // accepts them.
+        if programs.is_some() && operation.infer_output_types(input_types, &interfaces).is_err() {
+            return Ok(None);
+        }
+
         Ok(programs)
     }
 

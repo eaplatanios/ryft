@@ -399,6 +399,17 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
             })
         })
     }
+
+    fn refine(&self, declared: &ArrayIrType, symbolic: &[DimensionVariable]) -> Result<ArrayIrType, TypeError> {
+        // A first-class dimension type defines its identity rather than refining it, so it is returned unchanged.
+        Ok(match declared {
+            ArrayIrType::Array(r#type) => ArrayIrType::Array(self.arrays.refine(r#type, symbolic)?),
+            ArrayIrType::Dimension(r#type) => ArrayIrType::Dimension(r#type.clone()),
+            ArrayIrType::Reference(r#type) => {
+                ArrayIrType::Reference(ReferenceType::new(self.arrays.refine(r#type.referent(), symbolic)?))
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -766,5 +777,37 @@ mod tests {
         assert_eq!(reference_member.as_referent(), None);
         assert_eq!(dimension_member.as_referent(), None);
         assert_eq!(array_member.as_referent(), <&ArrayType>::try_from(&array_member).ok());
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_refine() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let extent = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(8)).unwrap());
+        let vector = |dimension: Dimension| ArrayType::new(F32, Shape::new(vec![dimension]));
+        let refinements = ArrayIrTypeRefinements::establish(
+            &[ArrayIrType::Dimension(extent.clone().into()), ArrayIrType::Array(vector(rows.clone().into()))],
+            &[ArrayIrType::Dimension(extent.clone().into()), ArrayIrType::Array(vector(Dimension::Static(3)))],
+        )
+        .unwrap();
+
+        // Arrays and reference referents are refined through the shared array facts, while a first-class dimension
+        // type defines its identity and is returned unchanged.
+        let matrix = ArrayType::new(F32, Shape::new(vec![rows.clone().into(), extent.clone().into()]));
+        assert_eq!(
+            refinements.refine(&ArrayIrType::Array(matrix), &[]),
+            Ok(ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3), extent.clone().into()])))),
+        );
+        assert_eq!(
+            refinements.refine(&ArrayIrType::Reference(ReferenceType::new(vector(rows.clone().into()))), &[]),
+            Ok(ArrayIrType::Reference(ReferenceType::new(vector(Dimension::Static(3))))),
+        );
+        assert_eq!(
+            refinements.refine(&ArrayIrType::Dimension(extent.clone().into()), &[]),
+            Ok(ArrayIrType::Dimension(extent.into())),
+        );
+        assert_eq!(
+            refinements.refine(&ArrayIrType::Array(vector(rows.clone().into())), std::slice::from_ref(&rows)),
+            Ok(ArrayIrType::Array(vector(rows.into()))),
+        );
     }
 }

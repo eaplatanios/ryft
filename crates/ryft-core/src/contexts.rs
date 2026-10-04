@@ -775,6 +775,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             let region_builder = preparation_builder.as_ref().unwrap_or(self.builder());
             let mut region_ids =
                 driver.import_into(region_builder, &region_input_types).map_err(|error| self.error(error))?;
+            let instantiated_region_ids = region_ids.clone();
 
             // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
             // reshape, the array portions of its forward and transpose signatures might specialize as follows:
@@ -806,6 +807,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     ))));
                 }
                 let mut specialized_regions = Vec::new();
+                let mut specialization_failed = false;
                 for index in 0..region_ids.len() {
                     let Some(requested) = &requests[index] else { continue };
                     if interfaces[index].input_types() == requested && !requires_specialization[index] {
@@ -820,8 +822,10 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     } else {
                         let source_id = region_ids[index];
                         let region = region_builder.borrow().region_ref(source_id).unwrap().to_program();
-                        let specialized =
-                            region.specialize_to_region_input_types(requested).map_err(|error| self.error(error))?;
+                        let Ok(specialized) = region.specialize_to_region_input_types(requested) else {
+                            specialization_failed = true;
+                            break;
+                        };
                         interfaces[index] = specialized.interface();
                         region_ids[index] = region_builder.borrow_mut().import_program(specialized);
                         specialized_regions.push((source_id, requested.clone(), region_ids[index]));
@@ -840,6 +844,19 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                             ))));
                         }
                     }
+                }
+
+                // Specialization is an optimization. Inputs only need to refine the declared region input types, so
+                // the regions whose type identities were merely instantiated are always a valid fallback. Specialized
+                // regions can be unusable even though their declared counterparts are fine. For example, a loop body
+                // specialized at a sharded carry may return that carry unsharded, so the specialized body no longer
+                // maps its carries to themselves. Such an application falls back to the instantiated regions, whose
+                // final inference below still reports genuine type errors.
+                if specialization_failed
+                    || (!specialized_regions.is_empty()
+                        && operation.infer_output_types(input_types, &interfaces).is_err())
+                {
+                    region_ids = instantiated_region_ids;
                 }
             }
 

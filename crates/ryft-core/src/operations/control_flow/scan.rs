@@ -36,7 +36,9 @@ use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType, validate_output_identities};
+use crate::operations::control_flow::{
+    TemporalResidualOperation, TemporalResidualType, refine_output_types, validate_output_identities,
+};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
@@ -2089,15 +2091,27 @@ impl ScanType for ArrayIrType {
         // A runtime length input that only refines the declared bounds fixes the trip count to one exact extent, so the
         // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
         // them symbolic would type a concretely sized result as an independent runtime extent.
-        match validate_scan_runtime_length(length, input_types, carry_count, expected_input_types.len())? {
-            Some(extent) => composite_scan_boundary_types(
-                ScanBoundarySide::Output,
-                body_output_types,
-                carry_count,
-                &Dimension::Static(extent),
-            ),
-            None => Ok(output_types),
-        }
+        let output_types =
+            match validate_scan_runtime_length(length, input_types, carry_count, expected_input_types.len())? {
+                Some(extent) => composite_scan_boundary_types(
+                    ScanBoundarySide::Output,
+                    body_output_types,
+                    carry_count,
+                    &Dimension::Static(extent),
+                )?,
+                None => output_types,
+            };
+        // The facts that the inputs establish then refine the outputs (refer to `refine_output_types`). This is a
+        // separate step from the trip-count refinement above: the stacked outputs' leading axis describes the trip
+        // count that is fixed before the first iteration, so it stays refined even when a first-class dimension carry
+        // shares the length's identity and keeps every carry that refers to it symbolic. Only the carries preserve
+        // the identities of reference inputs.
+        refine_output_types(
+            expected_input_types.as_slice(),
+            &input_types[..expected_input_types.len()],
+            output_types.as_slice(),
+            |index| (index < carry_count).then_some(index),
+        )
     }
 }
 
@@ -4667,36 +4681,99 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_type_inference_rejects_carries_that_refine_away_an_identity() {
-        // Initial carries only need to refine the carry types, but the outputs keep the declared carry types, so a
-        // static carry extent cannot stand in for a dynamic dimension that no input carries and no output defines.
+    fn test_scan_staging_falls_back_to_declared_regions_when_specialization_drops_a_refinement() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // The body replaces its carry with an unsharded constant, so the body specialized at a sharded carry no longer
+        // maps its carry to itself. Staging falls back to the declared body, and the carry keeps its declared type.
+        let carry_type = ArrayType::scalar(DataType::F32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_type = carry_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        body_builder.add_input(carry_type.clone().into());
+        let replacement = body_builder.add_constant(TestIrValue::Array(Array::scalar(1f32).unwrap()));
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![replacement], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let (output_type, _) = TestContext::trace(
+            |input: TestTracer| {
+                let context = input.context().clone();
+                Ok(context
+                    .bind(ScanOperation::<ArrayIrType>::new(1, 3), vec![body.clone()], std::slice::from_ref(&input))?
+                    .remove(0))
+            },
+            ArrayIrType::Array(sharded_type),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(carry_type));
+    }
+
+    #[test]
+    fn test_scan_type_inference_refines_carries_to_the_extents_their_inputs_establish() {
+        // Initial carries only need to refine the carry types, and the carry outputs take the static extents that the
+        // inputs establish for identities that no output defines.
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
         let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])));
         let static_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let operation = ScanOperation::<ArrayIrType>::new(1, 2);
         let interfaces = vec![RegionInterface::new(
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64)), carry_type.clone()],
+            vec![index_type.clone(), carry_type.clone()],
             vec![carry_type.clone()],
             EffectClasses::NONE,
         )];
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&static_type), interfaces.as_slice()),
-            Err(TypeError::invalid(
-                "`scan` output 0 has type `f32[rows]`, which refers to the identity `rows` that no input carries and \
-                 no output defines",
-            )),
+            Ok(vec![static_type.clone()]),
         );
 
-        // Another carry whose input still carries the identity makes the same refinement valid.
+        // Carries that share an identity share its established extent, even when one of their inputs is dynamic.
         let operation = ScanOperation::<ArrayIrType>::new(2, 2);
         let interfaces = vec![RegionInterface::new(
-            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64)), carry_type.clone(), carry_type.clone()],
+            vec![index_type.clone(), carry_type.clone(), carry_type.clone()],
             vec![carry_type.clone(), carry_type.clone()],
             EffectClasses::NONE,
         )];
         assert_eq!(
-            operation.infer_output_types(&[carry_type.clone(), static_type], interfaces.as_slice()),
-            Ok(vec![carry_type.clone(), carry_type]),
+            operation.infer_output_types(&[carry_type.clone(), static_type.clone()], interfaces.as_slice()),
+            Ok(vec![static_type.clone(), static_type]),
+        );
+
+        // When a first-class dimension carry shares the identity of the scan length, the carries that refer to it stay
+        // symbolic because that carry may change across iterations, while the stacked output's leading axis still
+        // takes the trip count that the exact runtime length fixes before the first iteration.
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension_carry_type = ArrayIrType::Dimension(DimensionType::from(length.clone()));
+        let array_carry_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())])));
+        let operation = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length));
+        let interfaces = vec![RegionInterface::new(
+            vec![index_type, dimension_carry_type.clone(), array_carry_type.clone()],
+            vec![
+                dimension_carry_type.clone(),
+                array_carry_type.clone(),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ],
+            EffectClasses::NONE,
+        )];
+        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    dimension_carry_type.clone(),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+                    four.into(),
+                ],
+                interfaces.as_slice(),
+            ),
+            Ok(vec![
+                dimension_carry_type,
+                array_carry_type,
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+            ]),
         );
     }
 
