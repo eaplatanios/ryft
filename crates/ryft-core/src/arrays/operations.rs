@@ -63,8 +63,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(identity, dispatch(batching, differentiation, transposition))]
@@ -163,6 +161,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Value-level capability bundle paired with the [`ArrayOperation`] family.
 ///
 /// [`ArrayOperations`] collects, as supertraits, the value-level capabilities through which a value materializes the
@@ -257,20 +257,20 @@ where
 {
 }
 
-/// [`Operation`] family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
+/// [`Operation`] family used for staged [`Program`](crate::Program)s over [`DimensionValue`]s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(identity)]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
+    Min(DimensionMinOperation),
+    Max(DimensionMaxOperation),
     Add(DimensionAddOperation),
     Sub(DimensionSubOperation),
     SaturatingSub(DimensionSaturatingSubOperation),
     Mul(DimensionMulOperation),
-    Pow(DimensionPowOperation),
     Div(DimensionDivOperation),
     Rem(DimensionRemOperation),
-    Min(DimensionMinOperation),
-    Max(DimensionMaxOperation),
+    Pow(DimensionPowOperation),
 }
 
 // Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
