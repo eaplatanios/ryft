@@ -373,14 +373,17 @@ where
 }
 
 /// Applies one participant permutation to `axis` of a packed value, filling untargeted destinations with zeros.
-fn permute_participant_axis<V>(value: &V, axis: usize, sources: &[Option<usize>]) -> Result<V, BatchingError>
-where
-    V: Value<Type = ArrayType> + Concatenate + Slice + Transpose + ZeroLike,
-{
+fn permute_participant_axis<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose>(
+    value: &V,
+    axis: usize,
+    sources: &[Option<usize>],
+) -> Result<V, BatchingError> {
     let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
     let Some(shape) = value.r#type().static_shape() else {
         return Err(BatchingError::UnsupportedOperation {
-            message: "`parallel_permute` batching requires statically shaped inputs and ragged extents".to_string(),
+            message: format!(
+                "`{PARALLEL_PERMUTE_OPERATION_NAME}` batching requires statically shaped inputs and ragged extents",
+            ),
         });
     };
     let dimensions = shape.dimensions().to_vec();
