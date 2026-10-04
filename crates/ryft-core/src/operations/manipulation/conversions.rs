@@ -618,7 +618,7 @@ impl ConvertElementType for Array {
 
         // Sub-byte host elements occupy separate padded bytes, so the meaningful bits are walked in logical order and
         // the padding is restored at each output element boundary instead of being reinterpreted as input data.
-        let output_count = Array::materialized_element_count(&output_type)?;
+        let output_count = Array::element_count(&output_type)?;
         let input_bytes = input_bits.div_ceil(8);
         let output_bytes = output_bits.div_ceil(8);
         let mut output = vec![0u8; output_count * output_bytes];

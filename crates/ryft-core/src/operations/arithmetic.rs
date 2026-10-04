@@ -109,7 +109,7 @@ define_elementwise_capability!(
 impl Neg for Array {
     fn neg(&self) -> Result<Self, ProgramError> {
         NegOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
-        if Self::element_count(self.r#type().as_ref()) == 0 {
+        if Self::element_count(self.r#type().as_ref())? == 0 {
             let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
             return Ok(Self::new_unchecked(
                 self.r#type().into_owned(),
@@ -532,7 +532,7 @@ impl Mul for Array {
         let output_type = MulOperation::<ArrayType>::new()
             .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
             .remove(0);
-        if Self::element_count(&output_type) == 0 {
+        if Self::element_count(&output_type)? == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
@@ -701,7 +701,7 @@ impl Div for Array {
         let output_type = DivOperation::<ArrayType>::new()
             .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
             .remove(0);
-        if Self::element_count(&output_type) == 0 {
+        if Self::element_count(&output_type)? == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
@@ -1025,7 +1025,7 @@ impl Abs for Array {
     fn abs(&self) -> Result<Self, ProgramError> {
         let output_type =
             AbsOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?.remove(0);
-        if Self::element_count(&output_type) == 0 {
+        if Self::element_count(&output_type)? == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
@@ -1131,7 +1131,7 @@ define_elementwise_capability!(
 impl Sign for Array {
     fn sign(&self) -> Result<Self, ProgramError> {
         SignOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
-        if Self::element_count(self.r#type().as_ref()) == 0 {
+        if Self::element_count(self.r#type().as_ref())? == 0 {
             let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
             return Ok(Self::new_unchecked(
                 self.r#type().into_owned(),

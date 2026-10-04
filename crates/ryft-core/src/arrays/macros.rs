@@ -532,7 +532,7 @@ macro_rules! impl_array_elementwise_operation {
 
                 // Empty results need only layout-sized, zero-initialized storage. Skip input conversions and scalar
                 // evaluation, since neither contributes any result elements.
-                if Self::element_count(&output_type) == 0 {
+                if Self::element_count(&output_type)? == 0 {
                     let addressing = $crate::arrays::addressing::ArrayAddressing::new(output_type.clone())?;
                     return Self::new(output_type, vec![0; addressing.storage_byte_len()]);
                 }

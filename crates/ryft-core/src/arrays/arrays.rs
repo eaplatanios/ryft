@@ -163,20 +163,13 @@ impl Array {
         Self { r#type, bytes }
     }
 
-    /// Returns the number of elements represented by `type`. Panics if the type has dynamic dimensions, so this
-    /// helper is reserved for types of already-materialized values (which are always fully static). Kernels that
-    /// materialize values from payload types use [`Array::materialized_element_count`] instead.
+    /// Returns the number of elements represented by `type`, or an error if its element count is not statically
+    /// known or does not fit in [`usize`]. A statically zero dimension makes the count zero even when another
+    /// dimension is dynamic.
     #[inline]
-    pub fn element_count(r#type: &ArrayType) -> usize {
-        r#type.element_count().unwrap().unwrap()
-    }
-
-    /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
-    /// therefore cannot be materialized into a concrete payload.
-    #[inline]
-    pub fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
-        r#type.element_count().map_err(|error| TypeError::invalid(error.to_string()))?.ok_or_else(|| {
-            TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
+    pub fn element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
+        r#type.element_count()?.ok_or_else(|| {
+            TypeError::invalid(format!("cannot materialize a value of dynamically sized type `{type}`")).into()
         })
     }
 
@@ -254,14 +247,14 @@ impl Array {
     /// another array. Kernels that build a result by mutating a buffer they own (or one they just cloned from an
     /// input) use this to avoid a second allocation.
     #[inline]
-    pub(crate) fn storage_bytes_mut(&mut self) -> &mut [u8] {
+    pub fn storage_bytes_mut(&mut self) -> &mut [u8] {
         Arc::make_mut(&mut self.bytes).as_mut_slice()
     }
 
     /// Returns the shared handle to this array's physical storage, so that a kernel which only retypes a value can
     /// hand the same payload to [`Array::new_unchecked`] instead of copying it.
     #[inline]
-    pub(crate) fn shared_storage_bytes(&self) -> &Arc<Vec<u8>> {
+    pub fn shared_storage_bytes(&self) -> &Arc<Vec<u8>> {
         &self.bytes
     }
 
@@ -416,7 +409,7 @@ impl Array {
             .into());
         }
 
-        Self::materialized_element_count(&output_type)?;
+        Self::element_count(&output_type)?;
 
         let broadcast_shape = self
             .r#type
@@ -536,16 +529,17 @@ impl Array {
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Maps one flat row-major output index to the corresponding flat input index under NumPy-style broadcasting.
     /// Input axes are right-aligned with output axes, and an input extent of one always selects coordinate zero.
+    /// Both stride slices must be logical row-major element strides, independent of physical storage layouts.
+    /// The caller uses [`ArrayAddressing::byte_range_for_flat_index`] to map the returned logical input index
+    /// and the output index to their respective physical byte ranges, including strided and tiled layouts.
     pub(crate) fn broadcast_index(
         output_index: usize,
         output_shape: &StaticShape,
-        output_strides: &[usize],
+        output_row_major_strides: &[usize],
         input_shape: &StaticShape,
-        input_strides: &[usize],
+        input_row_major_strides: &[usize],
     ) -> usize {
         let output_axis_offset = output_shape.rank() - input_shape.rank();
         (0..input_shape.rank()).fold(0, |index, input_axis| {
@@ -553,9 +547,9 @@ impl Array {
             let coordinate = if input_shape[input_axis] == 1 {
                 0
             } else {
-                (output_index / output_strides[output_axis]) % output_shape[output_axis]
+                (output_index / output_row_major_strides[output_axis]) % output_shape[output_axis]
             };
-            index + coordinate * input_strides[input_axis]
+            index + coordinate * input_row_major_strides[input_axis]
         })
     }
 
@@ -630,6 +624,8 @@ impl Array {
         output
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 impl Array {
@@ -1252,6 +1248,27 @@ mod tests {
     }
 
     #[test]
+    fn test_array_element_count() {
+        assert_eq!(Array::element_count(&ArrayType::scalar(DataType::F32)), Ok(1));
+        assert_eq!(Array::element_count(&ArrayType::new_static(DataType::F32, [2, 3])), Ok(6));
+        let variable = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+        assert_eq!(
+            Array::element_count(&dynamic_type),
+            Err(TypeError::invalid(format!("cannot materialize a value of dynamically sized type `{dynamic_type}`",))
+                .into()),
+        );
+        let empty_type = ArrayType::new(DataType::F32, Shape::new(vec![variable.into(), Dimension::Static(0)]));
+        assert_eq!(Array::element_count(&empty_type), Ok(0));
+        let overflowing_type = ArrayType::new_static(DataType::F32, [usize::MAX, 2]);
+        assert_eq!(
+            Array::element_count(&overflowing_type),
+            Err(TypeError::invalid(format!("shape {} element count does not fit in usize", overflowing_type.shape(),))
+                .into()),
+        );
+    }
+
+    #[test]
     fn test_array_empty_and_payload_free_encoding_round_trips() {
         let empty_type = ArrayType::new_static(DataType::F32, [0, 3]);
         let empty = Array::from_elements(empty_type.clone(), &[] as &[f32]).unwrap();
@@ -1265,7 +1282,7 @@ mod tests {
             let r#type = ArrayType::new_static(data_type, [3]);
             let array = Array::new(r#type.clone(), Vec::new()).unwrap();
             assert_eq!(array.r#type().as_ref(), &r#type);
-            assert_eq!(Array::element_count(&r#type), 3);
+            assert_eq!(Array::element_count(&r#type), Ok(3));
             assert!(array.storage_bytes().is_empty());
             assert!(array.logical_bytes().is_empty());
             assert!(Array::from_logical_bytes(r#type, &[]).unwrap().storage_bytes().is_empty());
@@ -1382,6 +1399,18 @@ mod tests {
             ),
             Ok(Array::matrix(2, 3, vec![1.0f64, 1.0, -1.0, 2.0, 2.0, 0.0]).unwrap()),
         );
+
+        // Logical broadcast indexing also supports an independently laid-out output, including reversed axes
+        // and holes between rows. Addressing maps each logical input and output index to its own storage.
+        let output_type = ArrayType::new_static(DataType::F64, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![-40, -8])));
+        let output = strided_left
+            .map_element_pairs::<f64, f64>(&strided_right, output_type.clone(), |left, right| Ok(left + right))
+            .unwrap();
+        let expected = Array::from_elements(output_type, &[1.0f64, 1.0, -1.0, 2.0, 2.0, 0.0]).unwrap();
+        assert_eq!(output.r#type(), expected.r#type());
+        assert_eq!(output.storage_bytes(), expected.storage_bytes());
+        assert_eq!(output.elements::<f64>(), expected.elements::<f64>());
 
         // Callers must supply the actual input codec, output codec, and broadcast shape.
         assert!(matches!(

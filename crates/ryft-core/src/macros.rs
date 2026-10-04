@@ -5190,7 +5190,7 @@ macro_rules! check_gradient {
         };
 
         let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
-        let element_count = $crate::Array::materialized_element_count(&input_type).unwrap();
+        let element_count = $crate::Array::element_count(&input_type).unwrap();
         match input_type.data_type() {
             $crate::arrays::DataType::F64 => {
                 let perturbed = |index: usize, delta: f64| {

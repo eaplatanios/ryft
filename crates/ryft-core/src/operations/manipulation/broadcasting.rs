@@ -634,7 +634,7 @@ impl Broadcast for Array {
         let input_shape = self.r#type().static_shape().unwrap();
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
-        let output_count = Self::materialized_element_count(&r#type)?;
+        let output_count = Self::element_count(&r#type)?;
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(r#type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];

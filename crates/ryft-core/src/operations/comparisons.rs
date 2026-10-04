@@ -488,7 +488,7 @@ impl Compare for Array {
         let right = other.promoted_to(data_type)?;
 
         // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
-        if Self::element_count(&output_type) == 0 {
+        if Self::element_count(&output_type)? == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
