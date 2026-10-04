@@ -130,6 +130,46 @@ pub enum CollectiveMode {
     Tiled,
 }
 
+impl CollectiveMode {
+    /// Returns the physical split axis and mapped result axis when forwarding a collective past a mapped batch axis.
+    /// An untiled split consumes the selected input axis, shifting the mapped axis when it follows the consumed axis.
+    /// A tiled split preserves the rank and mapped axis position.
+    ///
+    /// # Parameters
+    ///
+    ///   - `split_axis`: Axis selected in the logical input, which excludes the mapped batch axis.
+    ///   - `batch_axis`: Position of the mapped batch axis in the physical input.
+    #[inline]
+    fn forwarded_split_axes(self, split_axis: usize, batch_axis: usize) -> (usize, usize) {
+        let physical_split_axis = split_axis + usize::from(split_axis >= batch_axis);
+        let output_batch_axis = match self {
+            Self::Tiled => batch_axis,
+            Self::Untiled if split_axis < batch_axis => batch_axis - 1,
+            Self::Untiled => batch_axis,
+        };
+        (physical_split_axis, output_batch_axis)
+    }
+
+    /// Returns the physical concat axis and mapped result axis when forwarding a collective past a mapped batch axis.
+    /// An untiled concat inserts a participant axis before the mapped axis when both occupy the same logical boundary.
+    /// A tiled concat preserves the rank and mapped axis position. For an all-to-all, apply this function after
+    /// [`forwarded_split_axes`](Self::forwarded_split_axes), using the mapped axis position returned by that function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `concat_axis`: Insertion position for an untiled concat, or existing axis for a tiled concat,
+    ///     in the logical array without the mapped batch axis and after any split performed by the caller.
+    ///   - `batch_axis`: Position of the mapped batch axis in the physical array before the concat.
+    #[inline]
+    fn forwarded_concat_axes(self, concat_axis: usize, batch_axis: usize) -> (usize, usize) {
+        match self {
+            Self::Tiled => (concat_axis + usize::from(concat_axis >= batch_axis), batch_axis),
+            Self::Untiled if concat_axis <= batch_axis => (concat_axis, batch_axis + 1),
+            Self::Untiled => (concat_axis + 1, batch_axis),
+        }
+    }
+}
+
 /// Shared shape and grouping options for collective operations that resize an array axis (e.g., [`AllGatherOperation`],
 /// [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
@@ -1435,12 +1475,146 @@ mod tests {
         AllGatherOperation, AllGatherOutputVariance, infer_explicit_all_gather_output_types,
     };
     use crate::operations::collectives::all_to_all::{AllToAllOperation, infer_explicit_all_to_all_output_types};
-    use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder};
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    #[test]
+    fn test_collective_mode_forwarded_split_axes() {
+        for mode in [CollectiveMode::Untiled, CollectiveMode::Tiled] {
+            for rank in 1..=4 {
+                for batch_axis in 0..=rank {
+                    // Original axes retain their labels; `None` identifies the mapped batch axis.
+                    let mut input_axes = (0..rank).map(Some).collect::<Vec<_>>();
+                    input_axes.insert(batch_axis, None);
+                    for split_axis in 0..rank {
+                        let physical_split_axis = input_axes.iter().position(|axis| *axis == Some(split_axis)).unwrap();
+                        let mut output_axes = input_axes.clone();
+                        if mode == CollectiveMode::Untiled {
+                            output_axes.remove(physical_split_axis);
+                        }
+                        let output_batch_axis = output_axes.iter().position(Option::is_none).unwrap();
+                        assert_eq!(
+                            mode.forwarded_split_axes(split_axis, batch_axis),
+                            (physical_split_axis, output_batch_axis),
+                            "mode={mode:?}, rank={rank}, split_axis={split_axis}, batch_axis={batch_axis}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_collective_mode_forwarded_concat_axes() {
+        // Preserve the original all-gather regressions at and on either side of the mapped axis.
+        for (mode, concat_axis, batch_axis, expected) in [
+            (CollectiveMode::Tiled, 0, 0, (1, 0)),
+            (CollectiveMode::Tiled, 0, 1, (0, 1)),
+            (CollectiveMode::Untiled, 0, 0, (0, 1)),
+            (CollectiveMode::Untiled, 1, 0, (2, 0)),
+        ] {
+            assert_eq!(mode.forwarded_concat_axes(concat_axis, batch_axis), expected);
+        }
+
+        for mode in [CollectiveMode::Untiled, CollectiveMode::Tiled] {
+            for rank in 0..=4 {
+                let concat_positions = if mode == CollectiveMode::Untiled { rank + 1 } else { rank };
+                for batch_axis in 0..=rank {
+                    for concat_axis in 0..concat_positions {
+                        // Untiled concat introduces a new label before the batch label at an equal boundary.
+                        let mut output_axes = Vec::new();
+                        for axis in 0..=rank {
+                            if mode == CollectiveMode::Untiled && axis == concat_axis {
+                                output_axes.push(Some(rank));
+                            }
+                            if axis == batch_axis {
+                                output_axes.push(None);
+                            }
+                            if axis < rank {
+                                output_axes.push(Some(axis));
+                            }
+                        }
+                        let concat_label = if mode == CollectiveMode::Untiled { rank } else { concat_axis };
+                        let physical_concat_axis =
+                            output_axes.iter().position(|axis| *axis == Some(concat_label)).unwrap();
+                        let output_batch_axis = output_axes.iter().position(Option::is_none).unwrap();
+                        assert_eq!(
+                            mode.forwarded_concat_axes(concat_axis, batch_axis),
+                            (physical_concat_axis, output_batch_axis),
+                            "mode={mode:?}, rank={rank}, concat_axis={concat_axis}, batch_axis={batch_axis}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_collective_mode_forwarded_split_and_concat_axes() {
+        // Preserve the original all-to-all regression triples while testing the shared mappings' composition.
+        for (mode, split_axis, concat_axis, batch_axis, expected) in [
+            (CollectiveMode::Tiled, 0, 1, 1, (0, 2, 1)),
+            (CollectiveMode::Tiled, 1, 0, 0, (2, 1, 0)),
+            (CollectiveMode::Untiled, 0, 0, 2, (0, 0, 2)),
+            (CollectiveMode::Untiled, 1, 1, 0, (2, 2, 0)),
+        ] {
+            let (physical_split_axis, batch_axis) = mode.forwarded_split_axes(split_axis, batch_axis);
+            let (physical_concat_axis, batch_axis) = mode.forwarded_concat_axes(concat_axis, batch_axis);
+            assert_eq!((physical_split_axis, physical_concat_axis, batch_axis), expected);
+        }
+
+        for mode in [CollectiveMode::Untiled, CollectiveMode::Tiled] {
+            for rank in 1..=4 {
+                for batch_axis in 0..=rank {
+                    let mut input_axes = (0..rank).map(Some).collect::<Vec<_>>();
+                    input_axes.insert(batch_axis, None);
+                    for split_axis in 0..rank {
+                        let physical_split_axis = input_axes.iter().position(|axis| *axis == Some(split_axis)).unwrap();
+                        let mut intermediate_axes = input_axes.clone();
+                        if mode == CollectiveMode::Untiled {
+                            intermediate_axes.remove(physical_split_axis);
+                        }
+                        let intermediate_batch_axis = intermediate_axes.iter().position(Option::is_none).unwrap();
+                        let logical_axes = intermediate_axes.iter().filter_map(|axis| *axis).collect::<Vec<_>>();
+                        let concat_positions =
+                            if mode == CollectiveMode::Untiled { logical_axes.len() + 1 } else { logical_axes.len() };
+                        for concat_axis in 0..concat_positions {
+                            let mut output_axes = Vec::new();
+                            for axis in 0..=logical_axes.len() {
+                                if mode == CollectiveMode::Untiled && axis == concat_axis {
+                                    output_axes.push(Some(rank));
+                                }
+                                if axis == intermediate_batch_axis {
+                                    output_axes.push(None);
+                                }
+                                if let Some(label) = logical_axes.get(axis) {
+                                    output_axes.push(Some(*label));
+                                }
+                            }
+                            let concat_label =
+                                if mode == CollectiveMode::Untiled { rank } else { logical_axes[concat_axis] };
+                            let physical_concat_axis =
+                                output_axes.iter().position(|axis| *axis == Some(concat_label)).unwrap();
+                            let output_batch_axis = output_axes.iter().position(Option::is_none).unwrap();
+                            let (actual_split_axis, actual_batch_axis) =
+                                mode.forwarded_split_axes(split_axis, batch_axis);
+                            let (actual_concat_axis, actual_batch_axis) =
+                                mode.forwarded_concat_axes(concat_axis, actual_batch_axis);
+                            assert_eq!(
+                                (actual_split_axis, actual_concat_axis, actual_batch_axis),
+                                (physical_split_axis, physical_concat_axis, output_batch_axis),
+                                "mode={mode:?}, rank={rank}, split_axis={split_axis}, \
+                                 concat_axis={concat_axis}, batch_axis={batch_axis}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_collective_options_validate_axis_index_groups() {
@@ -1772,14 +1946,15 @@ mod tests {
 
         // Removing an axis or removing then inserting one needs no separate output-to-input axis mapping.
         assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 2, 1, CollectiveOptions::default()),
-                &[
-                    ArrayType::new_static(DataType::F32, [3, 2, 4]).into(),
-                    exact_three.clone().into(),
-                    exact_four.clone().into(),
-                ],
-            ),
+            ParallelSumScatterOperation::new("x".to_string(), 2, 1, CollectiveOptions::default())
+                .infer_parent_output_types(
+                    &[
+                        ArrayType::new_static(DataType::F32, [3, 2, 4]).into(),
+                        exact_three.clone().into(),
+                        exact_four.clone().into(),
+                    ],
+                    &[],
+                ),
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
         );
         assert_eq!(

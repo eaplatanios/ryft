@@ -332,7 +332,7 @@ where
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
                 let (concat_axis, output_batch_axis) =
-                    forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);
+                    self.options.mode.forwarded_concat_axes(self.concat_axis, batch_axis);
                 let operation = Self::new(
                     self.axis_name.clone(),
                     self.axis_size,
@@ -444,7 +444,7 @@ where
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_concat_axis, output_batch_axis) =
-                forwarded_all_gather_axes(self.options().mode(), self.concat_axis(), input_batch_axis);
+                self.options().mode().forwarded_concat_axes(self.concat_axis(), input_batch_axis);
             let operation = Self::new(
                 self.axis_name().to_string(),
                 self.axis_size(),
@@ -897,15 +897,6 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Returns the physical concat axis and mapped result axis for a forwarded all-gather.
-fn forwarded_all_gather_axes(mode: CollectiveMode, concat_axis: usize, batch_axis: usize) -> (usize, usize) {
-    match mode {
-        CollectiveMode::Tiled => (concat_axis + usize::from(concat_axis >= batch_axis), batch_axis),
-        CollectiveMode::Untiled if concat_axis <= batch_axis => (concat_axis, batch_axis + 1),
-        CollectiveMode::Untiled => (concat_axis + 1, batch_axis),
-    }
-}
-
 /// Applies the matching-axis all-gather batching semantics over the policy-selected extent representation.
 fn batch_all_gather_matching_axis<C, P>(
     operation: &AllGatherOperation,
@@ -1022,9 +1013,8 @@ mod tests {
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError};
+    use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder, ProgramError};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1064,10 +1054,11 @@ mod tests {
         // the varying input-cotangent state without a second reduce-scatter operation type.
         let reduced_cotangent = reduced.cotangent().unwrap();
         assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default()),
-                &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
-            ),
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
+                .infer_parent_output_types(
+                    &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
+                    &[],
+                ),
             Ok(vec![input.cotangent().unwrap().into()]),
         );
     }
@@ -1145,14 +1136,6 @@ mod tests {
         assert_eq!(imported_dimension_size.inputs(), &[imported_input]);
         assert_eq!(imported_all_gather.inputs(), &[imported_input, imported_multiplied_extent.outputs()[0]]);
         assert_eq!(imported_all_gather.outputs(), imported_outputs.as_slice());
-    }
-
-    #[test]
-    fn test_all_gather_forwarded_axes_account_for_the_mapped_axis() {
-        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Tiled, 0, 0), (1, 0));
-        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Tiled, 0, 1), (0, 1));
-        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 0, 0), (0, 1));
-        assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 1, 0), (2, 0));
     }
 
     #[test]

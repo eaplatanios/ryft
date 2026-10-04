@@ -560,7 +560,7 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
                 let (scatter_axis, output_batch_axis) =
-                    forwarded_parallel_sum_scatter_axes(self.options.mode, self.scatter_axis, batch_axis);
+                    self.options.mode.forwarded_split_axes(self.scatter_axis, batch_axis);
                 let operation = Self::new(self.axis_name.clone(), self.axis_size, scatter_axis, self.options.clone());
                 (operation, output_batch_axis)
             });
@@ -778,7 +778,7 @@ where
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_scatter_axis, output_batch_axis) =
-                forwarded_parallel_sum_scatter_axes(self.options().mode(), self.scatter_axis(), input_batch_axis);
+                self.options().mode().forwarded_split_axes(self.scatter_axis(), input_batch_axis);
             let operation = Self::new(
                 self.axis_name().to_string(),
                 self.axis_size(),
@@ -1018,17 +1018,6 @@ where
             .into_projected()
             .map_err(Into::into)
     }
-}
-
-/// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
-fn forwarded_parallel_sum_scatter_axes(mode: CollectiveMode, scatter_axis: usize, batch_axis: usize) -> (usize, usize) {
-    let physical_scatter_axis = scatter_axis + usize::from(scatter_axis >= batch_axis);
-    let output_batch_axis = match mode {
-        CollectiveMode::Tiled => batch_axis,
-        CollectiveMode::Untiled if scatter_axis < batch_axis => batch_axis - 1,
-        CollectiveMode::Untiled => batch_axis,
-    };
-    (physical_scatter_axis, output_batch_axis)
 }
 
 #[cfg(test)]
