@@ -28,8 +28,8 @@ use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use crate::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
-    RaggedAllToAllOperation,
+    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
+    ParallelSumScatterOperation,
 };
 use crate::operations::complex::{
     Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -140,11 +140,11 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
     ParallelReduce(ParallelReduceOperation),
     ParallelVary(ParallelVaryOperation),
-    AllGather(AllGatherOperation),
+    ParallelAllGather(ParallelAllGatherOperation),
     ParallelSumScatter(ParallelSumScatterOperation),
     ParallelPermute(ParallelPermuteOperation),
-    AllToAll(AllToAllOperation),
-    RaggedAllToAll(RaggedAllToAllOperation),
+    ParallelAllToAll(ParallelAllToAllOperation),
+    ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
     Reverse(ReverseOperation),
@@ -207,9 +207,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     family;
 ///   - random bit generation, whose [`RngBitGenerator`](crate::RngBitGenerator) contract threads
 ///     explicit algorithm state rather than shaping a value-to-value capability;
-///   - the collectives ([`AllGather`](crate::operations::collectives::AllGather),
-///     [`AllToAll`](crate::operations::collectives::AllToAll),
-///     [`RaggedAllToAll`](crate::operations::collectives::RaggedAllToAll),
+///   - the collectives ([`ParallelAllGather`](crate::operations::collectives::ParallelAllGather),
+///     [`ParallelAllToAll`](crate::operations::collectives::ParallelAllToAll),
+///     [`ParallelRaggedAllToAll`](crate::operations::collectives::ParallelRaggedAllToAll),
 ///     [`ParallelSumScatter`](crate::operations::collectives::ParallelSumScatter),
 ///     [`ParallelSwapAxes`](crate::operations::collectives::ParallelSwapAxes),
 ///     [`ParallelPermute`](crate::operations::collectives::ParallelPermute),
@@ -497,7 +497,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed all-gather whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
-    AllGather(AllGatherOperation),
+    ParallelAllGather(ParallelAllGatherOperation),
 
     /// Mixed sum-scatter whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
@@ -505,12 +505,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed all-to-all whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
-    AllToAll(AllToAllOperation),
+    ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Direct array-only ragged all-to-all carrier. It is explicit because the composite enum already has one
     /// projected array-family variant and operation projection permits only one canonical member carrier.
     #[ryft(mixed)]
-    RaggedAllToAll(RaggedAllToAllOperation),
+    ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
@@ -711,7 +711,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
     fn from(operation: ArrayOperation<A>) -> Self {
         match operation {
             ArrayOperation::Zero(operation) => Self::from(operation),
-            ArrayOperation::RaggedAllToAll(operation) => Self::RaggedAllToAll(operation),
+            ArrayOperation::ParallelRaggedAllToAll(operation) => Self::ParallelRaggedAllToAll(operation),
             ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayOperation::While(operation) => {
                 Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
@@ -1100,7 +1100,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::collectives::{AllGatherOutputVariance, CollectiveMode, CollectiveOptions};
+    use crate::operations::collectives::{CollectiveMode, CollectiveOptions, ParallelAllGatherOutputVariance};
     use crate::operations::{
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
@@ -3671,10 +3671,10 @@ mod tests {
             ArrayIrOperation::Pad(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::DynamicSlice(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::AllGather(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::ParallelAllGather(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::AllToAll(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::RaggedAllToAll(_) => MemberKindSignature::ArrayToArray,
+            ArrayIrOperation::ParallelAllToAll(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::ParallelRaggedAllToAll(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
@@ -3801,12 +3801,12 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::AllGather(AllGatherOperation::new(
+                ArrayIrOperation::ParallelAllGather(ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
                     0,
                     CollectiveOptions::new(CollectiveMode::Untiled),
-                    AllGatherOutputVariance::Varying,
+                    ParallelAllGatherOutputVariance::Varying,
                 )),
                 MemberKindSignature::GeometryMixed,
             ),
@@ -3820,7 +3820,7 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::AllToAll(AllToAllOperation::new(
+                ArrayIrOperation::ParallelAllToAll(ParallelAllToAllOperation::new(
                     "x".to_string(),
                     2,
                     0,
@@ -3830,7 +3830,7 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::RaggedAllToAll(RaggedAllToAllOperation::new("x".to_string(), 2)),
+                ArrayIrOperation::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 2)),
                 MemberKindSignature::ArrayToArray,
             ),
             (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),

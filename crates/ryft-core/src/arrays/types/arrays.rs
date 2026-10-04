@@ -449,11 +449,7 @@ impl ArrayType {
                 (Dimension::Dynamic(declared), Dimension::Dynamic(actual))
                     if declared.bounds().contains_bounds(actual.bounds()) =>
                 {
-                    DimensionType::extend_identity_renaming(
-                        &DimensionType::from(declared.clone()),
-                        &DimensionType::from(actual.clone()),
-                        renaming,
-                    )
+                    DimensionVariable::extend_identity_renaming(declared, actual, renaming)
                 }
                 (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
                     refinements.bind(declared, *actual)
@@ -881,9 +877,8 @@ impl ArrayTypeRefinements {
     /// this after folding over every member, so the check is independent of the order of the observations.
     pub fn require_disjoint_from(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<(), TypeError> {
         for (variable, extent) in &self.bindings {
-            if let Some((_, target)) = renaming.replacements().iter().find(|(source, _)| source == variable) {
-                let bounds = target.bounds();
-                if bounds.lower() == *extent && bounds.lower().checked_add(1) == bounds.upper() {
+            if let Some(target) = renaming.target(variable) {
+                if target.bounds().extent() == Some(*extent) {
                     continue;
                 }
                 return Err(TypeError::invalid(format!(

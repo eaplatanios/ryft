@@ -143,6 +143,13 @@ impl DimensionBounds {
         self.upper
     }
 
+    /// Returns the single extent admitted by this [`DimensionBounds`] instance when it admits exactly one extent
+    /// (i.e., when its bounds are `[n, n + 1)`), and [`None`] for every wider range.
+    #[inline]
+    pub fn extent(&self) -> Option<usize> {
+        (self.lower.checked_add(1) == self.upper).then_some(self.lower)
+    }
+
     /// Returns the inclusive lower and upper endpoints of the portable extents admitted by this [`DimensionBounds`].
     /// The upper endpoint is capped at [`MAX_DIMENSION_EXTENT`], including when the bounds are unbounded. Returns
     /// [`DimensionError::ExtentExceedsBackendWidth`] if the lower bound exceeds [`MAX_DIMENSION_EXTENT`].
@@ -223,6 +230,31 @@ impl DimensionVariable {
     #[inline]
     pub fn bounds(&self) -> DimensionBounds {
         self.payload.bounds
+    }
+
+    /// Records the renaming of `declared` to `actual` in `renaming`. A different existing target for `declared`
+    /// is accepted only when both targets' bounds prove the same single extent, in which case the first target is
+    /// retained as a representative of that concrete instantiation without equating their identities. Every other
+    /// different existing target is a conflicting renaming.
+    ///
+    /// This function does not check bounds. Callers must first check that the bounds of `declared` contain the bounds
+    /// of `actual`, so that each caller reports a bounds violation with diagnostics phrased in terms of its own types
+    /// (e.g., [`DimensionType::extend_identity_renaming`] and
+    /// [`ArrayType::extend_identity_renaming`](crate::ArrayType::extend_identity_renaming)).
+    pub(crate) fn extend_identity_renaming(
+        declared: &Self,
+        actual: &Self,
+        renaming: &mut TypeIdentityRenaming<Self>,
+    ) -> Result<(), TypeError> {
+        if let Some(extent) = actual.bounds().extent()
+            && renaming.target(declared).is_some_and(|existing| existing.bounds().extent() == Some(extent))
+        {
+            // Several first-class reads can reify one source dimension as independently named exact literals.
+            // Keep the first representative when both bounds prove the same single extent. This does not equate
+            // the nominal identities; it only chooses a valid representative for this concrete instantiation.
+            return Ok(());
+        }
+        renaming.insert(declared.clone(), actual.clone())
     }
 }
 
@@ -375,8 +407,7 @@ impl DimensionType {
     /// [`DimensionValue::constant`](crate::DimensionValue::constant) literals) stay recognizably static.
     #[inline]
     pub fn extent(&self) -> Option<usize> {
-        let bounds = self.bounds();
-        (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
+        self.bounds().extent()
     }
 
     /// Returns the exclusive upper bound minus one, capped at [`MAX_DIMENSION_EXTENT`], or [`None`] when this
@@ -394,10 +425,10 @@ impl DimensionType {
         self.extent().map_or_else(|| Dimension::Dynamic(self.variable.clone()), Dimension::Static)
     }
 
-    // TODO(eaplatanios): Should this be a `TypeIdentityRenaming::extend` function instead?
-    /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared bounds)
-    /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming`. A different existing
-    /// target is accepted only when both targets prove the same single extent. Otherwise, it is a conflicting renaming.
+    /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared
+    /// bounds) and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming` using
+    /// [`DimensionVariable::extend_identity_renaming`]. A different existing target is accepted only when both
+    /// targets prove the same single extent. Otherwise, it is a conflicting renaming.
     ///
     /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
     /// an entire signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::arrays::ArrayIrType)'s, which
@@ -406,6 +437,10 @@ impl DimensionType {
     /// accumulator is what makes a declared [`DimensionVariable`] that appears in several signature positions rename
     /// consistently. Distinct targets are rejected unless both admit the same single extent, in which case the first
     /// target is retained as a representative of that concrete instantiation without equating their identities.
+    ///
+    /// This function is an associated function of [`DimensionType`] rather than a generic [`TypeIdentityRenaming`]
+    /// function because both the bounds check and the single-extent exception are dimension semantics that the generic
+    /// renaming of arbitrary [`TypeIdentity`]s cannot express.
     ///
     /// # Example
     ///
@@ -428,17 +463,7 @@ impl DimensionType {
                 "dimension type {actual} cannot instantiate declared type {declared}",
             )));
         }
-        if let Some(extent) = actual.extent()
-            && let Some((_, existing)) =
-                renaming.replacements().iter().find(|(source, _)| source == declared.variable())
-            && Self::from(existing.clone()).extent() == Some(extent)
-        {
-            // Several first-class reads can reify one source dimension as independently named exact literals.
-            // Keep the first representative when both bounds prove the same single extent. This does not equate
-            // the nominal identities; it only chooses a valid representative for this concrete instantiation.
-            return Ok(());
-        }
-        renaming.insert(declared.variable.clone(), actual.variable.clone())
+        DimensionVariable::extend_identity_renaming(&declared.variable, &actual.variable, renaming)
     }
 }
 
@@ -573,9 +598,7 @@ impl Dimension {
     #[inline]
     pub fn has_equal_extents(&self, other: &Self) -> bool {
         let bounds = self.bounds();
-        self == other
-            || (bounds == other.bounds()
-                && bounds.upper().is_some_and(|upper| bounds.lower().checked_add(1) == Some(upper)))
+        self == other || (bounds == other.bounds() && bounds.extent().is_some())
     }
 
     /// Returns `true` if `other` is a valid refinement of this dimension. Static dimensions can only be refined by
@@ -1044,6 +1067,12 @@ mod tests {
         assert!(nonnegative.contains_bounds(positive));
         assert!(!positive.contains_bounds(nonnegative));
 
+        // Only bounds that admit exactly one extent determine that extent.
+        assert_eq!(DimensionBounds::new(0, Some(1)).unwrap().extent(), Some(0));
+        assert_eq!(DimensionBounds::new(7, Some(8)).unwrap().extent(), Some(7));
+        assert_eq!(nonnegative.extent(), None);
+        assert_eq!(DimensionBounds::at_least(7).extent(), None);
+
         let unbounded = DimensionBounds::unbounded();
         assert_eq!(unbounded, DimensionBounds::at_least(0));
         assert_eq!(unbounded.representable_extent_range(), Ok((0, MAX_DIMENSION_EXTENT)));
@@ -1097,6 +1126,37 @@ mod tests {
         variables.insert(batch);
         assert!(variables.contains(&batch_clone));
         assert!(!variables.contains(&same_declaration));
+    }
+
+    #[test]
+    fn test_dimension_variable_extend_identity_renaming() {
+        let declared = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
+        let wide = DimensionVariable::new("wide", DimensionBounds::non_negative(Some(8)).unwrap());
+        let other_wide = DimensionVariable::new("other_wide", DimensionBounds::non_negative(Some(8)).unwrap());
+        let seven = DimensionVariable::new("seven", DimensionBounds::new(7, Some(8)).unwrap());
+        let another_seven = DimensionVariable::new("another_seven", DimensionBounds::new(7, Some(8)).unwrap());
+        let six = DimensionVariable::new("six", DimensionBounds::new(6, Some(7)).unwrap());
+
+        // A renaming is recorded once and its consistent repetition is accepted.
+        let mut renaming = TypeIdentityRenaming::new();
+        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &wide, &mut renaming), Ok(()));
+        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &wide, &mut renaming), Ok(()));
+        assert_eq!(renaming.replacements(), &[(declared.clone(), wide.clone())]);
+        assert_eq!(
+            DimensionVariable::extend_identity_renaming(&declared, &other_wide, &mut renaming),
+            Err(TypeError::invalid("type identity `declared` is renamed to both `wide` and `other_wide`")),
+        );
+
+        // Distinct targets that prove the same single extent keep the first one as the representative, while
+        // targets that prove different extents still conflict.
+        let mut renaming = TypeIdentityRenaming::new();
+        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &seven, &mut renaming), Ok(()));
+        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &another_seven, &mut renaming), Ok(()));
+        assert_eq!(renaming.replacements(), &[(declared.clone(), seven.clone())]);
+        assert_eq!(
+            DimensionVariable::extend_identity_renaming(&declared, &six, &mut renaming),
+            Err(TypeError::invalid("type identity `declared` is renamed to both `seven` and `six`")),
+        );
     }
 
     #[test]

@@ -62,7 +62,7 @@ impl<I: TypeIdentity> TypeIdentityRenaming<I> {
 
     /// Adds one source-to-target replacement, rejecting conflicting replacements for the same source.
     pub fn insert(&mut self, source: I, target: I) -> Result<(), TypeError> {
-        if let Some((_, existing)) = self.replacements.iter().find(|(candidate, _)| candidate == &source) {
+        if let Some(existing) = self.target(&source) {
             if existing != &target {
                 return Err(TypeError::invalid(format!(
                     "type identity `{source}` is renamed to both `{existing}` and `{target}`",
@@ -87,13 +87,17 @@ impl<I: TypeIdentity> TypeIdentityRenaming<I> {
         Ok(target)
     }
 
+    /// Returns the target registered for `source`, or [`None`] when no replacement was registered. Unlike
+    /// [`Self::rename`], this function distinguishes an unregistered `source` from one that is renamed to itself.
+    #[inline]
+    pub fn target(&self, source: &I) -> Option<&I> {
+        self.replacements.iter().find_map(|(candidate, target)| (candidate == source).then_some(target))
+    }
+
     /// Returns the renamed identity, or a clone of `identity` when no replacement was registered.
     #[inline]
     pub fn rename(&self, identity: &I) -> I {
-        self.replacements
-            .iter()
-            .find_map(|(source, target)| (source == identity).then(|| target.clone()))
-            .unwrap_or_else(|| identity.clone())
+        self.target(identity).unwrap_or(identity).clone()
     }
 
     /// Returns `true` if applying this [`TypeIdentityRenaming`] leaves every [`TypeIdentity`] unchanged.
@@ -229,6 +233,15 @@ mod tests {
         renaming.insert(second.clone(), first.clone()).unwrap();
         assert_eq!(renaming.rename(&first), second);
         assert_eq!(renaming.rename(&second), first);
+
+        // Check that targets distinguish unregistered identities from identities renamed to themselves.
+        let third = TestIdentity::new("third");
+        assert_eq!(renaming.target(&first), Some(&second));
+        assert_eq!(renaming.target(&third), None);
+        assert_eq!(renaming.rename(&third), third);
+        let mut self_renaming = TypeIdentityRenaming::new();
+        self_renaming.insert(third.clone(), third.clone()).unwrap();
+        assert_eq!(self_renaming.target(&third), Some(&third));
         assert!(matches!(
             renaming.insert(first, TestIdentity::new("third")),
             Err(TypeError::Invalid { message })

@@ -4568,7 +4568,7 @@ pub(crate) mod tests {
         assert!(matches!(
             pushforward_with_boundary(boundary_program(&[], &[Array::scalar(1.0_f32).unwrap()]), vec![], &[], &[Array::scalar(1.0_f64).unwrap()]),
             Err(ProgramError::MalformedProgram(message)) if message == "pushforward program tangent output 0 has type \
-                f32[] but its public boundary requires tangenttype f64[]",
+                f32[] but its public boundary requires tangent type f64[]",
         ));
     }
 

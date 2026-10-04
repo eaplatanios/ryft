@@ -846,12 +846,13 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     }
                 }
 
-                // Specialization is an optimization. Inputs only need to refine the declared region input types, so
-                // the regions whose type identities were merely instantiated are always a valid fallback. Specialized
-                // regions can be unusable even though their declared counterparts are fine. For example, a loop body
+                // Specialization is an optimization. The regions whose type identities were merely instantiated keep
+                // the declared region signatures, so falling back to them is always sound: the operation's final
+                // inference below decides whether the inputs may feed them (e.g., control flow operations accept value
+                // inputs that refine their declared types) and still reports genuine type errors. Specialized regions
+                // can be unusable even though their declared counterparts are fine. For example, a loop body
                 // specialized at a sharded carry may return that carry unsharded, so the specialized body no longer
-                // maps its carries to themselves. Such an application falls back to the instantiated regions, whose
-                // final inference below still reports genuine type errors.
+                // maps its carries to themselves. Such an application falls back to the instantiated regions.
                 if specialization_failed
                     || (!specialized_regions.is_empty()
                         && operation.infer_output_types(input_types, &interfaces).is_err())

@@ -183,10 +183,10 @@ in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, 
 | mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ConstrainShardingOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
 | `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/shard_map.rs`) |
 | `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `ParallelReduceOperation` with any `ReductionKind` (incl. `Min`) |
-| `lax.all_gather` | tensor-parallel gathers | ✅ | `AllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
+| `lax.all_gather` | tensor-parallel gathers | ✅ | `ParallelAllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
 | reduce-scatter | ZeRO-style gradient sharding | ✅ | `ParallelSumScatterOperation` |
 | `lax.ppermute` | pipeline parallelism | ✅ | `ParallelPermuteOperation` (+ `ParallelPermute::parallel_shuffle`, `ParallelSwapAxes` conveniences) |
-| `lax.all_to_all` | MoE expert exchange | ✅ | `AllToAllOperation` |
+| `lax.all_to_all` | MoE expert exchange | ✅ | `ParallelAllToAllOperation` |
 
 ### 1.9 Autodiff & training transforms
 
@@ -223,7 +223,7 @@ The transform stack was rebuilt around a single builder entry point:
 - [x] fused `dot_product_attention` (+ backward) with causal mask, sliding window, GQA, dropout, bias, sequence lengths, cuDNN FMHA lowering
 - [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_rng_key`, `random_normal`, `random_uniform`, `random_categorical`)
 - [x] `condition`, `while_loop`, `scan`
-- [x] Collectives (`parallel_sum`/`parallel_mean`/`parallel_max`, `all_gather`, `parallel_sum_scatter`, `parallel_permute`, `all_to_all`) + `shard_map`, `reshard`, sharding constraints
+- [x] Collectives (`parallel_sum`/`parallel_mean`/`parallel_max`, `parallel_all_gather`, `parallel_sum_scatter`, `parallel_permute`, `parallel_all_to_all`) + `shard_map`, `reshard`, sharding constraints
 - [x] Activation checkpointing (`rematerialize` with JAX-parity policies and offload)
 - [x] `custom_function` (JVP, VJP, and batching rules), `stop_gradient`, `tag`, `print`, `custom_call`, `transfer_to_memory`
 - [x] `jvp`, `linearize`, `vjp`, `gradient`, `value_and_gradient`, Jacobians/Hessians, `batch` (vmap), backend-neutral `jit`
@@ -337,10 +337,10 @@ forward+backward.
 
 ### Phase 7 — Sharding & collectives — ✅ DONE
 
-Add `AllReduceOperation`, `AllGatherOperation`, `ReduceScatterOperation`, and
+Add `AllReduceOperation`, `ParallelAllGatherOperation`, `ReduceScatterOperation`, and
 `CollectivePermuteOperation` for use inside `shard_map` bodies. These are needed for tensor
 parallelism (head-sharded GQA needs an `all_reduce` after the output projection) and for
-MoE dispatch (`all_to_all` can be expressed as `reduce_scatter` + `all_gather` or as a dedicated
+MoE dispatch (`parallel_all_to_all` can be expressed as `reduce_scatter` + `parallel_all_gather` or as a dedicated
 primitive). The `Mesh` and `Sharding` machinery already exists; this phase only adds the
 IR primitives.
 
@@ -1580,7 +1580,7 @@ choices (attention projections FP8, MLP NVFP4, §4.4) so call sites stay clean.
   variant needs per-attention logit transforms, the fallback is the unfused composition, which
   all exists.
 - **MoE variant (26B-A4B).** The dense path is fully covered. For MoE, `top_k`, `scatter`, and
-  `all_to_all` all exist now; what remains is model-level routing code and (likely) a ragged /
+  `parallel_all_to_all` all exist now; what remains is model-level routing code and (likely) a ragged /
   grouped GEMM story for expert efficiency — flag as Phase 8b once the dense path is stable.
 - **Vision encoder needs convolution.** The only missing IR primitive in the whole plan:
   `ConvolutionOperation` + `stablehlo.convolution` lowering for the SigLIP patch embedding

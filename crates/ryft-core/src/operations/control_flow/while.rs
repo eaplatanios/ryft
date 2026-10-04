@@ -39,7 +39,8 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, validate_reference_carry_axis};
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{
-    TemporalResidualOperation, TemporalResidualType, refine_output_types, validate_output_identities,
+    TemporalResidualOperation, TemporalResidualType, refine_output_types, region_input_mismatch,
+    validate_output_identities,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::logical::AndOperation;
@@ -212,22 +213,23 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // Inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather than
+        // Value inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation rather than
         // strict type equality, so actual inputs that carry metadata the state types leave unspecified (e.g., the
         // normalized shardings of concrete backend array types) or static extents within the bounds of dynamic state
-        // dimensions are accepted. The outputs are the state types refined by the facts that the inputs establish
-        // (refer to `refine_output_types`): an identity that the inputs fix to a static extent and that no state
-        // element defines is loop-invariant, so every iteration carries values of that extent, while an identity that a
-        // first-class dimension carry defines may change across iterations and stays symbolic. Metadata such as
-        // shardings is not propagated, because the body may change it.
+        // dimensions are accepted. Reference inputs must equal their state types (refer to `region_input_mismatch`).
+        // The outputs are the state types refined by the facts that the inputs establish (refer to
+        // `refine_output_types`): an identity that the inputs fix to a static extent and that no state element defines
+        // is loop-invariant, so every iteration carries values of that extent, while an identity that a first-class
+        // dimension carry defines may change across iterations and stays symbolic. Metadata such as shardings is not
+        // propagated, because the body may change it.
         let (_, body_interface) = validated_while_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
         check_count!("input", input_types, state_types.len(), TypeError);
         for (index, (state_type, input_type)) in state_types.iter().zip(input_types).enumerate() {
-            if !state_type.is_refined_by(input_type) {
+            if let Some(relation) = region_input_mismatch(state_type, input_type) {
                 return Err(TypeError::invalid(format!(
-                    "`{WHILE_OPERATION_NAME}` input {index} has type `{input_type}`, which does not refine its state \
-                     type `{state_type}`",
+                    "`{WHILE_OPERATION_NAME}` input {index} has type `{input_type}`, which {relation} its state type \
+                     `{state_type}`",
                 )));
             }
         }
@@ -2923,8 +2925,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension, StridedLayout,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::batch;
@@ -3093,6 +3095,74 @@ mod tests {
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds a program whose `while` loop runs over the states `[counter: f64[], vector: f64[rows]]` from
+    /// unspecialized regions (`counter > 0`, and `[counter - 1, vector + vector]`) while the program feeds it a static
+    /// `f64[3]` vector, so the loop's outputs are refined by its inputs rather than by re-typed regions.
+    fn refined_vector_while_program(
+        iteration_bound: Option<usize>,
+    ) -> Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let counter_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let vector_type = ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)])));
+        let state_types = vec![counter_type.clone(), vector_type];
+
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition_inputs =
+            state_types.iter().map(|r#type| condition_builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let zero = condition_builder.add_constant(array(Array::scalar(0.0).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::GreaterThan))),
+                Vec::new(),
+                vec![condition_inputs[0], zero],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body_inputs = state_types.iter().map(|r#type| body_builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let one = body_builder.add_constant(array(Array::scalar(1.0).unwrap()));
+        let next_counter = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(SubOperation::new())),
+                Vec::new(),
+                vec![body_inputs[0], one],
+                None,
+            )
+            .unwrap()[0];
+        let next_vector = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![body_inputs[1], body_inputs[1]],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next_counter, next_vector],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let inputs = vec![
+            builder.add_input(counter_type),
+            builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]))),
+        ];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(iteration_bound).unwrap();
+        let outputs = builder.add_instruction(operation, regions, inputs, None).unwrap().to_vec();
+        builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap()
     }
 
@@ -3397,7 +3467,7 @@ mod tests {
     fn test_while_type_inference_refines_input_types() {
         // Inputs only need to refine the state types, so actual types that carry metadata the state types leave
         // unspecified (e.g., the normalized shardings of concrete backend array types) are accepted, and the outputs
-        // keep the declared state types. The regions are requested at the refined input types, so that staging can
+        // do not inherit that metadata. The regions are requested at the refined input types, so that staging can
         // specialize them.
         let state_type = ArrayType::scalar(DataType::F64);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -3449,8 +3519,7 @@ mod tests {
         );
 
         // Without the first-class dimension state, nothing defines `extent`, so it is loop-invariant and the output
-        // takes the static extent that the input establishes for it. A reference output takes exactly the type of the
-        // input that it aliases.
+        // takes the static extent that the input establishes for it.
         let array_state_types = vec![state_types[1].clone()];
         let array_interfaces = vec![
             RegionInterface::new(
@@ -3467,6 +3536,56 @@ mod tests {
             ),
             Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5]))]),
         );
+
+        // Facts are established from the complete input signature, so two states that observe different extents for
+        // `extent` conflict. A partial refinement fixes `rows` and keeps `columns` symbolic in the output.
+        let pair_state_types = vec![state_types[1].clone(), state_types[1].clone()];
+        let pair_interfaces = vec![
+            RegionInterface::new(
+                pair_state_types.clone(),
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                EffectClasses::NONE,
+            ),
+            RegionInterface::new(pair_state_types.clone(), pair_state_types, EffectClasses::NONE),
+        ];
+        let conflict = WhileOperation::new()
+            .infer_output_types(
+                &[
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [6])),
+                ],
+                pair_interfaces.as_slice(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            conflict.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "extent".to_string(), expected: 5, actual: 6 }),
+        );
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
+        let matrix_type = |rows: Dimension| {
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![rows, Dimension::Dynamic(columns.clone())]),
+            ))
+        };
+        let matrix_state_types = vec![matrix_type(Dimension::Dynamic(rows))];
+        let matrix_interfaces = vec![
+            RegionInterface::new(
+                matrix_state_types.clone(),
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                EffectClasses::NONE,
+            ),
+            RegionInterface::new(matrix_state_types.clone(), matrix_state_types, EffectClasses::NONE),
+        ];
+        assert_eq!(
+            WhileOperation::new()
+                .infer_output_types(&[matrix_type(Dimension::Static(3))], matrix_interfaces.as_slice()),
+            Ok(vec![matrix_type(Dimension::Static(3))]),
+        );
+
+        // A reference input must equal its state type exactly, because its allocation keeps its type when references
+        // are discharged.
         let ArrayIrType::Array(referent_type) = &state_types[1] else { unreachable!() };
         let reference_state_types = vec![ArrayIrType::Reference(ReferenceType::new(referent_type.clone()))];
         let reference_interfaces = vec![
@@ -3482,7 +3601,9 @@ mod tests {
         assert_eq!(
             WhileOperation::new()
                 .infer_output_types(std::slice::from_ref(&refined_reference_type), reference_interfaces.as_slice()),
-            Ok(vec![refined_reference_type]),
+            Err(TypeError::invalid(
+                "`while` input 0 has type `ref<f32[5]>`, which does not equal its state type `ref<f32[extent]>`",
+            )),
         );
     }
 
@@ -6176,6 +6297,48 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_while_partial_evaluation_refines_outputs_of_unspecialized_regions() {
+        // Partially evaluating a loop whose refined outputs come from unspecialized regions keeps them refined
+        // whichever state is known, and the residual program reproduces the original one.
+        let program = refined_vector_while_program(None);
+        let static_vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        assert_eq!(program.output_types()[1], static_vector_type);
+        let counter = array(Array::scalar(2.0).unwrap());
+        let vector = array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
+        let expected = vec![array(Array::scalar(0.0).unwrap()), array(Array::vector(vec![4.0, 8.0, 12.0]).unwrap())];
+        for partial_inputs in [
+            vec![PartialValue::Known(counter.clone()), PartialValue::Unknown(static_vector_type.clone())],
+            vec![
+                PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+                PartialValue::Known(vector.clone()),
+            ],
+        ] {
+            let evaluation = program.partially_evaluate(&partial_inputs).unwrap();
+            let arguments = evaluation
+                .inputs
+                .iter()
+                .map(|input| match input {
+                    PartialEvaluationInput::Known(value) => value.clone(),
+                    PartialEvaluationInput::Unknown(index) => [counter.clone(), vector.clone()][*index].clone(),
+                })
+                .collect::<Vec<_>>();
+            let residual_outputs = evaluation.program.interpret(arguments).unwrap();
+            let reassembled = evaluation
+                .outputs
+                .iter()
+                .map(|output| match output {
+                    PartialEvaluationOutput::Known(value) => value.clone(),
+                    PartialEvaluationOutput::Unknown(index) => {
+                        assert!(evaluation.program.output_types()[*index].identities().next().is_none());
+                        residual_outputs[*index].clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(reassembled, expected);
+        }
+    }
+
+    #[test]
     fn test_while_partial_evaluation_never_folds_a_reference_carry() {
         // A pure loop that only passes a known reference through is still never folded, because a folded carry would
         // be rebuilt as a program constant instead of keeping its allocation flowing through the loop boundary.
@@ -7602,6 +7765,39 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_while_batching_refines_outputs_of_unspecialized_regions() {
+        // Batching a loop whose refined outputs come from unspecialized regions keeps its batched outputs refined.
+        let extent = DimensionValue::constant(2).unwrap();
+        let batched = refined_vector_while_program(None)
+            .batched_with_threaded_extent(
+                extent.r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(batched.output_types()[2], ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])));
+        let vectors =
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap();
+        let outputs = batched
+            .interpret(vec![TestIrValue::Dimension(extent), array(Array::scalar(2.0).unwrap()), array(vectors)])
+            .unwrap();
+        assert_eq!(
+            outputs[2],
+            array(
+                Array::from_elements::<f64>(
+                    ArrayType::new_static(DataType::F64, [2, 3]),
+                    &[4.0, 8.0, 12.0, 16.0, 20.0, 24.0],
+                )
+                .unwrap(),
+            ),
+        );
+    }
+
+    #[test]
     fn test_composite_while_batching_threads_reference_carries() {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
@@ -8185,6 +8381,47 @@ mod tests {
             .unwrap()[0];
         let body = body_builder.build(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         vec![condition, body]
+    }
+
+    #[test]
+    fn test_composite_while_differentiation_refines_outputs_of_unspecialized_regions() {
+        // Differentiating a loop whose refined outputs come from unspecialized regions keeps the primal, tangent, and
+        // cotangent types refined. The loop computes `[counter - 2, 4 * vector]` for a counter of 2.
+        let static_vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let counter = array(Array::scalar(2.0).unwrap());
+        let vector = array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
+
+        let jvp = refined_vector_while_program(None).jvp().unwrap();
+        assert!(jvp.output_types().iter().all(|r#type| r#type.identities().next().is_none()));
+        assert_eq!(
+            jvp.interpret(vec![
+                counter.clone(),
+                vector.clone(),
+                array(Array::scalar(0.0).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+            ]),
+            Ok(vec![
+                array(Array::scalar(0.0).unwrap()),
+                array(Array::vector(vec![4.0, 8.0, 12.0]).unwrap()),
+                array(Array::scalar(0.0).unwrap()),
+                array(Array::vector(vec![4.0, 4.0, 4.0]).unwrap()),
+            ]),
+        );
+
+        let linearization = refined_vector_while_program(Some(4)).linearize().unwrap();
+        assert_eq!(linearization.primal().output_types()[1], static_vector_type);
+        let mut primal_outputs = linearization.primal().interpret(vec![counter, vector]).unwrap();
+        assert_eq!(primal_outputs[1], array(Array::vector(vec![4.0, 8.0, 12.0]).unwrap()));
+        let residuals = primal_outputs.split_off(2);
+        let pullback = linearization.pullback().unwrap();
+        assert!(pullback.output_types().iter().all(|r#type| r#type.identities().next().is_none()));
+        let mut pullback_inputs =
+            vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![4.0, 4.0, 4.0]).unwrap())]),
+        );
     }
 
     #[test]

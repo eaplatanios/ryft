@@ -104,6 +104,19 @@ where
     }
 }
 
+/// Returns how an instruction input of type `input_type` fails to feed a region input of type `region_input_type` of a
+/// control-flow operation (i.e., `"does not refine"` or `"does not equal"`, for use in diagnostics), or [`None`] when it
+/// may feed it. Value inputs only need to refine the region input type (refer to [`Type::is_refined_by`]). Reference
+/// inputs must match it exactly: a reference denotes an allocation whose type is fixed, and reference discharge assigns
+/// that allocation to every region input that receives it, which requires their types to match the allocation's type.
+pub(crate) fn region_input_mismatch<T: Type>(region_input_type: &T, input_type: &T) -> Option<&'static str> {
+    if region_input_type.is_reference() || input_type.is_reference() {
+        (region_input_type != input_type).then_some("does not equal")
+    } else {
+        (!region_input_type.is_refined_by(input_type)).then_some("does not refine")
+    }
+}
+
 /// Returns the output types of a control-flow operation whose `input_types` refine the `declared_input_types` of its
 /// regions, by applying the refinement facts that those inputs establish (e.g., `rows = 3` for an `f32[3]` input that
 /// a region declares as `f32[rows]`) to the `declared_output_types`. The facts are established from the complete input
@@ -111,8 +124,9 @@ where
 /// first-class dimension carry may change its extent across iterations, and a branch produces the identities that its
 /// outputs define. A reference output whose aliased input is known (i.e., for which `aliased_input` returns that
 /// input's index) takes exactly that input's type, so an alias family never mixes refined and declared reference
-/// types, while any other reference output keeps its declared type. Metadata that is not a fact about an identity
-/// (e.g., a sharding or layout that only the inputs carry) is never propagated to the outputs.
+/// types, while any other reference output keeps its declared type (reference inputs match their region input types
+/// exactly, as [`region_input_mismatch`] requires, so both rules agree). Metadata that is not a fact about an
+/// identity (e.g., a sharding or layout that only the inputs carry) is never propagated to the outputs.
 pub(crate) fn refine_output_types<T: Type>(
     declared_input_types: &[T],
     input_types: &[T],
