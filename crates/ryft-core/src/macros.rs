@@ -4667,7 +4667,7 @@ macro_rules! check_operation_differentiation {
         let step: f64 = $step;
         let epsilon: f64 = $epsilon;
         assert!(step > 0.0, "finite-difference step must be positive");
-        assert!(epsilon >= 0.0, "comparison epsilon must be nonnegative");
+        assert!(epsilon >= 0.0, "comparison epsilon must be non-negative");
         $(
         {
             // Convert each fixture into the selected backend's value family. Every primal input and output must

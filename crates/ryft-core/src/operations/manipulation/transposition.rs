@@ -26,7 +26,7 @@ use crate::tracing::{Tracer, TracingContext};
 /// into a permutation, as do [`Axes`] collections. Use [`Self::default`] for an empty permutation.
 ///
 /// Construction preserves the supplied indices without validating them. [`Self::normalize`] resolves negative axes
-/// against the input rank and checks that every input axis appears exactly once. The resulting nonnegative positions
+/// against the input rank and checks that every input axis appears exactly once. The resulting non-negative positions
 /// are suitable for indexing and backend lowering. Equality and hashing compare the supplied notation, so `[-1, -2]`
 /// and `[1, 0]` are distinct values even though they describe the same matrix transpose.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
@@ -52,7 +52,7 @@ impl Permutation {
         Ok(inverse.into())
     }
 
-    /// Resolves signed axes against `rank` and returns their nonnegative positions in output-axis order.
+    /// Resolves signed axes against `rank` and returns their non-negative positions in output-axis order.
     /// The [`Permutation`] must contain exactly `rank` axes, with no duplicates after normalization.
     ///
     /// # Example

@@ -12,7 +12,7 @@
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
     DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
-    DynamicSliceBounds, EffectClass, Layout, Operation, ProgramError, Shape,
+    DynamicSliceBounds, EffectClass, Layout, MemberOperation, Operation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -1347,6 +1347,14 @@ where
             lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
         }
         ArrayIrOperation::ParallelAllGather(operation) => {
+            collective_state.check_manual_collective(
+                operation.name(),
+                operation.axis_name(),
+                operation.axis_size(),
+                operation.mesh(),
+                output_types,
+                |mesh| operation.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            )?;
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1368,6 +1376,14 @@ where
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayIrOperation::ParallelSumScatter(operation) => {
+            collective_state.check_manual_collective(
+                operation.name(),
+                operation.axis_name(),
+                operation.axis_size(),
+                operation.mesh(),
+                output_types,
+                |mesh| operation.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            )?;
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1389,6 +1405,14 @@ where
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayIrOperation::ParallelAllToAll(operation) => {
+            collective_state.check_manual_collective(
+                operation.name(),
+                operation.axis_name(),
+                operation.axis_size(),
+                operation.mesh(),
+                output_types,
+                |mesh| operation.clone().with_mesh(mesh.clone()).infer_parent_output_types(input_types, &[]),
+            )?;
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };

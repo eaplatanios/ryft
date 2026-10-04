@@ -498,6 +498,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -729,8 +731,8 @@ mod tests {
         );
         let initial_bytes = 1.0_f32.to_le_bytes().to_vec();
         let replacement_bytes = 2.0_f32.to_le_bytes().to_vec();
-        let live = ArrayReference::new(Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone()));
-        let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
+        let live = ArrayReference::new(Array::new_unchecked(dynamic_type.clone(), Arc::new(initial_bytes.clone())));
+        let replacement = Array::new_unchecked(dynamic_type.clone(), Arc::new(replacement_bytes.clone()));
         let mut outputs = InterpretableOperation::<TestIrContext>::interpret(
             &TestIrReferenceSwapOperation::new(),
             &TestIrContext::new(),

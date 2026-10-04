@@ -137,7 +137,7 @@ impl<T: Type> PadOperation<T> {
 
     /// Returns the number of padding elements inserted between each pair of adjacent input elements along each axis.
     /// Zero leaves adjacent elements contiguous, while one inserts a single padding element between them. These counts
-    /// use [`usize`] because interior padding is nonnegative and cannot crop elements. No interior padding is inserted
+    /// use [`usize`] because interior padding is non-negative and cannot crop elements. No interior padding is inserted
     /// along an axis with fewer than two input elements.
     #[inline]
     pub fn interior_padding(&self) -> &[usize] {
@@ -1414,7 +1414,7 @@ impl_differentiable_operation! {
 ///
 /// For an input extent `d`, the output extent is `d + max(d - 1, 0) * interior_padding + edge_padding_low +
 /// edge_padding_high`. An empty input axis therefore contributes no interior padding. Each resulting extent must be
-/// nonnegative and fit in [`usize`]. All three configuration slices must contain one entry per input axis, and the
+/// non-negative and fit in [`usize`]. All three configuration slices must contain one entry per input axis, and the
 /// padding value must be a scalar with the input's element data type and memory space.
 ///
 /// An effective identity returns its input unchanged after validating the inputs. Otherwise, padding preserves memory

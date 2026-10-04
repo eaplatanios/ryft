@@ -1049,36 +1049,36 @@ mod tests {
         assert_eq!(DimensionBounds::new(3, Some(3)), Err(DimensionError::InvalidBounds { lower: 3, upper: 3 }));
         assert_eq!(DimensionBounds::new(4, Some(3)), Err(DimensionError::InvalidBounds { lower: 4, upper: 3 }));
 
-        let nonnegative = DimensionBounds::non_negative(Some(5)).unwrap();
-        assert_eq!(nonnegative.lower(), 0);
-        assert_eq!(nonnegative.upper(), Some(5));
-        assert_eq!(nonnegative.representable_extent_range(), Ok((0, 4)));
+        let non_negative = DimensionBounds::non_negative(Some(5)).unwrap();
+        assert_eq!(non_negative.lower(), 0);
+        assert_eq!(non_negative.upper(), Some(5));
+        assert_eq!(non_negative.representable_extent_range(), Ok((0, 4)));
         assert_eq!(DimensionBounds::new(0, Some(1)).unwrap().representable_extent_range(), Ok((0, 0)));
-        assert!(nonnegative.contains(0));
-        assert!(nonnegative.contains(4));
-        assert!(!nonnegative.contains(5));
-        assert_eq!(nonnegative.to_string(), "[0, 5)");
+        assert!(non_negative.contains(0));
+        assert!(non_negative.contains(4));
+        assert!(!non_negative.contains(5));
+        assert_eq!(non_negative.to_string(), "[0, 5)");
 
         let positive = DimensionBounds::positive(Some(5)).unwrap();
         assert_eq!(positive.representable_extent_range(), Ok((1, 4)));
         assert_eq!(DimensionBounds::new(2, Some(9)).unwrap().representable_extent_range(), Ok((2, 8)));
         assert!(!positive.contains(0));
         assert!(positive.contains(1));
-        assert!(nonnegative.contains_bounds(positive));
-        assert!(!positive.contains_bounds(nonnegative));
+        assert!(non_negative.contains_bounds(positive));
+        assert!(!positive.contains_bounds(non_negative));
 
         // Only bounds that admit exactly one extent determine that extent.
         assert_eq!(DimensionBounds::new(0, Some(1)).unwrap().extent(), Some(0));
         assert_eq!(DimensionBounds::new(7, Some(8)).unwrap().extent(), Some(7));
-        assert_eq!(nonnegative.extent(), None);
+        assert_eq!(non_negative.extent(), None);
         assert_eq!(DimensionBounds::at_least(7).extent(), None);
 
         let unbounded = DimensionBounds::unbounded();
         assert_eq!(unbounded, DimensionBounds::at_least(0));
         assert_eq!(unbounded.representable_extent_range(), Ok((0, MAX_DIMENSION_EXTENT)));
         assert!(unbounded.contains(usize::MAX));
-        assert!(unbounded.contains_bounds(nonnegative));
-        assert!(!nonnegative.contains_bounds(unbounded));
+        assert!(unbounded.contains_bounds(non_negative));
+        assert!(!non_negative.contains_bounds(unbounded));
         assert_eq!(unbounded.to_string(), "[0, ∞)");
 
         assert_eq!(

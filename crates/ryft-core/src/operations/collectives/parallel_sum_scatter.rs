@@ -74,9 +74,10 @@ pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 /// cross-device sum completed by the exchange, and its output varies over the axis too. An ordinary sum-scatter
 /// carries no mesh and preserves the input's mesh state, even when its input carries a manual mesh axis with the same
 /// name, because a `batch` level whose axis name shadows that mesh axis may bind it instead. The collective is linear,
-/// and its transpose is a varying [`ParallelAllGatherOperation`] with the same mode, axis, participant groups, and
-/// mesh. Outside any binder, the single participant of a degenerate axis keeps its value, with the size-one scatter
-/// axis removed in untiled mode.
+/// and its transpose is a [`ParallelAllGatherOperation`] with the same mode, axis, participant groups, and mesh.
+/// The gather is reduced when the input is unreduced over the scattered manual axis, and varying otherwise. Pending
+/// sums over unrelated mesh axes are preserved. Outside any binder, the single participant of a degenerate axis keeps
+/// its value, with the size-one scatter axis removed in untiled mode.
 ///
 /// A matching `batch` level consumes the mapped batch axis of an ordinary sum-scatter by summing over it and mapping
 /// the scattered chunks back onto it, so that batch item `i` receives chunk `i` of the sum and a value that is the
@@ -215,7 +216,7 @@ impl ParallelSumScatterOperation {
     /// inference paths. An ordinary sum-scatter performs no mesh exchange, even when its axis name shadows a mesh axis,
     /// so it preserves pending mesh sums and variance. Over a manual mesh axis, an input that is unreduced over the
     /// scattered axis is the cotangent of a reduced all-gather result, so the sum-scatter consumes that pending
-    /// reduction and returns a value that varies over the axis.
+    /// reduction and returns a value that varies over the axis. Pending reductions over other axes are preserved.
     fn finalize_output_type(&self, input_type: &ArrayType, output_type: ArrayType) -> Result<ArrayType, TypeError> {
         let data_type = input_type.data_type();
         if !data_type.is_numeric() && data_type != DataType::Zero {
@@ -256,7 +257,7 @@ impl ParallelSumScatterOperation {
             )));
         }
 
-        if input_type.unreduced_axes().is_empty() {
+        if !input_type.unreduced_axes().contains(axis_name) {
             // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant
             // over that axis would yield an output whose type wrongly claims that it is invariant.
             if !sharding.varying_manual_axes().contains(axis_name) {
@@ -269,24 +270,28 @@ impl ParallelSumScatterOperation {
             return Ok(output_type);
         }
 
-        if input_type.unreduced_axes().len() != 1 || !input_type.unreduced_axes().contains(self.axis_name()) {
+        // Participant groups sum only within each group, so a grouped exchange would leave part of the pending sum
+        // over the axis uncompleted while typing its output as complete.
+        if self.options.axis_index_groups.is_some() {
             return Err(TypeError::invalid(format!(
-                "`{}` only supports an unreduced input over its own axis `{}`",
-                PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                self.axis_name(),
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` with axis index groups cannot complete a pending sum over \
+                 manual axis `{axis_name}`",
             )));
         }
 
-        // Unreduced axes require a sharding, and the shape-only output type preserves the input sharding.
+        // Complete only the participating axis's pending sum. Independent pending sums commute with this exchange
+        // and stay pending; the shape-only output type already preserves their sharding state.
         let input_sharding = input_type.sharding().unwrap();
         let mut varying_axes = input_sharding.varying_manual_axes().clone();
         varying_axes.insert(self.axis_name().to_string());
         let output_sharding = output_type.sharding().unwrap().clone();
         Ok(output_type.with_sharding(
             output_sharding
-                .with_unreduced_axes(Vec::<String>::new())
+                .with_unreduced_axes(
+                    input_type.unreduced_axes().iter().filter(|axis| axis.as_str() != axis_name).cloned(),
+                )
                 .and_then(|sharding| sharding.with_varying_manual_axes(varying_axes))
-                .map_err(|error| TypeError::invalid(error.to_string()))?,
+                .map_err(TypeError::from)?,
         )?)
     }
 
@@ -325,7 +330,6 @@ impl ParallelSumScatterOperation {
             let base_output_type = input_type.without_dimension(self.scatter_axis)?.0;
             let mut output_types = infer_array_ir_shape_changing_collective_output_type(
                 PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                true,
                 input_types,
                 base_output_type,
                 &[],
@@ -361,7 +365,6 @@ impl ParallelSumScatterOperation {
         base_output_type.sharding = sharding;
         let mut output_types = infer_array_ir_shape_changing_collective_output_type(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
-            true,
             input_types,
             base_output_type,
             &[self.scatter_axis],
@@ -464,13 +467,20 @@ impl ParallelSumScatterOperation {
     }
 
     /// Returns the adjoint collective that transposition stages on the output cotangent.
-    fn adjoint(&self) -> Result<ParallelAllGatherOperation, ProgramError> {
+    fn adjoint(&self, input_type: &ArrayType) -> Result<ParallelAllGatherOperation, ProgramError> {
+        // Completing a pending sum has a reduced cotangent, whereas varying inputs keep varying cotangents.
+        // Ordinary batch-bound collectives preserve mesh state even when their name shadows a manual mesh axis.
+        let output_variance = if self.mesh.is_some() && input_type.unreduced_axes().contains(self.axis_name()) {
+            ParallelAllGatherOutputVariance::Reduced
+        } else {
+            ParallelAllGatherOutputVariance::Varying
+        };
         let adjoint = ParallelAllGatherOperation::new(
             self.axis_name.clone(),
             self.axis_size,
             self.scatter_axis,
             self.options.clone(),
-            ParallelAllGatherOutputVariance::Varying,
+            output_variance,
         );
         Ok(match &self.mesh {
             Some(mesh) => adjoint.with_mesh(mesh.clone()),
@@ -671,14 +681,13 @@ impl<
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // A sum-scatter is the adjoint of a varying all-gather with the same mode, axis, and participant groups,
-        // so the input cotangent is a `ParallelAllGatherOperation` of the output cotangent.
+        // Restore the input cotangent's reduction state with a reduced or varying all-gather over the same axis.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
 
         // Only a live output cotangent of an unknown input stages the adjoint collective.
-        let adjoint = self.adjoint()?;
+        let adjoint = self.adjoint(inputs[0].r#type().as_ref())?;
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
         };
@@ -928,9 +937,14 @@ impl<
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Explicit output extents are retained as ordinary residual values, and the
-        // transposed linear region applies varying all-gather to the output cotangent.
-        differentiate_shape_changing_collective_with_adjoint(self, self.adjoint()?, context, inputs)
+        // Output extents are ordinary residual values. The transposed linear region must restore the input
+        // cotangent's reduction state, so completing a pending sum uses reduced rather than varying all-gather.
+        let Some(array) = inputs.first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        let input_type = array.primal().r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        differentiate_shape_changing_collective_with_adjoint(self, self.adjoint(input_type)?, context, inputs)
     }
 }
 
@@ -1021,8 +1035,8 @@ pub trait ParallelSumScatter: Sized {
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`](crate::axes::AxisError) when no
     /// enclosing binder binds `axis_name`, and a [`ProgramError`] if `scatter_axis` is out of bounds, if its extent
-    /// does not fit the tiling mode, if the participant groups are invalid, if this value is not numeric, or if it
-    /// carries unreduced axes other than `axis_name`.
+    /// does not fit the tiling mode, if the participant groups are invalid, if this value is not numeric, or if its
+    /// manual mesh state does not satisfy the input variation or pending-sum contract.
     fn parallel_sum_scatter_with_options(
         &self,
         axis_name: &str,
@@ -1270,7 +1284,7 @@ mod tests {
 
         // Over a manual mesh axis, every participant receives a different chunk, so an invariant input is rejected and
         // a varying input keeps its variation. An input that is unreduced over the operation's own axis has its pending
-        // sum completed and its output varies over the axis, while any other unreduced axis is rejected. The input
+        // sum completed and its output varies over the axis, while unrelated pending sums are preserved. The input
         // must carry the operation's mesh.
         let sharding = Sharding::replicated(manual_mesh(), 1);
         let with_sharding =
@@ -1298,7 +1312,8 @@ mod tests {
                 },
                 {
                     input_types = [with_sharding(sharding.clone().with_unreduced_axes(["y"]).unwrap())],
-                    error = "`parallel_sum_scatter` only supports an unreduced input over its own axis `x`",
+                    error = "`parallel_sum_scatter` input must vary over manual axis `x`; pass an invariant value \
+                             through `parallel_vary` first so that every copy is counted",
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [4])],
@@ -1309,6 +1324,29 @@ mod tests {
                         Sharding::replicated(other_mesh, 1).with_varying_manual_axes(["x"]).unwrap(),
                     )],
                     error = "`parallel_sum_scatter` input mesh does not match the operation mesh",
+                },
+            ],
+        );
+
+        // Participant groups sum only within each group, so a grouped sum-scatter accepts varying inputs but cannot
+        // complete a pending sum over the whole axis.
+        check_operation_type_inference!(
+            operation = ParallelSumScatterOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]),
+            )
+            .with_mesh(manual_mesh()),
+            cases = [
+                {
+                    input_types = [with_sharding(varying.clone())],
+                    output_types = [with_sharding(varying.clone())],
+                },
+                {
+                    input_types = [with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())],
+                    error = "`parallel_sum_scatter` with axis index groups cannot complete a pending sum over manual \
+                             axis `x`",
                 },
             ],
         );
@@ -1943,6 +1981,101 @@ mod tests {
             context.builder().borrow().instructions()[0].operation(),
             ArrayIrOperation::Array(ArrayOperation::ParallelAllGather(_)),
         ));
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_transposition_preserves_reduction_state() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let shardings = [
+            replicated.clone().with_varying_manual_axes(["x"]).unwrap(),
+            replicated.clone().with_unreduced_axes(["x"]).unwrap(),
+            replicated.clone().with_unreduced_axes(["x", "y"]).unwrap(),
+            replicated.clone().with_unreduced_axes(["x"]).unwrap().with_reduced_axes(["y"]).unwrap(),
+            replicated.clone().with_varying_manual_axes(["x"]).unwrap().with_unreduced_axes(["y"]).unwrap(),
+        ];
+        for sharding in shardings {
+            let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled())
+                .with_mesh(mesh.clone());
+            let input_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(sharding).unwrap();
+            let output_type = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap().remove(0);
+            assert_eq!(
+                output_type.unreduced_axes(),
+                &input_type.unreduced_axes().iter().filter(|axis| axis.as_str() != "x").cloned().collect(),
+            );
+
+            // Both representations must restore the complete input cotangent state, including a reduced `x` when
+            // scatter completes its pending sum, and pending or reduced state on independent manual axes.
+            let program = parallel_sum_scatter_program(operation.clone(), input_type.clone());
+            let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+            assert_eq!(transposed.output_types(), vec![input_type.cotangent().unwrap()]);
+
+            let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let output_cotangent = context.input(output_type.cotangent().unwrap().into());
+            let mut context = TranspositionContext::new(context);
+            let inputs = [
+                PartialValue::Unknown(input_type.clone().into()),
+                PartialValue::Unknown(DimensionValue::constant(4).unwrap().r#type().into_owned().into()),
+            ];
+            let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+            transpose_mixed_operation(
+                &mut context,
+                &operation,
+                &inputs,
+                &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
+            )
+            .unwrap();
+            let cotangents = context.take_cotangents(&accumulators).unwrap();
+            let [MaybeZero::Value(array), MaybeZero::Zero(_)] = cotangents.as_slice() else {
+                panic!("expected an array cotangent and a structural-zero extent cotangent");
+            };
+            assert_eq!(array.r#type().as_ref(), &ArrayIrType::from(input_type.cotangent().unwrap()));
+        }
+
+        // Scattering over separate axes completes each pending sum independently. Transposition reconstructs the
+        // doubly reduced cotangent by composing reduced gathers in the reverse order.
+        let input_type = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(replicated.with_unreduced_axes(["x", "y"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let scatter_x =
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()).with_mesh(mesh.clone());
+        let intermediate = builder.add_instruction(scatter_x.clone(), Vec::new(), vec![input], None).unwrap()[0];
+        let scatter_y =
+            ParallelSumScatterOperation::new("y".to_string(), 2, 0, CollectiveOptions::tiled()).with_mesh(mesh);
+        let output = builder.add_instruction(scatter_y.clone(), Vec::new(), vec![intermediate], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert!(program.output_types()[0].unreduced_axes().is_empty());
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().output_types(),
+            vec![input_type.cotangent().unwrap()],
+        );
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let intermediate_extent = builder.add_constant(DimensionValue::constant(4).unwrap().into());
+        let output_extent = builder.add_constant(DimensionValue::constant(2).unwrap().into());
+        let intermediate =
+            builder.add_instruction(scatter_x, Vec::new(), vec![input, intermediate_extent], None).unwrap()[0];
+        let output =
+            builder.add_instruction(scatter_y, Vec::new(), vec![intermediate, output_extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().output_types(),
+            vec![ArrayIrType::from(input_type.cotangent().unwrap())],
+        );
     }
 
     #[test]

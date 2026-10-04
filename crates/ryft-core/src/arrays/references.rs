@@ -1717,6 +1717,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -3042,9 +3043,9 @@ mod tests {
                 .dynamic_index(0, &TestValue::Array(Array::vector(vec![1i32]).unwrap())),
             Err(TypeError::invalid("reference transform requires a scalar integer index but received `i32[1]`").into()),
         );
-        let host_index = Array::with_unchecked_type(
+        let host_index = Array::new_unchecked(
             ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: false }),
-            0i32.to_le_bytes().to_vec(),
+            Arc::new(0i32.to_le_bytes().to_vec()),
         );
         assert_eq!(
             TestView::new(allocation).unwrap().dynamic_index(0, &TestValue::Array(host_index)),

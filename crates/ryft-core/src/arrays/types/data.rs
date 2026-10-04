@@ -1325,7 +1325,7 @@ impl DataType {
     /// Returns an order-preserving `u64` key for one real-valued element, so that comparing the order keys of two
     /// elements of the same data type compares the elements themselves, or `None` for complex and payload-free element
     /// data types. Booleans and unsigned integers are keyed by value, and signed integers by their sign-biased two's
-    /// complement (i.e., with the sign bit flipped), so that negative values compare below nonnegative ones. Every
+    /// complement (i.e., with the sign bit flipped), so that negative values compare below non-negative ones. Every
     /// floating-point value converts exactly to `f64` and is keyed as documented on
     /// [`DataType::floating_point_element_order_key`]. Order keys are exact for every data type, including 64-bit
     /// integers that `f64` cannot represent exactly.
@@ -1359,7 +1359,7 @@ impl DataType {
 
     /// Returns the order key of `value` in the IEEE 754 total order (i.e., `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞
     /// < +NaN`, with NaNs of the same sign ordered by payload) as an order-preserving `u64`. The key flips every bit
-    /// of a negative value and only the sign bit of a nonnegative one. When `canonicalize` is `true`, both signed zeros
+    /// of a negative value and only the sign bit of a non-negative one. When `canonicalize` is `true`, both signed zeros
     /// are keyed as `+0.0` and every NaN is keyed as the same positive quiet NaN, so that signed zeros compare equal
     /// and NaNs compare equal and greater than `+∞`.
     pub(crate) fn floating_point_element_order_key(value: f64, canonicalize: bool) -> u64 {

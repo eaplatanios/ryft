@@ -307,10 +307,10 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped-dot iteration
 /// space.
 ///
-/// In non-contracting and contracting modes every size must be nonnegative. The eager interpreter rejects negative
+/// In non-contracting and contracting modes every size must be non-negative. The eager interpreter rejects negative
 /// metadata in those modes. XLA's decomposition lowering additionally clamps signed negatives to zero before unsigned
 /// accumulation so invalid runtime metadata cannot become a large interval. The instruction lowering passes metadata
-/// unchanged to `chlo.ragged_dot` and therefore relies on the nonnegative-input contract.
+/// unchanged to `chlo.ragged_dot` and therefore relies on the non-negative-input contract.
 ///
 /// The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical LHS ragged
 /// extent, so an over-covering group is clipped and every later group is empty once its raw start reaches or exceeds

@@ -704,6 +704,7 @@ fn extract_auxiliary_primals<
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Arc;
 
     use approx::assert_abs_diff_eq;
     use num_complex::Complex as ComplexNumber;
@@ -1136,7 +1137,7 @@ mod tests {
             F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
         );
-        let dynamic = Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec());
+        let dynamic = Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0f64.to_le_bytes().to_vec()));
         assert_eq!(
             context.differentiate_at(dynamic).jacobian_forward(|x| Ok(x)).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
@@ -1151,7 +1152,7 @@ mod tests {
                 .differentiate_at(Array::scalar(1.0).unwrap())
                 .jacobian_forward(|input| Ok(input
                     .context()
-                    .lift(Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec()))?))
+                    .lift(Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0f64.to_le_bytes().to_vec())))?))
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianForward,
@@ -1161,7 +1162,7 @@ mod tests {
             },
         );
 
-        let dynamic = Array::with_unchecked_type(dynamic_type, 1.0f64.to_le_bytes().to_vec());
+        let dynamic = Array::new_unchecked(dynamic_type, Arc::new(1.0f64.to_le_bytes().to_vec()));
         assert_eq!(
             context
                 .differentiate_at(dynamic)

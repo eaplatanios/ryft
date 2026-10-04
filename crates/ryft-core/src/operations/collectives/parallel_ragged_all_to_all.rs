@@ -2278,7 +2278,7 @@ mod tests {
         );
         assert_eq!(
             interpret_single_participant_parallel_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
-            ProgramError::InvalidArgument { message: "`input_offsets[0]` must be nonnegative but got -1".to_string() },
+            ProgramError::InvalidArgument { message: "`input_offsets[0]` must be non-negative but got -1".to_string() },
         );
         assert_eq!(
             interpret_single_participant_parallel_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]).unwrap_err(),

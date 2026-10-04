@@ -10,7 +10,7 @@
 //!
 //! [`Axis`] stores a signed index and delays normalization until an array rank is known. Nonnegative indices count
 //! from the leading dimension. Negative indices count backward, so `-1` denotes the trailing dimension. Normalization
-//! accepts exactly `[-rank, rank)` and returns a nonnegative position. [`Axes`] preserves an ordered collection of
+//! accepts exactly `[-rank, rank)` and returns a non-negative position. [`Axes`] preserves an ordered collection of
 //! these values and rejects duplicates after normalization, including aliases such as `0` and `-rank`.
 //!
 //! Positional axes are array-boundary descriptors. They differ from [`BatchAxis`](crate::BatchAxis), which additionally
@@ -87,7 +87,7 @@ impl Axis {
         self.0
     }
 
-    /// Normalizes this [`Axis`] against `rank`, returning its nonnegative position. Valid axes lie in `[-rank, rank)`.
+    /// Normalizes this [`Axis`] against `rank`, returning its non-negative position. Valid axes lie in `[-rank, rank)`.
     #[inline]
     pub fn normalize(self, rank: usize) -> Result<usize, AxisError> {
         let position = if self.0 >= 0 {

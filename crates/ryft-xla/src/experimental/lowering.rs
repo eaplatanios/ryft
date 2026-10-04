@@ -6629,6 +6629,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                collective_state.check_manual_collective(
+                    operation.name(),
+                    operation.axis_name(),
+                    operation.axis_size(),
+                    operation.mesh(),
+                    output_types,
+                    |mesh| operation.clone().with_mesh(mesh.clone()).infer_output_types(&lowerer.input_types, &[]),
+                )?;
                 lower_parallel_all_gather_to_mlir(
                     operation,
                     &collective_state,
@@ -6643,6 +6651,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                collective_state.check_manual_collective(
+                    operation.name(),
+                    operation.axis_name(),
+                    operation.axis_size(),
+                    operation.mesh(),
+                    output_types,
+                    |mesh| operation.clone().with_mesh(mesh.clone()).infer_output_types(&lowerer.input_types, &[]),
+                )?;
                 lower_parallel_sum_scatter_to_mlir(
                     operation,
                     &collective_state,
@@ -6655,7 +6671,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             }
             ArrayOperation::ParallelPermute(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                collective_state.check_manual_collective(
+                    operation.name(),
+                    operation.axis_name(),
+                    operation.axis_size(),
+                    operation.mesh(),
+                    output_types,
+                    |mesh| operation.clone().with_mesh(mesh.clone()).infer_output_types(&lowerer.input_types, &[]),
+                )?;
                 lower_parallel_permute_to_mlir(
                     operation,
                     &collective_state,
@@ -6668,6 +6693,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                collective_state.check_manual_collective(
+                    operation.name(),
+                    operation.axis_name(),
+                    operation.axis_size(),
+                    operation.mesh(),
+                    output_types,
+                    |mesh| operation.clone().with_mesh(mesh.clone()).infer_output_types(&lowerer.input_types, &[]),
+                )?;
                 lower_parallel_all_to_all_to_mlir(
                     operation,
                     &collective_state,
@@ -7232,6 +7265,56 @@ impl CollectiveLoweringState {
             .rev()
             .find(|region| region.manual_axes().iter().any(|axis| axis == axis_name))
             .map(Rc::as_ref)
+    }
+
+    /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication.
+    /// A payload without a mesh is valid only when the owning operation's inference accepts the actual binder.
+    fn checked_collective_mesh(
+        &self,
+        operation_name: &str,
+        axis_name: &str,
+        axis_size: usize,
+        payload_mesh: Option<&LogicalMesh>,
+    ) -> Result<&LogicalMesh, LoweringError> {
+        // Resolve the binding and recorded size first, preserving the replica-group diagnostics and the nearest
+        // enclosing binder when another manual region shadows the axis name.
+        collective_replica_groups(self, axis_name, axis_size, None)?;
+        let mesh = self.manual_axis_region(axis_name).unwrap().mesh();
+        if payload_mesh.is_some_and(|payload_mesh| payload_mesh != mesh) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
+            ))
+            .into());
+        }
+        Ok(mesh)
+    }
+
+    /// Revalidates a collective against the manual mesh of its actual enclosing binder before it emits cross-device
+    /// communication. Raw payloads can describe batch-bound collectives without a mesh, so the operation's own type
+    /// inference, re-run over that mesh by `infer_output_types`, must reproduce the recorded `output_types`. This keeps
+    /// a mesh-free payload from bypassing the manual variation and pending-sum contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoweringError`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
+    /// payload mesh disagrees with that region, if re-inference fails, or if it produces different output types.
+    fn check_manual_collective<T: PartialEq>(
+        &self,
+        operation_name: &str,
+        axis_name: &str,
+        axis_size: usize,
+        payload_mesh: Option<&LogicalMesh>,
+        output_types: &[T],
+        infer_output_types: impl FnOnce(&LogicalMesh) -> Result<Vec<T>, TypeError>,
+    ) -> Result<(), LoweringError> {
+        let mesh = self.checked_collective_mesh(operation_name, axis_name, axis_size, payload_mesh)?;
+        if infer_output_types(mesh).map_err(ProgramError::from)? != output_types {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` output types do not match the enclosing manual mesh contract",
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.
@@ -16715,6 +16798,123 @@ mod tests {
             lower_traced_module(&traced, "main"),
             Err(ShardMapTraceError::LoweringFailure { message })
                 if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
+        ));
+    }
+
+    #[test]
+    fn test_manual_collective_lowering_revalidates_raw_bindings() {
+        use ryft_core::operations::collectives::CollectiveOptions;
+
+        let mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let state = CollectiveLoweringState::new().enter_manual_region(
+            ShardMap::new(mesh.clone(), vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
+        );
+        let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
+        let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
+        let incompatible_mesh = test_manual_mesh("x", 3);
+        for operation in [
+            ArrayOperation::<CpuArray>::ParallelAllToAll(exchange.clone()),
+            ArrayOperation::ParallelPermute(permute.clone()),
+            ArrayOperation::ParallelAllToAll(exchange.with_mesh(incompatible_mesh.clone())),
+            ArrayOperation::ParallelPermute(permute.with_mesh(incompatible_mesh)),
+        ] {
+            for sharding in [&replicated, &varying, &unreduced] {
+                let input_type = test_vector_type(2).with_sharding(sharding.clone()).unwrap();
+                // Record the output of the mesh-free payload, reproducing raw binding without the capability's
+                // checked mesh metadata. Varying values remain a supported raw-bind path.
+                let output_types = vec![input_type.clone()];
+                let context = MlirContext::new();
+                let location = context.unknown_location();
+                let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+                let block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap().as_ref();
+                let mut lowerer = PlainMlirLowerer::new(block.as_ref(), &context, location.as_ref())
+                    .with_input_types(vec![input_type])
+                    .with_collective_state(state.clone());
+                let result =
+                    operation.lower_to_mlir(&[input], &output_types, PlainMlirLoweringMode::Unpacked, &mut lowerer);
+                let matching_mesh = match &operation {
+                    ArrayOperation::ParallelAllToAll(operation) => operation.mesh().is_none(),
+                    ArrayOperation::ParallelPermute(operation) => operation.mesh().is_none(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(result.is_ok(), matching_mesh && sharding == &varying, "{operation}: {result:?}");
+                if result.is_err() {
+                    // Reject the contract before allocating a channel or emitting a communication operation.
+                    assert_eq!(state.channel_ids.get(), 1);
+                } else {
+                    state.channel_ids.set(1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_ir_manual_collective_lowering_revalidates_dynamic_raw_bindings() {
+        use ryft_core::operations::collectives::CollectiveOptions;
+        use ryft_core::{ArrayIrOperation, MemberOperation};
+
+        let mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let state = CollectiveLoweringState::new().enter_manual_region(
+            ShardMap::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
+        );
+        let extent = DimensionType::new("items", DimensionBounds::new(0, Some(9)).unwrap());
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
+        for sharding in [&replicated, &varying, &unreduced] {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.variable().clone().into()]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+            let input_types = vec![input_type.into(), extent.clone().into()];
+            let output_types = operation.infer_parent_output_types(&input_types, &[]).unwrap();
+            let context = MlirContext::new();
+            let location = context.unknown_location();
+            let mlir_types = input_types
+                .iter()
+                .map(|r#type| (composite::lower_array_ir_type(r#type, &context, location).unwrap(), location))
+                .collect::<Vec<_>>();
+            let block = context.block(&mlir_types);
+            let inputs =
+                (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+            let mut block_ref = block.as_ref();
+            let result = composite::lower_array_ir_operation(
+                &ArrayIrOperation::<CpuArray>::ParallelAllToAll(operation.clone()),
+                &inputs,
+                &input_types,
+                &output_types,
+                &state,
+                &mut EffectTokens::default(),
+                &mut block_ref,
+                &context,
+                location.as_ref(),
+            );
+            assert_eq!(result.is_ok(), sharding == &varying, "{sharding}: {result:?}");
+            if result.is_err() {
+                assert_eq!(state.channel_ids.get(), 1);
+            } else {
+                state.channel_ids.set(1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_collective_mesh_validation_uses_the_nearest_manual_binder() {
+        let outer_mesh = test_manual_mesh("x", 2);
+        let inner_mesh = test_manual_mesh("x", 3);
+        let outer = ShardMap::new(outer_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let inner = ShardMap::new(inner_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let state = CollectiveLoweringState::new().enter_manual_region(outer).enter_manual_region(inner);
+        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 3, None).unwrap(), &inner_mesh);
+        assert!(state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)).is_err());
+        assert!(matches!(
+            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
+            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+                if message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
         ));
     }
 

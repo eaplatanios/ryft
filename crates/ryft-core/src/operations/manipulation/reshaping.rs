@@ -385,7 +385,7 @@ pub trait Reshape: Sized {
             } else {
                 sizes.push(usize::try_from(size).map_err(|_| {
                     TypeError::invalid(format!(
-                        "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`",
+                        "`{RESHAPE_OPERATION_NAME}` dimensions must be non-negative or the inferred size `-1`",
                     ))
                 })?);
             }
@@ -2535,7 +2535,7 @@ mod tests {
         assert_eq!(
             input.reshape_to_sizes(&[-2]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`",
+                "`{RESHAPE_OPERATION_NAME}` dimensions must be non-negative or the inferred size `-1`",
             )))),
         );
         assert_eq!(

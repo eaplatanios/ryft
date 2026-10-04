@@ -339,6 +339,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -599,7 +601,7 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
         let dynamic =
-            TestIrValue::Array(Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec()));
+            TestIrValue::Array(Array::new_unchecked(dynamic_type.clone(), Arc::new(1.0_f32.to_le_bytes().to_vec())));
         let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
             &TestIrReferenceNewOperation::new(),
             &context,

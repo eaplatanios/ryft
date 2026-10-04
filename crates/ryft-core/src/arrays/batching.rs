@@ -410,7 +410,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         self.batch_axis
     }
 
-    /// Returns the canonical nonnegative position of this [`ArrayBatch`]'s mapped [`BatchAxis`]. [`ArrayBatch::new`]
+    /// Returns the canonical non-negative position of this [`ArrayBatch`]'s mapped [`BatchAxis`]. [`ArrayBatch::new`]
     /// normalizes signed declarations before storing them, and so internal batching rules can use this index directly.
     #[inline]
     pub fn batch_axis_position(&self) -> Option<usize> {
@@ -3555,7 +3555,7 @@ impl<
         // against each packed output rank so equivalent positive and negative spellings hit the same entry, and reject
         // malformed arity or out-of-bounds axes before lookup. `AlignAllTo` is subtler: one signed axis is interpreted
         // separately for every output, so heterogeneous ranks may resolve it to different positions. It can be replaced
-        // by one canonical nonnegative axis only when every output resolves to that same position. Otherwise, retaining
+        // by one canonical non-negative axis only when every output resolves to that same position. Otherwise, retaining
         // the raw signed axis preserves the per-output semantics. Using the raw policy everywhere would remain correct,
         // but equivalent requests would occupy duplicate cache entries and repeat structural derivation.
         let output_axes_policy = match output_axes_policy {
@@ -4482,7 +4482,7 @@ mod tests {
         );
 
         // Negative axes follow Python/JAX indexing and are normalized once at construction.
-        // `-1` denotes the final axis and the stored metadata is the canonical nonnegative position.
+        // `-1` denotes the final axis and the stored metadata is the canonical non-negative position.
         let batched_axis_negative_one = ArrayBatch::new(matrix.clone(), BatchAxis::new(-1)).unwrap();
         assert_eq!(batched_axis_negative_one.batch_axis(), BatchAxis::new(1));
         assert_eq!(batched_axis_negative_one.batch_axis_position(), Some(1));
@@ -6416,9 +6416,9 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
         );
-        let dynamic = Array::with_unchecked_type(
+        let dynamic = Array::new_unchecked(
             dynamic_type.clone(),
-            [1.0_f64, 2.0, 3.0].into_iter().flat_map(f64::to_le_bytes).collect(),
+            Arc::new([1.0_f64, 2.0, 3.0].into_iter().flat_map(f64::to_le_bytes).collect()),
         );
         assert_eq!(
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(

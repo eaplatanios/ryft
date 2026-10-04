@@ -347,20 +347,20 @@ macro_rules! dispatch_on_array_element_type {
 /// ```
 /// # use ryft_core::{Array, ArrayElement, ProgramError};
 /// # use ryft_core::arrays::macros::impl_array_elementwise_operation;
-/// trait Nonnegative: Sized {
-///     fn nonnegative(&self) -> Result<Self, ProgramError>;
+/// trait NonNegative: Sized {
+///     fn non_negative(&self) -> Result<Self, ProgramError>;
 /// }
 ///
 /// impl_array_elementwise_operation!(
 ///     @unary
-///     Nonnegative, nonnegative,
-///     operation = "nonnegative",
+///     NonNegative, non_negative,
+///     operation = "non_negative",
 ///     inputs = @numeric @real,
 ///     checks = [@no_unreduced],
 ///     |input| Ok(ArrayElement::max(&input, &ArrayElement::from_signed(0)?)),
 /// );
 ///
-/// let result = Array::vector(vec![-2i32, 1, 5]).unwrap().nonnegative()?;
+/// let result = Array::vector(vec![-2i32, 1, 5]).unwrap().non_negative()?;
 /// assert_eq!(result.elements::<i32>()?, vec![0, 1, 5]);
 /// # Ok::<(), ProgramError>(())
 /// ```

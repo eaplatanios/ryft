@@ -56,12 +56,12 @@ pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 /// A permutation over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
 /// [`ParallelPermute::parallel_permute`] supplies the mesh automatically from the enclosing manual region. Such a
 /// permutation generally gives the axis positions different values, so its input must vary over the axis (refer to
-/// [`ParallelVary`]) and its output varies over it as well, and it rejects inputs with pending cross-device sums. An
-/// ordinary permutation carries no mesh and preserves the input's mesh variation and pending sums, even when its input
-/// carries a manual mesh axis with the same name, because a `batch` level whose axis name shadows that mesh axis may
-/// bind it instead. The collective is linear and its transpose is the permutation with every pair inverted, over the
-/// same mesh. Outside any binder, the single position of a degenerate axis keeps its value when the pair `(0, 0)` is
-/// present and receives zeros otherwise.
+/// [`ParallelVary`]) and its output varies over it as well. Pending cross-device sums over that axis are rejected; sums
+/// over unrelated manual axes are preserved. An ordinary permutation carries no mesh and preserves the input's mesh
+/// variation and pending sums, even when its input carries a manual mesh axis with the same name, because a `batch`
+/// level whose axis name shadows that mesh axis may bind it instead. The collective is linear and its transpose is the
+/// permutation with every pair inverted, over the same mesh. Outside any binder, the single position of a degenerate
+/// axis keeps its value when the pair `(0, 0)` is present and receives zeros otherwise.
 ///
 /// A matching `batch` level consumes the mapped batch axis of an ordinary permutation by reassembling it in target
 /// order from per-item slices, with zero slices at untargeted positions, and passes a replicated input through
@@ -233,8 +233,9 @@ impl Operation for ParallelPermuteOperation {
                     )));
                 }
 
-                // A cross-device permutation cannot complete a pending cross-device sum as part of routing values.
-                if !sharding.unreduced_axes().is_empty() {
+                // Routing values cannot complete a pending sum over the same axis. Sums over unrelated axes commute
+                // with this permutation and retain their pending state.
+                if sharding.unreduced_axes().contains(axis_name) {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_PERMUTE_OPERATION_NAME}` does not support unreduced inputs",
                     )));
@@ -521,7 +522,8 @@ pub trait ParallelPermute<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Si
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`](crate::axes::AxisError) when no
     /// enclosing binder binds `axis_name`, and a [`ProgramError`] if a pair references a participant outside the axis,
-    /// if two pairs share a source or a target, or if this value carries unreduced axes over a manual mesh axis.
+    /// if two pairs share a source or a target, or if this value carries a pending sum over the participating manual
+    /// mesh axis.
     fn parallel_permute(&self, axis_name: &str, source_target_pairs: Vec<(usize, usize)>)
     -> Result<Self, ProgramError>;
 
@@ -585,7 +587,7 @@ impl<
         let mut operation = ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs);
         let mut input = self.clone();
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-            if !input.r#type().unreduced_axes().is_empty() {
+            if input.r#type().unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_PERMUTE_OPERATION_NAME}` does not support unreduced inputs",
                 ))
@@ -864,14 +866,14 @@ mod tests {
 
         // A permutation over a manual mesh axis preserves a varying input type, but an input that is invariant over
         // the axis would wrongly type the permuted output as invariant, so the input must vary over the axis of the
-        // operation's mesh. It also rejects inputs with a pending cross-device sum, which an ordinary permutation
-        // preserves.
+        // operation's mesh. It rejects a pending sum over its own axis while preserving sums over unrelated axes.
+        // An ordinary permutation preserves all pending sums.
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let other_varying = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(other_mesh, 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let unreduced = ArrayType::new_static(DataType::F32, [4])
-            .with_sharding(sharding.with_unreduced_axes(["y"]).unwrap())
+            .with_sharding(sharding.with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         check_operation_type_inference!(
             operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]),
@@ -911,6 +913,54 @@ mod tests {
                 error = "`parallel_permute` axis size 3 does not match the size of manual mesh axis `x`",
             }],
         );
+    }
+
+    #[test]
+    fn test_parallel_permute_preserves_unrelated_pending_sums() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]).with_mesh(mesh.clone());
+        for pending_axis in ["x", "y"] {
+            let sharding = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes([pending_axis]).unwrap();
+            let invariant = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+            let input_type = if pending_axis == "y" {
+                invariant.clone().with_sharding(sharding.with_varying_manual_axes(["x"]).unwrap()).unwrap()
+            } else {
+                invariant.clone()
+            };
+            let expected = if pending_axis == "y" {
+                Ok(vec![input_type.clone()])
+            } else {
+                Err(TypeError::invalid("`parallel_permute` does not support unreduced inputs"))
+            };
+            // Routing along `x` commutes with a pending sum along `y`, but not with one along `x`.
+            assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), expected);
+
+            // Capability staging must normalize invariance over `x` while preserving unrelated pending state.
+            let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+            let expected = expected.map(|mut outputs| outputs.remove(0)).map_err(ProgramError::Type);
+            assert_eq!(
+                TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                    |input| input.parallel_permute("x", vec![(0, 1), (1, 0)]),
+                    invariant.clone(),
+                    axes.clone(),
+                )
+                .map(|(output, _)| output),
+                expected.clone(),
+            );
+            assert_eq!(
+                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                    |input| input.parallel_permute("x", vec![(0, 1), (1, 0)]),
+                    ArrayIrType::Array(invariant),
+                    axes,
+                )
+                .map(|(output, _)| output),
+                expected.map(ArrayIrType::Array),
+            );
+        }
     }
 
     #[test]

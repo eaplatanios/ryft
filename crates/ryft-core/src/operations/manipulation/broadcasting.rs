@@ -1550,9 +1550,9 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///
     /// # Parameters
     ///
-    ///   - `output_sizes`: Complete desired shape as nonnegative host sizes, including unchanged trailing axes. For
-    ///     example, `[2, 3]` repeats a vector of size three into two rows. Zero-sized axes are allowed when the
-    ///     corresponding input extent is zero or one, or when the axis is newly introduced.
+    ///   - `output_sizes`: Complete desired shape as non-negative host sizes, including unchanged trailing axes.
+    ///     For example, `[2, 3]` repeats a vector of size three into two rows. Zero-sized axes are allowed when
+    ///     the corresponding input extent is zero or one, or when the axis is newly introduced.
     #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
@@ -3278,9 +3278,9 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
         );
-        let dynamic = Array::with_unchecked_type(
+        let dynamic = Array::new_unchecked(
             dynamic_type.clone(),
-            [1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect(),
+            Arc::new([1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect()),
         );
         for output_axes in [vec![0, 1], vec![1, 0]] {
             assert!(matches!(

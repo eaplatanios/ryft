@@ -115,6 +115,13 @@ fn parallel_all_gather_output_type(
         )));
     }
 
+    // Gathering across this pending sum would change its reduction semantics, but independent sums commute.
+    if input_sharding.unreduced_axes().contains(axis_name) {
+        return Err(TypeError::invalid(format!(
+            "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
+        )));
+    }
+
     // Gathering an input that is still invariant over the axis would concatenate identical copies under a type that
     // cannot tell them apart from per-participant values, and its transpose would produce a varying cotangent.
     if !input_sharding.varying_manual_axes().contains(axis_name) {
@@ -182,7 +189,6 @@ pub(crate) fn infer_array_ir_parallel_all_gather_output_types(
     };
     let mut output_types = infer_array_ir_shape_changing_collective_output_type(
         PARALLEL_ALL_GATHER_OPERATION_NAME,
-        false,
         input_types,
         base_output_type,
         &[operation.concat_axis],
@@ -220,8 +226,15 @@ pub(crate) fn infer_array_ir_parallel_all_gather_output_types(
             Ok(())
         },
     )?;
-    let input_type = <&ArrayType>::try_from(&input_types[0])?;
-    let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+    let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
+    if operation.options.mode == CollectiveMode::Tiled {
+        // The placeholder zero cannot prove divisibility of the actual result by its explicit mesh placement.
+        output_type.sharding =
+            input_type.resized_sharding(output_type.shape().dimensions(), PARALLEL_ALL_GATHER_OPERATION_NAME)?;
+        if output_type.shape() == input_type.shape() {
+            output_type = output_type.with_layout(input_type.layout().cloned());
+        }
+    }
     Ok(vec![parallel_all_gather_output_type(input_type, output_type, operation)?.into()])
 }
 
@@ -267,7 +280,6 @@ define_linear_collective_operation!(
         /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
         mesh: LogicalMesh,
     },
-    check_array_types = [@no_unreduced],
     infer_output_type = |operation, input_type, dimensions| {
         let effective_axis_size = operation.effective_axis_size()?;
         let output_type = match operation.options.mode {
@@ -289,7 +301,8 @@ define_linear_collective_operation!(
             }
         };
         parallel_all_gather_output_type(input_type, output_type, operation)
-    },    interpret<C> where C::Value: Reshape {
+    },
+    interpret<C> where C::Value: Reshape {
         |operation, input| {
             // A single participant gathers only its own value. Untiled mode inserts a size-one gathered axis, which a
             // reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
@@ -787,6 +800,12 @@ where
         );
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
             let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+            if array.r#type().unreduced_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
+            }
             if !array.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
             }
@@ -1092,8 +1111,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, RaggedAxis, Shape, Sharding,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
@@ -1677,17 +1696,6 @@ mod tests {
                 },
             ],
         );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = ParallelAllGatherOperation::new(
-                "x".to_string(),
-                4,
-                0,
-                CollectiveOptions::tiled(),
-                ParallelAllGatherOutputVariance::Varying,
-            ),
-            input_types = [ArrayType::new_static(DataType::F32, [2])],
-        );
 
         // An all-gather over a manual mesh axis records and renders its mesh. Its input must vary over the axis on the
         // operation's mesh, and its output variance selects whether the result keeps varying over the axis.
@@ -1791,6 +1799,121 @@ mod tests {
                 ParallelAllGatherOutputVariance::Varying,
             ),
             cases = [{ input_types = [with_sharding(2, &sharding)], output_types = [with_sharding(4, &sharding)] }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_preserves_unrelated_pending_sums() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(
+                Sharding::replicated(mesh.clone(), 1)
+                    .with_varying_manual_axes(["x"])
+                    .unwrap()
+                    .with_unreduced_axes(["y"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let expected = input.clone().with_shape(Shape::new(vec![Dimension::Static(8)]));
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        )
+        .with_mesh(mesh.clone());
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![expected.clone()]));
+        assert_eq!(
+            infer_array_ir_parallel_all_gather_output_types(
+                &operation,
+                &[input.clone().into(), DimensionValue::constant(8).unwrap().r#type().into_owned().into()],
+            ),
+            Ok(vec![expected.clone().into()]),
+        );
+
+        // Normalizing an invariant input over x must retain the independent pending sum over y.
+        let invariant = input
+            .clone()
+            .with_sharding(input.sharding().unwrap().clone().with_varying_manual_axes(Vec::<String>::new()).unwrap())
+            .unwrap();
+        let (output, _) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_gather_tiled("x", 0),
+            ArrayIrType::Array(invariant),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output, ArrayIrType::Array(expected));
+
+        // Gathering over a pending sum on the participating axis remains invalid.
+        let pending = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[pending], &[]),
+            Err(TypeError::invalid("`parallel_all_gather` does not support unreduced inputs")),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_array_ir_type_inference_metadata() {
+        let operation = ParallelAllGatherOperation::new(
+            "participants".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let dimension = DimensionVariable::new("input", DimensionBounds::new(0, Some(9)).unwrap());
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension.clone())]))
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap())
+            .unwrap()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
+
+        // Check the final extent, even when the input dimension is symbolic and cannot establish exact geometry.
+        assert_eq!(
+            infer_array_ir_parallel_all_gather_output_types(
+                &operation,
+                &[input.clone().into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
+            ),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` on a dimension sharded over explicit mesh axes requires the output size (3) \
+                 at axis 0 to be divisible by the mesh-axis product (2)",
+            )),
+        );
+        let outputs = infer_array_ir_parallel_all_gather_output_types(
+            &operation,
+            &[input.clone().into(), DimensionValue::constant(4).unwrap().r#type().into_owned().into()],
+        )
+        .unwrap();
+        let output = <&ArrayType>::try_from(&outputs[0]).unwrap();
+        assert_eq!(output.sharding(), input.sharding());
+        assert_eq!(output.memory(), input.memory());
+        assert!(output.layout().is_none());
+
+        // An unchanged symbolic shape retains layout just like the homogeneous identity case.
+        assert_eq!(
+            infer_array_ir_parallel_all_gather_output_types(
+                &operation,
+                &[input.clone().into(), DimensionType::from(dimension).into()],
+            ),
+            Ok(vec![input.into()]),
+        );
+        let input = ArrayType::new_static(DataType::F32, [4])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            infer_array_ir_parallel_all_gather_output_types(
+                &operation,
+                &[input.clone().into(), DimensionValue::constant(4).unwrap().r#type().into_owned().into()],
+            ),
+            Ok(vec![input.into()]),
         );
     }
 

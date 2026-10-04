@@ -201,7 +201,7 @@ impl Array {
                     };
                     if value < 0 {
                         return Err(ProgramError::InvalidArgument {
-                            message: format!("`{name}[{index}]` must be nonnegative but got {value}"),
+                            message: format!("`{name}[{index}]` must be non-negative but got {value}"),
                         });
                     }
                     usize::try_from(value).map_err(|_| ProgramError::InvalidArgument {
@@ -625,18 +625,6 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-#[cfg(test)]
-impl Array {
-    /// Creates an array without enforcing the storage invariants, so that `ryft-core`'s own transform-validation tests
-    /// can materialize values whose declared types are deliberately not materializable (e.g., dynamically shaped
-    /// types) and exercise the type-level rejection paths. Never use this outside of such validation tests.
-    pub(crate) fn with_unchecked_type(r#type: ArrayType, bytes: Vec<u8>) -> Self {
-        Self::new_unchecked(r#type, Arc::new(bytes))
-    }
-}
-
 impl Debug for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The payload renders through `Display`, which supports every element data type, including sub-byte types.
@@ -650,35 +638,14 @@ impl Debug for Array {
     }
 }
 
-impl PartialEq for Array {
-    fn eq(&self, other: &Self) -> bool {
-        if self.r#type != other.r#type {
-            return false;
-        }
-
-        let data_type = self.r#type.data_type();
-        if matches!(data_type, DataType::Token | DataType::Zero) {
-            return true;
-        }
-
-        // Compare typed values rather than physical byte patterns: signed floating-point zeros compare equal,
-        // while NaNs compare unequal.
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        dispatch_on_array_element_type!(data_type, |Element| {
-            (0..addressing.element_count()).all(|index| {
-                let range = addressing.byte_range_for_flat_index(index);
-                Element::decode(&self.bytes[range.clone()]) == Element::decode(&other.bytes[range])
-            })
-        })
-    }
-}
-
-// Arrays render in logical shape order: a scalar renders as one element, and every array dimension contributes one
-// bracketed nesting level. Real floating-point payloads use debug formatting so integral values retain a decimal point
-// (e.g., `1.0` rather than `1`), keeping the element type visually apparent in diagnostics.
 impl Display for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Renders elements in logical row-major order, adding one bracketed level per static array dimension.
+        // Arrays render in logical shape order. Specifically, a scalar renders as one element, and every array
+        // dimension contributes one bracketed nesting level. Real floating-point payloads use debug formatting so
+        // integral values retain a decimal point (e.g., `1.0` rather than `1`), keeping the element type visually
+        // apparent in diagnostics.
+
+        /// Renders elements in logical row-major order, adding one bracketed level per static array dimension.
         fn write_elements(
             formatter: &mut std::fmt::Formatter<'_>,
             dimensions: &[Dimension],
@@ -708,10 +675,10 @@ impl Display for Array {
                 }
                 formatter.write_str("]")
             }
-
             let mut flat_index = 0;
             write_dimensions(formatter, dimensions, &mut flat_index, &mut write_element)
         }
+
         let dimensions = self.r#type.shape().dimensions();
         let data_type = self.r#type.data_type();
         if matches!(data_type, DataType::Token | DataType::Zero) {
@@ -719,10 +686,11 @@ impl Display for Array {
                 formatter.write_str(if data_type == DataType::Token { "token" } else { "zero" })
             });
         }
+
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
         match data_type {
-            // `f32` and `f64` payloads keep a decimal point through debug formatting, per the rendering contract
-            // stated above this implementation.
+            // `f32` and `f64` payloads keep a decimal point through debug formatting,
+            // per the rendering contract stated above this implementation.
             DataType::F32 => write_elements(formatter, dimensions, |formatter, element| {
                 let value = f32::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]);
                 write!(formatter, "{value:?}")
@@ -741,9 +709,33 @@ impl Display for Array {
     }
 }
 
+impl PartialEq for Array {
+    fn eq(&self, other: &Self) -> bool {
+        if self.r#type != other.r#type {
+            return false;
+        }
+
+        let data_type = self.r#type.data_type();
+        if matches!(data_type, DataType::Token | DataType::Zero) {
+            return true;
+        }
+
+        // Compare typed values rather than physical byte patterns: signed floating-point zeros compare equal,
+        // while NaNs compare unequal.
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        dispatch_on_array_element_type!(data_type, |Element| {
+            (0..addressing.element_count()).all(|index| {
+                let range = addressing.byte_range_for_flat_index(index);
+                Element::decode(&self.bytes[range.clone()]) == Element::decode(&other.bytes[range])
+            })
+        })
+    }
+}
+
 impl Typed for Array {
     type Type = ArrayType;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
@@ -757,10 +749,12 @@ impl Value for Array {
     // transform entry points such as `crate::batching::batch` serve top-level concrete values.
     type ExecutionDomain = EagerContext<Self, ArrayOperation<Self>>;
 
+    #[inline]
     fn dispatch_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 
+    #[inline]
     fn execution_domain(&self) -> EagerContext<Self, ArrayOperation<Self>> {
         EagerContext::new()
     }
@@ -770,7 +764,7 @@ impl Value for Array {
             DataType::Token => false,
             DataType::Zero => true,
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                // Decode logical elements rather than inspecting physical bytes: signed zeros have nonzero bytes,
+                // Decode logical elements rather than inspecting physical bytes: signed zeros have non-zero bytes.
                 // and strided or tiled layouts can contain padding that is not part of the array's value.
                 let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
                 (0..addressing.element_count()).all(|index| {
@@ -782,6 +776,8 @@ impl Value for Array {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl LiteralIdentity for Array {
     // An array's physical storage is canonical for its type (layout holes and tile padding are always zero), so
@@ -1648,7 +1644,7 @@ mod tests {
 
     #[test]
     fn test_array_is_zero() {
-        // Both signs of floating-point zero represent the zero vector; NaNs and nonzero elements do not.
+        // Both signs of floating-point zero represent the zero vector; NaNs and non-zero elements do not.
         assert!(Array::vector(vec![0.0f32, -0.0]).unwrap().is_zero());
         assert!(!Array::vector(vec![0.0f32, 1.0]).unwrap().is_zero());
         assert!(!Array::scalar(f32::NAN).unwrap().is_zero());

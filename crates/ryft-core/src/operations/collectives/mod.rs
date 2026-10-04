@@ -389,8 +389,6 @@ fn infer_linear_collective_operation_output_type(
 /// # Parameters
 ///
 ///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (e.g., a sum-scatter,
-///     which completes the pending reduction as part of its exchange).
 ///   - `input_types`: Array input type followed by one explicit extent type per output axis.
 ///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
 ///   - `changed_output_axes`: Output axes whose extents may differ from `base_output_type`. Every other axis must
@@ -398,7 +396,6 @@ fn infer_linear_collective_operation_output_type(
 ///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit output extents.
 fn infer_array_ir_shape_changing_collective_output_type(
     operation_name: &'static str,
-    accepts_unreduced: bool,
     input_types: &[ArrayIrType],
     base_output_type: ArrayType,
     changed_output_axes: &[usize],
@@ -406,10 +403,9 @@ fn infer_array_ir_shape_changing_collective_output_type(
 ) -> Result<Vec<ArrayIrType>, TypeError> {
     check_count!("input", input_types, 1 + base_output_type.rank(), TypeError);
 
-    let input_type = <&ArrayType>::try_from(&input_types[0])?;
-    if !accepts_unreduced && !input_type.unreduced_axes().is_empty() {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
-    }
+    // Only the kind of the first input is checked here. Each collective applies its own pending-sum contract, and
+    // the shape-only output type preserves every other piece of the input's mesh state.
+    <&ArrayType>::try_from(&input_types[0])?;
 
     let output_extents = ArrayIrType::extents(&input_types[1..])?;
     for (output_axis, (expected_extent, output_extent)) in
