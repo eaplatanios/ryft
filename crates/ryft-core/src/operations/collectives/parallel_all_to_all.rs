@@ -28,10 +28,10 @@ use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_ragged_all_to_all::PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
-    LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
-    ShapeChangingCollectiveValue, collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
+    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
+    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -956,8 +956,9 @@ where
             }
             operation = operation.with_mesh(mesh);
         }
-        let mut output_extents = collective_input_extents(&input)?;
-        let rank = output_extents.len();
+        let input_type = input.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let rank = input_type.rank();
         if split_axis >= rank || concat_axis >= rank {
             return Err(TypeError::invalid(format!(
                 "`parallel_all_to_all` split axis {split_axis} or concat axis {concat_axis} is out of bounds for rank \
@@ -965,24 +966,62 @@ where
             ))
             .into());
         }
+
+        // Untiled exchange replaces the split axis. Its static extent needs no instruction; a dynamic one still
+        // needs an equality assertion before it is discarded. Operation type inference checks static geometry.
+        if options.mode == CollectiveMode::Untiled
+            && matches!(input_type.shape().dimensions()[split_axis], Dimension::Dynamic(_))
+        {
+            let extent = ValueProjection::<DimensionType>::into_projected(input.dimension_size(split_axis)?)?;
+            let participants =
+                ValueProjection::<DimensionType>::into_projected(context.dimension_constant(effective_axis_size)?)?;
+            extent.equal(&participants)?.assert(
+                "collective axis extent must match the participant count",
+                &[
+                    ("extent", ValueProjection::<DimensionType>::from_projected(extent)),
+                    ("participants", ValueProjection::<DimensionType>::from_projected(participants)),
+                ],
+            )?;
+        }
+        let mut output_extents = (0..rank)
+            .filter(|axis| options.mode != CollectiveMode::Untiled || *axis != split_axis)
+            .map(|axis| input.dimension_size(axis))
+            .collect::<Result<Vec<_>, _>>()?;
         match options.mode {
             CollectiveMode::Untiled => {
-                output_extents[split_axis].require_equal(&context, effective_axis_size)?;
-                output_extents.remove(split_axis);
-                output_extents.insert(concat_axis, CollectiveExtent::Static(effective_axis_size));
-            }
-            CollectiveMode::Tiled if split_axis == concat_axis => {
-                output_extents[split_axis].require_divisible(&context, effective_axis_size)?;
+                output_extents.insert(concat_axis, context.dimension_constant(effective_axis_size)?);
             }
             CollectiveMode::Tiled => {
-                let split_extent = output_extents[split_axis].divided(&context, effective_axis_size)?;
-                let concat_extent = output_extents[concat_axis].multiplied(&context, effective_axis_size)?;
-                output_extents[split_axis] = split_extent;
-                output_extents[concat_axis] = concat_extent;
+                // Coincident axes preserve the shape. Only a dynamic split then needs a participant constant and
+                // divisibility assertion; distinct axes additionally use ordinary dimension division and multiplication.
+                if split_axis != concat_axis
+                    || matches!(input_type.shape().dimensions()[split_axis], Dimension::Dynamic(_))
+                {
+                    let extent = ValueProjection::<DimensionType>::into_projected(output_extents[split_axis].clone())?;
+                    let participants = ValueProjection::<DimensionType>::into_projected(
+                        context.dimension_constant(effective_axis_size)?,
+                    )?;
+                    if matches!(input_type.shape().dimensions()[split_axis], Dimension::Dynamic(_)) {
+                        let zero = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?;
+                        extent.rem(&participants)?.equal(&zero)?.assert(
+                            "collective extent must be divisible by the participant count",
+                            &[
+                                ("extent", ValueProjection::<DimensionType>::from_projected(extent.clone())),
+                                ("divisor", ValueProjection::<DimensionType>::from_projected(participants.clone())),
+                            ],
+                        )?;
+                    }
+                    if split_axis != concat_axis {
+                        let concatenation_extent =
+                            ValueProjection::<DimensionType>::into_projected(output_extents[concat_axis].clone())?;
+                        output_extents[split_axis] =
+                            ValueProjection::<DimensionType>::from_projected(extent.div(&participants)?);
+                        output_extents[concat_axis] =
+                            ValueProjection::<DimensionType>::from_projected(concatenation_extent.mul(&participants)?);
+                    }
+                }
             }
-        };
-        let output_extents =
-            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
+        }
         let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
@@ -1106,6 +1145,7 @@ mod tests {
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_gradient, check_operation_type_inference};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
@@ -2234,6 +2274,67 @@ mod tests {
             ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_all_to_all("x", 0, 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_dimension_extents() {
+        let groups = vec![vec![0, 2], vec![3, 1]];
+        for (mode, concat_axis) in
+            [(CollectiveMode::Untiled, 1), (CollectiveMode::Tiled, 1), (CollectiveMode::Tiled, 0)]
+        {
+            let options = CollectiveOptions::new(mode).with_axis_index_groups(groups.clone());
+            let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options.clone()),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 3])),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .unwrap_err();
+            let expected = match mode {
+                CollectiveMode::Untiled => "`parallel_all_to_all` untiled split axis 0 size 3 must equal group size 2",
+                CollectiveMode::Tiled => "`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2",
+            };
+            assert_eq!(error, ProgramError::Type(TypeError::invalid(expected)));
+
+            // Group-local requirements remain runtime assertions, including when coincident axes preserve the shape.
+            let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![dimension.into(), Dimension::Static(3)]),
+                )),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .unwrap();
+            let error =
+                program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
+            let (message, label) = match mode {
+                CollectiveMode::Untiled => ("collective axis extent must match the participant count", "participants"),
+                CollectiveMode::Tiled => ("collective extent must be divisible by the participant count", "divisor"),
+            };
+            assert_eq!(
+                error.downcast_custom::<AssertionError>(),
+                Some(&AssertionError::Failed {
+                    message: message.to_string(),
+                    observations: vec![("extent".to_string(), "3".to_string()), (label.to_string(), "2".to_string())],
+                }),
+            );
+        }
+
+        // Untiled exchange omits its consumed static input axis, while coincident tiled axes need no arithmetic.
+        for (options, input_shape, output_shape) in
+            [(CollectiveOptions::default(), [2, 3], [3, 2]), (CollectiveOptions::tiled(), [4, 3], [4, 3])]
+        {
+            let concat_axis = if options.mode == CollectiveMode::Untiled { 1 } else { 0 };
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, input_shape)),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
+            )
+            .unwrap();
+            assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, output_shape).into()]);
+            assert_eq!(program.instructions().len(), 3);
+        }
     }
 
     #[test]

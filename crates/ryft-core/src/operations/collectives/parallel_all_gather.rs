@@ -49,11 +49,10 @@ use super::axis_index::AxisIndexOperation;
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
-    LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
-    ShapeChangingCollectiveValue, collective_input_extents, collective_output_extents, forward_linear_collective,
-    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_named_axis_size, validate_manual_mesh_input,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
+    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
+    collective_output_extents, forward_linear_collective, infer_array_ir_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -1049,31 +1048,25 @@ where
             }
             operation = operation.with_mesh(mesh);
         }
-        let mut output_extents = collective_input_extents(&input)?;
+        let input_type = input.r#type();
+        let rank = <&ArrayType>::try_from(input_type.as_ref())?.rank();
+        if concat_axis > rank || (options.mode == CollectiveMode::Tiled && concat_axis == rank) {
+            return Err(TypeError::invalid(format!(
+                "`parallel_all_gather` concat axis {concat_axis} is out of bounds for rank {rank}",
+            ))
+            .into());
+        }
+        let mut output_extents = (0..rank).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+        let participants = context.dimension_constant(effective_axis_size)?;
         match options.mode {
-            CollectiveMode::Untiled => {
-                if concat_axis > output_extents.len() {
-                    return Err(TypeError::invalid(format!(
-                        "`parallel_all_gather` concat axis {concat_axis} is out of bounds for rank {}",
-                        output_extents.len(),
-                    ))
-                    .into());
-                }
-                output_extents.insert(concat_axis, CollectiveExtent::Static(effective_axis_size));
-            }
+            CollectiveMode::Untiled => output_extents.insert(concat_axis, participants),
             CollectiveMode::Tiled => {
-                let rank = output_extents.len();
-                let Some(output_extent) = output_extents.get_mut(concat_axis) else {
-                    return Err(TypeError::invalid(format!(
-                        "`parallel_all_gather` concat axis {concat_axis} is out of bounds for rank {rank}",
-                    ))
-                    .into());
-                };
-                *output_extent = output_extent.multiplied(&context, effective_axis_size)?;
+                let extent = ValueProjection::<DimensionType>::into_projected(output_extents[concat_axis].clone())?;
+                let participants = ValueProjection::<DimensionType>::into_projected(participants)?;
+                output_extents[concat_axis] =
+                    ValueProjection::<DimensionType>::from_projected(extent.mul(&participants)?);
             }
-        };
-        let output_extents =
-            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
+        }
         let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
