@@ -96,7 +96,7 @@ impl DotProductAttentionBackward for Array {
 
 /// Any context-carrying value computes attention by binding a [`DotProductAttentionOperation`] through its own
 /// context. The `From<DotProductAttentionOperation>` bound makes this disjoint from the eager reference value types
-/// (whose context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers
+/// (whose context operation is [`ConstantOperation`]), so it covers
 /// the transform tracers and backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttention for V
 where

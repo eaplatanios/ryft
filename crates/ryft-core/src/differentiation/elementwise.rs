@@ -461,7 +461,7 @@ pub struct BinaryElementwiseJvpInputs<'o, T: DifferentiableType, V: ElementwiseD
     /// Primal [`Value`] of the right input.
     right_primal: &'o V,
 
-    /// Primal output [`Value`] of the operation, which carries the result [`Type`].
+    /// Primal output [`Value`] of the operation, which carries the result [`Type`](crate::Type).
     output_primal: &'o V,
 
     /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].

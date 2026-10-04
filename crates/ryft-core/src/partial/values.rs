@@ -113,10 +113,10 @@ pub struct PartialEvaluationValue<V: Value> {
     /// exists. The slot is shared via [`Rc`] across every clone of this value, so that the residual atom assigned by
     /// the first materialization is reused by every other residualized consumer, which is what deduplicates residual
     /// inputs and inline constants without keying on source-program atoms. Furthermore, the [`Cell`] supplies the
-    /// interior mutability that this lazy assignment needs. The residual atom is recorded at *first residual use*,
+    /// interior mutability that this lazy assignment needs. The residual atom is recorded at _first residual use_,
     /// long after the value has been cloned and shared, and so the write must go through `&self`. Because
-    /// [`PartialValueMaterialization`] is a small [`Copy`] value, [`Cell`] suffices without [`RefCell`]'s borrow
-    /// tracking.
+    /// [`PartialValueMaterialization`] is a small [`Copy`] value, [`Cell`] suffices without
+    /// [`RefCell`](std::cell::RefCell)'s borrow tracking.
     pub(super) materialization: Rc<Cell<PartialValueMaterialization>>,
 }
 

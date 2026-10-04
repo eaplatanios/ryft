@@ -191,9 +191,10 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     /// retain their packed axes).
     ///
     /// The batching policy owns the boundary shape of its structurally batched programs.
-    /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
-    /// boundary, and any [`BatchingPolicy::boundary_inputs`] (e.g., a composite program's first-class mapped extent)
-    /// become additional leading residuals of the batched call.
+    /// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program)
+    /// adapts each batched region to the plain two-region linear-call boundary, and any
+    /// [`BatchingPolicy::boundary_inputs`](crate::BatchingPolicy::boundary_inputs) (e.g., a composite
+    /// program's first-class mapped extent) become additional leading residuals of the batched call.
     ///
     /// # Parameters
     ///

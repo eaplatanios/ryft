@@ -2214,7 +2214,7 @@ pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, leng
 
 /// Returns the declared type of a stacked scan input whose slices have type `slice_type`, which is the
 /// [`stacked_scan_type`] of `slice_type` without its optional sharding metadata. Scan input validation compares it
-/// against actual input types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by), so stacked
+/// against actual input types with [`Type::is_refined_by`], so stacked
 /// inputs are validated by their data types, shapes, and memory placements alone.
 fn declared_stacked_scan_input_type(slice_type: &ArrayType, length: &Dimension) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
@@ -2296,7 +2296,7 @@ fn composite_scan_boundary_types(
 /// actual stacked input types, and returns the concrete trip count when the runtime length input only refines
 /// `length`'s bounds instead of carrying its nominal identity.
 ///
-/// A runtime length input that carries `length`'s own [`DimensionVariable`](crate::arrays::DimensionVariable) defines
+/// A runtime length input that carries `length`'s own [`DimensionVariable`] defines
 /// exactly the runtime extent that every stacked axis typed `length` has, so the scan is consistent by construction and
 /// [`None`] is returned. A runtime length input of an unrelated identity is admissible only when its bounds pin exactly
 /// one extent inside `length`'s bounds. The trip count is then that extent, which agrees with the stacked inputs only

@@ -342,11 +342,11 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
 
-    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
-    /// trace binds no named axes and this stays empty. Traces that run inside a manual-parallelism region (e.g., a
-    /// `shard_map` body) are seeded with that region's device mesh axes so that named-axis readers (e.g., collectives)
-    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
-    /// cloned contexts.
+    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation. An ordinary trace binds no named axes and this stays empty. Traces that run inside a
+    /// manual parallelism region (e.g., a `shard_map` body) are seeded with that region's device mesh axes so
+    /// that named axis readers (e.g., collectives) can validate and resolve them. The list is immutable for
+    /// the [`TracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
     /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
@@ -630,10 +630,10 @@ pub struct NestedTracingContext<C: Context> {
     /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
     builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
 
-    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation ahead
-    /// of the parent context's bindings. An ordinary nested trace binds no named axes of its own and this stays empty,
-    /// in which case every lookup delegates to the parent. The list is immutable for the [`NestedTracingContext`]'s
-    /// lifetime and shared across cloned contexts.
+    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation ahead of the parent context's bindings. An ordinary nested trace binds no named axes of its
+    /// own and this stays empty, in which case every lookup delegates to the parent. The list is immutable for the
+    /// [`NestedTracingContext`]'s lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 
     /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the

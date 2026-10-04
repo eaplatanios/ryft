@@ -1102,7 +1102,7 @@ struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
     instantiated_edge_ordinals: Vec<Option<usize>>,
 }
 
-/// Splits an [`Input`]-predicate `condition` with a known-but-symbolic predicate into a *known* condition bound in
+/// Splits a `condition` with a known-but-symbolic predicate into a *known* condition bound in
 /// the enclosing known-side context and a *residual* condition emitted into the residual program — ryft's analogue
 /// of JAX's `_cond_partial_eval` for a known branch index.
 ///

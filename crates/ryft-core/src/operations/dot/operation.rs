@@ -33,7 +33,7 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// [`DimensionVariable`](crate::arrays::DimensionVariable).
 ///
 /// Every bounded ragged axis is either contracted or free. A contracted axis is zero-padded and consumed, and its
-/// dimension variable is reported as [`BatchedOutputs`](crate::batching::BatchedOutputs) evidence so carrier validation
+/// dimension variable is reported as [`BatchedOutputs`] evidence so carrier validation
 /// can distinguish deliberate consumption from a missing extent. Each input is padded along only its own contracted
 /// ragged axes because zeroing either factor removes the corresponding product. A free ragged axis propagates to the
 /// result through the dot output layout: batching dimensions, then LHS free axes, then RHS free axes. A bounded ragged

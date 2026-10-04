@@ -266,6 +266,35 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// refined at the latter. Refinements never add metadata that is not a fact about an identity (e.g., an array's
     /// sharding or layout).
     ///
+    /// # Example
+    ///
+    /// A region that declares its input as `f32[rows, columns]` and receives an `f32[3, 4]` input establishes the
+    /// facts `rows = 3` and `columns = 4`, which then refine the region's declared output types:
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     ArrayType, ArrayTypeRefinements, DataType, DimensionBounds, DimensionVariable, Shape, TypeRefinements,
+    /// # };
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+    /// let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
+    /// let declared_input_type =
+    ///     ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), columns.clone().into()]));
+    /// let input_type = ArrayType::new_static(DataType::F32, [3, 4]);
+    /// let refinements = ArrayTypeRefinements::establish([&declared_input_type], [&input_type]).unwrap();
+    ///
+    /// // Every identity that has a fact is replaced by it, wherever it appears in the declared type.
+    /// let declared_output_type =
+    ///     ArrayType::new(DataType::F32, Shape::new(vec![columns.clone().into(), rows.clone().into()]));
+    /// assert_eq!(refinements.refine(&declared_output_type, &[]).unwrap().to_string(), "f32[4, 3]");
+    ///
+    /// // Identities in `symbolic` (e.g., ones that an output defines and that may therefore change, such as the extent
+    /// // of a loop's dimension carry) are kept, while the remaining identities of the same type are still refined.
+    /// assert_eq!(
+    ///     refinements.refine(&declared_output_type, &[rows]).unwrap().to_string(),
+    ///     "f32[4, rows]",
+    /// );
+    /// ```
+    ///
     /// # Parameters
     ///
     ///   - `declared`: Declared type to refine.

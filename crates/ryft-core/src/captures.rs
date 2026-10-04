@@ -352,7 +352,7 @@ pub struct ClosedProgram<
     /// [`Program`] whose constants are [`CaptureConstant`] payloads.
     program: Program<V, O, Input, Output>,
 
-    /// Captured values referenced by [`CaptureConstant::capture_index`] indices in [`Self::program`].
+    /// Captured values referenced by [`Value::capture_index`] indices in [`Self::program`].
     captures: Vec<C>,
 }
 

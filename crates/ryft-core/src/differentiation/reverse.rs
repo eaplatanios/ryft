@@ -1153,8 +1153,8 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// mirroring how [`Pushforward`] replays its pushforward program.
     context: C,
 
-    /// Linear pushforward [`Program`] `(live(ẋ), r) ↦ live(ẏ)` over the primal operation family in the context's
-    /// staged [`Constant`](Context::Constant) space, whose trailing inputs consume the residuals. It is transposed on
+    /// Linear pushforward [`Program`] `(live(ẋ), r) ↦ live(ẏ)` over the primal operation family in the context's staged
+    /// [`Constant`](crate::Domain::Constant) space, whose trailing inputs consume the residuals. It is transposed on
     /// application and its literal constants are lifted through the context's [`lift`](Context::lift) when the
     /// transposed program is replayed.
     linear_program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,

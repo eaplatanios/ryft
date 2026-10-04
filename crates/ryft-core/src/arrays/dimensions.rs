@@ -19,7 +19,8 @@ use crate::programs::{
 /// provide panicking operator sugar for both owned and borrowed values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionValue {
-    /// [`DimensionType`] defining this [`DimensionValue`]'s [`DimensionVariable`] and [`DimensionBounds`].
+    /// [`DimensionType`] defining this [`DimensionValue`]'s [`DimensionVariable`](crate::DimensionVariable)
+    /// and [`DimensionBounds`].
     r#type: DimensionType,
 
     /// Concrete non-negative extent of this [`DimensionValue`].

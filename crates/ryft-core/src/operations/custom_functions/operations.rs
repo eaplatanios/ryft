@@ -81,7 +81,7 @@ enum CustomFunctionRules<T, S> {
         batching: Option<CustomRuleBatching<T>>,
 
         /// Whether the call's reference state was discharged, which discharges its rule programs as well (refer to
-        /// [`CustomRuleDefinition::with_reference_discharge`]).
+        /// [`CustomRuleDefinition::with_reference_discharge`](crate::CustomRuleDefinition::with_reference_discharge)).
         discharged: bool,
     },
 }
@@ -325,7 +325,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     /// Returns a description of this call for diagnostics, which names the definition of retained rules unless it has
-    /// the default name of [`custom_function`] functions.
+    /// the default name of [`custom_function`](crate::custom_function) functions.
     fn description(&self) -> String {
         match &self.rules {
             CustomFunctionRules::Retained { rules, .. } if rules.name() != CUSTOM_FUNCTION_OPERATION_NAME => {

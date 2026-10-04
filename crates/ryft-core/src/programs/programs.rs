@@ -1355,13 +1355,13 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// whose retained transforms remain reusable inside the published artifact).
     ///
     /// This is the publish-time sanitization step of [`RegionRef::transform`]. Cache cells ride region copies by strong
-    /// [`Arc`], and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell to preserve
-    /// sharing. A derived program that legitimately contains a copy of its source region therefore carries the very
-    /// cell the artifact is about to be stored in, and publishing it unsanitized would close a strong reference cycle
-    /// (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public handle drops.
-    /// Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding derivation can
-    /// create. Refer to the ownership-cycle discussion in the documentation of
-    /// [`transforms`](crate::programs::transforms) for why that is sufficient.
+    /// [`Arc`](std::sync::Arc), and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell
+    /// to preserve sharing. A derived program that legitimately contains a copy of its source region therefore carries
+    /// the very cell the artifact is about to be stored in, and publishing it unsanitized would close a strong
+    /// reference cycle (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public
+    /// handle drops. Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding
+    /// derivation can create. Refer to the ownership-cycle discussion in the documentation
+    /// of [`transforms`](crate::programs::transforms) for why that is sufficient.
     ///
     /// This delegates to [`RegionArena::detach_transform_cache`] across the complete arena, so the entry region
     /// is covered too. This function is private to this crate deliberately as it is sound only as part of the
@@ -2189,7 +2189,60 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O
                     let prunes = pruning.kept_inputs.contains(&false)
                         || pruning.kept_outputs.contains(&false)
                         || kept_region_inputs.iter().chain(&kept_region_outputs).any(|kept| kept.contains(&false));
-                    if prunes {
+
+                    // An operation may infer more refined output types from inputs that its regions never read (e.g.,
+                    // a `condition` input whose static extent fixes a dynamic dimension of every branch input that
+                    // shares it), so a pruning that drops such an input would change the types of the kept outputs.
+                    // Such a pruning is rejected as a whole and the instruction keeps its boundary, because only the
+                    // operation could propose a narrower one. The comparison is exact, like the output type validation
+                    // of the pruned program in `Program::into_pruned`, so an instruction whose recorded output types
+                    // differ from the inferred ones (e.g., one added with `ProgramBuilder::add_instruction_unchecked`)
+                    // conservatively keeps its boundary too.
+                    let preserves_output_types = prunes && {
+                        let keep = |types: &[V::Type], kept: &[bool]| {
+                            types
+                                .iter()
+                                .zip(kept)
+                                .filter(|(_, kept)| **kept)
+                                .map(|(r#type, _)| r#type.clone())
+                                .collect::<Vec<_>>()
+                        };
+
+                        let atom_types = |atoms: &[AtomId]| {
+                            atoms
+                                .iter()
+                                .map(|atom| source.atoms()[atom.index()].r#type().into_owned())
+                                .collect::<Vec<_>>()
+                        };
+
+                        // The pruned region interfaces keep the effects and deferred work of the original regions,
+                        // which is a conservative superset of what their pruned copies retain.
+                        let region_interfaces = instruction
+                            .regions()
+                            .iter()
+                            .zip(kept_region_inputs.iter().zip(&kept_region_outputs))
+                            .map(|(region, (kept_inputs, kept_outputs))| {
+                                let interface = RegionRef::new(arena, *region)?.interface();
+                                Ok(RegionInterface::new(
+                                    keep(interface.input_types(), kept_inputs),
+                                    keep(interface.output_types(), kept_outputs),
+                                    interface.effects(),
+                                )
+                                .with_deferred_work(interface.has_deferred_work()))
+                            })
+                            .collect::<Result<Vec<_>, ProgramError>>()?;
+
+                        // Re-infer the kept outputs from the pruned operation over the kept instruction inputs. An
+                        // inference error means that the pruned boundary is not well-typed, which also rejects it.
+                        let input_types = keep(&atom_types(instruction.inputs()), &pruning.kept_inputs);
+                        let output_types = keep(&atom_types(instruction.outputs()), &pruning.kept_outputs);
+                        pruning
+                            .operation
+                            .infer_output_types(&input_types, &region_interfaces)
+                            .is_ok_and(|inferred_output_types| inferred_output_types == output_types)
+                    };
+
+                    if preserves_output_types {
                         InstructionPruning::Pruned { pruning, kept_region_inputs, kept_region_outputs }
                     } else {
                         InstructionPruning::Kept
