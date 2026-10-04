@@ -1111,7 +1111,7 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
-///     such as `ConditionOperation<V>` are not exposed.
+///     such as `CustomFunctionOperation<V, ArrayOperation<V>>` are not exposed.
 ///   - [`from_payload`](Self::from_payload) tries the family's own (composite-native) variants first, in declaration
 ///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
 ///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
@@ -2008,9 +2008,9 @@ mod tests {
             Some("residual")
         );
 
-        // Payloads that mention a generic parameter of their family are not exposed.
-        let condition = ArrayOperation::<Array>::from(ConditionOperation::<Array>::new());
-        assert!(condition.projected_payload::<ConditionOperation<Array>>().is_none());
+        // Region-carrying payloads are exposed too when their types mention no generic parameter of their family.
+        let condition = ArrayOperation::<Array>::from(ConditionOperation::<ArrayType>::new());
+        assert!(condition.projected_payload::<ConditionOperation<ArrayType>>().is_some());
     }
 
     #[test]
@@ -2036,6 +2036,9 @@ mod tests {
             ArrayIrType,
         >::new()));
         assert!(matches!(reference, Ok(ArrayIrOperation::ReferenceNew(_))));
+        let condition =
+            ArrayOperation::<Array>::from_payload(ErasedOperation::new(ConditionOperation::<ArrayType>::new()));
+        assert!(matches!(condition, Ok(ArrayOperation::Condition(_))));
 
         // Array payloads construct through the projected array member, whose result the composite family's `From`
         // conversion lifts. The mixed `Zero` variant is never constructed directly, so the zero constructor reaches
@@ -2048,13 +2051,10 @@ mod tests {
             ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ZeroOperation::new(r#type.clone()))).unwrap();
         assert_eq!(zero.to_string(), ArrayIrOperation::<Array>::from(ZeroOperation::new(r#type)).to_string());
 
-        // Payloads that no variant holds, or that mention a generic parameter of their family, are returned unchanged.
+        // Payloads that no variant holds are returned unchanged.
         let payload = ErasedOperation::new(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
         let payload = ArrayOperation::<Array>::from_payload(payload).unwrap_err();
         assert_eq!(payload.type_name(), std::any::type_name::<ReferenceNewOperation<ArrayType, ArrayIrType>>());
-        let payload = ErasedOperation::new(ConditionOperation::<Array>::new());
-        let payload = ArrayOperation::<Array>::from_payload(payload).unwrap_err();
-        assert_eq!(payload.type_name(), std::any::type_name::<ConditionOperation<Array>>());
     }
 
     #[test]

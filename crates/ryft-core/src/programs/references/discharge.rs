@@ -9808,7 +9808,7 @@ mod tests {
             .unwrap()[0];
         let observed = builder
             .add_instruction(
-                ConditionOperation::<DischargeValue>::new(),
+                ConditionOperation::<ArrayIrType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, pipeline, kernel],
                 None,
@@ -10143,12 +10143,7 @@ mod tests {
         let leaf = middle_builder.import_region(leaf.entry_region_ref());
         let predicate = middle_builder.add_constant(DischargeCapture::new(1, predicate_type.clone().into()));
         let value = middle_builder
-            .add_instruction(
-                ConditionOperation::<ArrayIrValue<DischargeArrayCapture>>::new(),
-                vec![leaf, leaf],
-                vec![predicate],
-                None,
-            )
+            .add_instruction(ConditionOperation::<ArrayIrType>::new(), vec![leaf, leaf], vec![predicate], None)
             .unwrap()[0];
         let middle = middle_builder
             .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
@@ -10158,12 +10153,7 @@ mod tests {
         let middle = builder.import_region(middle.entry_region_ref());
         let predicate = builder.add_constant(DischargeCapture::new(1, predicate_type.into()));
         let value = builder
-            .add_instruction(
-                ConditionOperation::<ArrayIrValue<DischargeArrayCapture>>::new(),
-                vec![middle, middle],
-                vec![predicate],
-                None,
-            )
+            .add_instruction(ConditionOperation::<ArrayIrType>::new(), vec![middle, middle], vec![predicate], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])

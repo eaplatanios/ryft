@@ -3638,7 +3638,7 @@ mod tests {
     enum ReferenceTestOperation {
         Base(ArrayIrOperation<Array>),
         Computation,
-        Condition(ConditionOperation<ArrayIrValue<Array>>),
+        Condition(ConditionOperation<ArrayIrType>),
         LinearCall(LinearCallOperation<ArrayIrType>),
         CustomFunctionTranspose(ReferenceTestCarrier),
     }
@@ -3757,8 +3757,8 @@ mod tests {
         }
     }
 
-    impl From<ConditionOperation<ArrayIrValue<Array>>> for ReferenceTestOperation {
-        fn from(operation: ConditionOperation<ArrayIrValue<Array>>) -> Self {
+    impl From<ConditionOperation<ArrayIrType>> for ReferenceTestOperation {
+        fn from(operation: ConditionOperation<ArrayIrType>) -> Self {
             Self::Condition(operation)
         }
     }

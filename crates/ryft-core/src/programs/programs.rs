@@ -3192,7 +3192,7 @@ mod tests {
         let shared_branch = builder.import_program(branch);
         let output = builder
             .add_instruction(
-                ConditionOperation::<Array>::new(),
+                ConditionOperation::<ArrayType>::new(),
                 vec![shared_branch, shared_branch],
                 vec![predicate, input],
                 None,
@@ -3709,7 +3709,7 @@ mod tests {
         let branch_region = builder.import_program(branch);
         let output = builder
             .add_instruction(
-                ConditionOperation::<Array>::new(),
+                ConditionOperation::<ArrayType>::new(),
                 vec![branch_region, branch_region],
                 vec![predicate, input],
                 None,
@@ -3965,7 +3965,7 @@ mod tests {
         let y = builder.add_input(ArrayType::scalar(DataType::F64));
         let branch = builder.import_program(pruning_branch(false));
         let outputs = builder
-            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .add_instruction(ConditionOperation::<ArrayType>::new(), vec![branch, branch], vec![p, x, y], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -4001,7 +4001,7 @@ mod tests {
         let y = builder.add_input(ArrayType::scalar(DataType::F64));
         let branch = builder.import_program(pruning_branch(false));
         let outputs = builder
-            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .add_instruction(ConditionOperation::<ArrayType>::new(), vec![branch, branch], vec![p, x, y], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -4027,7 +4027,7 @@ mod tests {
         let branch = builder.import_program(pruning_branch(false));
         let mut condition = |inputs: Vec<AtomId>| {
             builder
-                .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], inputs, None)
+                .add_instruction(ConditionOperation::<ArrayType>::new(), vec![branch, branch], inputs, None)
                 .unwrap()
                 .to_vec()
         };
@@ -4080,7 +4080,7 @@ mod tests {
         let y = builder.add_input(ArrayType::scalar(DataType::F64));
         let branch = builder.import_program(pruning_branch(true));
         let outputs = builder
-            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .add_instruction(ConditionOperation::<ArrayType>::new(), vec![branch, branch], vec![p, x, y], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -4114,7 +4114,12 @@ mod tests {
         let y = outer_branch.add_input(scalar.clone());
         let inner_branch = outer_branch.import_program(pruning_branch(false));
         let inner = outer_branch
-            .add_instruction(ConditionOperation::<Array>::new(), vec![inner_branch, inner_branch], vec![p, x, y], None)
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![inner_branch, inner_branch],
+                vec![p, x, y],
+                None,
+            )
             .unwrap()
             .to_vec();
         let outer_branch = outer_branch
@@ -4128,7 +4133,7 @@ mod tests {
         let outer_branch = builder.import_program(outer_branch);
         let outputs = builder
             .add_instruction(
-                ConditionOperation::<Array>::new(),
+                ConditionOperation::<ArrayType>::new(),
                 vec![outer_branch, outer_branch],
                 vec![p, p, x, y],
                 None,

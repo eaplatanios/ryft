@@ -512,7 +512,7 @@ where
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
-    Condition(ConditionOperation<Constant>),
+    Condition(ConditionOperation<ArrayIrType>),
 
     /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
     While(WhileOperation<ArrayIrType>),
@@ -2107,7 +2107,7 @@ mod tests {
         let condition: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::Condition(ConditionOperation::new()).into();
         assert!(matches!(condition, XlaOperation::Condition(_)));
-        assert_eq!(condition.region_slots(), ConditionOperation::<XlaConstant>::new().region_slots());
+        assert_eq!(condition.region_slots(), ConditionOperation::<ArrayIrType>::new().region_slots());
 
         let r#while: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::While(WhileOperation::new().with_iteration_bound(3).unwrap()).into();

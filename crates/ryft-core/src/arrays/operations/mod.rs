@@ -160,7 +160,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     DynamicUpdateSlice(DynamicUpdateSliceOperation),
     Compare(CompareOperation<ArrayType>),
     Select(SelectOperation<ArrayType>),
-    Condition(ConditionOperation<V>),
+    Condition(ConditionOperation<ArrayType>),
     While(WhileOperation<ArrayType>),
     Scan(ScanOperation<ArrayType>),
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
@@ -515,7 +515,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
     /// remain unsupported until discharge.
-    Condition(ConditionOperation<ArrayIrValue<A>>),
+    Condition(ConditionOperation<ArrayIrType>),
 
     /// Composite while loop whose condition and body use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued carries/results and generic
@@ -1763,10 +1763,10 @@ mod tests {
             ),
             Ok(vec![None, None]),
         );
-        assert_eq!(condition.region_slots(), ConditionOperation::<ArrayIrValue<Array>>::new().region_slots());
+        assert_eq!(condition.region_slots(), ConditionOperation::<ArrayIrType>::new().region_slots());
         assert_eq!(
             condition.output_region_provenance(0),
-            ConditionOperation::<ArrayIrValue<Array>>::new().output_region_provenance(0),
+            ConditionOperation::<ArrayIrType>::new().output_region_provenance(0),
         );
 
         // Canonical lifts keep identity-free zeros homogeneous, explicit static mixed constructors are also valid,

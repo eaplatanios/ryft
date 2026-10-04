@@ -5705,7 +5705,7 @@ pub(crate) mod tests {
         let x = builder.add_input(vector.clone());
         let output = builder
             .add_instruction(
-                ConditionOperation::<Array>::new(),
+                ConditionOperation::<ArrayType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, x],
                 None,

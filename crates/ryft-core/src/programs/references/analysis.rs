@@ -4247,7 +4247,7 @@ mod tests {
             .unwrap();
         let forwarded = builder
             .add_instruction(
-                ConditionOperation::<TestArrayValue>::new(),
+                ConditionOperation::<ArrayIrType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, external],
                 None,

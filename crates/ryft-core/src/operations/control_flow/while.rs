@@ -1166,7 +1166,7 @@ where
     C::Value: Concretizable<bool>,
     C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + From<ConditionOperation<C::Constant>>
+        + From<ConditionOperation<C::Type>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Type>>
         + WhileResidualStackOperation<C::Type>,
@@ -1927,7 +1927,7 @@ where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + From<ConditionOperation<C::Constant>>
+        + From<ConditionOperation<C::Type>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Type>>
         + WhileResidualStackOperation<C::Type>,
@@ -1985,7 +1985,7 @@ where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + WhileResidualStackOperation<C::Type>
-        + From<ConditionOperation<C::Constant>>
+        + From<ConditionOperation<C::Type>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Type>>,
 {
@@ -4278,7 +4278,7 @@ mod tests {
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let value = builder
             .add_instruction(
-                ConditionOperation::<TestIrValue>::new(),
+                ConditionOperation::<ArrayIrType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, initial],
                 None,

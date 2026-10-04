@@ -13819,7 +13819,7 @@ mod tests {
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
-                ConditionOperation::<XlaConstant>::new(),
+                ConditionOperation::<ArrayIrType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference, replacement],
                 None,
@@ -13936,7 +13936,7 @@ mod tests {
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
-                ConditionOperation::<XlaConstant>::new(),
+                ConditionOperation::<ArrayIrType>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference],
                 None,

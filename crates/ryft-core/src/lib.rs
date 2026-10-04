@@ -304,7 +304,7 @@ pub(crate) mod tests {
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Select(SelectOperation<ArrayType>),
-        Condition(ConditionOperation<Array>),
+        Condition(ConditionOperation<ArrayType>),
         StopGradient(StopGradientOperation<ArrayType>),
         LinearCall(LinearCallOperation<ArrayType>),
         CustomFunction(CustomFunctionOperation<Array, TestArrayOperation>),
