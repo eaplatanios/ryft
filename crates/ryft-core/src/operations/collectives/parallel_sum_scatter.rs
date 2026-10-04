@@ -27,8 +27,8 @@ use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
     ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
-    collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
+    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -731,24 +731,19 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to sum values across the participants of a named axis and scatter the sum, so that every
-/// participant receives only its own chunk, by staging a [`ParallelSumScatterOperation`]. This is the analogue of
-/// [JAX's `psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html), whose default
+/// participant receives only its own chunk, by staging a [`ParallelSumScatterOperation`]. This is the analogue of JAX's
+/// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html), whose default
 /// `tiled = False` corresponds to [`ParallelSumScatter::parallel_sum_scatter`] and whose `tiled = True` corresponds to
 /// [`ParallelSumScatter::parallel_sum_scatter_tiled`]. Refer to [`ParallelSumScatterOperation`] for the semantics and
 /// transformation rules.
 ///
-/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
-/// values share the same call syntax.
+/// Over a manual mesh axis, an input that neither varies over the axis nor carries a pending cross-device sum
+/// over it is first made varying through [`ParallelVary`], so that every device's copy is counted, as with
+/// [`ParallelReduce::parallel_reduce`](super::ParallelReduce::parallel_reduce). The output extents are staged
+/// as explicit extent values, and a runtime assertion checks every extent that is not statically known.
 ///
-/// Over a manual mesh axis, an input that neither varies over the axis nor carries a pending cross-device sum over it
-/// is first made varying through [`ParallelVary`], so that every device's copy is counted, as with
-/// [`ParallelReduce::parallel_reduce`](super::ParallelReduce::parallel_reduce). The output extents are staged as
-/// explicit extent values, and a runtime assertion checks every extent that is not statically known.
-///
-/// # Examples
+/// # Example
 ///
 /// Sum two rows elementwise and give each batch item half of the summed row:
 ///
@@ -775,8 +770,8 @@ impl<
 /// ```
 pub trait ParallelSumScatter<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
     /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
-    /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed, so
-    /// that participant `i` receives row `i` of the sum.
+    /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed,
+    /// so that participant `i` receives row `i` of the sum.
     ///
     /// # Parameters
     ///
@@ -819,33 +814,16 @@ pub trait ParallelSumScatter<T: Type = <Self as Typed>::Type>: Typed<Type = T> +
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`](crate::axes::AxisError) when no
-    /// enclosing binder binds `axis_name`, and a [`ProgramError`] if `scatter_axis` is out of bounds, if its extent
-    /// does not fit the tiling mode, if the participant groups are invalid, if this value is not numeric, or if its
-    /// manual mesh state does not satisfy the input variation or pending-sum contract.
+    /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
+    /// `axis_name`, and a [`ProgramError`] if `scatter_axis` is out of bounds, if its extent does not fit the tiling
+    /// mode, if the participant groups are invalid, if this value is not numeric, or if its manual mesh state does
+    /// not satisfy the input variation or pending-sum contract.
     fn parallel_sum_scatter_with_options(
         &self,
         axis_name: &str,
         scatter_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
-}
-
-// A concrete composite value performs the collective through its array member.
-impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScatter<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_sum_scatter_with_options(
-            axis_name,
-            scatter_axis,
-            options,
-        )?))
-    }
 }
 
 impl ParallelSumScatter<ArrayType> for Array {
@@ -862,6 +840,57 @@ impl ParallelSumScatter<ArrayType> for Array {
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
+
+impl<
+    V: ShapeChangingCollectiveValue<
+            DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+        > + ParallelVary,
+> ParallelSumScatter<ArrayType> for V
+{
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let mut input = self.clone();
+        let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            if !input.r#type().sharding().is_some_and(|sharding| {
+                sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
+            }) {
+                input = input.parallel_vary(axis_name)?;
+            }
+            operation = operation.with_mesh(mesh);
+        }
+        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScatter<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        // A concrete composite value performs the collective through its array member.
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_sum_scatter_with_options(
+            axis_name,
+            scatter_axis,
+            options,
+        )?))
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 // A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit extent
 // value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a manual mesh
@@ -901,25 +930,52 @@ where
             }
             operation = operation.with_mesh(mesh);
         }
-        let mut output_extents = collective_input_extents(&input)?;
-        if scatter_axis >= output_extents.len() {
+        let input_type = input.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let rank = input_type.rank();
+        if scatter_axis >= rank {
             return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {scatter_axis} is out of bounds for rank {}",
-                output_extents.len(),
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {scatter_axis} is out of bounds for rank {rank}",
             ))
             .into());
         }
-        match options.mode {
-            CollectiveMode::Untiled => {
-                output_extents[scatter_axis].require_equal(&context, effective_axis_size)?;
-                output_extents.remove(scatter_axis);
+
+        // Untiled scatter consumes its selected axis. Only a dynamic extent needs to be observed and checked;
+        // operation type inference checks the static input geometry when the collective is bound below.
+        if options.mode == CollectiveMode::Untiled
+            && matches!(input_type.shape().dimensions()[scatter_axis], Dimension::Dynamic(_))
+        {
+            let extent = ValueProjection::<DimensionType>::into_projected(input.dimension_size(scatter_axis)?)?;
+            let participants =
+                ValueProjection::<DimensionType>::into_projected(context.dimension_constant(effective_axis_size)?)?;
+            extent.equal(&participants)?.assert(
+                "collective axis extent must match the participant count",
+                &[
+                    ("extent", ValueProjection::<DimensionType>::from_projected(extent)),
+                    ("participants", ValueProjection::<DimensionType>::from_projected(participants)),
+                ],
+            )?;
+        }
+        let mut output_extents = (0..rank)
+            .filter(|axis| options.mode != CollectiveMode::Untiled || *axis != scatter_axis)
+            .map(|axis| input.dimension_size(axis))
+            .collect::<Result<Vec<_>, _>>()?;
+        if options.mode == CollectiveMode::Tiled {
+            let extent = ValueProjection::<DimensionType>::into_projected(output_extents[scatter_axis].clone())?;
+            let participants =
+                ValueProjection::<DimensionType>::into_projected(context.dimension_constant(effective_axis_size)?)?;
+            if matches!(input_type.shape().dimensions()[scatter_axis], Dimension::Dynamic(_)) {
+                let zero = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?;
+                extent.rem(&participants)?.equal(&zero)?.assert(
+                    "collective extent must be divisible by the participant count",
+                    &[
+                        ("extent", ValueProjection::<DimensionType>::from_projected(extent.clone())),
+                        ("divisor", ValueProjection::<DimensionType>::from_projected(participants.clone())),
+                    ],
+                )?;
             }
-            CollectiveMode::Tiled => {
-                output_extents[scatter_axis] = output_extents[scatter_axis].divided(&context, effective_axis_size)?;
-            }
-        };
-        let output_extents =
-            output_extents.into_iter().map(|extent| extent.stage(&context)).collect::<Result<Vec<_>, _>>()?;
+            output_extents[scatter_axis] = ValueProjection::<DimensionType>::from_projected(extent.div(&participants)?);
+        }
         let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
@@ -944,37 +1000,6 @@ where
     }
 }
 
-// Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
-impl<V> ParallelSumScatter<ArrayType> for V
-where
-    V: ShapeChangingCollectiveValue + ParallelVary,
-    V::DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
-{
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
-        let mut input = self.clone();
-        let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-            if !input.r#type().sharding().is_some_and(|sharding| {
-                sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
-            }) {
-                input = input.parallel_vary(axis_name)?;
-            }
-            operation = operation.with_mesh(mesh);
-        }
-        let mut outputs = context.bind(operation, Vec::new(), &[input])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use half::f16;
@@ -992,6 +1017,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_gradient, check_operation_type_inference};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::partial::{
@@ -1982,8 +2008,8 @@ mod tests {
 
         // Over a manual mesh axis, the capability stages the output extents and the sum-scatter for a varying value
         // directly, while an invariant value, and a value without a sharding, are first made varying, so that every
-        // copy is counted. A static scatter extent stages only its result extent, while a dynamic one is checked by a
-        // staged runtime assertion.
+        // copy is counted. Both static and dynamic extents use dimension arithmetic; dynamic divisibility additionally
+        // requires a staged runtime assertion.
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 1);
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(5)).unwrap());
@@ -1994,16 +2020,18 @@ mod tests {
                     .unwrap(),
                 indoc! {"
                     lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
-                    let %1:dimension<2> = constant [value=2]
-                        %2:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
+                    let %1:dimension<4> = constant [value=4]
+                        %2:dimension<2> = constant [value=2]
+                        %3:dimension<2> = dimension_div %1 %2
+                        %4:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                             parallel_sum_scatter [
                             axis_name=\"x\",
                             axis_size=2,
                             scatter_axis=0,
                             options=Tiled,
                             mesh=['x'=2:manual, 'y'=1:manual],
-                        ] %0 %1
-                    in (%2)"
+                        ] %0 %3
+                    in (%4)"
                 },
             ),
             (
@@ -2011,16 +2039,18 @@ mod tests {
                 indoc! {"
                     lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] .
                     let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
-                        %2:dimension<2> = constant [value=2]
-                        %3:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
+                        %2:dimension<4> = constant [value=4]
+                        %3:dimension<2> = constant [value=2]
+                        %4:dimension<2> = dimension_div %2 %3
+                        %5:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
                             parallel_sum_scatter [
                             axis_name=\"x\",
                             axis_size=2,
                             scatter_axis=0,
                             options=Tiled,
                             mesh=['x'=2:manual, 'y'=1:manual],
-                        ] %1 %2
-                    in (%3)"
+                        ] %1 %4
+                    in (%5)"
                 },
             ),
             (
