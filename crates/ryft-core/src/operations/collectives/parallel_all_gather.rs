@@ -245,9 +245,9 @@ define_linear_collective_operation!(
     /// chunks non-prefix-shaped, which one [`RaggedAxis`] cannot represent faithfully.
     ///
     /// An all-gather over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
-    /// [`ParallelAllGather::parallel_all_gather_with_options`] supplies the mesh automatically from the enclosing manual
-    /// region. Its input must vary over the axis (refer to [`ParallelVary`]), and its output variance selects the
-    /// manual variation of the result. An ordinary all-gather carries no mesh and preserves the input's mesh state,
+    /// [`ParallelAllGather::parallel_all_gather_with_options`] supplies the mesh automatically from the enclosing
+    /// manual region. Its input must vary over the axis (refer to [`ParallelVary`]), and its output variance selects
+    /// the manual variation of the result. An ordinary all-gather carries no mesh and preserves the input's mesh state,
     /// even when its input carries a manual mesh axis with the same name, because a `batch` level whose axis name
     /// shadows that mesh axis may bind it instead. A matching `batch` level rejects all-gathers over a manual mesh
     /// axis, and only those support reduced output variance.
@@ -334,8 +334,8 @@ impl ParallelAllGatherOperation {
     }
 
     /// Returns the logical mesh whose manual axis this [`ParallelAllGatherOperation`] gathers over, or [`None`] for an
-    /// ordinary all-gather, whose named axis may be bound by any enclosing binder. Only an all-gather over a manual mesh
-    /// axis validates and updates the manual variation of its input.
+    /// ordinary all-gather, whose named axis may be bound by any enclosing binder. Only an all-gather over a manual
+    /// mesh axis validates and updates the manual variation of its input.
     #[inline]
     pub fn mesh(&self) -> Option<&LogicalMesh> {
         self.mesh.as_ref()
@@ -1108,12 +1108,13 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_output_variance_updates_canonical_sharding_state() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying_sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
         let input = ArrayType::new_static(DataType::F32, [3]).with_sharding(varying_sharding).unwrap();
 
         let infer = |output_variance| {
             infer_explicit_parallel_all_gather_output_types(
-                &ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance),
+                &ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance)
+                    .with_mesh(mesh.clone()),
                 &[
                     ArrayIrType::Array(input.clone()),
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
@@ -1141,6 +1142,7 @@ mod tests {
         let reduced_cotangent = reduced.cotangent().unwrap();
         assert_eq!(
             ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
+                .with_mesh(mesh)
                 .infer_parent_output_types(
                     &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
                     &[],
@@ -1175,18 +1177,15 @@ mod tests {
 
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let input_variable = DimensionVariable::new("items", bounds);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["devices"]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]))
+            .with_sharding(sharding.clone())
+            .unwrap();
         let (_, program) = TestContext::trace_with_named_axes(
             |input| input.parallel_all_gather_tiled("devices", 0),
             ArrayIrType::Array(input_type),
-            vec![(
-                "devices".to_string(),
-                NamedAxis::Mesh {
-                    mesh: LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
-                    axis: 0,
-                    size: 2,
-                },
-            )],
+            vec![("devices".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
         )
         .unwrap();
 
@@ -1207,7 +1206,9 @@ mod tests {
         assert!(rendered.contains("options=Tiled"));
 
         let target_variable = DimensionVariable::new("target", bounds);
-        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_variable)]));
+        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_variable)]))
+            .with_sharding(sharding)
+            .unwrap();
         let instantiated = program
             .with_instantiated_type_identities(&[ArrayIrType::Array(target_type.clone())])
             .unwrap()
@@ -1493,11 +1494,11 @@ mod tests {
         };
         assert_eq!(adjoint.options().axis_index_groups(), Some(groups.as_slice()));
 
-        // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation consumes that
-        // state and returns the original varying input cotangent.
+        // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation, over the same
+        // mesh, consumes that state and returns the original varying input cotangent.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(input_type.clone());
@@ -1509,7 +1510,8 @@ mod tests {
                     0,
                     CollectiveOptions::tiled(),
                     ParallelAllGatherOutputVariance::Reduced,
-                ),
+                )
+                .with_mesh(mesh.clone()),
                 Vec::new(),
                 vec![input],
                 None,
@@ -1517,8 +1519,24 @@ mod tests {
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
+        let ArrayOperation::ParallelSumScatter(adjoint) = pullback.instructions()[0].operation() else {
+            panic!("expected reduced all-gather transpose to stage parallel-sum-scatter");
+        };
+        assert_eq!(adjoint.mesh(), Some(&mesh));
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+
+        // Reduced output variance requires a manual mesh axis.
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Reduced,
+            )
+            .infer_output_types(&[input_type], &[]),
+            Err(TypeError::invalid("`parallel_all_gather` with reduced output variance requires a manual mesh axis")),
+        );
     }
 
     #[test]
@@ -1670,6 +1688,110 @@ mod tests {
                 ParallelAllGatherOutputVariance::Varying,
             ),
             input_types = [ArrayType::new_static(DataType::F32, [2])],
+        );
+
+        // An all-gather over a manual mesh axis records and renders its mesh. Its input must vary over the axis on the
+        // operation's mesh, and its output variance selects whether the result keeps varying over the axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1);
+        let varying = sharding.clone().with_varying_manual_axes(["x"]).unwrap();
+        let with_sharding = |extent: usize, sharding: &Sharding| {
+            ArrayType::new_static(DataType::F32, [extent]).with_sharding(sharding.clone()).unwrap()
+        };
+        let mesh_gather = |output_variance| {
+            ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled(), output_variance)
+                .with_mesh(mesh.clone())
+        };
+        let operation = mesh_gather(ParallelAllGatherOutputVariance::Varying);
+        assert_eq!(operation.mesh(), Some(&mesh));
+        assert_eq!(
+            operation.to_string(),
+            indoc::indoc! {r#"
+                parallel_all_gather [
+                    axis_name="x",
+                    axis_size=2,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                    mesh=['x'=2:manual],
+                ]
+            "#}
+            .trim_end(),
+        );
+        let other_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                { input_types = [with_sharding(2, &varying)], output_types = [with_sharding(4, &varying)] },
+                {
+                    input_types = [with_sharding(2, &sharding)],
+                    error = "`parallel_all_gather` input must vary over manual axis `x`; pass an invariant value \
+                             through `parallel_vary` first so that every copy is gathered",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2])],
+                    error = "`parallel_all_gather` input must carry a mesh containing manual axis `x`",
+                },
+                {
+                    input_types = [with_sharding(
+                        2,
+                        &Sharding::replicated(other_mesh, 1).with_varying_manual_axes(["x"]).unwrap(),
+                    )],
+                    error = "`parallel_all_gather` input mesh does not match the operation mesh",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = mesh_gather(ParallelAllGatherOutputVariance::Invariant),
+            cases = [{ input_types = [with_sharding(2, &varying)], output_types = [with_sharding(4, &sharding)] }],
+        );
+
+        // The mesh axis must be manual, and its size must equal the axis size of the operation.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .with_mesh(explicit_mesh),
+            cases = [{
+                input_types = [with_sharding(2, &varying)],
+                error = "`parallel_all_gather` mesh axis `x` must be manual",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelAllGatherOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .with_mesh(mesh.clone()),
+            cases = [{
+                input_types = [with_sharding(2, &varying)],
+                error = "`parallel_all_gather` axis size 4 does not match the size of manual mesh axis `x`",
+            }],
+        );
+
+        // An ordinary all-gather preserves the mesh state of its input, including invariance over a manual mesh axis
+        // with the same name, because a `batch` level that shadows that mesh axis may bind it.
+        check_operation_type_inference!(
+            operation = ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            ),
+            cases = [{ input_types = [with_sharding(2, &sharding)], output_types = [with_sharding(4, &sharding)] }],
         );
     }
 
