@@ -150,3 +150,16 @@ impl<
 > ManipulationOperations for V
 {
 }
+
+/// Group of the array IR manipulation capabilities, whose dynamic result geometry consumes explicit first-class
+/// dimension values (i.e., [`DynamicReshape`], [`DynamicBroadcast`], [`DynamicPad`], [`DynamicConcatenate`], and
+/// [`DynamicSliceWithDimensions`]). It is implemented automatically for every type that implements all of its members.
+pub trait DynamicManipulationOperations:
+    DynamicReshape + DynamicBroadcast + DynamicPad + DynamicConcatenate + DynamicSliceWithDimensions
+{
+}
+
+impl<V: DynamicReshape + DynamicBroadcast + DynamicPad + DynamicConcatenate + DynamicSliceWithDimensions>
+    DynamicManipulationOperations for V
+{
+}

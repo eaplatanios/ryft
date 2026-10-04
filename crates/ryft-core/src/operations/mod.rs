@@ -109,10 +109,10 @@ pub use manipulation::{
     BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType,
     ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicPad, DynamicReshape, DynamicReshapeOperation,
-    DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions,
-    DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather,
-    GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
+    DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations, DynamicPad,
+    DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
+    DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME,
+    Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
     IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation,
     REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision,
     ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME,
@@ -135,7 +135,7 @@ pub use references::{
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
     REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
     ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceOperations, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };
 pub use rounding::{

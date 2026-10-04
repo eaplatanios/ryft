@@ -63,6 +63,8 @@
 //! # }
 //! ```
 
+use crate::programs::ReferenceTransform;
+
 mod reference_add_update;
 mod reference_atomic_add_update;
 mod reference_freeze;
@@ -80,6 +82,33 @@ pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNew
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};
+
+/// Group of the reference capabilities over references addressed through `Transform` paths: [`ReferenceNew`],
+/// [`ReferenceRead`], [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and
+/// [`ReferenceFreeze`]. It is implemented automatically for every type that implements all of its members.
+pub trait ReferenceOperations<Transform: ReferenceTransform>:
+    ReferenceNew
+    + ReferenceRead<Transform>
+    + ReferenceWrite<Transform>
+    + ReferenceSwap<Transform>
+    + ReferenceAddUpdate<Transform>
+    + ReferenceAtomicAddUpdate<Transform>
+    + ReferenceFreeze
+{
+}
+
+impl<
+    Transform: ReferenceTransform,
+    V: ReferenceNew
+        + ReferenceRead<Transform>
+        + ReferenceWrite<Transform>
+        + ReferenceSwap<Transform>
+        + ReferenceAddUpdate<Transform>
+        + ReferenceAtomicAddUpdate<Transform>
+        + ReferenceFreeze,
+> ReferenceOperations<Transform> for V
+{
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

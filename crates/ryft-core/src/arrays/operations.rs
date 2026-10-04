@@ -20,7 +20,8 @@ use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use crate::operations::collectives::{
-    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
+    ParallelAllGather, ParallelAllGatherOperation, ParallelAllToAll, ParallelAllToAllOperation,
+    ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelSumScatter,
     ParallelSumScatterOperation,
 };
 use crate::operations::complex::{
@@ -37,22 +38,22 @@ use crate::operations::{
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    DotOperation, DotOperations, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations,
-    ExtremaOperations, FloorOperation, GatherOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
-    Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
-    MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
-    OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
-    RaggedDotOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
-    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation,
-    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    DotOperation, DotOperations, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
+    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation,
+    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
+    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation,
+    PowOperation, Print, PrintOperation, RaggedDotOperation, ReduceOperation, ReducePrecisionOperation,
+    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
+    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations,
+    SignOperation, SinOperation, SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient,
+    StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -211,7 +212,7 @@ pub trait ArrayOperations:
 {
 }
 
-impl<V> ArrayOperations for V where
+impl<
     V: Value<Type = ArrayType>
         + ConstantOperations
         + ExtremaOperations
@@ -238,7 +239,8 @@ impl<V> ArrayOperations for V where
         + RngBitGenerator
         + Print
         + Assert
-        + CustomCall
+        + CustomCall,
+> ArrayOperations for V
 {
 }
 
@@ -280,53 +282,48 @@ where
     }
 }
 
-/// Value-level capability bundle paired with the [`DimensionOperation`] family.
+/// Value-level capability bundle that groups every operation Ryft supports on first-class dimension values, so that
+/// generic first-class-dimension code can state one bound instead of listing each capability it uses. Its members are
+/// the capabilities through which values stage or execute [`DimensionOperation`] variants, listed in variant order.
+/// Checked arithmetic reuses the shared [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`]
+/// capabilities alongside the dedicated [`DimensionMin`], [`DimensionMax`], [`DimensionSaturatingSub`], and
+/// [`DimensionPow`]. It is implemented automatically for every value that implements all of its members, and so it
+/// must never be implemented manually. [`ArrayIrOperations`] requires it of the first-class-dimension projections of
+/// composite values.
 ///
-/// [`DimensionOperations`] is to [`DimensionOperation`] what [`ArrayOperations`] is to [`ArrayOperation`]: a pure
-/// bundle of the value-level capabilities through which a [`DimensionType`]-typed value materializes the family's
-/// variants, blanket-implemented for every value that satisfies the same supertrait list and therefore never
-/// implemented manually. Generic first-class-dimension code states this one bound instead of re-listing checked
-/// dimension arithmetic capability by capability, and it is also the dimension member profile that
-/// [`ArrayIrOperations`] pins on its [`ValueProjection<DimensionType>`](ValueProjection) supertrait.
+/// [`DimensionOperation::Constant`] is necessarily absent, because
+/// [`DimensionConstant`](crate::operations::constants::DimensionConstant) is implemented by contexts rather than
+/// values. The conversions [`DimensionSize`], [`DimensionFromScalar`], and [`DimensionToScalar`] belong to
+/// [`ArrayIrOperations`] instead, because their signatures cross the array and first-class-dimension member kinds.
 ///
-/// # Membership
-///
-/// Membership follows the rule documented on [`ArrayOperations`]: a member is a value-level capability whose methods
-/// take [`DimensionType`]-typed values and stage or execute one [`DimensionOperation`] variant. Checked arithmetic
-/// reaches the shared capabilities [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`] pinned to
-/// dimension-typed values, alongside the dedicated [`DimensionSaturatingSub`], [`DimensionPow`], [`DimensionMin`],
-/// and [`DimensionMax`]. Boolean comparisons and assertions belong to the composite family because their
-/// signatures include ordinary array predicates.
-///
-/// What a variant needs in order to exist, but that a dimension value does not itself perform, stays out:
-///
-///   - staging machinery, namely [`DimensionOperation::Constant`], exactly as
-///     [`Constant`](crate::operations::constants::Constant) stays out of [`ArrayOperations`]; and
-///   - the mixed conversions [`DimensionSize`], [`DimensionFromScalar`], and [`DimensionToScalar`], whose signatures
-///     cross the array and first-class-dimension member kinds. They live in the composite family and belong to
-///     [`ArrayIrOperations`]. [`DimensionToScalar`] does have a dimension-typed receiver, but its output is an array
-///     representation the member universe cannot name, so it is reached through the composite value instead.
-///
-/// Composite values reach these capabilities through [`ValueProjection<DimensionType>`], just as they reach
-/// [`ArrayOperations`] through [`ValueProjection<ArrayType>`].
-///
-/// # Tracers
-///
-/// As with [`ArrayOperations`], this bundle deliberately implies nothing about the tracers derived from an
-/// implementing value; a tracer requirement stays a separate explicit bound.
+/// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value, and
+/// a tracer requirement stays a separate bound.
 pub trait DimensionOperations:
     Value<Type = DimensionType>
-    // Checked first-class-dimension arithmetic.
-    + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub + DimensionPow + DimensionMin + DimensionMax
+    + DimensionMin
+    + DimensionMax
+    + Add
+    + Sub
+    + DimensionSaturatingSub
+    + Mul
+    + Div
+    + Rem
+    + DimensionPow
 {
 }
 
-// The predicates below restate the supertrait list of `DimensionOperations`, so that the bundle is satisfied exactly
-// when every one of its member capabilities is.
-impl<V> DimensionOperations for V
-where
-    V: Value<Type = DimensionType> + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub,
-    V: DimensionPow + DimensionMin + DimensionMax,
+impl<
+    V: Value<Type = DimensionType>
+        + DimensionMin
+        + DimensionMax
+        + Add
+        + Sub
+        + DimensionSaturatingSub
+        + Mul
+        + Div
+        + Rem
+        + DimensionPow,
+> DimensionOperations for V
 {
 }
 
@@ -526,37 +523,29 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ),
 }
 
-/// Value-level capability bundle paired with the [`ArrayIrOperation`] family.
+/// Value-level capability bundle that groups every operation Ryft supports on composite array IR values, so that generic
+/// composite code can state one bound instead of listing each capability it uses. Its members are the capability
+/// groups, member projections, and individual capabilities through which values stage or execute [`ArrayIrOperation`]
+/// variants, listed in variant order. It is implemented automatically for every value that implements all of its
+/// members, and so it must never be implemented manually.
 ///
-/// [`ArrayIrOperations`] is to [`ArrayIrOperation`] what [`ArrayOperations`] is to [`ArrayOperation`]: a pure bundle
-/// of the value-level capabilities that the family's variants expose, blanket-implemented for every value that
-/// satisfies the same supertrait list and therefore never implemented manually. It obeys the same membership rule,
-/// documented on [`ArrayOperations`], but its inventory is deliberately *not* the array inventory pinned to
-/// [`ArrayIrType`], because the composite universe reaches the two surfaces differently:
+/// The homogeneous [`ArrayIrOperation::Array`] and [`ArrayIrOperation::Dimension`] variants are reached through member
+/// projections, so the bundle requires that the [`ValueProjection<ArrayType>`](ValueProjection) of a value satisfies
+/// [`ArrayOperations`] and that its [`ValueProjection<DimensionType>`](ValueProjection) satisfies
+/// [`DimensionOperations`]. Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
+/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site. Bounding homogeneous
+/// capabilities such as [`Add`] directly would instead demand `From<AddOperation<ArrayIrType>>`-style conversions of
+/// every array operation, which the composite family intentionally does not provide. The remaining members are mixed
+/// capabilities, whose signatures cross the array and first-class-dimension member kinds (e.g., [`DimensionSize`] and
+/// [`DynamicManipulationOperations`]), the [`ReferenceOperations`] over [`ArrayReferenceTransform`] paths, the
+/// shape-changing collectives, which stage explicit result extents, and [`Compare`] of first-class dimensions.
 ///
-///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
-///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
-///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], [`DynamicReshape`],
-///     and the reference capabilities. The latter comprise the allocation [`ReferenceNew`], the consuming
-///     [`ReferenceFreeze`], and the accesses [`ReferenceRead`], [`ReferenceWrite`], [`ReferenceSwap`],
-///     [`ReferenceAddUpdate`], and [`ReferenceAtomicAddUpdate`], each of which addresses either the complete referent
-///     or the state selected by a path of [`ArrayReferenceTransform`]s.
-///   - Homogeneous array and dimension capabilities such as [`Add`], [`Dot`], and [`DimensionPow`] are reached
-///     through member projections. The composite family carries array payloads through [`ArrayIrOperation::Array`]
-///     and dimension payloads through [`ArrayIrOperation::Dimension`]. Composite values perform their capabilities
-///     through [`ValueProjection`] onto [`ArrayType`] or [`DimensionType`], respectively. Bounding homogeneous
-///     capabilities directly here would demand `From<AddOperation<ArrayIrType>>`-style conversions of every array
-///     operation, which the composite family intentionally does not provide.
-///
-/// # Member Profiles
-///
-/// The two computational member projections are themselves supertraits, each pinned to the sibling bundle of the
-/// member family it projects onto, so one bound carries the complete surface: the array member satisfies
-/// [`ArrayOperations`] and the first-class-dimension member satisfies [`DimensionOperations`]. References deliberately
-/// have no homogeneous operation family or projection bundle; their cross-kind capabilities are direct supertraits
-/// because the corresponding operations remain composite-native.
-/// Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
-/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
+/// Variants without a value-level capability are necessarily absent. These are the context-side constructors
+/// [`DynamicZero`](crate::operations::constants::DynamicZero),
+/// [`DynamicOne`](crate::operations::constants::DynamicOne), and
+/// [`DynamicIota`](crate::operations::constants::DynamicIota), the foreign-kernel calls that composite values reach
+/// through their array projection, and the variants that function-level APIs and transforms stage on behalf of values,
+/// namely control flow, rematerialization, linear calls, and custom functions.
 ///
 /// Checked arithmetic over first-class dimensions uses their member projection:
 ///
@@ -601,42 +590,44 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// derivative terminals ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that same route, because
 /// their coordinate machinery is defined on [`ArrayType`].
 ///
-/// As with [`ArrayOperations`], this bundle never implies anything about the tracers derived from an implementing
-/// value; a tracer requirement stays a separate explicit bound.
+/// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value, and
+/// a tracer requirement stays a separate bound.
 pub trait ArrayIrOperations:
     Value<Type = ArrayIrType>
-    // Array member profile.
     + ValueProjection<ArrayType, Projected: ArrayOperations>
-    // First-class-dimension member profile.
     + ValueProjection<DimensionType, Projected: DimensionOperations>
-    // Comparison of first-class dimensions, producing ordinary Boolean array data.
-    + Compare + Assert
-    // First-class dimensions.
-    + DimensionSize + DimensionFromScalar + DimensionToScalar
-    + DynamicBroadcast + DynamicReshape
-    // References, whose accesses address the complete referent or an `ArrayReferenceTransform` path.
-    + ReferenceNew + ReferenceRead<ArrayReferenceTransform> + ReferenceWrite<ArrayReferenceTransform>
-    + ReferenceSwap<ArrayReferenceTransform>
-    + ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceAtomicAddUpdate<ArrayReferenceTransform>
-    + ReferenceFreeze
+    + DimensionSize
+    + DimensionFromScalar
+    + DimensionToScalar
+    + ReferenceOperations<ArrayReferenceTransform>
+    + ParallelAllGather<ArrayIrType>
+    + ParallelSumScatter<ArrayIrType>
+    + ParallelAllToAll<ArrayIrType>
+    + ParallelRaggedAllToAll<ArrayIrType>
+    + Compare
+    + DynamicManipulationOperations
+    + DynamicRngBitGenerator
+    + Assert
 {
 }
 
-// The predicates below restate the supertrait list of `ArrayIrOperations`, so that the bundle is satisfied exactly
-// when every one of its member capabilities is.
-impl<V> ArrayIrOperations for V
-where
-    V: Value<Type = ArrayIrType> + Compare + Assert,
-    V: DimensionSize + DimensionFromScalar + DimensionToScalar,
-    V: DynamicBroadcast + DynamicReshape,
-    V: ReferenceNew
-        + ReferenceRead<ArrayReferenceTransform>
-        + ReferenceWrite<ArrayReferenceTransform>
-        + ReferenceSwap<ArrayReferenceTransform>,
-    V: ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceAtomicAddUpdate<ArrayReferenceTransform>,
-    V: ReferenceFreeze,
-    V: ValueProjection<ArrayType, Projected: ArrayOperations>,
-    V: ValueProjection<DimensionType, Projected: DimensionOperations>,
+impl<
+    V: Value<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: ArrayOperations>
+        + ValueProjection<DimensionType, Projected: DimensionOperations>
+        + DimensionSize
+        + DimensionFromScalar
+        + DimensionToScalar
+        + ReferenceOperations<ArrayReferenceTransform>
+        + ParallelAllGather<ArrayIrType>
+        + ParallelSumScatter<ArrayIrType>
+        + ParallelAllToAll<ArrayIrType>
+        + ParallelRaggedAllToAll<ArrayIrType>
+        + Compare
+        + DynamicManipulationOperations
+        + DynamicRngBitGenerator
+        + Assert,
+> ArrayIrOperations for V
 {
 }
 

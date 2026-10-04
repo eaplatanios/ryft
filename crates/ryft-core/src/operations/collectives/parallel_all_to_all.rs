@@ -7,19 +7,19 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
+    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    BatchingTracer, MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -28,9 +28,9 @@ use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveExtent, CollectiveMode, CollectiveOptions,
-    LinearCollectiveOperation, ShapeChangingCollectiveKernel, ShapeChangingCollectiveOperation,
-    check_manual_mesh_input, collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, resolve_named_axis_size,
+    LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
+    collective_input_extents, infer_array_ir_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -43,7 +43,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -179,7 +179,7 @@ impl ParallelAllToAllOperation {
         };
 
         let axis_name = self.axis_name();
-        let sharding = check_manual_mesh_input(
+        validate_manual_mesh_input(
             PARALLEL_ALL_TO_ALL_OPERATION_NAME,
             axis_name,
             Some(self.axis_size),
@@ -189,6 +189,7 @@ impl ParallelAllToAllOperation {
 
         // Exchanging chunks cannot complete a pending sum over the same axis. Sums over unrelated axes commute with the
         // exchange and retain their pending state.
+        let sharding = input_type.sharding().unwrap();
         if sharding.unreduced_axes().contains(axis_name) {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
@@ -413,7 +414,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveKernel<C> for ParallelAllToAllOperation {
+impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatching<C> for ParallelAllToAllOperation {
     fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
         context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -751,7 +752,7 @@ impl<
     }
 }
 
-impl ParallelAllToAll for Array {
+impl ParallelAllToAll<ArrayType> for Array {
     // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
     // a manual region are tracers, so every axis name is unbound for it.
 
@@ -764,6 +765,25 @@ impl ParallelAllToAll for Array {
         _options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
+}
+
+// A concrete composite value performs the collective through its array member.
+impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_to_all_with_options(
+            axis_name,
+            split_axis,
+            concat_axis,
+            options,
+        )?))
     }
 }
 
@@ -793,6 +813,9 @@ where
 /// semantics. Dynamic result extents are staged as first-class dimension values, and runtime assertions validate
 /// dynamic split extents.
 ///
+/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
+/// values share the same call syntax.
+///
 /// # Example
 ///
 /// Each row sends its first half to batch item zero and its second half to batch item one:
@@ -818,7 +841,7 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelAllToAll: Sized {
+pub trait ParallelAllToAll<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
     /// Exchanges single slices, removing `split_axis` from the input and inserting the sender axis at `concat_axis`
     /// in the output. The split extent must equal the participant count, and rank is preserved.
     ///
@@ -896,7 +919,7 @@ pub trait ParallelAllToAll: Sized {
 // Composite values stage the array followed by one result extent per axis. Only a manual mesh binder records its mesh
 // on the operation and introduces variation; a named batch that shadows the same mesh-axis name performs its own local
 // exchange.
-impl<V> ParallelAllToAll for V
+impl<V> ParallelAllToAll<ArrayIrType> for V
 where
     V: Value<Type = ArrayIrType>
         + Assert
@@ -966,9 +989,9 @@ where
     }
 }
 
-impl<V> ParallelAllToAll for ProjectedValue<ArrayType, V>
+impl<V> ParallelAllToAll<ArrayType> for ProjectedValue<ArrayType, V>
 where
-    V: ParallelAllToAll + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+    V: ParallelAllToAll<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
 {
     fn parallel_all_to_all_with_options(
         &self,
@@ -984,8 +1007,109 @@ where
     }
 }
 
+// Staged homogeneous array values share one staging implementation. Their static shapes let the operation infer its
+// result type, whereas composite values stage explicit result extents (see the array IR implementation above).
+impl<C: Context> ParallelAllToAll<ArrayType> for Tracer<C>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> ParallelAllToAll<ArrayType> for BatchingTracer<C, P>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
+    }
+}
+
+impl<C: Context, P: DifferentiationPolicy<C>> ParallelAllToAll<ArrayType> for DifferentiationTracer<C, P>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
+    }
+}
+
+/// Stages a [`ParallelAllToAllOperation`] for the homogeneous array `value` through its dispatch domain. This is the
+/// shared implementation of [`ParallelAllToAll<ArrayType>`] for staged array values (e.g., [`Tracer`],
+/// [`BatchingTracer`], and [`DifferentiationTracer`]) and is public so that backend array values can delegate to it as
+/// well. Over a manual mesh axis, the operation records the mesh, and an input that does not vary over the axis is
+/// first made varying through [`ParallelVary`].
+///
+/// # Errors
+///
+/// Returns the errors documented on [`ParallelAllToAll::parallel_all_to_all_with_options`].
+pub fn array_parallel_all_to_all<V>(
+    value: &V,
+    axis_name: &str,
+    split_axis: usize,
+    concat_axis: usize,
+    options: CollectiveOptions,
+) -> Result<V, ProgramError>
+where
+    V: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    let context = value.dispatch_domain();
+    let axis_size = resolve_named_axis_size(&context, axis_name)?;
+    options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
+    let mut input = value.clone();
+    let mut operation =
+        ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options);
+    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if input.r#type().unreduced_axes().contains(axis_name) {
+            return Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs").into());
+        }
+        if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+            input = input.parallel_vary(axis_name)?;
+        }
+        operation = operation.with_mesh(mesh);
+    }
+    let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
 /// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.
-pub trait ParallelSwapAxes: ParallelAllToAll {
+pub trait ParallelSwapAxes<T: Type = <Self as Typed>::Type>: ParallelAllToAll<T> {
     /// Swaps `axis` with `axis_name` over the full named axis. The ranked axis must have the participant count as its
     /// extent. This is [`ParallelAllToAll::parallel_all_to_all`] with identical split and concatenation positions.
     ///
@@ -1030,7 +1154,7 @@ pub trait ParallelSwapAxes: ParallelAllToAll {
     }
 }
 
-impl<V: ParallelAllToAll> ParallelSwapAxes for V {}
+impl<T: Type, V: ParallelAllToAll<T>> ParallelSwapAxes<T> for V {}
 
 #[cfg(test)]
 mod tests {
@@ -2122,6 +2246,60 @@ mod tests {
             ),
         );
         assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all() {
+        // Homogeneous array values stage the static-shape operation without explicit result extents, and exchange
+        // chunks over a `batch` level so that batch item `j` receives chunk `j` of every item.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_tiled("x", 0, 0),
+            varying_type,
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    split_axis=0,
+                    concat_axis=0,
+                    options=Tiled,
+                    mesh=['x'=2:manual],
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_all_to_all("x", 0, 0)
+                },
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0]).unwrap()),
+        );
+
+        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
+        // binder, so every axis name is unbound for them.
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap().parallel_all_to_all("x", 0, 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }))
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_all_to_all("x", 0, 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
     }
 
     #[test]

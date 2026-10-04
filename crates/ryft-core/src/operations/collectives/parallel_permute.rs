@@ -17,7 +17,7 @@ use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    LinearCollectiveOperation, check_manual_mesh_input, forward_linear_collective, resolve_named_axis_size,
+    LinearCollectiveOperation, forward_linear_collective, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
@@ -213,7 +213,7 @@ impl Operation for ParallelPermuteOperation {
         // permutation never inspects the input's mesh, including its pending sums, because a `batch` level may bind a
         // shadowing axis name.
         if let Some(mesh) = &self.mesh {
-            let sharding = check_manual_mesh_input(
+            validate_manual_mesh_input(
                 PARALLEL_PERMUTE_OPERATION_NAME,
                 axis_name,
                 Some(self.axis_size),
@@ -223,6 +223,7 @@ impl Operation for ParallelPermuteOperation {
 
             // Routing values cannot complete a pending sum over the same axis. Sums over unrelated axes commute with
             // this permutation and retain their pending state.
+            let sharding = input_type.sharding().unwrap();
             if sharding.unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_PERMUTE_OPERATION_NAME}` does not support unreduced inputs",
@@ -1521,6 +1522,12 @@ mod tests {
             )
             .map(|(output, _)| output),
             Err(ProgramError::Type(TypeError::invalid("`parallel_permute` does not support unreduced inputs"))),
+        );
+
+        // A concrete array is never inside an axis binder, so every axis name is unbound for it.
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap().parallel_permute("i", vec![(0, 1)]),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
         );
     }
 

@@ -1,19 +1,20 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType,
-    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
+    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape,
+    Sharding,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    BatchingTracer, MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -25,9 +26,9 @@ use crate::operations::collectives::parallel_all_gather::{
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
-    ShapeChangingCollectiveKernel, ShapeChangingCollectiveOperation, check_manual_mesh_input, collective_input_extents,
+    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, collective_input_extents,
     infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_named_axis_size,
+    resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -41,7 +42,7 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -59,11 +60,11 @@ pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 ///   - [`CollectiveMode::Tiled`] requires the extent of `scatter_axis` to be divisible by `n` and divides it by
 ///     `n`, so that participant `i` receives the `i`-th contiguous chunk of the sum.
 ///
-/// Inputs must be numeric (or structural zeros). Cross-device sums accumulate in the input element type. A
-/// matching `batch` level uses [`ReductionKind::Sum`] along its local participant axis; when interpreted eagerly
-/// on [`Array`](crate::Array), this widens narrow floating-point accumulation to `f32` before rounding the
-/// result back to the input element type. Its rounding can therefore differ from cross-device execution.
-/// Participant groups (refer to [`CollectiveOptions`]) restrict the sum and the scatter to each group.
+/// Inputs must be numeric (or structural zeros). Cross-device sums accumulate in the input element type. A matching
+/// `batch` level uses [`ReductionKind::Sum`] along its local participant axis; when interpreted eagerly on [`Array`],
+/// this widens narrow floating-point accumulation to `f32` before rounding the result back to the input element type.
+/// Its rounding can therefore differ from cross-device execution. Participant groups (refer to [`CollectiveOptions`])
+/// restrict the sum and the scatter to each group.
 ///
 /// A sum-scatter over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
 /// [`ParallelSumScatter::parallel_sum_scatter_with_options`] supplies the mesh automatically from the enclosing manual
@@ -221,7 +222,7 @@ impl ParallelSumScatterOperation {
         };
 
         let axis_name = self.axis_name();
-        let sharding = check_manual_mesh_input(
+        validate_manual_mesh_input(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
             axis_name,
             Some(self.axis_size),
@@ -229,6 +230,7 @@ impl ParallelSumScatterOperation {
             input_type,
         )?;
 
+        let sharding = input_type.sharding().unwrap();
         if !input_type.unreduced_axes().contains(axis_name) {
             // Every participant of a manual mesh axis receives a different chunk, so an input that is still invariant
             // over that axis would yield an output whose type wrongly claims that it is invariant.
@@ -439,7 +441,7 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
 }
 
 // TODO(eaplatanios): Review this.
-impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingCollectiveKernel<C>
+impl<C: Context<Type = ArrayType, Value: Reduce + Transpose>> ShapeChangingCollectiveBatching<C>
     for ParallelSumScatterOperation
 {
     fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
@@ -740,6 +742,9 @@ impl<
 /// [`ParallelSumScatter::parallel_sum_scatter_tiled`]. Refer to [`ParallelSumScatterOperation`] for the semantics and
 /// transformation rules.
 ///
+/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
+/// values share the same call syntax.
+///
 /// Over a manual mesh axis, an input that neither varies over the axis nor carries a pending cross-device sum over it
 /// is first made varying through [`ParallelVary`], so that every device's copy is counted, as with
 /// [`ParallelReduce::parallel_reduce`](super::ParallelReduce::parallel_reduce). The output extents are staged as
@@ -770,7 +775,7 @@ impl<
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelSumScatter: Sized {
+pub trait ParallelSumScatter<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
     /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
     /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed, so
     /// that participant `i` receives row `i` of the sum.
@@ -828,7 +833,24 @@ pub trait ParallelSumScatter: Sized {
     ) -> Result<Self, ProgramError>;
 }
 
-impl ParallelSumScatter for Array {
+// A concrete composite value performs the collective through its array member.
+impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScatter<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_sum_scatter_with_options(
+            axis_name,
+            scatter_axis,
+            options,
+        )?))
+    }
+}
+
+impl ParallelSumScatter<ArrayType> for Array {
     // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
     // a manual region are tracers, so every axis name is unbound for it.
 
@@ -847,7 +869,7 @@ impl ParallelSumScatter for Array {
 // value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a manual mesh
 // axis, an input that neither varies over the axis nor is unreduced over it is first made varying through its array
 // view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
-impl<V> ParallelSumScatter for V
+impl<V> ParallelSumScatter<ArrayIrType> for V
 where
     V: Value<Type = ArrayIrType>
         + Assert
@@ -907,9 +929,9 @@ where
     }
 }
 
-impl<V> ParallelSumScatter for ProjectedValue<ArrayType, V>
+impl<V> ParallelSumScatter<ArrayType> for ProjectedValue<ArrayType, V>
 where
-    V: ParallelSumScatter + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+    V: ParallelSumScatter<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
 {
     fn parallel_sum_scatter_with_options(
         &self,
@@ -922,6 +944,101 @@ where
             .into_projected()
             .map_err(Into::into)
     }
+}
+
+// Staged homogeneous array values share one staging implementation. Their static shapes let the operation infer its
+// result type, whereas composite values stage explicit result extents (see the array IR implementation above).
+impl<C: Context> ParallelSumScatter<ArrayType> for Tracer<C>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> ParallelSumScatter<ArrayType> for BatchingTracer<C, P>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
+    }
+}
+
+impl<C: Context, P: DifferentiationPolicy<C>> ParallelSumScatter<ArrayType> for DifferentiationTracer<C, P>
+where
+    Self: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = Self, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    #[inline]
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
+    }
+}
+
+/// Stages a [`ParallelSumScatterOperation`] for the homogeneous array `value` through its dispatch domain. This is the
+/// shared implementation of [`ParallelSumScatter<ArrayType>`] for staged array values (e.g., [`Tracer`],
+/// [`BatchingTracer`], and [`DifferentiationTracer`]) and is public so that backend array values can delegate to it as
+/// well. Over a manual mesh axis, the operation records the mesh, and an input that neither varies over the axis nor
+/// carries a pending sum over it is first made varying through [`ParallelVary`].
+///
+/// # Errors
+///
+/// Returns the errors documented on [`ParallelSumScatter::parallel_sum_scatter_with_options`].
+pub fn array_parallel_sum_scatter<V>(
+    value: &V,
+    axis_name: &str,
+    scatter_axis: usize,
+    options: CollectiveOptions,
+) -> Result<V, ProgramError>
+where
+    V: Value<
+            Type = ArrayType,
+            DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+        > + ParallelVary,
+{
+    let context = value.dispatch_domain();
+    let axis_size = resolve_named_axis_size(&context, axis_name)?;
+    options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+    let mut input = value.clone();
+    let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
+    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+        if !input.r#type().sharding().is_some_and(|sharding| {
+            sharding.varying_manual_axes().contains(axis_name) || sharding.unreduced_axes().contains(axis_name)
+        }) {
+            input = input.parallel_vary(axis_name)?;
+        }
+        operation = operation.with_mesh(mesh);
+    }
+    let mut outputs = context.bind(operation, Vec::new(), &[input])?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
 }
 
 #[cfg(test)]
@@ -2011,5 +2128,55 @@ mod tests {
             .unwrap();
             assert_eq!(program.to_string(), expected);
         }
+
+        // Homogeneous array values stage the static-shape operation without explicit result extents, and sum and
+        // scatter over a `batch` level exactly like composite values.
+        let varying_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_sum_scatter_tiled("x", 0),
+            varying_type,
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_sum_scatter [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    scatter_axis=0,
+                    options=Tiled,
+                    mesh=['x'=2:manual, 'y'=1:manual],
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_sum_scatter_tiled("x", 0)
+                },
+                Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![11.0, 22.0, 33.0, 44.0]).unwrap()),
+        );
+
+        // Concrete arrays, and concrete composite values through their array members, are never inside an axis
+        // binder, so every axis name is unbound for them.
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap().parallel_sum_scatter("x", 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }))
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_sum_scatter("x", 0),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
     }
 }

@@ -1,4 +1,8 @@
 use ryft_core::macros::check_count;
+use ryft_core::operations::collectives::{
+    CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelSumScatter,
+    array_parallel_all_gather, array_parallel_all_to_all, array_parallel_sum_scatter,
+};
 use ryft_core::{
     Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Concretizable, Context,
     DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
@@ -19,8 +23,10 @@ use crate::{Array, ArrayShard};
 /// [`XlaDomain`](crate::XlaDomain) that the array belongs to. That domain executes the operation through a
 /// single-operation program that its session caches per operation application, so a repeated eager operation skips
 /// tracing and lowering. This module therefore only implements the capabilities those blankets cannot cover: the
-/// foreign `std::ops` operator sugar (per-type implementations required by the orphan rule) and host-readback
-/// capabilities such as [`Concretizable`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step.
+/// foreign `std::ops` operator sugar (per-type implementations required by the orphan rule), host-readback
+/// capabilities such as [`Concretizable`] and [`WhilePredicate`], and the shape-changing collectives, whose
+/// homogeneous array implementations in `ryft-core` are per value family. This helper is the shared bind-and-unwrap
+/// step of the first two.
 /// Callers must pass at least one input, and the first input determines the domain (and thereby the session, its
 /// caches, and the effect scope) that the operation executes in.
 fn bind_single_output<'o, P: Into<ArrayOperation<XlaArrayConstant>>>(
@@ -236,6 +242,46 @@ impl WhilePredicate for Array<'_> {
 // concrete backend values; these per-type implementations provide the ergonomic panicking sugar by delegating to
 // the fallible `ryft` capabilities (and, for the logical operators that have no fallible `ryft` counterpart
 // traits, by binding the logical operations directly).
+
+// The shape-changing collectives stage the static-shape operation through the array's domain, exactly like the staged
+// array values of `ryft-core`, which implement them per value family rather than through a blanket.
+impl ParallelAllGather<ArrayType> for Array<'_> {
+    #[inline]
+    fn parallel_all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concat_axis: usize,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_all_gather(self, axis_name, concat_axis, options, output_variance)
+    }
+}
+
+impl ParallelSumScatter<ArrayType> for Array<'_> {
+    #[inline]
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_sum_scatter(self, axis_name, scatter_axis, options)
+    }
+}
+
+impl ParallelAllToAll<ArrayType> for Array<'_> {
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        array_parallel_all_to_all(self, axis_name, split_axis, concat_axis, options)
+    }
+}
 
 impl std::ops::Add for Array<'_> {
     type Output = Self;

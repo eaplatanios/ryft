@@ -13,7 +13,7 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{
-    check_manual_mesh_input, effective_collective_axis_size, resolve_named_axis_size,
+    effective_collective_axis_size, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::{Complex, Real};
@@ -224,8 +224,9 @@ impl Operation for ParallelReduceOperation {
                     )));
                 }
 
-                let sharding = check_manual_mesh_input(PARALLEL_REDUCE_OPERATION_NAME, axis_name, None, mesh, input)?;
+                validate_manual_mesh_input(PARALLEL_REDUCE_OPERATION_NAME, axis_name, None, mesh, input)?;
 
+                let sharding = input.sharding().unwrap();
                 if sharding.unreduced_axes().contains(axis_name) || sharding.reduced_axes().contains(axis_name) {
                     return Err(TypeError::invalid(format!(
                         "`{PARALLEL_REDUCE_OPERATION_NAME}` axis `{axis_name}` must not carry reduction state",
@@ -2081,6 +2082,12 @@ mod tests {
                 "`parallel_reduce` with kind `log_sum_exp` requires floating-point or complex inputs but got `i32`",
             ))),
         );
+
+        // A concrete array is never inside an axis binder, so every axis name is unbound for it.
+        assert_eq!(
+            Array::scalar(1.0).unwrap().parallel_reduce(ReductionKind::Sum, "i"),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
+        );
     }
 
     #[test]
@@ -2172,6 +2179,14 @@ mod tests {
             )
             .map(|(output, _)| output),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+
+        // A concrete array is never inside an axis binder, so every axis name is unbound for it.
+        assert_eq!(
+            Array::scalar(1.0)
+                .unwrap()
+                .parallel_reduce_with_axis_index_groups(ReductionKind::Sum, "m", vec![vec![0]]),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "m".to_string() })),
         );
     }
 }

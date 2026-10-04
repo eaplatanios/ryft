@@ -448,6 +448,15 @@ mod tests {
     }
 
     #[test]
+    fn test_print_array() {
+        // A concrete array prints immediately and returns itself unchanged for every effect class. The printed text
+        // goes to standard error, which unit tests cannot capture, so only the returned value is asserted.
+        let array = Array::vector(vec![1.0, 2.0]).unwrap();
+        assert_eq!(array.clone().print("x"), Ok(array.clone()));
+        assert_eq!(array.clone().print_with_effect_class("x", EffectClass::UnorderedIo), Ok(array));
+    }
+
+    #[test]
     fn test_print_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")?),
