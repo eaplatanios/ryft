@@ -163,6 +163,23 @@ impl Array {
         Self { r#type, bytes }
     }
 
+    /// Returns the number of elements represented by `type`. Panics if the type has dynamic dimensions, so this
+    /// helper is reserved for types of already-materialized values (which are always fully static). Kernels that
+    /// materialize values from payload types use [`Array::materialized_element_count`] instead.
+    #[inline]
+    pub fn element_count(r#type: &ArrayType) -> usize {
+        r#type.element_count().unwrap().unwrap()
+    }
+
+    /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
+    /// therefore cannot be materialized into a concrete payload.
+    #[inline]
+    pub fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
+        r#type.element_count().map_err(|error| TypeError::invalid(error.to_string()))?.ok_or_else(|| {
+            TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
+        })
+    }
+
     /// Decodes this array as typed elements in logical row-major order.
     #[inline]
     pub fn elements<T: ArrayElement>(&self) -> Result<Vec<T>, ProgramError> {
@@ -202,6 +219,25 @@ impl Array {
         })
     }
 
+    /// Returns the row-major payload of this array converted elementwise to `f64`. This is a "test assertion view" for
+    /// real-valued arrays (Booleans convert to `0.0`/`1.0` and integers to their exact values where representable),
+    /// and it panics for arrays whose elements cannot be viewed as real numbers (i.e., complex, token, and
+    /// structural-zero element data types), because in tests such a failure corresponds to the assertion failing.
+    pub fn to_f64s(&self) -> Vec<f64> {
+        let data_type = self.r#type.data_type();
+        if data_type.is_complex() {
+            panic!("cannot view an array of complex element data type `{data_type}` as `f64` values");
+        }
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        (0..addressing.element_count())
+            .map(|index| {
+                data_type.element_as_f64(&self.bytes[addressing.byte_range_for_flat_index(index)]).unwrap_or_else(
+                    || panic!("cannot view an array of element data type `{data_type}` as `f64` values"),
+                )
+            })
+            .collect()
+    }
+
     /// Returns the concatenated logical element encodings in row-major order, omitting layout holes and tile padding.
     #[inline]
     pub fn logical_bytes(&self) -> Vec<u8> {
@@ -227,6 +263,64 @@ impl Array {
     #[inline]
     pub(crate) fn shared_storage_bytes(&self) -> &Arc<Vec<u8>> {
         &self.bytes
+    }
+
+    /// Creates a new array holding this array's elements converted into `data_type`, preserving shape, sharding, and
+    /// memory space. Tiled layouts are preserved while byte-stride layouts are cleared when element storage width
+    /// changes. This is the foundational cast of the reference backend: the
+    /// [`ConvertElementType`](crate::ConvertElementType) capability delegates to it, and
+    /// so does every kernel that promotes mixed-type inputs through [`Array::promoted_to`].
+    ///
+    /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
+    /// (including rounding, truncation, saturation, and exceptional-value handling) are documented on that trait.
+    /// Converting an array to its own element data type shares the existing payload instead of copying it. Token
+    /// conversions are always rejected, and structural-zero conversion is accepted only as a same-type no-op.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element [`DataType`] of the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either data type is [`DataType::Token`] or exactly one is [`DataType::Zero`]. Numerical
+    /// conversion maps zero to NaN for `f8e8m0fnu`. Finite-only microscaling formats map NaN to their positive maximum
+    /// and saturate infinities to their signed finite limits. Explicit checked element constructors retain their own
+    /// representability checks.
+    pub fn converted_to(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        let source_data_type = self.r#type.data_type();
+        if source_data_type.is_token() || data_type.is_token() {
+            return Err(TypeError::invalid("cannot convert values to or from the `token` data type").into());
+        }
+        if source_data_type == data_type {
+            return Ok(self.clone());
+        }
+        if source_data_type.is_zero() || data_type.is_zero() {
+            return Err(TypeError::invalid("cannot convert values to or from the `zero` data type").into());
+        }
+        let output_type = self.r#type.with_element_type(data_type);
+
+        // The nested dispatch selects the concrete source and destination element types, which monomorphizes
+        // `convert_to` into the pair's direct conversion (refer to the documentation of `ArrayElement::convert_to`).
+        // Should a measured hot pair ever justify a bespoke kernel, it can be matched here ahead of the generic path
+        // without changing the element interchange contract.
+        dispatch_on_array_element_type!(source_data_type, |Input| {
+            dispatch_on_array_element_type!(data_type, |Output| {
+                self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
+            })
+        })
+    }
+
+    /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data type
+    /// so that already-promoted inputs keep their exact physical storage and layout. Kernels that promote mixed-type
+    /// inputs to a common element data type (which each kernel computes from its own type-inference contract) use this
+    /// to convert only the mismatched inputs.
+    #[inline]
+    pub fn promoted_to(&self, data_type: DataType) -> Result<Cow<'_, Self>, ProgramError> {
+        if self.r#type.data_type() == data_type {
+            Ok(Cow::Borrowed(self))
+        } else {
+            Ok(Cow::Owned(self.converted_to(data_type)?))
+        }
     }
 
     /// Applies a typed elementwise function to this array in logical row-major order, producing a new array of
@@ -362,96 +456,21 @@ impl Array {
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
-    /// Creates a new array holding this array's elements converted into `data_type`, preserving shape, sharding, and
-    /// memory space. Tiled layouts are preserved while byte-stride layouts are cleared when element storage width
-    /// changes. This is the foundational cast of the reference backend: the
-    /// [`ConvertElementType`](crate::ConvertElementType) capability delegates to it, and
-    /// so does every kernel that promotes mixed-type inputs through [`Array::promoted_to`].
-    ///
-    /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
-    /// (including rounding, truncation, saturation, and exceptional-value handling) are documented on that trait.
-    /// Converting an array to its own element data type shares the existing payload instead of copying it. Token
-    /// conversions are always rejected, and structural-zero conversion is accepted only as a same-type no-op.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element [`DataType`] of the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either data type is [`DataType::Token`] or exactly one is [`DataType::Zero`]. Numerical
-    /// conversion maps zero to NaN for `f8e8m0fnu`. Finite-only microscaling formats map NaN to their positive maximum
-    /// and saturate infinities to their signed finite limits. Explicit checked element constructors retain their own
-    /// representability checks.
-    pub fn converted_to(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        let source_data_type = self.r#type.data_type();
-        if source_data_type.is_token() || data_type.is_token() {
-            return Err(TypeError::invalid("cannot convert values to or from the `token` data type").into());
-        }
-        if source_data_type == data_type {
-            return Ok(self.clone());
-        }
-        if source_data_type.is_zero() || data_type.is_zero() {
-            return Err(TypeError::invalid("cannot convert values to or from the `zero` data type").into());
-        }
-        let output_type = self.r#type.with_element_type(data_type);
-
-        // The nested dispatch selects the concrete source and destination element types, which monomorphizes
-        // `convert_to` into the pair's direct conversion (refer to the documentation of `ArrayElement::convert_to`).
-        // Should a measured hot pair ever justify a bespoke kernel, it can be matched here ahead of the generic path
-        // without changing the element interchange contract.
-        dispatch_on_array_element_type!(source_data_type, |Input| {
-            dispatch_on_array_element_type!(data_type, |Output| {
-                self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
-            })
-        })
-    }
-
-    /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data type
-    /// so that already-promoted inputs keep their exact physical storage and layout. Kernels that promote mixed-type
-    /// inputs to a common element data type (which each kernel computes from its own type-inference contract) use this
-    /// to convert only the mismatched inputs.
-    #[inline]
-    pub fn promoted_to(&self, data_type: DataType) -> Result<Cow<'_, Self>, ProgramError> {
-        if self.r#type.data_type() == data_type {
-            Ok(Cow::Borrowed(self))
-        } else {
-            Ok(Cow::Owned(self.converted_to(data_type)?))
-        }
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Broadcasts the types of the provided arrays together (including element data type promotion) and promotes
-    /// every array to the broadcast element data type, borrowing the ones that already have it. This is the shared
-    /// entry step of broadcasting elementwise kernels: the returned arrays all have the broadcast element data type,
-    /// while their shapes may still differ from the returned broadcast type, which the shared elementwise loops bridge
-    /// by indexing the arrays with NumPy-style broadcasting.
-    pub fn broadcast_promoted<'a>(arrays: &[&'a Self]) -> Result<(ArrayType, Vec<Cow<'a, Self>>), ProgramError> {
-        let types = arrays.iter().map(|array| &array.r#type).collect::<Vec<_>>();
-        let output_type = ArrayType::broadcasted(&types).map_err(|error| TypeError::invalid(error.to_string()))?;
-        let promoted = arrays
-            .iter()
-            .map(|array| array.promoted_to(output_type.data_type()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((output_type, promoted))
-    }
-
     /// Creates an array of `type` by evaluating a typed function at every flat logical row-major element index. This
     /// is the constructor form of [`Array::map_elements`], serving iota-style and coordinate-dependent kernels.
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: static array type of the result, whose [`DataType`] must be represented by `T`.
-    ///   - `function`: function producing the element at each flat logical row-major index.
+    ///   - `r#type`: Static array type of the result, whose [`DataType`] must be represented by `T`.
+    ///   - `function`: Function producing the element at each flat logical row-major index.
     ///
     /// # Errors
     ///
     /// Returns an error if `r#type` cannot describe materialized storage, if `T` represents a different [`DataType`],
     /// or if `function` fails.
-    pub fn from_fn_elements<T: ArrayElement>(
+    pub fn from_fn_elements<T: ArrayElement, F: Fn(usize) -> Result<T, ProgramError>>(
         r#type: ArrayType,
-        function: impl Fn(usize) -> Result<T, ProgramError>,
+        function: F,
     ) -> Result<Self, ProgramError> {
         if r#type.data_type() != T::data_type() {
             return Err(TypeError::invalid(format!(
@@ -469,25 +488,25 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    /// Creates an array of `output_type` whose every element is copied from this array through an
-    /// output-index-to-input-index mapping over flat logical row-major indices. The copy moves whole element
-    /// encodings without decoding them, so this is the element-data-type-agnostic workhorse behind structural kernels
-    /// such as transpose, broadcast, slice, reverse, and gather, which never need element-type dispatch.
+    /// Creates an array of `output_type` whose every element is copied from this array through an output-to-input index
+    /// mapping over flat logical row-major indices. The copy moves whole element encodings without decoding them, so
+    /// this is the element-data-type-agnostic workhorse behind structural kernels such as transpose, broadcast, slice,
+    /// reverse, and gather, which never need element-type dispatch.
     ///
     /// # Parameters
     ///
-    ///   - `output_type`: static array type of the result, which must have the same [`DataType`] as this array.
-    ///   - `index`: mapping from each flat logical output element index to the flat logical input element index whose
+    ///   - `output_type`: Static array type of the result, which must have the same [`DataType`] as this array.
+    ///   - `index`: Mapping from each flat logical output element index to the flat logical input element index whose
     ///     element it copies. Input indices may repeat or be skipped.
     ///
     /// # Errors
     ///
     /// Returns an error if either array type cannot describe materialized storage, if the element data types differ,
     /// or if `index` produces an out-of-bounds input index.
-    pub fn gather_elements(
+    pub fn gather_elements<F: Fn(usize) -> usize>(
         &self,
         output_type: ArrayType,
-        index: impl Fn(usize) -> usize,
+        index: F,
     ) -> Result<Self, ProgramError> {
         if output_type.data_type() != self.r#type.data_type() {
             return Err(TypeError::invalid(format!(
@@ -504,7 +523,8 @@ impl Array {
             let input_element = index(output_element);
             if input_element >= input_addressing.element_count() {
                 return Err(TypeError::invalid(format!(
-                    "gather index {input_element} is out of bounds for {} elements",
+                    "gather index {} is out of bounds for {} elements",
+                    input_element,
                     input_addressing.element_count(),
                 ))
                 .into());
@@ -516,39 +536,7 @@ impl Array {
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
-    /// Returns the row-major payload of this array converted elementwise to `f64`. This is a test-assertion view for
-    /// real-valued arrays (Booleans convert to `0.0`/`1.0` and integers to their exact values where representable),
-    /// and it panics for arrays whose elements cannot be viewed as real numbers (complex, token, and structural-zero
-    /// element data types), because in tests such a failure is the assertion failing.
-    pub fn to_f64s(&self) -> Vec<f64> {
-        let data_type = self.r#type.data_type();
-        if data_type.is_complex() {
-            panic!("cannot view an array of complex element data type `{data_type}` as `f64` values");
-        }
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        (0..addressing.element_count())
-            .map(|index| {
-                data_type.element_as_f64(&self.bytes[addressing.byte_range_for_flat_index(index)]).unwrap_or_else(
-                    || panic!("cannot view an array of element data type `{data_type}` as `f64` values"),
-                )
-            })
-            .collect()
-    }
-
-    /// Returns the number of elements represented by `type`. Panics if the type has dynamic dimensions, so this
-    /// helper is reserved for types of already-materialized values (which are always fully static); kernels that
-    /// materialize values from payload types use [`Array::materialized_element_count`] instead.
-    pub fn element_count(r#type: &ArrayType) -> usize {
-        r#type.element_count().unwrap().unwrap()
-    }
-
-    /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
-    /// therefore cannot be materialized into a concrete payload.
-    pub fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
-        r#type.element_count().map_err(|error| TypeError::invalid(error.to_string()))?.ok_or_else(|| {
-            TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
-        })
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Maps one flat row-major output index to the corresponding flat input index under NumPy-style broadcasting.
     /// Input axes are right-aligned with output axes, and an input extent of one always selects coordinate zero.

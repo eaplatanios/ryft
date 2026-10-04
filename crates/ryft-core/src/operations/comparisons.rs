@@ -481,8 +481,11 @@ impl Compare for Array {
         // mirror the `CompareOperation` type-inference contract, and then compare the promoted elements pairwise.
         // The output type is the Boolean-typed counterpart of the broadcast type.
         let output_type = self.r#type().infer_comparison_output_type(other.r#type().as_ref(), direction)?;
-        let (broadcast_type, inputs) = Self::broadcast_promoted(&[self, other])?;
+        let broadcast_type = ArrayType::broadcasted(&[self.r#type().as_ref(), other.r#type().as_ref()])
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         let data_type = broadcast_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = other.promoted_to(data_type)?;
 
         // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
         if Self::element_count(&output_type) == 0 {
@@ -490,9 +493,8 @@ impl Compare for Array {
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
 
-        // `broadcast_promoted` converts only mismatched inputs, so equal-typed inputs retain their exact physical
-        // storage and are decoded one addressed element at a time by the shared binary loop.
-        let [left, right] = <[_; 2]>::try_from(inputs).unwrap();
+        // Promotion converts only mismatched inputs, preserving the physical storage of equal-typed inputs.
+        // The shared binary loop applies shape broadcasting through indexing, without expanding either input.
         if data_type.is_complex() {
             // The shared inference rule has already restricted complex comparisons to equality and inequality.
             let equal = matches!(direction, ComparisonDirection::Equal);
