@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
@@ -10,22 +12,21 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    MemberDifferentiableOperation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
-use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::{Div, Mul, Rem};
+use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::all_gather::{AllGatherOperation, AllGatherOutputVariance};
 use crate::operations::collectives::parallel_vary::ParallelVary;
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    define_linear_collective_operation, explicit_collective_inputs, forward_explicit_collective,
-    forward_shape_changing_collective, impl_differentiable_linear_collective_operation,
-    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size,
-    validate_explicit_collective_output_extents,
+    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
+    infer_explicit_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
+    jvp_shape_changing_collective_with_adjoint, resolve_named_axis_size, validate_explicit_collective_output_extents,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -36,73 +37,80 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue, RegionInterface, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
+use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ParallelSumScatterOperation`].
 pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 
-define_linear_collective_operation!(
-    /// [`Operation`] that sums every participant's input across the named axis and scatters the sum along
-    /// `scatter_axis`, so that every participant receives only its own chunk of the sum. This is the analogue of
-    /// JAX's [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) and
-    /// of StableHLO's [`reduce_scatter`](https://openxla.org/stablehlo/spec#reduce_scatter) with a sum reduction.
-    /// The [`CollectiveMode`] of its options selects the output shape over a group of `n` participants:
-    ///
-    ///   - [`CollectiveMode::Untiled`] requires `scatter_axis` to have extent `n` and removes it, so that participant
-    ///     `i` receives row `i` of the sum.
-    ///   - [`CollectiveMode::Tiled`] requires the extent of `scatter_axis` to be divisible by `n` and divides it by
-    ///     `n`, so that participant `i` receives the `i`-th contiguous chunk of the sum.
-    ///
-    /// Inputs must be numeric (or structural zeros). Cross-device sums accumulate in the input element type. A
-    /// matching `batch` level uses [`ReductionKind::Sum`] along its local participant axis; when interpreted eagerly
-    /// on [`Array`](crate::Array), this widens narrow floating-point accumulation to `f32` before rounding the
-    /// result back to the input element type. Its rounding can therefore differ from cross-device execution.
-    /// Participant groups (refer to [`CollectiveOptions`]) restrict the sum and the scatter to each group.
-    ///
-    /// Over a manual mesh axis, every participant receives a different chunk, so the input must vary over the axis
-    /// (refer to [`ParallelVary`]) and the output varies over it as well. An input that is instead unreduced over
-    /// the operation's own axis (e.g., the cotangent of a reduced [`AllGatherOperation`] result) has its pending
-    /// cross-device sum completed by the exchange, and its output varies over the axis too. The collective is linear,
-    /// and its transpose is a varying [`AllGatherOperation`] with the same mode, axis, and participant groups. Outside
-    /// any binder, the single participant of a degenerate axis keeps its value, with the size-one scatter axis removed
-    /// in untiled mode.
-    ///
-    /// A matching `batch` level consumes the mapped batch axis by summing over it and mapping the scattered chunks back
-    /// onto it, so that batch item `i` receives chunk `i` of the sum and a value that is the same for every item counts
-    /// once per item. A matching level rejects participant groups, and every `batch` level rejects bounded ragged
-    /// inputs.
-    ParallelSumScatterOperation,
-    PARALLEL_SUM_SCATTER_OPERATION_NAME,
-    fields = {
-        /// Axis of the input along which the summed result is scattered across the participants.
-        scatter_axis: usize,
+/// [`Operation`] that sums every participant's input across the named axis and scatters the sum along `scatter_axis`,
+/// so that every participant receives only its own chunk of the sum. This is the analogue of JAX's
+/// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) and of StableHLO's
+/// [`reduce_scatter`](https://openxla.org/stablehlo/spec#reduce_scatter) with a sum reduction. The [`CollectiveMode`]
+/// of its options selects the output shape over a group of `n` participants:
+///
+///   - [`CollectiveMode::Untiled`] requires `scatter_axis` to have extent `n` and removes it, so that participant
+///     `i` receives row `i` of the sum.
+///   - [`CollectiveMode::Tiled`] requires the extent of `scatter_axis` to be divisible by `n` and divides it by
+///     `n`, so that participant `i` receives the `i`-th contiguous chunk of the sum.
+///
+/// Inputs must be numeric (or structural zeros). Cross-device sums accumulate in the input element type. A
+/// matching `batch` level uses [`ReductionKind::Sum`] along its local participant axis; when interpreted eagerly
+/// on [`Array`](crate::Array), this widens narrow floating-point accumulation to `f32` before rounding the
+/// result back to the input element type. Its rounding can therefore differ from cross-device execution.
+/// Participant groups (refer to [`CollectiveOptions`]) restrict the sum and the scatter to each group.
+///
+/// Over a manual mesh axis, every participant receives a different chunk, so the input must vary over the axis
+/// (refer to [`ParallelVary`]) and the output varies over it as well. An input that is instead unreduced over
+/// the operation's own axis (e.g., the cotangent of a reduced [`AllGatherOperation`] result) has its pending
+/// cross-device sum completed by the exchange, and its output varies over the axis too. The collective is linear,
+/// and its transpose is a varying [`AllGatherOperation`] with the same mode, axis, and participant groups. Outside
+/// any binder, the single participant of a degenerate axis keeps its value, with the size-one scatter axis removed
+/// in untiled mode.
+///
+/// A matching `batch` level consumes the mapped batch axis by summing over it and mapping the scattered chunks back
+/// onto it, so that batch item `i` receives chunk `i` of the sum and a value that is the same for every item counts
+/// once per item. A matching level rejects participant groups, and every `batch` level rejects bounded ragged
+/// inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ParallelSumScatterOperation {
+    /// Axis name referenced by this collective.
+    axis_name: String,
 
-        /// Shared rank and participant-group semantics.
-        options: CollectiveOptions,
-    },
-    // TODO(eaplatanios): Review from here onwards.
-    infer_output_type = |operation, input_type, dimensions| {
-        infer_parallel_sum_scatter_output_type(operation, input_type, dimensions, true)
-    },
-    interpret<C> where C::Value: Reshape {
-        |operation, input| {
-            // A single participant sums only its own value. Untiled mode removes the size-one scatter axis,
-            // which a reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
-            match operation.options.mode {
-                CollectiveMode::Tiled => Ok(input.clone()),
-                CollectiveMode::Untiled => {
-                    let output_type = operation.infer_output_types(&[input.r#type().into_owned()], &[])?.remove(0);
-                    input.reshape_with_output_sharding(output_type.shape().clone(), output_type.sharding().cloned())
-                }
-            }
-        }
-    },
-);
+    /// Number of participants along the named axis, resolved from the active [`NamedAxes`] environment
+    /// when the operation is staged.
+    axis_size: usize,
+
+    /// Axis of the input along which the summed result is scattered across the participants.
+    scatter_axis: usize,
+
+    /// Shared rank and participant-group semantics.
+    options: CollectiveOptions,
+}
 
 impl ParallelSumScatterOperation {
+    /// Creates a new [`ParallelSumScatterOperation`] over the axis with the provided namd and resolved axis size.
+    #[inline]
+    pub fn new(axis_name: String, axis_size: usize, scatter_axis: usize, options: CollectiveOptions) -> Self {
+        Self { axis_name, axis_size, scatter_axis, options }
+    }
+
+    /// Returns the axis name referenced by this collective.
+    #[inline]
+    pub fn axis_name(&self) -> &str {
+        &self.axis_name
+    }
+
+    /// Returns the number of participants along the named axis.
+    #[inline]
+    pub fn axis_size(&self) -> usize {
+        self.axis_size
+    }
+
     /// Returns the axis of the input along which the summed result is scattered across the participants.
     #[inline]
     pub fn scatter_axis(&self) -> usize {
@@ -124,6 +132,114 @@ impl ParallelSumScatterOperation {
     pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
         self.options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size)
     }
+
+    /// Returns the adjoint collective that transposition stages on the output cotangent.
+    #[inline]
+    fn adjoint(&self) -> Result<AllGatherOperation, ProgramError> {
+        Ok(AllGatherOperation::new(
+            self.axis_name.clone(),
+            self.axis_size,
+            self.scatter_axis,
+            self.options.clone(),
+            AllGatherOutputVariance::Varying,
+        ))
+    }
+}
+
+impl Display for ParallelSumScatterOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ParallelSumScatterOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        PARALLEL_SUM_SCATTER_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        check_count!("input", input_types, 1, TypeError);
+
+        // A zero-participant collective is rejected before any extent arithmetic divides by its size.
+        if self.axis_size == 0 {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` axis size must be greater than zero",
+            )));
+        }
+
+        // Result-shape arithmetic in the homogeneous array family requires static extents.
+        // Dynamic geometry uses explicit result extents in the composite array/dimension family.
+        let Some(shape) = input_types[0].static_shape() else {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
+            )));
+        };
+
+        let dimensions = shape.dimensions().to_vec();
+        // TODO(eaplatanios): Review from here onwards.
+        Ok(vec![infer_parallel_sum_scatter_output_type(self, &input_types[0], dimensions, true)?])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            operation.field("axis_size", &self.axis_size)?;
+            operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
+            operation.field("options", format_args!("{:?}", &self.options))?;
+            Ok(())
+        })
+    }
+}
+
+impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ParallelSumScatterOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        // Eager binding does not infer output types, so interpretation validates the shared input contract
+        // and the operation payload before applying either degenerate-axis rule.
+        check_count!("input", inputs, 1, ProgramError);
+
+        // Outside any binder, only the degenerate single-participant axis has defined per-item semantics.
+        // Any larger axis is an error because the other participants do not exist per item.
+        if self.axis_size > 1 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_name, self.axis_size,
+                ),
+            });
+        }
+
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
+        let input = &inputs[0];
+
+        // A single participant sums only its own value. Untiled mode removes the size-one scatter axis,
+        // which a reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
+        Ok(vec![match self.options.mode {
+            CollectiveMode::Tiled => input.clone(),
+            CollectiveMode::Untiled => {
+                input.reshape_with_output_sharding(output_type.shape().clone(), output_type.sharding().cloned())?
+            }
+        }])
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>> PartiallyEvaluatableOperation<C>
+    for ParallelSumScatterOperation
+{
 }
 
 // Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by summing
@@ -131,10 +247,9 @@ impl ParallelSumScatterOperation {
 // `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of
 // the sum. A non-matching level forwards the collective to the parent context, unchanged for a replicated input
 // (through `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
-impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for ParallelSumScatterOperation
+impl<C: Context<Type = ArrayType>, P: CollectiveArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelSumScatterOperation
 where
-    C: Context<Type = ArrayType>,
     C::Operation: From<ParallelSumScatterOperation>,
     <C as Domain>::Value: Reduce + Transpose,
 {
@@ -179,25 +294,151 @@ where
     }
 }
 
-// Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
-// same mode, axis, and participant groups, so the input cotangent is an [`AllGatherOperation`] of the output cotangent.
-impl_differentiable_linear_collective_operation! {
-    ParallelSumScatterOperation,
-    transpose = |operation| -> AllGatherOperation {
-        AllGatherOperation::new(
-            operation.axis_name.clone(),
-            operation.axis_size,
-            operation.scatter_axis,
-            operation.options.clone(),
-            AllGatherOutputVariance::Varying,
-        )
-    },
+impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>> DifferentiableOperation<C>
+    for ParallelSumScatterOperation
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let mut primals = context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
+        check_count!("output", primals, 1, ProgramError);
+        let primal = primals.remove(0);
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+            MaybeZero::Value(tangent) => {
+                let mut tangents = context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
+                check_count!("output", tangents, 1, ProgramError);
+                MaybeZero::Value(tangents.remove(0))
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
 }
 
-impl_shape_changing_collective_member_operation!(
-    ParallelSumScatterOperation,
-    infer_explicit_parallel_sum_scatter_output_types
-);
+// Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
+// same mode, axis, and participant groups, so the input cotangent is an [`AllGatherOperation`] of the output cotangent.
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ParallelSumScatterOperation
+where
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<AllGatherOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+        // Only a live output cotangent of an unknown input stages the adjoint collective.
+        let adjoint = self.adjoint()?;
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return Ok(());
+        };
+        if inputs[0].is_known() {
+            return Ok(());
+        }
+        let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
+        check_count!("output", contributions, 1, ProgramError);
+        accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
+        Ok(())
+    }
+}
+
+impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
+    fn infer_parent_region_input_types(
+        &self,
+        _input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        Ok(vec![None; region_interfaces.len()])
+    }
+
+    fn infer_parent_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        infer_explicit_parallel_sum_scatter_output_types(self, input_types)
+    }
+
+    fn rename_parent_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<DimensionVariable>,
+    ) -> Result<Self, TypeError> {
+        self.rename_type_identities(renaming)
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType>> MemberInterpretableOperation<C> for ParallelSumScatterOperation
+where
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+{
+    fn interpret_in_parent<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let Some((input, output_extents)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        };
+        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+        let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
+            (0..input.r#type().rank())
+                .map(|axis| input.dimension_size(axis).map(Dimension::Static))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&concrete_input_type), &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = output_types.remove(0);
+        let expected_extents = output_type.static_shape().ok_or_else(|| {
+            TypeError::invalid(format!("`{}` could not resolve its concrete output shape", self.name()))
+        })?;
+        if output_extents.len() != expected_extents.rank() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: 1 + expected_extents.rank(),
+                actual: inputs.len(),
+            });
+        }
+        for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
+            let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
+            if actual != *expected {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{}` output axis {axis} extent must equal observed result extent {expected} but got \
+                         {actual}",
+                        self.name(),
+                    ),
+                });
+            }
+        }
+        let effective_axis_size = self.effective_axis_size()?;
+        if effective_axis_size != 1 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                    self.name(),
+                    self.axis_name(),
+                    effective_axis_size,
+                ),
+            });
+        }
+        let output = match self.options().mode() {
+            CollectiveMode::Tiled => input,
+            CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
+        };
+        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
+    }
+}
 
 // Batching rule for explicit-extent [`ParallelSumScatterOperation`]. The explicit result extents remain the only
 // source for dynamic reshape geometry while matching-axis array mechanics reuse the homogeneous collective kernel.
