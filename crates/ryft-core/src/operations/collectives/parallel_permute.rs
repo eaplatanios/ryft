@@ -307,11 +307,9 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents the ability to shuffle values across the participants of a named axis by listing, for every output
-/// participant, the participant whose value it receives. This is the Ryft analogue of JAX's
-/// [`pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it stages a
+/// Represents the ability to shuffle values across the participants of a named axis by listing,
+/// for every output participant, the participant whose value it receives. This is the Ryft analogue of JAX's
+/// [`jax.lax.pshuffle`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pshuffle.html), and it stages a
 /// [`ParallelPermuteOperation`] with the pair `(permutation[target], target)` for every target through
 /// [`ParallelPermute`], whose manual-axis behavior therefore applies to shuffles as well.
 pub trait ParallelShuffle: Sized {
@@ -322,27 +320,28 @@ pub trait ParallelShuffle: Sized {
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `permutation`: Source participant of every output participant, which must be a permutation of
-    ///     `0..permutation.len()`.
+    ///   - `permutation`: Source participant of every output participant, which must be a permutation
+    ///     of `0..permutation.len()`.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if `permutation` is not a permutation of `0..permutation.len()`, and any error of
-    /// [`ParallelPermute::parallel_permute`] otherwise (e.g., when `permutation` is longer than the axis).
+    /// Returns a [`ProgramError`] if `permutation` is not a permutation of `0..permutation.len()`, and any error
+    /// of [`ParallelPermute::parallel_permute`] otherwise (e.g., when `permutation` is longer than the axis).
     fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError>;
 }
 
-// A composite value shuffles through its array view, so that every shuffle shares the staging path of
-// `ParallelPermute`.
-impl<V> ParallelShuffle for V
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    ParallelShuffle for V
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
     ProjectedValue<ArrayType, V>: ParallelShuffle,
 {
+    #[inline]
     fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
-        let shuffled =
-            ValueProjection::<ArrayType>::into_projected(self.clone())?.parallel_shuffle(axis_name, permutation)?;
-        Ok(V::from_projected(shuffled))
+        // A composite value shuffles through its array view, so that every shuffle shares the staging path
+        // of `ParallelPermute`.
+        Ok(V::from_projected(
+            ValueProjection::<ArrayType>::into_projected(self.clone())?.parallel_shuffle(axis_name, permutation)?,
+        ))
     }
 }
 
@@ -355,7 +354,8 @@ where
         for &source in permutation {
             let Some(source_seen) = seen.get_mut(source) else {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_shuffle` source index {source} is out of bounds for a permutation of length {}",
+                    "`parallel_shuffle` source index {} is out of bounds for a permutation of length {}",
+                    source,
                     permutation.len(),
                 ))
                 .into());
@@ -372,10 +372,10 @@ where
     }
 }
 
-/// Returns `value` with its slices along `axis` routed from their source positions to their target positions: slice
-/// `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when `sources[target]` is `None`.
-/// The result has `sources.len()` slices along `axis` and otherwise the shape of `value`. For example, routing the rows
-/// `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
+/// Returns `value` with its slices along `axis` routed from their source positions to their target positions.
+/// Specifically, slice `target` of the result is slice `sources[target]` of `value`, or a slice of zeros when
+/// `sources[target]` is `None`. The result has `sources.len()` slices along `axis` and otherwise the shape of `value`.
+/// For example, routing the rows `[a, b, c]` with `sources = [None, Some(0), Some(1)]` yields `[0, a, b]`.
 ///
 /// The batching rule of [`ParallelPermuteOperation`] applies this function along the batch axis, where every slice is
 /// one batch item, both to the packed values and to the extents of their bounded ragged axes, so that the extents move
@@ -383,8 +383,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns a [`BatchingError`] if `value` is not statically shaped, or if staging one of the slices, the zero slice, or
-/// the concatenation fails.
+/// Returns a [`BatchingError`] if `value` is not statically shaped, or if staging one of the slices, the zero slice,
+/// or the concatenation fails.
 fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice + Transpose>(
     value: &V,
     axis: usize,
@@ -915,7 +915,8 @@ mod tests {
                 varying.clone(),
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] .
-                    let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
+                    let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %0
                     in (%1)"
                 },
             ),
@@ -923,8 +924,10 @@ mod tests {
                 invariant,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, []}] .
-                    let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
-                        %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %1
+                    let %1:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
+                            parallel_vary [axis_name=\"x\"] %0
+                        %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
+                            parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %1
                     in (%2)"
                 },
             ),
@@ -936,8 +939,10 @@ mod tests {
                         output_type=f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, []}],
                         output_axes=[],
                     ] %0
-                        %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %1
-                        %3:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %2
+                        %2:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
+                            parallel_vary [axis_name=\"x\"] %1
+                        %3:f32[][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [], varying_manual={'x'}}] = \
+                            parallel_permute [axis_name=\"x\", axis_size=2, source_target_pairs=[(0, 1)]] %2
                     in (%3)"
                 },
             ),
@@ -955,8 +960,8 @@ mod tests {
 
     #[test]
     fn test_parallel_shuffle_parallel_shuffle() {
-        // A composite value shuffles through its array view: output item `i` receives input item `permutation[i]`, and
-        // a permutation shorter than the axis gives every remaining item zeros.
+        // A composite value shuffles through its array view: output item `i` receives input item `permutation[i]`,
+        // and a permutation shorter than the axis gives every remaining item zeros.
         let shuffle = |permutation: &[usize]| {
             let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
                 EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
