@@ -8,7 +8,7 @@ use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
-use crate::operations::collectives::parallel_vary::ParallelVary;
+use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     define_linear_collective_operation, impl_differentiable_linear_collective_operation,
     infer_linear_collective_operation_output_type, resolve_named_axis_size,
@@ -19,34 +19,32 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::programs::{Operation, ProgramError, ProjectedValue, TypeError, Typed, Value, ValueProjection};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ParallelPermuteOperation`].
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 
 define_linear_collective_operation!(
     /// [`Operation`] that sends every participant's input to another participant along the named axis, according to
-    /// explicit `(source, target)` pairs: the input of participant `source` becomes the output of participant
-    /// `target`. Sources must be unique, targets must be unique, and both must lie in `0..axis_size`. Participants that
-    /// no pair targets receive zeros, and the output type is the input type. This is the analogue of
-    /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
-    /// [StableHLO's `collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
+    /// explicit `(source, target)` pairs. The input of participant `source` becomes the output of participant `target`.
+    /// Sources must be unique, targets must be unique, and both must lie in `0..axis_size`. Participants that no pair
+    /// targets receive zeros, and the output type is the input type. This is the Ryft analogue of JAX's
+    /// [`jax.lax.ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and StableHLO's
+    /// [`collective_permute`](https://openxla.org/stablehlo/spec#collective_permute).
     ///
     /// Over a manual mesh axis, a permutation generally gives the participants different values, so the input must
     /// vary over the axis (refer to [`ParallelVary`]) and the output varies over it as well. The collective is linear
     /// and its transpose is the permutation with every pair inverted. Outside any binder, the single participant of a
     /// degenerate axis keeps its value when the pair `(0, 0)` is present and receives zeros otherwise.
     ///
-    /// A matching `batch` level consumes the mapped batch axis by reassembling it in target order from per-item
-    /// slices, with zero slices at untargeted positions, and passes a replicated input through unchanged when every
-    /// position is targeted. Unlike JAX's batching rule, which requires a full permutation, partial permutations are
-    /// supported. Bounded ragged extents follow the same source-to-target routing as their packed values, and
-    /// untargeted participants receive zero extents together with their zero-filled values.
+    /// A matching `batch` level consumes the mapped batch axis by reassembling it in target order from per-item slices,
+    /// with zero slices at untargeted positions, and passes a replicated input through unchanged when every position is
+    /// targeted. Unlike JAX's batching rule, which requires a full permutation, partial permutations are supported.
+    /// Bounded ragged extents follow the same source-to-target routing as their packed values, and untargeted
+    /// participants receive zero extents together with their zero-filled values.
     ParallelPermuteOperation,
     PARALLEL_PERMUTE_OPERATION_NAME,
     fields = {
-        /// Pairs of `(source, target)` positions along the named axis: the value of participant `source` is sent to
-        /// participant `target`.
+        /// Pairs of `(source, target)` positions along the named axis. For each pair, the value of participant `source`
+        /// is sent to participant `target`.
         source_target_pairs: Vec<(usize, usize)>,
     },
     check_array_types = [@no_unreduced],
@@ -56,7 +54,10 @@ define_linear_collective_operation!(
         for &(source, target) in &operation.source_target_pairs {
             if source >= operation.axis_size || target >= operation.axis_size {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_PERMUTE_OPERATION_NAME}` pair ({source}, {target}) is out of bounds for axis size {}",
+                    "`{}` pair ({}, {}) is out of bounds for axis size {}",
+                    PARALLEL_PERMUTE_OPERATION_NAME,
+                    source,
+                    target,
                     operation.axis_size,
                 )));
             }
@@ -75,21 +76,26 @@ define_linear_collective_operation!(
             && !sharding.varying_manual_axes().contains(&operation.axis_name)
         {
             return Err(TypeError::invalid(format!(
-                "`{PARALLEL_PERMUTE_OPERATION_NAME}` input must vary over manual axis `{}`; pass an invariant value \
-                 through `parallel_vary` first so that the permuted output is typed as varying",
+                "`{}` input must vary over manual axis `{}`; pass an invariant value \
+                 through `{}` first so that the permuted output is typed as varying",
+                PARALLEL_PERMUTE_OPERATION_NAME,
                 operation.axis_name,
+                PARALLEL_VARY_OPERATION_NAME,
             )));
         }
+
         infer_linear_collective_operation_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
     },
     interpret<C> where C::Value: ZeroLike {
         |operation, input| {
-            // With one participant, the only valid pairs are none at all and `(0, 0)`. Without a pair, nothing targets
-            // the participant, so it receives zeros.
+            // With one participant, the only valid pairs are none at all and `(0, 0)`.
+            // Without a pair, nothing targets the participant, so it receives zeros.
             if operation.source_target_pairs.is_empty() { input.zero_like() } else { Ok(input.clone()) }
         }
     },
 );
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ParallelPermuteOperation {
     /// Returns the `(source, target)` pairs of participant positions along the named axis.
