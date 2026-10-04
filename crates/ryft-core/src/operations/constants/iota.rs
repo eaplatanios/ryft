@@ -210,7 +210,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
             .map(|dimension| {
                 dimension.value().ok_or_else(|| {
                     TypeError::invalid(format!(
-                        "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
+                        "cannot materialize an iota of dynamically sized type `{type}`; stage it in an array program \
                          over `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per \
                          dynamic axis",
                     ))
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(
             context.iota(&dynamic_type, 0),
             Err(ProgramError::Type(TypeError::invalid(
-                "cannot materialize an iota of dynamically sized type f32[size]; stage it in an array program over \
+                "cannot materialize an iota of dynamically sized type `f32[size]`; stage it in an array program over \
                  `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per dynamic axis",
             ))),
         );
@@ -627,7 +627,7 @@ mod tests {
         );
         assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),
-            "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
+            "cannot materialize an iota of dynamically sized type `f64[dynamic, 3]`; stage it in an array program over \
              `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per dynamic axis",
         );
     }

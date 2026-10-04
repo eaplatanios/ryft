@@ -424,7 +424,7 @@ macro_rules! impl_codec_for_signed_sub_byte_integer_type {
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::BIT_MASK != 0 {
                     return Err(TypeError::invalid(format!(
-                        "byte {:#04x} is not a valid {} array-element encoding",
+                        "byte {:#04x} is not a valid `{}` array-element encoding",
                         bits,
                         DataType::$data_type,
                     )));
@@ -556,7 +556,7 @@ macro_rules! impl_unsigned_sub_byte_array_element {
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::BIT_MASK != 0 {
                     return Err(TypeError::invalid(format!(
-                        "byte {:#04x} is not a valid {} array-element encoding",
+                        "byte {:#04x} is not a valid `{}` array-element encoding",
                         bits,
                         DataType::$data_type,
                     )));
@@ -1161,7 +1161,7 @@ macro_rules! impl_codec_for_sub_byte_low_precision_floating_point_type {
             pub fn from_bits(bits: u8) -> Result<Self, TypeError> {
                 if bits & !Self::FORMAT.bit_mask() != 0 {
                     return Err(TypeError::invalid(format!(
-                        "byte {bits:#04x} is not a valid {} array-element encoding",
+                        "byte {bits:#04x} is not a valid `{}` array-element encoding",
                         Self::FORMAT.data_type,
                     )));
                 }
@@ -2870,7 +2870,7 @@ pub(crate) fn validate_element_bytes(data_type: DataType, element: usize, bytes:
     };
     if !valid {
         return Err(TypeError::invalid(format!(
-            "array element {element} has invalid {data_type} byte encoding {bytes:?}",
+            "array element {element} has invalid `{data_type}` byte encoding {bytes:?}",
         ))
         .into());
     }
@@ -3985,27 +3985,27 @@ mod tests {
 
         assert!(matches!(
             i1::from_bits(0x02),
-            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid i1 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid `i1` array-element encoding",
         ));
         assert!(matches!(
             u1::from_bits(0x02),
-            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid u1 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0x02 is not a valid `u1` array-element encoding",
         ));
         assert!(matches!(
             i2::from_bits(0x04),
-            Err(TypeError::Invalid { message }) if message == "byte 0x04 is not a valid i2 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0x04 is not a valid `i2` array-element encoding",
         ));
         assert!(matches!(
             u2::from_bits(0xff),
-            Err(TypeError::Invalid { message }) if message == "byte 0xff is not a valid u2 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0xff is not a valid `u2` array-element encoding",
         ));
         assert!(matches!(
             i4::from_bits(0x10),
-            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid i4 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid `i4` array-element encoding",
         ));
         assert!(matches!(
             u4::from_bits(0x10),
-            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid u4 array-element encoding",
+            Err(TypeError::Invalid { message }) if message == "byte 0x10 is not a valid `u4` array-element encoding",
         ));
     }
 
@@ -4199,17 +4199,17 @@ mod tests {
         assert!(matches!(
             f4e2m1fn::from_bits(0x10),
             Err(TypeError::Invalid { message })
-                if message == "byte 0x10 is not a valid f4e2m1fn array-element encoding",
+                if message == "byte 0x10 is not a valid `f4e2m1fn` array-element encoding",
         ));
         assert!(matches!(
             f6e2m3fn::from_bits(0x40),
             Err(TypeError::Invalid { message })
-                if message == "byte 0x40 is not a valid f6e2m3fn array-element encoding",
+                if message == "byte 0x40 is not a valid `f6e2m3fn` array-element encoding",
         ));
         assert!(matches!(
             f6e3m2fn::from_bits(0xff),
             Err(TypeError::Invalid { message })
-                if message == "byte 0xff is not a valid f6e3m2fn array-element encoding",
+                if message == "byte 0xff is not a valid `f6e3m2fn` array-element encoding",
         ));
     }
 
@@ -4532,7 +4532,7 @@ mod tests {
         assert!(matches!(
             encode_logical_bytes(&booleans, &[0, 2]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 1 has invalid bool byte encoding [2]",
+                if message == "array element 1 has invalid `bool` byte encoding [2]",
         ));
 
         let narrow = ArrayType::scalar(DataType::I2);
@@ -4540,21 +4540,21 @@ mod tests {
         assert!(matches!(
             encode_logical_bytes(&narrow, &[0b100]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 0 has invalid i2 byte encoding [4]",
+                if message == "array element 0 has invalid `i2` byte encoding [4]",
         ));
         let low_precision = ArrayType::scalar(DataType::F4E2M1FN);
         assert_eq!(encode_logical_bytes(&low_precision, &[0b1111]), Ok(vec![0b1111]));
         assert!(matches!(
             encode_logical_bytes(&low_precision, &[0b1_0000]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 0 has invalid f4e2m1fn byte encoding [16]",
+                if message == "array element 0 has invalid `f4e2m1fn` byte encoding [16]",
         ));
         let six_bit = ArrayType::scalar(DataType::F6E2M3FN);
         assert_eq!(encode_logical_bytes(&six_bit, &[0b11_1111]), Ok(vec![0b11_1111]));
         assert!(matches!(
             encode_logical_bytes(&six_bit, &[0b100_0000]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 0 has invalid f6e2m3fn byte encoding [64]",
+                if message == "array element 0 has invalid `f6e2m3fn` byte encoding [64]",
         ));
 
         assert!(matches!(

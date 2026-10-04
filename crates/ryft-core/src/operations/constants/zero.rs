@@ -547,7 +547,7 @@ mod tests {
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f32[size]; dynamically shaped \
+                if message == "cannot materialize a value of dynamically sized type `f32[size]`; dynamically shaped \
                                values exist only in array programs over `ArrayIrOperation`",
         ));
 
@@ -594,7 +594,7 @@ mod tests {
                 Dimension::Static(3),
             ]),
         );
-        let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]; dynamically \
+        let expected_message = "cannot materialize a value of dynamically sized type `f64[dynamic, 3]`; dynamically \
                                 shaped values exist only in array programs over `ArrayIrOperation`";
         assert!(matches!(
             context.zero(&dynamic_type),

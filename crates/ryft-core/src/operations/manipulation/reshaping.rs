@@ -2718,7 +2718,7 @@ mod tests {
         assert_eq!(
             ArrayType::new(DataType::F64, huge_shape.clone()).reshape(Shape::new(vec![Dimension::Static(2)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{}` input shape [{}, 2] element count does not fit in usize",
+                "`{}` input shape [{}, 2] element count does not fit in `usize`",
                 RESHAPE_OPERATION_NAME,
                 usize::MAX,
             )))),
@@ -2726,7 +2726,7 @@ mod tests {
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).reshape(huge_shape),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{}` output shape [{}, 2] element count does not fit in usize",
+                "`{}` output shape [{}, 2] element count does not fit in `usize`",
                 RESHAPE_OPERATION_NAME,
                 usize::MAX,
             )))),

@@ -1031,7 +1031,7 @@ mod tests {
                 Array::new(ArrayType::new_static($data_type, [1]), vec![$invalid_byte]),
                 Err(ProgramError::Type(TypeError::Invalid { message }))
                     if message == format!(
-                        "array element 0 has invalid {} byte encoding [{}]",
+                        "array element 0 has invalid `{}` byte encoding [{}]",
                         $data_type,
                         $invalid_byte,
                     ),
@@ -1143,7 +1143,7 @@ mod tests {
         assert!(matches!(
             Array::new(ArrayType::scalar(DataType::Boolean), vec![2]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 0 has invalid bool byte encoding [2]",
+                if message == "array element 0 has invalid `bool` byte encoding [2]",
         ));
 
         // Dynamically shaped types cannot describe materialized storage.
@@ -1154,7 +1154,7 @@ mod tests {
         assert!(matches!(
             Array::new(dynamic_type, Vec::new()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type u8[dynamic]; dynamically \
+                if message == "cannot materialize a value of dynamically sized type `u8[dynamic]`; dynamically \
                                shaped values exist only in array programs over `ArrayIrOperation`",
         ));
     }
@@ -1191,7 +1191,7 @@ mod tests {
         assert!(matches!(
             Array::from_elements(dynamic_type, &[1.0f64]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f64[dynamic]; dynamically \
+                if message == "cannot materialize a value of dynamically sized type `f64[dynamic]`; dynamically \
                                shaped values exist only in array programs over `ArrayIrOperation`",
         ));
     }
@@ -1392,7 +1392,7 @@ mod tests {
         assert!(matches!(
             Array::from_logical_bytes(ArrayType::scalar(DataType::Boolean), &[2]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 0 has invalid bool byte encoding [2]",
+                if message == "array element 0 has invalid `bool` byte encoding [2]",
         ));
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
         assert!(matches!(
             Array::element_count(&ArrayType::new_static(DataType::F32, [usize::MAX, 2])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
+                if message == format!("shape [{}, 2] element count does not fit in `usize`", usize::MAX),
         ));
     }
 

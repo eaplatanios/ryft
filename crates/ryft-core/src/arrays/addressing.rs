@@ -30,7 +30,7 @@ impl ArrayAddressing {
     pub fn new(r#type: ArrayType) -> Result<Self, ProgramError> {
         if r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
             return Err(TypeError::invalid(format!(
-                "cannot materialize a value of dynamically sized type {}; dynamically shaped values exist only in \
+                "cannot materialize a value of dynamically sized type `{}`; dynamically shaped values exist only in \
                  array programs over `ArrayIrOperation`",
                 r#type,
             ))
@@ -821,7 +821,7 @@ mod tests {
         assert!(matches!(
             booleans.validate_storage_bytes(&[0, 2]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array element 1 has invalid bool byte encoding [2]",
+                if message == "array element 1 has invalid `bool` byte encoding [2]",
         ));
 
         let mut index = vec![0, 0];
@@ -885,7 +885,7 @@ mod tests {
         assert!(matches!(
             ArrayAddressing::new(dynamic),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f32[dynamic]; dynamically \
+                if message == "cannot materialize a value of dynamically sized type `f32[dynamic]`; dynamically \
                                shaped values exist only in array programs over `ArrayIrOperation`",
         ));
         let oversized = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(usize::MAX)]));

@@ -57,7 +57,7 @@ impl<L: ArrayElement, O: Operation<Type = ArrayType>> Fill<L, Array> for EagerCo
     fn fill(&self, r#type: &ArrayType, value: L) -> Result<Array, ProgramError> {
         if r#type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
-                "cannot materialize a value of dynamically sized type {}; stage a rank-zero fill \
+                "cannot materialize a value of dynamically sized type `{}`; stage a rank-zero fill \
                  and expand it with a dynamic `{BROADCAST_OPERATION_NAME}` operation instead",
                 r#type,
             ))
@@ -356,7 +356,7 @@ mod tests {
         assert!(matches!(
             context.fill(&dynamic_type, 1.0f32),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f32[size]; stage a rank-zero \
+                if message == "cannot materialize a value of dynamically sized type `f32[size]`; stage a rank-zero \
                                fill and expand it with a dynamic `broadcast` operation instead",
         ));
     }

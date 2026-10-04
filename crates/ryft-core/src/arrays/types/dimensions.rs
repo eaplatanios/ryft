@@ -748,7 +748,7 @@ impl Shape {
             match dimension {
                 Dimension::Static(extent) => {
                     count = count.checked_mul(*extent).ok_or_else(|| {
-                        TypeError::invalid(format!("shape {self} element count does not fit in usize"))
+                        TypeError::invalid(format!("shape {self} element count does not fit in `usize`"))
                     })?;
                 }
                 Dimension::Dynamic(_) => return Ok(None),
@@ -1397,7 +1397,7 @@ mod tests {
         );
         assert_eq!(
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]).element_count(),
-            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
+            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in `usize`", usize::MAX))),
         );
     }
 

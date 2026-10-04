@@ -2510,7 +2510,7 @@ mod tests {
                 if message == format!(
                     "mapped batching of a `{BROADCAST_OPERATION_NAME}` with an explicit strided output layout requires \
                      static output extents to derive the batch stride: cannot materialize a value of dynamically \
-                     sized type f64[extent][layout=strided{{8}}]; dynamically shaped values exist only in array \
+                     sized type `f64[extent][layout=strided{{8}}]`; dynamically shaped values exist only in array \
                      programs over `ArrayIrOperation`",
                 ),
         ));
@@ -3364,7 +3364,7 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "shape [{}, 2] element count does not fit in usize",
+                "shape [{}, 2] element count does not fit in `usize`",
                 usize::MAX,
             )))),
         );

@@ -1368,7 +1368,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&state_type), &[]),
-            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
+            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in `usize`", usize::MAX))),
         );
         let operation = RngBitGeneratorOperation::<ArrayType>::new(
             RandomAlgorithm::ThreeFry,
