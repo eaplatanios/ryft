@@ -331,6 +331,69 @@ fn infer_linear_collective_operation_output_type(
         .with_memory(input_type.memory()))
 }
 
+/// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the collective, used in diagnostics.
+///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (e.g., a sum-scatter,
+///     which completes the pending reduction as part of its exchange).
+///   - `input_types`: Array input type followed by one explicit extent type per output axis.
+///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
+///   - `unchanged_input_axes`: For every output axis, the input axis whose extent it must preserve, if any.
+///   - `validate_exact_extents_fn`: Collective-specific validation of the explicit extents against the array input.
+fn infer_explicit_shape_changing_collective_output_type<
+    F: FnOnce(&ArrayType, &[Dimension]) -> Result<(), TypeError>,
+>(
+    operation_name: &'static str,
+    accepts_unreduced: bool,
+    input_types: &[ArrayIrType],
+    base_output_type: ArrayType,
+    unchanged_input_axes: &[Option<usize>],
+    validate_exact_extents_fn: F,
+) -> Result<Vec<ArrayIrType>, TypeError> {
+    let expected = 1 + base_output_type.rank();
+    check_count!("input", input_types, expected, TypeError);
+
+    let input_type = <&ArrayType>::try_from(&input_types[0])?;
+    if !accepts_unreduced && !input_type.unreduced_axes().is_empty() {
+        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
+    }
+
+    let output_extents = ArrayIrType::extents(&input_types[1..])?;
+    if unchanged_input_axes.len() != output_extents.len() {
+        return Err(TypeError::invalid(format!(
+            "`{}` internal output-axis mapping has length {} but the result rank is {}",
+            operation_name,
+            unchanged_input_axes.len(),
+            output_extents.len(),
+        )));
+    }
+
+    for (output_axis, (&input_axis, output_extent)) in unchanged_input_axes.iter().zip(&output_extents).enumerate() {
+        let Some(input_axis) = input_axis else { continue };
+        let input_extent = input_type.shape().dimensions().get(input_axis).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "`{}` unchanged output axis {} references input axis {}, which is out of bounds for rank {}",
+                operation_name,
+                output_axis,
+                input_axis,
+                input_type.rank(),
+            ))
+        })?;
+
+        if output_extent != input_extent {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged input axis \
+                 {input_axis} extent {input_extent}",
+            )));
+        }
+    }
+
+    validate_exact_extents_fn(input_type, output_extents.as_slice())?;
+    Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
+}
+
 // TODO(eaplatanios): Review form here onwards.
 
 /// Defines the structural implementations shared by the single-input linear collectives (e.g., `all_gather` and
@@ -553,8 +616,6 @@ macro_rules! define_linear_collective_operation {
     };
 }
 
-use define_linear_collective_operation;
-
 /// Implements the forward-mode differentiation (i.e., Jacobian-Vector Product, or JVP) and primitive transposition
 /// rules of a collective defined by [`define_linear_collective_operation!`]. Linear collectives need only declare their
 /// adjoint collective, and the macro generates the rest:
@@ -674,60 +735,7 @@ macro_rules! impl_differentiable_linear_collective_operation {
     };
 }
 
-use impl_differentiable_linear_collective_operation;
-
-/// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (e.g., a sum-scatter, which
-///     completes the pending reduction as part of its exchange).
-///   - `input_types`: Array input type followed by one explicit extent type per output axis.
-///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
-///   - `unchanged_input_axes`: For every output axis, the input axis whose extent it must preserve, if any.
-///   - `validate_exact_extents`: Collective-specific validation of the explicit extents against the array input.
-fn infer_explicit_shape_changing_collective_output_type(
-    operation_name: &'static str,
-    accepts_unreduced: bool,
-    input_types: &[ArrayIrType],
-    base_output_type: ArrayType,
-    unchanged_input_axes: &[Option<usize>],
-    validate_exact_extents: impl FnOnce(&ArrayType, &[Dimension]) -> Result<(), TypeError>,
-) -> Result<Vec<ArrayIrType>, TypeError> {
-    let expected = 1 + base_output_type.rank();
-    check_count!("input", input_types, expected, TypeError);
-    let input_type = <&ArrayType>::try_from(&input_types[0])?;
-    if !accepts_unreduced && !input_type.unreduced_axes().is_empty() {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
-    }
-    let output_extents = ArrayIrType::extents(&input_types[1..])?;
-    if unchanged_input_axes.len() != output_extents.len() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` internal output-axis mapping has length {} but the result rank is {}",
-            unchanged_input_axes.len(),
-            output_extents.len(),
-        )));
-    }
-    for (output_axis, (&input_axis, output_extent)) in unchanged_input_axes.iter().zip(&output_extents).enumerate() {
-        let Some(input_axis) = input_axis else { continue };
-        let input_extent = input_type.shape().dimensions().get(input_axis).ok_or_else(|| {
-            TypeError::invalid(format!(
-                "`{operation_name}` unchanged output axis {output_axis} references input axis {input_axis}, which is \
-                 out of bounds for rank {}",
-                input_type.rank(),
-            ))
-        })?;
-        if output_extent != input_extent {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` output axis {output_axis} extent {output_extent} must equal unchanged input axis \
-                 {input_axis} extent {input_extent}",
-            )));
-        }
-    }
-    validate_exact_extents(input_type, output_extents.as_slice())?;
-    Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
-}
+use {define_linear_collective_operation, impl_differentiable_linear_collective_operation};
 
 /// Representation boundary used only by shape-changing collective batching rules.
 ///
