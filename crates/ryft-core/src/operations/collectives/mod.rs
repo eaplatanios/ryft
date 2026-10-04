@@ -482,8 +482,7 @@ fn infer_array_ir_shape_changing_collective_output_type(
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
-// TODO(eaplatanios): Review form here onwards.
-
+// TODO(eaplatanios): Move this to right after `impl Debug for CollectiveOptions`.
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Each carries
 /// the referenced axis name, the participant count resolved from the active [`NamedAxes`] environment, and, when it
@@ -530,17 +529,13 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     /// whose transpose selects a participant-indexed chunk instead).
     fn adjoint(&self, input_type: &ArrayType) -> Result<Self::Adjoint, ProgramError>;
 
-    /// Returns this collective with its array axes moved past the mapped batch axis at position `batch_axis` of the
+    /// Returns this collective with its array axes adjusted around the mapped batch axis at `input_batch_axis` in the
     /// physical input of a `batch` level that does not bind its named axis, together with the position of the mapped
     /// batch axis in the physical result.
-    fn forwarded(&self, batch_axis: usize) -> (Self, usize);
+    fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize);
 
-    /// Validates the input contract that every linear collective shares (i.e., no regions, a nonzero axis size, and
+    /// Validates the input contract that every linear collective shares (i.e., no regions, a non-zero axis size, and
     /// exactly one input) and returns that input's type.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] if any part of that contract is violated.
     fn check_input<'o>(
         &self,
         input_types: &'o [ArrayType],
@@ -557,12 +552,17 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         Ok(&input_types[0])
     }
 
-    /// Checks that this collective has defined semantics outside any binder. Only a collective whose instances each
-    /// combine a single participant does, because the other participants do not exist per item.
+    /// Checks whether this collective can be evaluated locally, without an enclosing binder that supplies its
+    /// participants. Each participant group must contain only one participant; a larger group requires values
+    /// from other participants that evaluating one array in isolation cannot provide.
+    ///
+    /// This single-participant case is called degenerate because no exchange between participants is needed. The
+    /// function only validates that condition; the caller computes the local result, which may still change the shape
+    /// (e.g., an untiled all-gather inserts a size-one array axis).
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if the participant groups are invalid or combine more than one participant.
+    /// Returns a [`ProgramError`] if the participant groups are invalid or require more than one participant per group.
     fn check_degenerate_interpretation(&self) -> Result<(), ProgramError> {
         let effective_axis_size = self.effective_axis_size()?;
         if effective_axis_size > 1 {
@@ -578,9 +578,16 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         Ok(())
     }
 
-    /// Rejects consuming this collective at a `batch` level that binds its axis name when the collective exchanges
-    /// values over a manual mesh axis, because a mesh exchange requires devices, even when the batch axis shadows the
-    /// mesh axis.
+    /// Rejects replacing a manual mesh collective with local array operations at a `batch` level that binds its axis
+    /// name. A matching batch level normally implements the collective by rearranging or reducing the elements of its
+    /// batch dimension. A collective carrying a [`mesh`](Self::mesh) instead describes communication between devices,
+    /// which those local batch elements cannot stand in for.
+    ///
+    /// For example, a local batch axis named `devices` cannot take over an exchange across a manual mesh axis also
+    /// named `devices`, even though the batch axis shadows the mesh axis's name.
+    ///
+    /// Call this function when the batching level would consume the collective. An unrelated batch level can still
+    /// forward the mesh collective to its parent context without consuming it.
     ///
     /// # Errors
     ///
@@ -594,10 +601,9 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         Ok(())
     }
 
-    /// Implements [`DifferentiableOperation::jvp`](crate::differentiation::DifferentiableOperation::jvp) for this
-    /// collective. The collective is linear, so its tangent rides the same collective as its primal, while a
-    /// structural-zero tangent stays symbolic, retyped to the output tangent type because the collective may change
-    /// shapes.
+    /// Implements [`DifferentiableOperation::jvp`](crate::DifferentiableOperation::jvp) for this collective. The
+    /// collective is linear, so its tangent rides the same collective as its primal, while a structural-zero tangent
+    /// stays symbolic, retyped to the output tangent type because the collective may change shapes.
     fn linear_collective_jvp<C: Context<Type = ArrayType, Operation: From<Self>>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -618,9 +624,9 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 
-    /// Implements [`TransposableOperation::transpose`](crate::differentiation::TransposableOperation::transpose) for
-    /// this collective by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input and a
-    /// structural-zero output cotangent contribute nothing, which leaves the input cotangent a structural zero.
+    /// Implements [`TransposableOperation::transpose`](crate::TransposableOperation::transpose) for this collective
+    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input and a structural-zero output
+    /// cotangent contribute nothing, which leaves the input cotangent a structural zero.
     fn linear_collective_transpose<
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<Self::Adjoint>,
@@ -652,6 +658,8 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review form here onwards.
 
 /// [`LinearCollectiveOperation`] that resizes an array axis (i.e., [`ParallelAllGatherOperation`],
 /// [`ParallelSumScatterOperation`], or [`ParallelAllToAllOperation`]). Its output shape depends on the participant
@@ -1248,8 +1256,9 @@ where
 
 /// Forwards a linear collective over an axis that the active batching level does not bind to the parent context. An
 /// input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the collective
-/// that [`LinearCollectiveOperation::forwarded`] returns for the input's mapped axis position, because the collective's
-/// own axes shift around the mapped axis, together with the position of the mapped axis in the forwarded result.
+/// that [`LinearCollectiveOperation::adapt_to_batch_axis`] returns for the input's mapped axis position, because the
+/// collective's own axes shift around the mapped axis, together with the position of the mapped axis in the forwarded
+/// result.
 fn forward_linear_collective<C, P, O>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: &O,
@@ -1267,7 +1276,7 @@ where
     let Some(batch_axis) = input.batch_axis_position() else {
         return Ok(context.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
     };
-    let (operation, output_batch_axis) = operation.forwarded(batch_axis);
+    let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
     let mut outputs =
         context
             .parent()
@@ -1463,9 +1472,9 @@ where
 impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
     /// Binds an array IR linear collective over a non-matching named axis in the parent context. A replicated array
     /// requires no lifting, so the collective is forwarded unchanged and its result stays replicated. A mapped array
-    /// instead forwards the collective that [`LinearCollectiveOperation::forwarded`] returns for the array's mapped
-    /// axis position, inserts this context's batch extent into the result extent inputs at the mapped axis position of
-    /// the result, and marks the result mapped at that position.
+    /// instead forwards the collective that [`LinearCollectiveOperation::adapt_to_batch_axis`] returns for the array's
+    /// mapped axis position, inserts this context's batch extent into the result extent inputs at the mapped axis
+    /// position of the result, and marks the result mapped at that position.
     ///
     /// Unlike homogeneous array forwarding, the input dimension values describe one array result and are not
     /// separate result-producing inputs. The collective may also move the mapped axis when it changes the rank.
@@ -1491,7 +1500,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
         let (operation, output_batch_axis) = match array.batch_axis_position() {
             None => (operation.clone(), None),
             Some(batch_axis) => {
-                let (operation, output_batch_axis) = operation.forwarded(batch_axis);
+                let (operation, output_batch_axis) = operation.adapt_to_batch_axis(batch_axis);
                 (operation, Some(output_batch_axis))
             }
         };
