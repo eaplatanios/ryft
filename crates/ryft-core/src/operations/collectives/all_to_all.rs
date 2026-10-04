@@ -174,10 +174,15 @@ where
             return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
                 let (split_axis, output_batch_axis) =
                     self.options.mode.forwarded_split_axes(self.split_axis, batch_axis);
-                let (concat_axis, output_batch_axis) =
-                    self.options.mode.forwarded_concat_axes(self.concat_axis, output_batch_axis);
-                let operation =
-                    Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
+                let (concatenation_axis, output_batch_axis) =
+                    self.options.mode.forwarded_concatenation_axes(self.concat_axis, output_batch_axis);
+                let operation = Self::new(
+                    self.axis_name.clone(),
+                    self.axis_size,
+                    split_axis,
+                    concatenation_axis,
+                    self.options.clone(),
+                );
                 (operation, output_batch_axis)
             });
         }
@@ -280,13 +285,13 @@ where
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_split_axis, output_batch_axis) =
                 self.options().mode().forwarded_split_axes(self.split_axis(), input_batch_axis);
-            let (physical_concat_axis, output_batch_axis) =
-                self.options().mode().forwarded_concat_axes(self.concat_axis(), output_batch_axis);
+            let (physical_concatenation_axis, output_batch_axis) =
+                self.options().mode().forwarded_concatenation_axes(self.concat_axis(), output_batch_axis);
             let operation = Self::new(
                 self.axis_name().to_string(),
                 self.axis_size(),
                 physical_split_axis,
-                physical_concat_axis,
+                physical_concatenation_axis,
                 self.options().clone(),
             );
             return Ok(forward_explicit_collective(

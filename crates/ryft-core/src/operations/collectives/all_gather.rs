@@ -331,12 +331,12 @@ where
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
-                let (concat_axis, output_batch_axis) =
-                    self.options.mode.forwarded_concat_axes(self.concat_axis, batch_axis);
+                let (concatenation_axis, output_batch_axis) =
+                    self.options.mode.forwarded_concatenation_axes(self.concat_axis, batch_axis);
                 let operation = Self::new(
                     self.axis_name.clone(),
                     self.axis_size,
-                    concat_axis,
+                    concatenation_axis,
                     self.options.clone(),
                     self.output_variance,
                 );
@@ -443,12 +443,12 @@ where
                 return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
-            let (physical_concat_axis, output_batch_axis) =
-                self.options().mode().forwarded_concat_axes(self.concat_axis(), input_batch_axis);
+            let (physical_concatenation_axis, output_batch_axis) =
+                self.options().mode().forwarded_concatenation_axes(self.concat_axis(), input_batch_axis);
             let operation = Self::new(
                 self.axis_name().to_string(),
                 self.axis_size(),
-                physical_concat_axis,
+                physical_concatenation_axis,
                 self.options().clone(),
                 self.output_variance(),
             );
