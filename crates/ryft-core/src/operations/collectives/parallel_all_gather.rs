@@ -445,9 +445,8 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
                 input_extents.remove(self.concat_axis);
             }
             CollectiveMode::Tiled => {
-                let axis_extent =
-                    P::require_divisible_collective_extents(context, &output_extents[self.concat_axis], &axis_extent)?;
-                input_extents[self.concat_axis] = output_extents[self.concat_axis].div(&axis_extent)?;
+                input_extents[self.concat_axis] =
+                    P::divide_extents_exactly(context, &output_extents[self.concat_axis], &axis_extent)?;
             }
         }
         let input = P::match_collective_axis(context, input, input_extents.as_slice())?;

@@ -1005,14 +1005,13 @@ fn infer_array_ir_shape_changing_collective_output_type(
     Ok(vec![base_output_type.with_shape(Shape::new(output_extents)).into()])
 }
 
-// TODO(eaplatanios): Review this.
-/// Representation boundary used only by shape-changing collective batching rules.
-///
-/// The collective kernels own every formula. This trait exposes only the extent representation and the alignment and
-/// reshape encodings that differ between homogeneous arrays and composite array/dimension programs.
+// TODO(eaplatanios): Move this and its impl blocks right after `ShapeChangingCollectiveBatching`.
+/// Representation boundary used only by shape-changing collective batching rules. The collective kernels determine the
+/// exchange geometry. This trait exposes the extent representation, exact division, and the alignment and reshape
+/// encodings that differ between homogeneous arrays and composite array/dimension programs.
 trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayExtentBatchingPolicy<C> {
     /// Extent representation consumed by the shared collective kernels.
-    type ShapeExtent: Clone + Debug + Div + Mul;
+    type ShapeExtent: Clone + Debug + Mul;
 
     /// Returns and validates the active mapped-axis extent in the kernel's representation.
     fn collective_axis_extent(
@@ -1028,19 +1027,15 @@ trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError>;
 
-    /// Materializes a statically known type-level dimension in the kernel's representation.
-    fn collective_extent_from_dimension(
-        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
-        dimension: &Dimension,
-    ) -> Result<Self::ShapeExtent, BatchingError> {
-        let extent = dimension.value().ok_or_else(|| BatchingError::UnsupportedOperation {
-            message: "shape-changing collective batching requires statically shaped inputs".to_string(),
-        })?;
-        Self::collective_extent_constant(context, extent)
-    }
-
-    /// Enforces exact divisibility and returns a positive divisor safe for subsequent arithmetic.
-    fn require_divisible_collective_extents(
+    /// Returns the exact quotient of `left` divided by `right`, requiring a positive divisor and no remainder. Dynamic
+    /// policies stage assertions for requirements that the extent types cannot prove and guard the divisor before
+    /// staging arithmetic that requires it to be positive.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] if a requirement is statically violated or staging the checked division fails.
+    /// Staged assertions reject runtime violations when the resulting program executes.
+    fn divide_extents_exactly(
         context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
@@ -1092,7 +1087,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>> Colle
         Ok(extent)
     }
 
-    fn require_divisible_collective_extents(
+    fn divide_extents_exactly(
         _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
@@ -1102,7 +1097,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>> Colle
                 message: format!("extent {left} must be divisible by extent {right}"),
             });
         }
-        Ok(*right)
+        Ok(left / right)
     }
 
     fn match_collective_axis(
@@ -1177,7 +1172,7 @@ impl<
         Ok(ValueProjection::<DimensionType>::into_projected(outputs.remove(0))?)
     }
 
-    fn require_divisible_collective_extents(
+    fn divide_extents_exactly(
         context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
@@ -1190,7 +1185,7 @@ impl<
                     message: format!("extent {left_extent} must be divisible by extent {right_extent}"),
                 });
             }
-            return Ok(right.clone());
+            return Ok(left.div(right)?);
         }
         let zero = Self::collective_extent_constant(context, 0)?;
         let divisor = if right.r#type().bounds().lower() > 0 {
@@ -1210,7 +1205,7 @@ impl<
                 ("divisor", ValueProjection::<DimensionType>::from_projected(right.clone())),
             ],
         )?;
-        Ok(divisor)
+        Ok(left.div(&divisor)?)
     }
 
     fn match_collective_axis(
@@ -1303,7 +1298,12 @@ impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingCont
             .shape()
             .dimensions()
             .iter()
-            .map(|dimension| P::collective_extent_from_dimension(self, dimension))
+            .map(|dimension| {
+                let extent = dimension.value().ok_or_else(|| BatchingError::UnsupportedOperation {
+                    message: "shape-changing collective batching requires statically shaped inputs".to_string(),
+                })?;
+                P::collective_extent_constant(self, extent)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((output_type, output_extents))
     }

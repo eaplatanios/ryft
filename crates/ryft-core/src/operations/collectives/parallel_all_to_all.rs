@@ -452,16 +452,14 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
                 (input_extents, P::collective_extent_constant(context, 1)?)
             }
             CollectiveMode::Tiled if self.split_axis == self.concat_axis => {
-                let axis_extent =
-                    P::require_divisible_collective_extents(context, &output_extents[self.split_axis], &axis_extent)?;
-                (output_extents.clone(), output_extents[self.split_axis].div(&axis_extent)?)
+                let chunk_extent = P::divide_extents_exactly(context, &output_extents[self.split_axis], &axis_extent)?;
+                (output_extents.clone(), chunk_extent)
             }
             CollectiveMode::Tiled => {
-                let axis_extent =
-                    P::require_divisible_collective_extents(context, &output_extents[self.concat_axis], &axis_extent)?;
                 let mut input_extents = output_extents.clone();
+                input_extents[self.concat_axis] =
+                    P::divide_extents_exactly(context, &output_extents[self.concat_axis], &axis_extent)?;
                 input_extents[self.split_axis] = output_extents[self.split_axis].mul(&axis_extent)?;
-                input_extents[self.concat_axis] = output_extents[self.concat_axis].div(&axis_extent)?;
                 (input_extents, output_extents[self.split_axis].clone())
             }
         };
@@ -1986,9 +1984,9 @@ mod tests {
                         message=\"collective extent must be divisible by the participant count\",
                         labels=[\"extent\", \"divisor\"],
                     ] %8 %3 %0
-                    %9:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
-                    %10:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
-                    %11:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %10
+                    %9:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
+                    %10:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
+                    %11:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %9
                     %12:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %11
                     %13:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %12
                     %14:f32[batch, output_split, output_concat] = reshape %13 %0 %2 %3
