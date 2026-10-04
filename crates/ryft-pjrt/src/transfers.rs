@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use crate::{
-    Api, Buffer, BufferSpecification, Client, Device, Error, Event, HostBufferData, Memory, NamedValue,
+    Api, Buffer, BufferSpecification, BufferType, Client, Device, Error, Event, HostBufferData, Memory, NamedValue,
     invoke_pjrt_api_error_fn, slice_from_c_api,
 };
 
@@ -354,7 +354,8 @@ impl Drop for HostToDeviceTransferManager<'_> {
 
 impl<'s> Client<'s> {
     /// Creates a new [`HostToDeviceTransferManager`], allocating space for the [`Buffer`]s specified in the provided
-    /// [`BufferSpecification`]s in the provided [`Memory`].
+    /// [`BufferSpecification`]s in the provided [`Memory`]. Note that [`BufferType::Token`] specifications do not
+    /// support array layouts and so their `layout` field is ignored.
     pub fn host_to_device_transfer_manager<D: AsRef<[u64]>>(
         &'_ self,
         buffer_specifications: Vec<BufferSpecification<D>>,
@@ -377,7 +378,16 @@ impl<'s> Client<'s> {
             .collect::<Vec<_>>();
         let layouts = layouts
             .iter()
-            .map(|layout| layout as *const _ as *mut _)
+            .zip(&buffer_specifications)
+            .map(|(layout, specification)| {
+                // PJRT token shapes cannot carry a layout. Passing even an empty array layout makes
+                // PJRT plugins attempt to mutate a token's nonexistent layout and abort.
+                if specification.element_type == BufferType::Token {
+                    std::ptr::null_mut()
+                } else {
+                    layout as *const _ as *mut _
+                }
+            })
             .collect::<Vec<*mut crate::buffers::ffi::PJRT_Buffer_MemoryLayout>>();
         invoke_pjrt_api_error_fn!(
             self.api(),
@@ -978,7 +988,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
+    use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
     use crate::{
         BufferSpecification, BufferType, Chunk, CopyToDeviceStream, Error, HostToDeviceTransferManager, NamedValue,
     };
@@ -1091,6 +1101,39 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn test_host_to_device_transfer_manager_token() {
+        let client = test_cpu_client();
+        let devices = client.addressable_devices().unwrap();
+        let memory = devices[0].default_memory().unwrap();
+        let manager = client
+            .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+            .unwrap();
+        let buffer = manager.retrieve_buffer(0).unwrap();
+        assert_eq!(buffer.element_type(), Ok(BufferType::Token));
+        assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(0));
+        assert_eq!(buffer.ready().unwrap().ready(), Ok(false));
+        assert_eq!(manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await(), Ok(()));
+        assert_eq!(buffer.ready().unwrap().r#await(), Ok(()));
+    }
+
+    #[test]
+    fn test_host_to_device_transfer_manager_token_error() {
+        let client = test_cpu_client();
+        let devices = client.addressable_devices().unwrap();
+        let memory = devices[0].default_memory().unwrap();
+        let manager = client
+            .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+            .unwrap();
+        let buffer = manager.retrieve_buffer(0).unwrap();
+        assert_eq!(buffer.ready().unwrap().ready(), Ok(false));
+        assert_eq!(manager.set_error(0, Error::aborted("native token transfer failure")), Ok(()));
+        assert!(matches!(
+            buffer.ready().unwrap().r#await(),
+            Err(Error::Aborted { message, .. }) if message.contains("native token transfer failure"),
+        ));
     }
 
     #[test]

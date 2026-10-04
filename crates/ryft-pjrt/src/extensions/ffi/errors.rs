@@ -66,30 +66,52 @@ pub enum FfiError {
 }
 
 impl FfiError {
-    /// Constructs a new [`FfiError`] from the provided [`XLA_FFI_Error`](ffi::XLA_FFI_Error) handle that came
-    /// from a function in the XLA FFI API. Note that this function will return [`None`] if the provided
-    /// [`XLA_FFI_Error`](ffi::XLA_FFI_Error) has an empty error message.
+    /// Copies the code and message from an owned XLA FFI error and destroys the native error.
+    /// Returns `None` for a null handle.
     ///
-    /// Note that due to limitations in the XLA FFI API, we cannot extract an error code from the provided
-    /// [`XLA_FFI_Error`](ffi::XLA_FFI_Error) and thus, if the error message is non-empty, it will always be
-    /// converted to an [`FfiError::Unknown`].
+    /// # Safety
+    ///
+    /// A non-null handle must be an owned error allocated by `api`. This function consumes it; the caller
+    /// must not access or destroy it afterward. This boundary supports native FFI handler interoperability.
     pub unsafe fn from_c_api(handle: *mut ffi::XLA_FFI_Error, api: FfiApi) -> Result<Option<Self>, Self> {
         use ffi::*;
 
         if handle.is_null() {
             return Ok(None);
         }
-
-        // Helper closure to make sure that the underlying PJRT error is dropped before this function returns.
-        let destroy_error = || invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_Destroy, { error = handle as *mut _ });
-        let message = invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_GetMessage, { error = handle }, { message });
-        let message = message.inspect_err(|_: &Self| drop::<Result<(), Self>>(destroy_error()))?;
-        let message = if message.is_null() {
-            return Ok(None);
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned()
+        let details =
+            invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_GetDetails, { error = handle }, { message, error_code });
+        let result = match details {
+            Ok((message, error_code)) => {
+                let message = if message.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned()
+                };
+                let backtrace = Backtrace::capture().to_string();
+                Ok(Some(match error_code {
+                    ffi::XLA_FFI_Error_Code_CANCELLED => Self::Cancelled { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_INVALID_ARGUMENT => Self::InvalidArgument { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_DEADLINE_EXCEEDED => Self::DeadlineExceeded { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_NOT_FOUND => Self::NotFound { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_ALREADY_EXISTS => Self::AlreadyExists { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_PERMISSION_DENIED => Self::PermissionDenied { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_RESOURCE_EXHAUSTED => Self::ResourceExhausted { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_FAILED_PRECONDITION => Self::FailedPrecondition { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_ABORTED => Self::Aborted { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_OUT_OF_RANGE => Self::OutOfRange { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNIMPLEMENTED => Self::Unimplemented { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_INTERNAL => Self::Internal { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNAVAILABLE => Self::Unavailable { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_DATA_LOSS => Self::DataLoss { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNAUTHENTICATED => Self::Unauthenticated { message, backtrace },
+                    _ => Self::Unknown { message, backtrace },
+                }))
+            }
+            Err(error) => Err(error),
         };
-        Ok(Some(Self::unknown(message)))
+        invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_Destroy, { error = handle })?;
+        result
     }
 
     /// Returns the [`XLA_FFI_Error`](ffi::XLA_FFI_Error) that corresponds to this [`FfiError`] and which can
@@ -244,7 +266,7 @@ impl FfiError {
 pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
-    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Extension_Base;
+    use crate::extensions::ffi::handlers::ffi::XLA_FFI_InternalExtension;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
@@ -254,7 +276,7 @@ pub(crate) mod ffi {
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
 
-    pub type XLA_FFI_Error_GetMessage = unsafe extern "C" fn(args: *mut XLA_FFI_Error_GetMessage_Args);
+    pub type XLA_FFI_Error_GetDetails = unsafe extern "C" fn(args: *mut XLA_FFI_Error_GetDetails_Args);
 
     pub type XLA_FFI_Error_Code = std::ffi::c_uint;
     pub const XLA_FFI_Error_Code_OK: XLA_FFI_Error_Code = 0;
@@ -278,7 +300,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Error_Create_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub message: *const std::ffi::c_char,
         pub error_code: XLA_FFI_Error_Code,
     }
@@ -292,20 +314,22 @@ pub(crate) mod ffi {
     pub type XLA_FFI_Error_Create = unsafe extern "C" fn(args: *mut XLA_FFI_Error_Create_Args) -> *mut XLA_FFI_Error;
 
     #[repr(C)]
-    pub struct XLA_FFI_Error_GetMessage_Args {
+    pub struct XLA_FFI_Error_GetDetails_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub error: *mut XLA_FFI_Error,
         pub message: *const std::ffi::c_char,
+        pub error_code: XLA_FFI_Error_Code,
     }
 
-    impl XLA_FFI_Error_GetMessage_Args {
+    impl XLA_FFI_Error_GetDetails_Args {
         pub fn new(error: *mut XLA_FFI_Error) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
                 extension_start: std::ptr::null_mut(),
                 error,
                 message: std::ptr::null(),
+                error_code: XLA_FFI_Error_Code_UNKNOWN,
             }
         }
     }
@@ -313,7 +337,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Error_Destroy_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub error: *mut XLA_FFI_Error,
     }
 
@@ -328,6 +352,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use crate::extensions::ffi::tests::test_ffi_api;
+
     use super::{FfiError, ffi};
 
     #[test]
@@ -401,7 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn test_error_display_and_debug() {
+    fn test_ffi_error_from_c_api() {
+        let api = test_ffi_api();
+        assert_eq!(unsafe { FfiError::from_c_api(std::ptr::null_mut(), api) }, Ok(None));
+        let error = FfiError::invalid_argument("invalid argument");
+        let handle = unsafe { error.to_c_api(api) };
+        assert!(matches!(
+            unsafe { FfiError::from_c_api(handle, api) },
+            Ok(Some(FfiError::InvalidArgument { message, .. })) if message == "invalid argument",
+        ));
+        let handle = unsafe { FfiError::unavailable("").to_c_api(api) };
+        assert!(matches!(
+            unsafe { FfiError::from_c_api(handle, api) },
+            Ok(Some(FfiError::Unavailable { message, .. })) if message.is_empty(),
+        ));
+    }
+
+    #[test]
+    fn test_ffi_error_display_and_debug() {
         let error = FfiError::invalid_argument("bad input");
         assert_eq!(format!("{error}"), "bad input");
         let debug = format!("{error:?}");

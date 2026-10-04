@@ -78,17 +78,13 @@ pub enum BufferType {
     /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
     /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
     /// format with 2 exponent bits and 3 mantissa bits. Only finite values are supported (thus the `FN` suffix).
-    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
-    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
-    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
     F6E2M3FN,
 
     /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
     /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
     /// format with 3 exponent bits and 2 mantissa bits. Only finite values are supported (thus the `FN` suffix).
-    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
-    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
-    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
     F6E3M2FN,
 
     /// [`BufferType`] that represents 8-bit floating-point values that are represented using the format described in
@@ -195,6 +191,8 @@ impl BufferType {
             ffi::PJRT_Buffer_Type_U32 => Self::U32,
             ffi::PJRT_Buffer_Type_U64 => Self::U64,
             ffi::PJRT_Buffer_Type_F4E2M1FN => Self::F4E2M1FN,
+            ffi::PJRT_Buffer_Type_F6E2M3FN => Self::F6E2M3FN,
+            ffi::PJRT_Buffer_Type_F6E3M2FN => Self::F6E3M2FN,
             ffi::PJRT_Buffer_Type_F8E3M4 => Self::F8E3M4,
             ffi::PJRT_Buffer_Type_F8E4M3 => Self::F8E4M3,
             ffi::PJRT_Buffer_Type_F8E4M3FN => Self::F8E4M3FN,
@@ -236,9 +234,8 @@ impl BufferType {
             Self::U32 => ffi::PJRT_Buffer_Type_U32,
             Self::U64 => ffi::PJRT_Buffer_Type_U64,
             Self::F4E2M1FN => ffi::PJRT_Buffer_Type_F4E2M1FN,
-            // The PJRT C API does not define constants for the 6-bit floating-point types yet (XLA itself cannot pass
-            // them through the C API layer), and so they map to the invalid type.
-            Self::F6E2M3FN | Self::F6E3M2FN => ffi::PJRT_Buffer_Type_INVALID,
+            Self::F6E2M3FN => ffi::PJRT_Buffer_Type_F6E2M3FN,
+            Self::F6E3M2FN => ffi::PJRT_Buffer_Type_F6E3M2FN,
             Self::F8E3M4 => ffi::PJRT_Buffer_Type_F8E3M4,
             Self::F8E4M3 => ffi::PJRT_Buffer_Type_F8E4M3,
             Self::F8E4M3FN => ffi::PJRT_Buffer_Type_F8E4M3FN,
@@ -2178,6 +2175,9 @@ impl<'s> Client<'s> {
         // Call the appropriate PJRT C API function to create the new buffer.
         let data = unsafe { data.data() };
         let dimensions = dimensions.as_ref().iter().map(|&dimension| dimension as i64).collect::<Vec<_>>();
+
+        // Retain both the native descriptor and its Rust-owned arrays throughout the native call.
+        let mut layout_handle = device_layout.as_ref().map(|layout| unsafe { layout.to_c_api() });
         let (buffer_handle, done_event_handle) = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_BufferFromHostBuffer,
@@ -2192,10 +2192,7 @@ impl<'s> Client<'s> {
                 host_buffer_semantics = B::host_buffer_semantics().to_c_api(),
                 device = std::ptr::null_mut(),
                 memory = memory.default_memory().to_c_api(),
-                device_layout = device_layout
-                    .as_ref()
-                    .map(|layout| &layout.to_c_api() as *const _ as *mut _)
-                    .unwrap_or(std::ptr::null_mut()),
+                device_layout = layout_handle.as_mut().map(|layout| layout as *mut _).unwrap_or(std::ptr::null_mut()),
             },
             { buffer, done_with_host_buffer },
         )?;
@@ -2681,6 +2678,8 @@ pub(crate) mod ffi {
     pub const PJRT_Buffer_Type_F4E2M1FN: PJRT_Buffer_Type = 29;
     pub const PJRT_Buffer_Type_S1: PJRT_Buffer_Type = 30;
     pub const PJRT_Buffer_Type_U1: PJRT_Buffer_Type = 31;
+    pub const PJRT_Buffer_Type_F6E2M3FN: PJRT_Buffer_Type = 32;
+    pub const PJRT_Buffer_Type_F6E3M2FN: PJRT_Buffer_Type = 33;
 
     pub type PJRT_Buffer_MemoryLayout_Type = std::ffi::c_uint;
     pub const PJRT_Buffer_MemoryLayout_Type_Tiled: PJRT_Buffer_MemoryLayout_Type = 0;
@@ -3705,6 +3704,8 @@ mod tests {
             BufferType::U32,
             BufferType::U64,
             BufferType::F4E2M1FN,
+            BufferType::F6E2M3FN,
+            BufferType::F6E3M2FN,
             BufferType::F8E3M4,
             BufferType::F8E4M3,
             BufferType::F8E4M3FN,
@@ -3727,14 +3728,6 @@ mod tests {
             assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
         });
         assert_eq!(unsafe { BufferType::from_c_api(u32::MAX) }, BufferType::Invalid);
-
-        // The 6-bit floating-point types are not representable in the PJRT C API yet, and so they only
-        // round-trip through the Protobuf and string representations.
-        for r#type in [BufferType::F6E2M3FN, BufferType::F6E3M2FN] {
-            assert_eq!(BufferType::from_proto(r#type.proto()), r#type);
-            assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
-            assert_eq!(unsafe { BufferType::from_c_api(r#type.to_c_api()) }, BufferType::Invalid);
-        }
 
         assert_eq!(BufferType::Token.element_size_in_bytes(), Ok(0));
         assert_eq!(BufferType::Predicate.element_size_in_bytes(), Ok(1));
@@ -4063,8 +4056,8 @@ mod tests {
                 TestPlatform::Mps => {
                     assert!(matches!(
                         buffer.copy_raw_to_host(2, 3),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHost` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(Error::MissingFunction { function_name: "PJRT_Buffer_CopyRawToHost", pjrt_version, .. })
+                            if pjrt_version == client.version(),
                     ));
                 }
                 _ => {
@@ -4088,8 +4081,8 @@ mod tests {
                 TestPlatform::Mps => {
                     assert!(matches!(
                         buffer.copy_raw_to_host_buffer(&mut destination, 1),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHost` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(Error::MissingFunction { function_name: "PJRT_Buffer_CopyRawToHost", pjrt_version, .. })
+                            if pjrt_version == client.version(),
                     ));
                     assert_eq!(destination.as_slice(), vec![0u8; 3]);
                 }
@@ -4113,8 +4106,13 @@ mod tests {
                         .unwrap();
                     assert!(matches!(
                         buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHostFuture` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(
+                            Error::MissingFunction {
+                                function_name: "PJRT_Buffer_CopyRawToHostFuture",
+                                pjrt_version,
+                                ..
+                            }
+                        ) if pjrt_version == client.version(),
                     ));
                 }
                 _ => {
@@ -4188,7 +4186,11 @@ mod tests {
                 .unwrap();
             let buffer_and_callback = buffer.donate_with_control_dependency();
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 | TestPlatform::Tpu => {
+                TestPlatform::Cpu
+                | TestPlatform::Cuda12
+                | TestPlatform::Cuda13
+                | TestPlatform::Rocm7
+                | TestPlatform::Tpu => {
                     // Test invoking the callback with no error.
                     let (buffer, callback) = buffer_and_callback.unwrap();
                     assert!(!buffer.ready().unwrap().ready().unwrap());
@@ -4358,6 +4360,20 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+
+            let layout = Layout::dense_major_to_minor(2);
+            let buffer = client
+                .buffer(data.as_slice(), BufferType::U8, [2u64, 4u64], None, device, Some(layout.clone()))
+                .unwrap();
+
+            // The explicit `Some` path must retain its native descriptor until PJRT consumes it.
+            #[allow(deprecated)]
+            let device_layout = buffer.layout();
+            assert_eq!(device_layout, Ok(layout));
+            assert_eq!(
+                buffer.copy_to_host(Some(Layout::dense_major_to_minor(2))).unwrap().r#await(),
+                Ok(data.to_vec()),
+            );
         });
     }
 
@@ -4371,6 +4387,7 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+            assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.as_ref().clone()));
         });
     }
 
@@ -4387,6 +4404,7 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+            assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.as_ref().clone()));
         });
     }
 

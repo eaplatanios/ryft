@@ -7,7 +7,7 @@ pub static VERSION: Version = Version { major: ffi::PJRT_API_MAJOR as usize, min
 /// by using [`Plugin::version`](crate::Plugin::version) to check if the implementation is aware of newer interface
 /// additions. Refer to the [official documentation on PJRT API ABI versioning and compatibility](
 /// https://docs.google.com/document/d/1TKB5NyGtdzrpgw5mpyFjVAhJjpSNdF31T6pjPl_UT2o) for more information.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     /// Major version number. This number is incremented when an ABI-incompatible change is made to the PJRT interface.
     /// Such changes include deleting a method or an argument, changing the type of an argument, re-arranging fields
@@ -31,7 +31,7 @@ pub(crate) mod ffi {
     use crate::ffi::PJRT_Extension_Base;
 
     pub const PJRT_API_MAJOR: u32 = 0;
-    pub const PJRT_API_MINOR: u32 = 113;
+    pub const PJRT_API_MINOR: u32 = 115;
 
     #[repr(C)]
     pub struct PJRT_Api_Version {
@@ -50,9 +50,11 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::tests::test_cpu_client;
 
-    use super::VERSION;
+    use super::*;
 
     #[test]
     fn test_client_version() {
@@ -60,7 +62,15 @@ mod tests {
     }
 
     #[test]
+    fn test_version_hash() {
+        let versions = HashMap::from([(VERSION, "current")]);
+        assert_eq!(versions.get(&Version { major: VERSION.major, minor: VERSION.minor }), Some(&"current"));
+        assert_eq!(versions.get(&Version { major: VERSION.major, minor: VERSION.minor + 1 }), None);
+        assert_eq!(versions.get(&Version { major: VERSION.major + 1, minor: VERSION.minor }), None);
+    }
+
+    #[test]
     fn test_version_display() {
-        assert_eq!(format!("{VERSION}"), "0.113");
+        assert_eq!(format!("{VERSION}"), "0.115");
     }
 }

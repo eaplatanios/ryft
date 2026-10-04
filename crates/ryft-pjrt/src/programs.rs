@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use prost::Message;
 
@@ -220,7 +220,8 @@ impl Executable {
     /// for [`Executable`]s that are the result of ahead-of-time compilation (e.g., using [`Plugin::compile`],
     /// as opposed to [`Client::compile`] followed by [`LoadedExecutable::executable`]), this function may return
     /// an [`Error::Unavailable`]. That is because the size of the generated code may depend on the number and
-    /// type of addressable [`Device`]s after it is loaded, for example.
+    /// type of addressable [`Device`]s after it is loaded, for example. Note that zero is a valid size;
+    /// only a negative native size indicates that the generated code size is unknown.
     pub fn generated_code_size_in_bytes(&self) -> Result<usize, Error> {
         use ffi::PJRT_Executable_SizeOfGeneratedCodeInBytes_Args;
         let size = invoke_pjrt_api_error_fn!(
@@ -229,11 +230,7 @@ impl Executable {
             { executable = self.to_c_api() },
             { size_in_bytes },
         )?;
-        if size <= 0 {
-            Err(Error::unavailable("generated code size is unknown".to_string()))
-        } else {
-            Ok(size as usize)
-        }
+        if size < 0 { Err(Error::unavailable("generated code size is unknown".to_string())) } else { Ok(size as usize) }
     }
 
     /// Returns a unique fingerprint for this [`Executable`]. Two [`Executable`]s that were produced by compiling with
@@ -681,6 +678,13 @@ pub struct LoadedExecutable<'c> {
     /// the [`KeyValueStore`](crate::KeyValueStore) that is associated with that [`Client`].
     client: *mut crate::clients::ffi::PJRT_Client,
 
+    /// Addressable device count and output count of this [`LoadedExecutable`], which are fixed once it is loaded and
+    /// which [`Self::execute`] needs on every call. They are queried once on first use, because querying the output
+    /// count goes through [`Self::executable`], which creates (and later destroys) a fresh PJRT executable wrapper
+    /// that recomputes the output dimensions of the program. Only successful queries are cached, so a failed query
+    /// is retried by the next execution instead of failing every later one.
+    execution_counts: OnceLock<(usize, usize)>,
+
     /// [`PhantomData`] used to track the lifetime of the [`Client`] that owns this [`LoadedExecutable`].
     owner: PhantomData<&'c ()>,
 }
@@ -698,7 +702,7 @@ impl<'c> LoadedExecutable<'c> {
         } else if client.is_null() {
             Err(Error::invalid_argument("the provided PJRT client handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, client, owner: PhantomData })
+            Ok(Self { handle, api, client, execution_counts: OnceLock::new(), owner: PhantomData })
         }
     }
 
@@ -852,13 +856,16 @@ impl<'c> LoadedExecutable<'c> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
         let mut inputs = inputs;
-
-        let device_count = if device.is_some() { 1 } else { self.addressable_devices()?.len() };
+        let (addressable_device_count, output_count) = match self.execution_counts.get() {
+            Some(counts) => *counts,
+            None => {
+                let counts = (self.addressable_devices()?.len(), self.executable()?.output_count()?);
+                *self.execution_counts.get_or_init(|| counts)
+            }
+        };
+        let device_count = if device.is_some() { 1 } else { addressable_device_count };
         let input_count = inputs.first().map(|inputs| inputs.inputs.len()).unwrap_or(0);
-        let input_is_donatable = inputs
-            .first()
-            .map(|inputs| inputs.inputs.iter().map(|input| input.donatable).collect::<Vec<bool>>())
-            .unwrap_or_default();
+        let first_device_inputs = inputs.first().map(|inputs| inputs.inputs).unwrap_or_default();
         let send_callback_count = inputs.first().map(|inputs| inputs.send_callbacks.len()).unwrap_or(0);
         let receive_callback_count = inputs.first().map(|inputs| inputs.receive_callbacks.len()).unwrap_or(0);
 
@@ -878,7 +885,7 @@ impl<'c> LoadedExecutable<'c> {
             }
 
             for (input_index, input) in device_inputs.inputs.iter().enumerate() {
-                if input.donatable != input_is_donatable[input_index] {
+                if input.donatable != first_device_inputs[input_index].donatable {
                     return Err(Error::invalid_argument(format!(
                         "input {input_index} is not marked consistently across all devices \
                             as donatable or non-donatable",
@@ -912,25 +919,35 @@ impl<'c> LoadedExecutable<'c> {
         // underlying memory will be freed. Furthermore, after the call to `PJRT_LoadedExecutable_Execute` and assuming
         // that everything went well, we move ownership of the callbacks to the corresponding `Event::on_ready`
         // callbacks so that the underlying memory will be freed once execution completes.
-        let mut send_callbacks = unsafe {
-            inputs
-                .iter_mut()
-                .map(|i| i.send_callbacks.drain(..).map(|c| c.to_c_api()).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
+
+        // Executions without send or receive callbacks (the common case) skip building these per-device containers.
+        let mut send_callback_infos = if send_callback_count == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                inputs
+                    .iter_mut()
+                    .map(|i| i.send_callbacks.drain(..).map(|c| c.to_c_api()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            }
         };
-        let mut send_callback_pointers = send_callbacks.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut send_callbacks = send_callbacks
+        let mut send_callback_ptrs = send_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
+        let mut send_callbacks = send_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut SendCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         // We handle receive callbacks in exactly the same way as send callbacks.
-        let mut receive_callbacks = inputs
-            .iter_mut()
-            .map(|i| i.receive_callbacks.drain(..).map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let mut receive_callback_pointers = receive_callbacks.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut receive_callbacks = receive_callbacks
+        let mut receive_callback_infos = if receive_callback_count == 0 {
+            Vec::new()
+        } else {
+            inputs
+                .iter_mut()
+                .map(|i| i.receive_callbacks.drain(..).map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let mut receive_callback_ptrs = receive_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
+        let mut receive_callbacks = receive_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut ReceiveCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
@@ -942,17 +959,19 @@ impl<'c> LoadedExecutable<'c> {
         let hlo_output_callback_count = hlo_output_callbacks.len();
         let mut hlo_output_callback_infos =
             hlo_output_callbacks.into_iter().map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>();
-        let hlo_output_callbacks = Arc::new(Mutex::new(
-            hlo_output_callback_infos
-                .iter()
-                .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
-                .collect::<Vec<_>>(),
-        ));
+        let hlo_output_callbacks = (hlo_output_callback_count > 0).then(|| {
+            Arc::new(Mutex::new(
+                hlo_output_callback_infos
+                    .iter()
+                    .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
+                    .collect::<Vec<_>>(),
+            ))
+        });
 
-        let non_donatable_input_indices = input_is_donatable
-            .into_iter()
+        let non_donatable_input_indices = first_device_inputs
+            .iter()
             .enumerate()
-            .filter_map(|(index, donatable)| if donatable { None } else { Some(index as i64) })
+            .filter_map(|(index, input)| if input.donatable { None } else { Some(index as i64) })
             .collect::<Vec<_>>();
 
         let call_location = call_location
@@ -971,8 +990,8 @@ impl<'c> LoadedExecutable<'c> {
         });
 
         let mut options = ffi::PJRT_ExecuteOptions::new(
-            send_callback_pointers.as_mut_ptr(),
-            receive_callback_pointers.as_mut_ptr(),
+            send_callback_ptrs.as_mut_ptr(),
+            receive_callback_ptrs.as_mut_ptr(),
             send_callback_count,
             receive_callback_count,
             launch_id as i32,
@@ -990,18 +1009,20 @@ impl<'c> LoadedExecutable<'c> {
         );
 
         // We prepare the input buffer handles array. This is an array of `Buffer` handle arrays where the outer
-        // dimension corresponds to devices and the inner dimension corresponds to program inputs.
-        let inputs = inputs
+        // dimension corresponds to devices and the inner dimension corresponds to program inputs. The handles of
+        // all devices share one flat allocation.
+        let input_handles = inputs
             .iter()
-            .map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }).collect::<Vec<_>>())
+            .flat_map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }))
             .collect::<Vec<_>>();
-        let input_pointers = inputs.iter().map(|inputs| inputs.as_ptr()).collect::<Vec<_>>();
+        let input_pointers = (0..device_count)
+            .map(|device_index| unsafe { input_handles.as_ptr().add(device_index * input_count) })
+            .collect::<Vec<_>>();
 
         // We pre-allocate the backing arrays for the output `Buffer` and `Event` handles. The output buffer handles
         // array is an array of `Buffer` handles arrays where the outer dimension corresponds to devices and the inner
-        // dimension corresponds to program outputs. The `Event` handles array contains an `Event` for each
-        // `Device`, which can be used to track when the computation for this program is completed on each `Device`.
-        let output_count = self.executable()?.output_count()?;
+        // dimension corresponds to program outputs. The `Event` handles array contains an `Event` for each `Device`,
+        // which can be used to track when the computation for this program is completed on each `Device`.
         let mut output_buffers: Vec<*mut crate::buffers::ffi::PJRT_Buffer> =
             vec![std::ptr::null_mut(); device_count * output_count];
         let output_buffer_pointers = (0..device_count)
@@ -1029,14 +1050,14 @@ impl<'c> LoadedExecutable<'c> {
         let mut completion_events = Vec::with_capacity(device_count);
         for device_index in 0..device_count {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
-            let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
-            let receive_callbacks = std::mem::take(&mut receive_callbacks[device_index]);
-            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callback_count > 0 {
+            let send_callbacks = send_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
+            let receive_callbacks = receive_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
+            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callbacks.is_some() {
                 // Move the owned callback allocations into the event completion handler so that they
                 // are released *only after* the runtime signals the device execution is done. HLO output
                 // callbacks are shared across all devices and so each device holds one clone of the `Arc`,
                 // releasing the callbacks only after the last device execution is done.
-                let hlo_output_callbacks = Arc::clone(&hlo_output_callbacks);
+                let hlo_output_callbacks = hlo_output_callbacks.clone();
                 done_event.on_ready(move |_| {
                     drop(send_callbacks);
                     drop(receive_callbacks);
@@ -1103,9 +1124,9 @@ impl Drop for LoadedExecutable<'_> {
 
 /// Represents a [`Buffer`] that is used as input in a [`LoadedExecutable::execute`] invocation.
 pub struct ExecutionInput<'o> {
-    /// Reference-counted [`Buffer`] to use as the input value. [`ExecutionInput`] holds an [`Arc<Buffer>`] rather than
-    /// an owned [`Buffer`] so that callers can share a single PJRT handle across multiple concurrent executions and across
-    /// long-lived array containers, without a per-execute PJRT-level copy.
+    /// Reference-counted [`Buffer`] to use as the input value. [`ExecutionInput`] holds an [`Arc<Buffer>`] rather
+    /// than an owned [`Buffer`] so that callers can share a single PJRT handle across multiple concurrent executions
+    /// and across long-lived array containers, without a per-execute PJRT-level copy.
     pub buffer: Arc<Buffer<'o>>,
 
     /// Boolean flag indicating whether `buffer` should be treated as _donatable_, meaning that the runtime would be
@@ -1179,99 +1200,207 @@ pub struct ExecutionDeviceOutputs<'o> {
     pub outputs: Vec<Buffer<'o>>,
 }
 
-/// State of an [`ExecutionFence`], transitioning from [`ExecutionFenceState::Pending`] to
-/// [`ExecutionFenceState::Complete`] the first time a [`ExecutionFence`] owner observes completion.
-enum ExecutionFenceState {
-    /// The execution has not been observed as complete yet, and the per-device completion [`Event`]s
-    /// returned by the PJRT launch have not been consumed yet.
-    Pending(Vec<Event<()>>),
+/// Callback invoked once with an [`ExecutionFence`]'s terminal result.
+type ExecutionFenceCallback = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
-    /// The execution has completed and its per-device completion [`Event`]s have been consumed, with the recorded
-    /// result carrying the first observed asynchronous execution [`Error`], if any.
-    Complete(Result<(), Error>),
+/// Mutable joined-completion state driven by the native callbacks of every device event.
+struct ExecutionFenceCompletion {
+    /// Number of device events that have not completed or failed callback registration yet.
+    remaining: usize,
+
+    /// First observed asynchronous execution or callback-registration failure.
+    error: Option<Error>,
+
+    /// Terminal result, set exactly once when `remaining` reaches zero.
+    result: Option<Result<(), Error>>,
+
+    /// Consumers awaiting asynchronous notification.
+    callbacks: Vec<ExecutionFenceCallback>,
+}
+
+/// Shared storage underlying an [`ExecutionFence`].
+struct ExecutionFenceState {
+    /// Events retained for the complete lifetime of their native callback registrations.
+    events: Mutex<Vec<Event<()>>>,
+
+    /// Joined terminal state.
+    completion: Mutex<ExecutionFenceCompletion>,
+
+    /// Notification for blocking waiters.
+    ready: Condvar,
+}
+
+impl ExecutionFenceState {
+    /// Records one device event result and invokes terminal callbacks after releasing the state lock.
+    fn record(&self, error: Option<Error>) {
+        let callbacks_and_result = {
+            let mut completion = self.completion.lock().expect("execution fence completion mutex poisoned");
+            if completion.remaining == 0 {
+                return;
+            }
+            if completion.error.is_none() {
+                completion.error = error;
+            }
+            completion.remaining -= 1;
+            (completion.remaining == 0).then(|| {
+                let result = completion.error.clone().map_or(Ok(()), Err);
+                completion.result = Some(result.clone());
+                (std::mem::take(&mut completion.callbacks), result)
+            })
+        };
+        if let Some((callbacks, result)) = callbacks_and_result {
+            // Native callbacks retain this state so registered completion consumers survive after every public fence
+            // handle is dropped. Releasing the retained events at the terminal transition breaks that temporary
+            // `state -> event -> native callback -> state` ownership cycle before user callbacks are delivered.
+            // A fence whose events never complete keeps that cycle alive by design, exactly like a bare
+            // never-completing `Event` (refer to the ownership cycle explanation on `EventState::waker`
+            // for more information).
+            //
+            // The terminal transition runs inside the native `PJRT_Event_OnReady` callback of the last completing
+            // event, so this drop destroys native events from within an event callback frame. That is the sanctioned
+            // PJRT usage pattern: the upstream C API client's own event-to-future bridge calls `PJRT_Event_Destroy`
+            // inside the `PJRT_Event_OnReady` callback as its final action (refer to `ConvertCEventToCppFuture` in
+            // [`pjrt_c_api_helpers.cc`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_helpers.cc) for
+            // more information), so implementations must tolerate destruction that overlaps callback-dispatch teardown.
+            drop(std::mem::take(&mut *self.events.lock().expect("execution fence events mutex poisoned")));
+            self.ready.notify_all();
+            for callback in callbacks {
+                callback(result.clone());
+            }
+        }
+    }
 }
 
 /// Shared completion state for one asynchronous PJRT execution across all participating addressable devices. PJRT
-/// execution is enqueued before this value is constructed. Creating or cloning an [`ExecutionFence`] never waits.
-/// Call [`Self::block_until_ready`] only at an explicit host synchronization boundary. The first waiter owns the
-/// underlying PJRT events and records their result, while later waiters observe that same result without waiting
-/// on an event twice. This fence plays the role that [`tsl::JoinFutures`](
+/// execution is enqueued before this value is constructed. Creation is asynchronous when native callback registration
+/// succeeds while registration failure waits for the affected event before publishing its terminal error. Cloning never
+/// waits. Native event callbacks join device completion into one immutable terminal result shared by blocking waiters,
+/// readiness queries, and callbacks registered through [`Self::on_ready`]. Call [`Self::block_until_ready`] only
+/// at an explicit host synchronization boundary. This fence plays the role that [`tsl::JoinFutures`](
 /// https://github.com/openxla/xla/blob/main/xla/tsl/concurrency/future.h) plays for JAX. XLA joins the per-device
 /// completion futures returned by [`PjRtLoadedExecutable::Execute`](
 /// https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h) into a single all-of/first-error future that is
-/// then shared by every output array of the launch. XLA futures are multi-consumer values backed by shared state, so
-/// that join needs no locking, whereas PJRT C API events (and the [`Event`]s wrapping them) are single-consumer, and
-/// so this fence recreates the shared observation on top of them.
+/// then shared by every output array of the launch. XLA futures are multi-consumer values backed by shared state;
+/// this fence recreates that shared observation over PJRT C API events.
+///
+/// Note that, executions whose events have all completed successfully by the time the fence is created (as small CPU
+/// programs typically have once [`LoadedExecutable::execute`] returns) need no shared state at all. Such fences are
+/// trivially ready, allocate nothing, and register no native callbacks.
 #[derive(Clone)]
 pub struct ExecutionFence {
-    /// Shared per-execution completion state. The first waiter consumes the per-device completion [`Event`]s stored
-    /// inside and records their joined result for every later (or cloned) observer.
-    state: Arc<Mutex<ExecutionFenceState>>,
+    /// Shared per-execution events and joined completion state, or [`None`] for an execution that had already
+    /// completed successfully when this fence was created.
+    state: Option<Arc<ExecutionFenceState>>,
 }
 
 impl ExecutionFence {
-    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s.
-    #[inline]
+    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s. Callback registration
+    /// failures wait for native completion before publishing an error. A plugin missing both native completion
+    /// functions leaves the fence pending because device completion cannot be established safely.
     pub fn new(events: Vec<Event<()>>) -> Self {
-        Self { state: Arc::new(Mutex::new(ExecutionFenceState::Pending(events))) }
+        if events.iter().all(|event| event.ready().unwrap_or(false) && event.ready_error().is_none()) {
+            return Self { state: None };
+        }
+
+        let event_count = events.len();
+        let state = Arc::new(ExecutionFenceState {
+            events: Mutex::new(Vec::new()),
+            completion: Mutex::new(ExecutionFenceCompletion {
+                remaining: event_count,
+                error: None,
+                result: (event_count == 0).then_some(Ok(())),
+                callbacks: Vec::new(),
+            }),
+            ready: Condvar::new(),
+        });
+
+        let mut retained_events = Vec::with_capacity(event_count);
+        for event in events {
+            let callback_state = Arc::clone(&state);
+            if let Err(error) = event.on_ready(move |error| callback_state.record(error)) {
+                // Registration failure is not device completion. Only a dispatched native await establishes readiness.
+                // Dropping its unit-payload event does not complete this fence. Execution owners still retain their
+                // resources while the fence is pending.
+                match event.r#await() {
+                    Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. }) => continue,
+                    Err(error) => state.record(Some(error)),
+                    Ok(()) => state.record(Some(error)),
+                }
+            } else {
+                retained_events.push(event);
+            }
+        }
+
+        *state.events.lock().expect("execution fence events mutex poisoned") = retained_events;
+
+        // If every event completed while its callback was still being registered, the terminal transition has already
+        // run against an empty retention vector, and no later `record` call will release the events that were just
+        // installed. Releasing them here, on the constructing thread, keeps the ownership cycle bounded in that race
+        // as well: a concurrent terminal `record` and this cleanup take from the same vector, so the events are dropped
+        // exactly once.
+        if state.completion.lock().expect("execution fence completion mutex poisoned").result.is_some() {
+            drop(std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned")));
+        }
+
+        Self { state: Some(state) }
     }
 
     /// Returns `true` once every participating [`Event`] is completed, while preserving any asynchronous execution
-    /// error for [`Self::block_until_ready`]. This function only polls and never blocks. If another owner of this
-    /// fence is concurrently observing it (e.g., it is blocked inside [`Self::block_until_ready`]), then this
-    /// function conservatively returns `false` for this poll instead of waiting for that observation to finish.
+    /// error for [`Self::block_until_ready`]. This function only polls and never waits on execution completion:
+    /// blocking waiters release the completion lock while parked on the condition variable, so this lock acquisition
+    /// only ever contends with short state transitions.
+    #[inline]
     pub fn is_ready(&self) -> Result<bool, Error> {
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            // Another owner of this fence is concurrently observing it. If it is blocked inside `block_until_ready`,
-            // then waiting for the lock would block this poll until the whole execution completes, so we conservatively
-            // report that completion has not been observed yet, mirroring how XLA future readiness queries never block
-            // on concurrent waiters of the same shared state.
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::sync::TryLockError::Poisoned(_)) => panic!("execution fence state mutex poisoned"),
+        let Some(state) = &self.state else {
+            return Ok(true);
         };
-        match &mut *state {
-            ExecutionFenceState::Pending(events) => {
-                for event in events.iter() {
-                    if !event.ready()? {
-                        return Ok(false);
-                    }
-                }
-                let events = std::mem::take(events);
-                let result = Self::await_events(events);
-                *state = ExecutionFenceState::Complete(result.clone());
-                result.map(|_| true)
-            }
-            ExecutionFenceState::Complete(result) => result.clone().map(|_| true),
-        }
+
+        state
+            .completion
+            .lock()
+            .expect("execution fence completion mutex poisoned")
+            .result
+            .clone()
+            .map_or(Ok(false), |result| result.map(|_| true))
     }
 
     /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
     pub fn block_until_ready(&self) -> Result<(), Error> {
-        let mut state = self.state.lock().expect("execution fence state mutex poisoned");
-        match &mut *state {
-            ExecutionFenceState::Pending(events) => {
-                let result = Self::await_events(std::mem::take(events));
-                *state = ExecutionFenceState::Complete(result.clone());
-                result
-            }
-            ExecutionFenceState::Complete(result) => result.clone(),
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+
+        let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
+        while completion.result.is_none() {
+            completion = state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
         }
+        completion.result.clone().unwrap()
     }
 
-    /// Blocks until every provided [`Event`] is ready and returns the first observed asynchronous execution [`Error`],
-    /// if any. All events are consumed (i.e., awaited) even after an error is observed, so that no completion event is
-    /// left pending when the joined result is recorded.
-    fn await_events(events: Vec<Event<()>>) -> Result<(), Error> {
-        let mut result = Ok(());
-        for event in events {
-            if let Err(error) = event.r#await()
-                && result.is_ok()
-            {
-                result = Err(error);
+    /// Registers `callback` to run exactly once with this fence's terminal result. If the fence is already terminal,
+    /// the callback runs inline on the calling thread before this function returns. Otherwise, it runs on whichever
+    /// thread completes the last participating event. Registered callbacks are retained by the shared fence state,
+    /// which the native event callbacks themselves keep alive, so delivery survives dropping every public
+    /// [`ExecutionFence`] handle. The callback must therefore own its captured state for the full asynchronous
+    /// lifetime and be safe to send between threads.
+    pub fn on_ready(&self, callback: impl FnOnce(Result<(), Error>) + Send + 'static) {
+        let Some(state) = &self.state else {
+            return callback(Ok(()));
+        };
+
+        let callback = {
+            let mut completion = state.completion.lock().expect("execution fence completion mutex poisoned");
+            if let Some(result) = &completion.result {
+                Some((Box::new(callback) as ExecutionFenceCallback, result.clone()))
+            } else {
+                completion.callbacks.push(Box::new(callback));
+                None
             }
+        };
+
+        if let Some((callback, result)) = callback {
+            callback(result);
         }
-        result
     }
 }
 
@@ -1650,7 +1779,7 @@ impl<'s> Client<'s> {
                     .as_ref()
                     .map(|options| options.as_ptr() as *const _)
                     .unwrap_or(std::ptr::null()),
-                compile_options_size = options_bytes.map(|options| options.len()).unwrap_or(0),
+                compile_options_size = options_bytes.as_ref().map(|options| options.len()).unwrap_or(0),
             },
             { loaded_executable },
         )
@@ -2867,16 +2996,80 @@ pub(crate) mod ffi {
 mod tests {
     use std::collections::HashMap;
     use std::mem::ManuallyDrop;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     use indoc::indoc;
 
+    use crate::extensions::ffi::{
+        FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
+        FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    };
     use crate::extensions::multi_slice::{self, MultiSliceConfig, MultiSliceExtension};
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
-    use crate::{BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, slice_from_c_api};
+    use crate::{
+        BufferSpecification, BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error,
+        slice_from_c_api,
+    };
 
     use super::*;
+
+    /// One bounded gate shared only by this test's registered CPU handler.
+    struct NativeEffectGate {
+        /// Invocation order of the callbacks.
+        entered: mpsc::Sender<usize>,
+        /// Explicit release of the first callback; bounded to avoid stranding a scoped submitter.
+        release: Mutex<mpsc::Receiver<()>>,
+        /// Next invocation index.
+        invocation: AtomicUsize,
+    }
+
+    /// Handler registrations outlive clients, so their state contains no client or buffer handles.
+    static NATIVE_EFFECT_GATE: OnceLock<NativeEffectGate> = OnceLock::new();
+
+    /// Validates the native token ABI and holds the first effect until explicitly released.
+    fn invoke_native_effect(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+        if frame.input_count() != 1 || frame.output_count() != 1 {
+            return Err(FfiError::invalid_argument("native effect expects one input and one output"));
+        }
+        let FfiInput::Buffer { buffer: input } = frame.input(0)?;
+        let FfiOutput::Buffer { buffer: output } = frame.output(0)?;
+        if input.element_type() != FfiBufferType::Token || output.element_type() != FfiBufferType::Token {
+            return Err(FfiError::invalid_argument("native effect requires token input and output"));
+        }
+        let gate = NATIVE_EFFECT_GATE.get().ok_or_else(|| FfiError::internal("effect gate is not installed"))?;
+        let invocation = gate.invocation.fetch_add(1, Ordering::SeqCst);
+        gate.entered.send(invocation).map_err(|error| FfiError::internal(error.to_string()))?;
+        if invocation == 0 {
+            gate.release
+                .lock()
+                .map_err(|_| FfiError::internal("effect gate mutex poisoned"))?
+                .recv_timeout(Duration::from_secs(20))
+                .map_err(|error| FfiError::deadline_exceeded(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Exposes the test handler to XLA while reporting failures through the FFI error surface.
+    unsafe extern "C" fn native_effect(frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+        // XLA owns this frame during the callback. No buffer view or client-bound resource escapes the callback.
+        unsafe {
+            match FfiCallFrame::from_c_api(frame) {
+                Err(_) => std::ptr::null_mut(),
+                Ok(frame) if frame.register_metadata(FfiTypeId::default()) => std::ptr::null_mut(),
+                Ok(frame) if frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
+                Ok(frame) => match frame.api() {
+                    Err(_) => std::ptr::null_mut(),
+                    Ok(api) => match invoke_native_effect(&frame) {
+                        Ok(()) => std::ptr::null_mut(),
+                        Err(error) => error.to_c_api(api),
+                    },
+                },
+            }
+        }
+    }
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -2950,6 +3143,7 @@ mod tests {
             }),
             compile_portable_executable: false,
             profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
             serialized_multi_slice_configuration: Vec::new(),
             environment_option_overrides: HashMap::new(),
             target_config: None,
@@ -3059,22 +3253,19 @@ mod tests {
                     assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
                     assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
 
-                    // The CPU plugin reports memory kinds but still does not expose generated code size
-                    // and cost analysis.
+                    // The CPU plugin reports a valid zero code size but does not expose cost analysis.
                     let input_memory_kinds = executable.input_memory_kinds();
                     let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     match platform {
                         TestPlatform::Cpu => {
-                            assert!(matches!(
-                                executable.generated_code_size_in_bytes(),
-                                Err(Error::Unavailable { .. }),
-                            ));
+                            assert_eq!(executable.generated_code_size_in_bytes(), Ok(0));
                             assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
                         }
                         _ => {
-                            assert!(executable.generated_code_size_in_bytes().is_ok());
+                            let generated_code_size = executable.generated_code_size_in_bytes();
+                            assert!(generated_code_size.is_ok(), "{generated_code_size:?}");
                             assert!(executable.cost_analysis().is_ok());
                         }
                     }
@@ -3099,7 +3290,7 @@ mod tests {
             // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
+                TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
@@ -3109,6 +3300,15 @@ mod tests {
                         Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
                     );
                     let executable_from_loaded_executable = loaded_executable.executable().unwrap();
+                    // PJRT augments layouts and debug options while preserving the supplied compilation settings.
+                    let loaded_options = executable_from_loaded_executable.compilation_options().unwrap();
+                    assert_eq!(loaded_options.profile_version, options.profile_version);
+                    assert_eq!(loaded_options.compile_portable_executable, options.compile_portable_executable);
+                    assert_eq!(loaded_options.parameter_is_tupled_arguments, options.parameter_is_tupled_arguments);
+                    let loaded_build_options = loaded_options.executable_build_options.unwrap();
+                    let build_options = options.executable_build_options.as_ref().unwrap();
+                    assert_eq!(loaded_build_options.replica_count, build_options.replica_count);
+                    assert_eq!(loaded_build_options.partition_count, build_options.partition_count);
                     assert_eq!(executable_from_loaded_executable.name(), executable.name());
                     assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
                     assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
@@ -3153,14 +3353,31 @@ mod tests {
                         executable.output_element_types(),
                     );
                     assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
-                    assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+                    match platform {
+                        TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert_eq!(executable_from_loaded_executable.generated_code_size_in_bytes(), Ok(0));
+                        }
+                        _ => assert!(matches!(
+                            executable_from_loaded_executable.generated_code_size_in_bytes(),
+                            Err(Error::Unavailable { .. }),
+                        )),
+                    }
                     assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
                     assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
                     // The loaded executable optimized program and memory statistics
                     // are not guaranteed to match the original.
                     assert!(executable_from_loaded_executable.optimized_program().is_ok());
                     assert!(executable_from_loaded_executable.memory_statistics().is_ok());
-                    assert!(executable_from_loaded_executable.cost_analysis().is_err());
+                    match platform {
+                        TestPlatform::Cpu => assert!(matches!(
+                            executable_from_loaded_executable.cost_analysis(),
+                            Err(Error::Unimplemented { .. }),
+                        )),
+                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert!(!executable_from_loaded_executable.cost_analysis().unwrap().is_empty());
+                        }
+                        _ => assert!(executable_from_loaded_executable.cost_analysis().is_err()),
+                    }
                 }
             };
         });
@@ -3266,7 +3483,7 @@ mod tests {
             let options = test_compilation_options();
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
+                TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     assert_eq!(executable.name().unwrap(), "main");
@@ -3277,12 +3494,31 @@ mod tests {
                     assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
                     let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
-                    assert!(executable.generated_code_size_in_bytes().is_err());
+                    match platform {
+                        TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert_eq!(executable.generated_code_size_in_bytes(), Ok(0));
+                        }
+                        _ => {
+                            assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })))
+                        }
+                    }
                     assert!(executable.fingerprint().is_ok());
                     assert!(executable.compilation_options().is_ok());
                     assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
                     assert!(executable.memory_statistics().is_ok());
-                    assert!(executable.cost_analysis().is_err());
+                    match platform {
+                        TestPlatform::Cpu => assert!(matches!(
+                            executable.cost_analysis(),
+                            Err(Error::Unimplemented { message, .. })
+                                if message == "GetCostAnalysis is not implemented.",
+                        )),
+                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => assert!(matches!(
+                            executable.cost_analysis(),
+                            Err(Error::Unimplemented { message, .. })
+                                if message == "GetCostAnalysis is not supported.",
+                        )),
+                        _ => assert!(executable.cost_analysis().is_err()),
+                    }
                     assert!(executable.serialize().is_ok());
                 }
             };
@@ -3300,27 +3536,13 @@ mod tests {
 
     #[test]
     fn test_loaded_executable_delete() {
-        test_for_each_platform!(|_plugin, client, platform| {
+        test_for_each_platform!(|_plugin, client, _platform| {
             let program = test_program(false, false);
             let options = test_compilation_options();
             let loaded_executable = client.compile(&program, &options).unwrap();
-
-            // The assertions below encode known upstream bugs in the reference PJRT plugin implementations
-            // of `PJRT_LoadedExecutable_IsDeleted`, rather than the intended semantics:
-            //   - The StreamExecutor GPU implementation has inverted polarity (i.e., `return executable_ != nullptr;`
-            //     in `PjRtStreamExecutorLoadedExecutable::IsDeleted`), and so fresh executables report `true` and
-            //     deleted executables report `false`.
-            //   - The CPU implementation is a stub: `PjRtCpuLoadedExecutable::Delete` is a no-op and its `IsDeleted`
-            //     always returns `false`.
-            match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
-                    assert_eq!(loaded_executable.is_deleted(), Ok(true));
-                }
-                _ => assert_eq!(loaded_executable.is_deleted(), Ok(false)),
-            };
-
-            assert!(unsafe { loaded_executable.delete() }.is_ok());
             assert_eq!(loaded_executable.is_deleted(), Ok(false));
+            assert!(unsafe { loaded_executable.delete() }.is_ok());
+            assert_eq!(loaded_executable.is_deleted(), Ok(true));
         });
     }
 
@@ -3380,6 +3602,474 @@ mod tests {
     }
 
     #[test]
+    fn test_loaded_executable_execute_retries_failed_execution_count_queries() {
+        let client = test_cpu_client();
+        let executable = client.compile(&test_program(false, false), &test_compilation_options()).unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let bytes = [1i32, 2i32].iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+        let buffer = Arc::new(client.buffer(bytes.as_slice(), BufferType::I32, [2, 1], None, device, None).unwrap());
+        let inputs = [
+            ExecutionInput { buffer: Arc::clone(&buffer), donatable: false },
+            ExecutionInput { buffer, donatable: false },
+        ];
+
+        // Alias the executable through an API table whose addressable-device query is missing, so that the first
+        // execution fails to query its counts. The alias is never dropped because it does not own the handle.
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_LoadedExecutable_AddressableDevices = None;
+        let failing_api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let mut alias = ManuallyDrop::new(LoadedExecutable {
+            handle: executable.handle,
+            api: failing_api,
+            client: executable.client,
+            execution_counts: OnceLock::new(),
+            owner: PhantomData,
+        });
+        assert!(matches!(
+            alias.execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None),
+            Err(Error::MissingFunction { .. }),
+        ));
+        assert_eq!(alias.execution_counts.get(), None);
+
+        // Failed queries are not cached, so a later execution retries them and caches the successful result.
+        alias.api = executable.api;
+        let execution = alias
+            .execute(vec![ExecutionDeviceInputs::from(&inputs[..])], vec![], 0, None, None, None, None)
+            .unwrap();
+        assert_eq!(execution.block_until_ready().unwrap().len(), 1);
+        assert_eq!(alias.execution_counts.get(), Some(&(1, 1)));
+        drop(table);
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_with_native_token() {
+        let client = test_cpu_client();
+        let program = Program::Mlir {
+            bytecode: indoc! {"
+                module {
+                  func.func @main(%token: !stablehlo.token) -> !stablehlo.token {
+                    %result = stablehlo.after_all %token : !stablehlo.token
+                    return %result : !stablehlo.token
+                  }
+                }
+            "}
+            .as_bytes()
+            .to_vec(),
+        };
+        let executable = client.compile(&program, &test_compilation_options()).unwrap();
+        let initial_program = Program::Mlir {
+            bytecode: indoc! {"
+                module {
+                  func.func @main() -> !stablehlo.token {
+                    %result = stablehlo.after_all : !stablehlo.token
+                    return %result : !stablehlo.token
+                  }
+                }
+            "}
+            .as_bytes()
+            .to_vec(),
+        };
+        let initial = client.compile(&initial_program, &test_compilation_options()).unwrap();
+        let mut initial_outputs = initial
+            .execute(vec![ExecutionDeviceInputs::default()], vec![], 0, None, None, None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let token = initial_outputs.remove(0).outputs.remove(0);
+        assert_eq!(token.element_type(), Ok(BufferType::Token));
+        let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
+        let execution = executable
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .unwrap();
+        let mut outputs = execution.block_until_ready().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].outputs.len(), 1);
+        let token = outputs.remove(0).outputs.remove(0);
+        assert_eq!(token.element_type(), Ok(BufferType::Token));
+        assert_eq!(token.ready().unwrap().ready(), Ok(true));
+        let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
+        let execution = executable
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .unwrap();
+        assert_eq!(execution.block_until_ready().unwrap()[0].outputs[0].element_type(), Ok(BufferType::Token));
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_with_native_token_pending_predecessor() {
+        // Checks that pending native token carriers prevent a successor effect from overtaking its predecessor.
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        assert!(
+            NATIVE_EFFECT_GATE
+                .set(NativeEffectGate {
+                    entered: entered_sender,
+                    release: Mutex::new(release_receiver),
+                    invocation: AtomicUsize::new(0),
+                })
+                .is_ok()
+        );
+
+        let client = test_cpu_client();
+        eprintln!(
+            "native token proof: CPU platform {}, API {:?}",
+            client.platform_version().unwrap(),
+            test_cpu_plugin().api().version()
+        );
+        client
+            .register_ffi_handler(
+                "ryft.test.native_effect_hold",
+                client.platform_name().unwrap().as_ref(),
+                FfiHandler::from(native_effect as XLA_FFI_Handler),
+                FfiHandlerTraits::NONE,
+            )
+            .unwrap();
+        let program = Program::Mlir {
+            bytecode: indoc! {r#"
+                module {
+                  func.func @main(%carrier: !stablehlo.token) -> !stablehlo.token {
+                    %effect = stablehlo.custom_call @ryft.test.native_effect_hold(%carrier)
+                      {api_version = 4 : i32, backend_config = {}, has_side_effect = true}
+                      : (!stablehlo.token) -> !stablehlo.token
+                    return %effect : !stablehlo.token
+                  }
+                }
+            "#}
+            .as_bytes()
+            .to_vec(),
+        };
+        let executable = client.compile(&program, &test_compilation_options()).unwrap();
+        let devices = executable.addressable_devices().unwrap();
+        let memory = devices[0].default_memory().unwrap();
+        let manager = client
+            .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+            .unwrap();
+        let initial = manager.retrieve_buffer(0).unwrap();
+        assert_eq!(initial.ready().unwrap().ready(), Ok(false));
+
+        // Scoped submitters exercise the real client borrow. Input transfers complete before checking submission
+        // timeouts, and the held callback also has a deadline so failure unwinding cannot strand a scoped thread.
+        std::thread::scope(|threads| {
+            let (first_sender, first_receiver) = mpsc::channel();
+            let executable = &executable;
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: Arc::new(initial), donatable: false }];
+                first_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+
+            // A pending input gives the CPU a genuine scheduling dependency. Ready-input computations may run
+            // inline; the public execution contract does not require every submission to return asynchronously.
+            let first = first_receiver.recv_timeout(Duration::from_secs(5));
+            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            let first = first.expect("pending-input submission should return before input readiness").unwrap();
+            assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+            let (mut first_outputs, first_fence) = first.into_parts();
+            let carrier = Arc::new(first_outputs.remove(0).outputs.remove(0));
+            assert_eq!(carrier.ready().unwrap().ready(), Ok(false));
+            assert_eq!(first_fence.is_ready(), Ok(false));
+
+            let (second_sender, second_receiver) = mpsc::channel();
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: carrier, donatable: false }];
+                second_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+            let second = second_receiver.recv_timeout(Duration::from_secs(5));
+            let premature_effect = entered_receiver.recv_timeout(Duration::from_millis(100));
+            release_sender.send(()).unwrap();
+            let second = second.expect("dependent submission must return before predecessor completion").unwrap();
+            assert!(matches!(premature_effect, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+            first_fence.block_until_ready().unwrap();
+            second.fence().block_until_ready().unwrap();
+            let output = &second.output()[0].outputs[0];
+            assert_eq!(output.element_type().unwrap(), BufferType::Token);
+            assert_eq!(output.ready().unwrap().ready(), Ok(true));
+
+            // A failed predecessor must fail its successor without invoking the effect handler.
+            let manager = client
+                .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+                .unwrap();
+            let initial = manager.retrieve_buffer(0).unwrap();
+            let (failed_sender, failed_receiver) = mpsc::channel();
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: Arc::new(initial), donatable: false }];
+                failed_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+            let failed = failed_receiver.recv_timeout(Duration::from_secs(5));
+            assert_eq!(manager.set_error(0, Error::aborted("native token predecessor failure")), Ok(()));
+            let failed = failed.unwrap().unwrap();
+            let failure = failed.fence().block_until_ready();
+            assert!(matches!(
+                failure,
+                Err(Error::Internal { message, .. }) if message.contains("native token predecessor failure"),
+            ));
+            assert!(matches!(entered_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(NATIVE_EFFECT_GATE.get().unwrap().invocation.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn test_loaded_executable_drop_pending_effect() {
+        const CHILD_ENVIRONMENT: &str = "RYFT_TEST_PENDING_EFFECT_CLIENT_DROP";
+        if std::env::var_os(CHILD_ENVIRONMENT).is_none() {
+            // Plugin teardown behavior is isolated from the test runner, including native aborts and deadlocks.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "programs::tests::test_loaded_executable_drop_pending_effect", "--nocapture"])
+                .env(CHILD_ENVIRONMENT, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "pending-effect teardown subprocess failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("pending-effect teardown exceeded its 30-second deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        assert!(
+            NATIVE_EFFECT_GATE
+                .set(NativeEffectGate {
+                    entered: entered_sender,
+                    release: Mutex::new(release_receiver),
+                    invocation: AtomicUsize::new(0),
+                })
+                .is_ok()
+        );
+        let client = test_cpu_client();
+        client
+            .register_ffi_handler(
+                "ryft.test.native_effect_hold",
+                client.platform_name().unwrap().as_ref(),
+                FfiHandler::from(native_effect as XLA_FFI_Handler),
+                FfiHandlerTraits::NONE,
+            )
+            .unwrap();
+        let (dropped_sender, dropped_receiver) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let fence = {
+                let program = Program::Mlir {
+                    bytecode: indoc! {r#"
+                        module {
+                          func.func @main(%carrier: !stablehlo.token) -> !stablehlo.token {
+                            %effect = stablehlo.custom_call @ryft.test.native_effect_hold(%carrier)
+                              {api_version = 4 : i32, backend_config = {}, has_side_effect = true}
+                              : (!stablehlo.token) -> !stablehlo.token
+                            return %effect : !stablehlo.token
+                          }
+                        }
+                    "#}
+                    .as_bytes()
+                    .to_vec(),
+                };
+                let executable = client.compile(&program, &test_compilation_options()).unwrap();
+                let devices = client.addressable_devices().unwrap();
+                let memory = devices[0].default_memory().unwrap();
+                let manager = client
+                    .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+                    .unwrap();
+                let inputs =
+                    [ExecutionInput { buffer: Arc::new(manager.retrieve_buffer(0).unwrap()), donatable: false }];
+                let execution = executable
+                    .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+                    .unwrap();
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+                assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+                let (outputs, fence) = execution.into_parts();
+                assert_eq!(fence.is_ready(), Ok(false));
+                drop(outputs);
+                fence
+            };
+
+            // This worker owns only channels. No client, buffer, or client-borrowing reservation escapes the scope.
+            let releaser = threads.spawn(move || {
+                let dropped_early = match dropped_receiver.recv_timeout(Duration::from_millis(200)) {
+                    Ok(()) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(error) => panic!("client-drop observer disconnected: {error}"),
+                };
+                release_sender.send(()).unwrap();
+                if !dropped_early {
+                    dropped_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                dropped_early
+            });
+
+            // Every client-borrowing owner has gone away, but the native callback is still held.
+            drop(client);
+            dropped_sender.send(()).unwrap();
+            let dropped_early = releaser.join().unwrap();
+            fence.block_until_ready().unwrap();
+            eprintln!("CPU client destruction returned before pending effect release: {dropped_early}");
+        });
+    }
+
+    #[test]
+    fn test_execution_fence_new_waits_after_failed_callback_registration() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        std::thread::scope(|threads| {
+            let (started, waiting) = mpsc::channel();
+            let (sender, completed) = mpsc::channel();
+            threads.spawn(move || {
+                started.send(()).unwrap();
+                sender.send(ExecutionFence::new(vec![event])).unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(completed.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+            promise.set(Some(Error::aborted("test terminal failure"))).unwrap();
+            let fence = completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(fence.block_until_ready(), Err(Error::Aborted { .. })));
+        });
+        drop(table);
+    }
+
+    #[test]
+    fn test_execution_fence_new_missing_await_remains_pending() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        table.PJRT_Event_Await = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let completed = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::clone(&completed);
+        fence.on_ready(move |_| recorded.store(true, Ordering::SeqCst));
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(!completed.load(Ordering::SeqCst));
+        promise.set(None).unwrap();
+        // Without either observation mechanism, even later native completion cannot complete this fence.
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_execution_fence_new_native_unimplemented_is_terminal() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        promise.set(Some(Error::unimplemented("test terminal failure"))).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        assert!(matches!(
+            fence.block_until_ready(),
+            Err(Error::Unimplemented { message, .. }) if message == "test terminal failure",
+        ));
+    }
+
+    #[test]
+    fn test_execution_fence_without_events_is_immediately_terminal() {
+        // A fence that joins no device events is terminal at construction, so readiness polling and blocking both
+        // resolve without any asynchronous notification ever arriving.
+        let fence = ExecutionFence::new(Vec::new());
+        assert_eq!(fence.is_ready(), Ok(true));
+        assert_eq!(fence.block_until_ready(), Ok(()));
+
+        // Registering a callback on an already terminal fence delivers it inline on the calling thread, so the
+        // recorded result is observable as soon as `on_ready` returns.
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&delivered);
+        fence.on_ready(move |result| recorder.lock().unwrap().push(result));
+        assert_eq!(*delivered.lock().unwrap(), vec![Ok(())]);
+    }
+
+    #[test]
+    fn test_execution_fence_of_completed_events_is_immediately_terminal() {
+        // Executions whose events all completed successfully before the fence was created need no shared state.
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(None).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        assert!(fence.state.is_none());
+        assert_eq!(fence.is_ready(), Ok(true));
+        assert_eq!(fence.clone().block_until_ready(), Ok(()));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&delivered);
+        fence.on_ready(move |result| recorder.lock().unwrap().push(result));
+        assert_eq!(*delivered.lock().unwrap(), vec![Ok(())]);
+
+        // One pending event keeps the whole fence pending, even when the other events already completed.
+        let (completed_event, completed_promise) = client.event(()).unwrap();
+        let (pending_event, pending_promise) = client.event(()).unwrap();
+        completed_promise.set(None).unwrap();
+        let fence = ExecutionFence::new(vec![completed_event, pending_event]);
+        assert!(fence.state.is_some());
+        assert_eq!(fence.is_ready(), Ok(false));
+        pending_promise.set(None).unwrap();
+        assert_eq!(fence.block_until_ready(), Ok(()));
+    }
+
+    #[test]
+    fn test_execution_fence_readiness_transitions_around_a_blocked_waiter() {
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+
+        // Nothing has completed the underlying event yet, so readiness polling reports `false` instead of waiting.
+        assert_eq!(fence.is_ready(), Ok(false));
+
+        // Poll while another thread enters `block_until_ready`. This cannot distinguish a conservative poll from a
+        // truthful one (the waiter releases the completion lock either way and the event is genuinely pending), and
+        // the handshake orders only thread start, not parking, so the poll-while-parked overlap is opportunistic
+        // rather than guaranteed. What it pins is that after completion the waiter and a poll observe one shared
+        // terminal result.
+        let waiting_fence = fence.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            sender.send(()).unwrap();
+            waiting_fence.block_until_ready()
+        });
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(fence.is_ready(), Ok(false));
+
+        promise.set(None).unwrap();
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        assert_eq!(fence.is_ready(), Ok(true));
+    }
+
+    #[test]
     fn test_execution_fence_records_asynchronous_error() {
         let client = test_cpu_client();
         let expected = Error::aborted("asynchronous execution failed");
@@ -3407,6 +4097,60 @@ mod tests {
         promise.set(None).unwrap();
         waiter.join().unwrap().unwrap();
         assert_eq!(fence.is_ready(), Ok(true));
+    }
+
+    #[test]
+    fn test_execution_fence_notifies_callbacks_before_and_after_completion() {
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        fence.on_ready(move |result| sender.send(result).unwrap());
+        promise.set(None).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        fence.on_ready(move |result| sender.send(result).unwrap());
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_execution_fence_callback_survives_dropping_every_fence_handle() {
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        fence.on_ready(move |result| sender.send(result).unwrap());
+        drop(fence);
+
+        promise.set(None).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_execution_fence_joins_multiple_events_and_preserves_an_error() {
+        let client = test_cpu_client();
+        let (first_event, first_promise) = client.event(()).unwrap();
+        let (second_event, second_promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![first_event, second_event]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        fence.on_ready(move |result| sender.send(result).unwrap());
+
+        let expected = Error::aborted("second device failed");
+        second_promise.set(Some(expected.clone())).unwrap();
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+
+        first_promise.set(None).unwrap();
+        let callback_error = receiver.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert_eq!(callback_error.code(), expected.code());
+        assert_eq!(callback_error.message(), expected.message());
+        let readiness_error = fence.is_ready().unwrap_err();
+        assert_eq!(readiness_error.code(), expected.code());
+        assert_eq!(readiness_error.message(), expected.message());
+        let blocking_error = fence.block_until_ready().unwrap_err();
+        assert_eq!(blocking_error.code(), expected.code());
+        assert_eq!(blocking_error.message(), expected.message());
     }
 
     #[test]
@@ -3479,7 +4223,10 @@ mod tests {
     #[test]
     fn test_loaded_executable_execute_validation_errors() {
         let plugin = test_cpu_plugin();
-        let client = plugin.api().client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .api()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let program = test_program(false, false);
         let options = CompilationOptions {
             executable_build_options: Some(ExecutableCompilationOptions {

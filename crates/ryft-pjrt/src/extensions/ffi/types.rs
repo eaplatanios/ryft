@@ -102,7 +102,7 @@ impl FfiApi {
 pub(crate) mod ffi {
     use crate::extensions::ffi::attributes::ffi::XLA_FFI_ByteSpan;
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
-    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Extension_Base;
+    use crate::extensions::ffi::handlers::ffi::XLA_FFI_InternalExtension;
 
     #[repr(C)]
     pub struct XLA_FFI_TypeId {
@@ -118,7 +118,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_TypeInfo {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub deleter: Option<unsafe extern "C" fn(object: *mut std::ffi::c_void)>,
     }
 
@@ -131,7 +131,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Type_Register_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub name: XLA_FFI_ByteSpan,
         pub type_id: *mut XLA_FFI_TypeId,
         pub type_info: *const XLA_FFI_TypeInfo,
