@@ -1788,7 +1788,7 @@ mod tests {
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer};
-    use crate::programs::{ProgramBuilder, Provenance};
+    use crate::programs::{ProgramBuilder, ProgramRenderingMode};
 
     use super::*;
 
@@ -2836,39 +2836,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2, 4]));
-        let (operation, instruction) = program
-            .instructions()
-            .iter()
-            .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::ParallelRaggedAllToAll(operation) => Some((operation, instruction)),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!operation.is_physical());
-        let merged_input_types = instruction
-            .inputs()
-            .iter()
-            .map(|input| program.atoms()[input.index()].r#type().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(merged_input_types[0], ArrayType::new_static(DataType::F32, [6]));
-        assert_eq!(merged_input_types[1], ArrayType::new_static(DataType::F32, [8]));
-        for metadata_type in &merged_input_types[2..] {
-            assert_eq!(metadata_type, &ArrayType::new_static(DataType::U64, [4]));
-        }
         assert_eq!(
-            program.instructions().iter().filter(|instruction| instruction.operation().name() == "iota").count(),
-            2
-        );
-        let expected_provenance = Provenance::scope(
-            ProvenanceScope::new("ryft"),
-            Provenance::scope(
-                ProvenanceScope::new("batching"),
-                Provenance::scope(ProvenanceScope::new("parallel_ragged_all_to_all"), Provenance::unknown()),
-            ),
-        );
-        assert!(
-            program.instructions().iter().all(|instruction| instruction.provenance() == &expected_provenance),
-            "every merged batching instruction is attributed",
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:f32[2, 4], %2:i8[2, 2], %3:i8[2, 2], %4:i8[2, 2], %5:i8[2, 2] .
+                let %6:f32[6] = reshape [shape=[6]] %0 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %7:f32[8] = reshape [shape=[8]] %1 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %8:u64[2, 2] = convert_element_type [data_type=u64] %2 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %9:u64[2, 2] = convert_element_type [data_type=u64] %3 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %10:u64[2, 2] = convert_element_type [data_type=u64] %4 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %11:u64[2, 2] = convert_element_type [data_type=u64] %5 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %12:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %13:u64[] = constant [value=3] ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %14:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %13 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %15:u64[2, 2] = mul %12 %14 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %16:u64[2, 2] = add %8 %15 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %17:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %18:u64[] = constant [value=4] ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %19:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %18 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %20:u64[2, 2] = mul %17 %19 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %21:u64[2, 2] = add %10 %20 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %22:u64[4] = reshape [shape=[4]] %16 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %23:u64[4] = reshape [shape=[4]] %9 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %24:u64[4] = reshape [shape=[4]] %21 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %25:u64[4] = reshape [shape=[4]] %11 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %26:f32[8] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2] %6 %7 %22 %23 %24 %25 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %27:f32[2, 4] = reshape [shape=[2, 4]] %26 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                in (%27)"
+            },
         );
     }
 
@@ -3585,98 +3590,72 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
 
-        let parallel_all_to_all_groups = pullback
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction.operation() {
-                ArrayOperation::ParallelAllToAll(operation) => operation.options().axis_index_groups(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(parallel_all_to_all_groups, vec![groups.as_slice(), groups.as_slice()]);
-        let adjoint = pullback
-            .instructions()
-            .iter()
-            .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::ParallelRaggedAllToAll(operation) => Some(operation),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(adjoint.axis_index_groups(), Some(groups.as_slice()));
-        let expected_provenance = Provenance::scope(
-            ProvenanceScope::new("ryft"),
-            Provenance::scope(
-                ProvenanceScope::new("differentiation"),
-                Provenance::scope(ProvenanceScope::new("parallel_ragged_all_to_all_transpose"), Provenance::unknown()),
-            ),
-        );
-        assert!(
-            pullback.instructions().iter().all(|instruction| instruction.provenance() == &expected_provenance),
-            "every transpose instruction is attributed",
-        );
         assert_eq!(
-            pullback.to_string(),
-            indoc! {r#"
+            std::fmt::from_fn(|formatter| pullback.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
                 lambda %0:f32[4] .
                 let %1:i32[4] = const [0, 1, 0, 2]
                     %2:i32[4] = const [1, 1, 0, 1]
                     %3:i32[4] = const [0, 2, 1, 3]
                     %4:i32[4] = const [1, 0, 1, 1]
                     %5:i32[4] = parallel_all_to_all [
-                        axis_name="x",
+                        axis_name=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concat_axis=0,
                         options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
-                    ] %3
+                    ] %3 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %6:i32[4] = parallel_all_to_all [
-                        axis_name="x",
+                        axis_name=\"x\",
                         axis_size=4,
                         split_axis=0,
                         concat_axis=0,
                         options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
-                    ] %1
-                    %7:f32[3] = zero [type=f32[3]]
-                    __ADJOINT__
-                    %9:u64[4] = convert_element_type [data_type=u64] %5
-                    %10:u64[4] = convert_element_type [data_type=u64] %4
-                    %11:i64[5] = zero [type=i64[5]]
-                    %12:i64[4] = one [type=i64[4]]
-                    %13:i64[4] = neg %12
-                    %14:u64[4] = add %9 %10
-                    %15:u64[4, 1] = reshape [shape=[4, 1]] %9
-                    %16:u64[4, 1] = reshape [shape=[4, 1]] %14
+                    ] %1 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %7:f32[3] = zero [type=f32[3]] ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %8:f32[3] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, axis_index_groups=[[0, 2], \
+                        [3, 1]], update_kind=Add] %0 %7 %5 %4 %6 %2 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %9:u64[4] = convert_element_type [data_type=u64] %5 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %10:u64[4] = convert_element_type [data_type=u64] %4 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %11:i64[5] = zero [type=i64[5]] ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %12:i64[4] = one [type=i64[4]] ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %13:i64[4] = neg %12 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %14:u64[4] = add %9 %10 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %15:u64[4, 1] = reshape [shape=[4, 1]] %9 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %16:u64[4, 1] = reshape [shape=[4, 1]] %14 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %17:i64[5] = scatter [
                         kind=add,
-                        __SCATTER_DIMENSIONS__
-                    ] %11 %15 %12
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %11 %15 %12 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %18:i64[5] = scatter [
                         kind=add,
-                        __SCATTER_DIMENSIONS__
-                    ] %17 %16 %13
-                    %19:i64[5] = cumulative [kind=sum, axis=0] %18
-                    %20:i64[4] = slice [start_indices=[0], limits=[4]] %19
-                    %21:i64[4] = zero [type=i64[4]]
-                    %22:bool[4] = compare [direction=NotEqual] %20 %21
-                    %23:f32[4] = zero [type=f32[4]]
-                    %24:f32[4] = select %22 %23 %0
-                in (%8, %24)
-            "#}
-            .replace(
-                "__ADJOINT__",
-                concat!(
-                    "%8:f32[3] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, ",
-                    "axis_index_groups=[[0, 2], [3, 1]], update_kind=Add] %0 %7 %5 %4 %6 %2",
-                ),
-            )
-            .replace(
-                "__SCATTER_DIMENSIONS__",
-                concat!(
-                    "dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], ",
-                    "operand_batching=[], scatter_indices_batching=[]),",
-                ),
-            )
-            .trim_end(),
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %16 %13 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %19:i64[5] = cumulative [kind=sum, axis=0] %18 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %20:i64[4] = slice [start_indices=[0], limits=[4]] %19 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %21:i64[4] = zero [type=i64[4]] ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %22:bool[4] = compare [direction=NotEqual] %20 %21 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %23:f32[4] = zero [type=f32[4]] ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                    %24:f32[4] = select %22 %23 %0 ; \
+                        provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
+                in (%8, %24)"
+            },
         );
 
         let transposed_twice = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
@@ -3708,12 +3687,16 @@ mod tests {
         let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
 
         assert_eq!(
-            pullback
-                .instructions()
-                .iter()
-                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::ParallelAllToAll(_)))
-                .count(),
-            0,
+            std::fmt::from_fn(|formatter| pullback.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[3] .
+                let %2:i32[1] = const [0]
+                    %3:i32[1] = const [1]
+                    %4:i32[1] = const [0]
+                    %5:i32[1] = const [1]
+                in (%0)"
+            },
         );
     }
 
