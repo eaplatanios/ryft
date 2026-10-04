@@ -694,9 +694,8 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
+    #[inline]
     fn infer_parent_region_input_types(
         &self,
         _input_types: &[ArrayIrType],
@@ -705,6 +704,7 @@ impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
         Ok(vec![None; region_interfaces.len()])
     }
 
+    #[inline]
     fn infer_parent_output_types(
         &self,
         input_types: &[ArrayIrType],
@@ -714,6 +714,7 @@ impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
         self.infer_explicit_output_types(input_types)
     }
 
+    #[inline]
     fn rename_parent_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<DimensionVariable>,
@@ -722,10 +723,15 @@ impl MemberOperation<ArrayIrType> for ParallelSumScatterOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayIrType>> MemberInterpretableOperation<C> for ParallelSumScatterOperation
-where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
+    C: Domain<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape>
+                       + ValueProjection<DimensionType, Projected = DimensionValue>,
+        >,
+> MemberInterpretableOperation<C> for ParallelSumScatterOperation
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -759,9 +765,11 @@ where
             if actual != *expected {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "`{}` output axis {axis} extent must equal observed result extent {expected} but got \
-                         {actual}",
+                        "`{}` output axis {} extent must equal observed result extent {} but got {}",
                         self.name(),
+                        axis,
+                        expected,
+                        actual,
                     ),
                 });
             }
