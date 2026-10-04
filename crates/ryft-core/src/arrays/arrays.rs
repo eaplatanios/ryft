@@ -777,18 +777,19 @@ impl Value for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl LiteralIdentity for Array {
     // An array's physical storage is canonical for its type (layout holes and tile padding are always zero), so
-    // comparing the type and the storage bytes compares the literal exactly. Shared storage short-circuits the byte
-    // comparison.
+    // comparing the type and the storage bytes compares the literal exactly. Shared storage short-circuits the
+    // byte comparison.
+
+    #[inline]
     fn literal_eq(&self, other: &Self) -> bool {
         self.r#type() == other.r#type()
             && (std::ptr::eq(self.storage_bytes(), other.storage_bytes())
                 || self.storage_bytes() == other.storage_bytes())
     }
 
+    #[inline]
     fn literal_hash<H: Hasher>(&self, state: &mut H) {
         self.r#type().hash(state);
         self.storage_bytes().hash(state);
@@ -798,6 +799,7 @@ impl LiteralIdentity for Array {
 impl TryFrom<bool> for Array {
     type Error = ProgramError;
 
+    #[inline]
     fn try_from(value: bool) -> Result<Self, Self::Error> {
         Self::scalar(value)
     }
@@ -809,6 +811,7 @@ impl AbsDiffEq for Array {
 
     type Epsilon = f64;
 
+    #[inline]
     fn default_epsilon() -> f64 {
         f64::EPSILON
     }
@@ -845,6 +848,8 @@ impl AbsDiffEq for Array {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Implements checked integer extraction or exact element decoding for supported host scalar types.
 macro_rules! impl_array_scalar_concretization {
