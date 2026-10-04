@@ -5549,7 +5549,7 @@ fn array_data_dependent_padding_discipline(
         ArrayOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
-        ArrayOperation::RaggedAllToAll(_) => {
+        ArrayOperation::ParallelRaggedAllToAll(_) => {
             Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
         }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
@@ -5598,10 +5598,10 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Imaginary(_)
         | ArrayOperation::ParallelReduce(_)
         | ArrayOperation::ParallelVary(_)
-        | ArrayOperation::AllGather(_)
+        | ArrayOperation::ParallelAllGather(_)
         | ArrayOperation::ParallelSumScatter(_)
         | ArrayOperation::ParallelPermute(_)
-        | ArrayOperation::AllToAll(_)
+        | ArrayOperation::ParallelAllToAll(_)
         | ArrayOperation::AxisIndex(_)
         | ArrayOperation::Reverse(_)
         | ArrayOperation::Transpose(_)
@@ -5642,7 +5642,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         XlaOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
-        XlaOperation::RaggedAllToAll(_) => {
+        XlaOperation::ParallelRaggedAllToAll(_) => {
             Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
         }
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
@@ -5675,9 +5675,9 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Concatenate(_)
         | XlaOperation::Pad(_)
         | XlaOperation::DynamicSlice(_)
-        | XlaOperation::AllGather(_)
+        | XlaOperation::ParallelAllGather(_)
         | XlaOperation::ParallelSumScatter(_)
-        | XlaOperation::AllToAll(_)
+        | XlaOperation::ParallelAllToAll(_)
         | XlaOperation::Condition(_)
         | XlaOperation::While(_)
         | XlaOperation::Scan(_)
@@ -15172,6 +15172,48 @@ mod tests {
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "both predicate values must share one compiled executable");
+    }
+
+    #[test]
+    fn test_eager_bind_executes_condition_over_branches_refined_by_its_inputs() {
+        // Eager compilation attaches the branches as provided. Their bounded `f32[rows]` input type is refined by the
+        // static `f32[4]` input, so the eagerly executed output takes the refined static type rather than the bounded
+        // branch output type.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let branch_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let branch = |squares: bool| {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(branch_type.clone().into());
+            let output = if squares {
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
+            } else {
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
+            };
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
+                .unwrap()
+        };
+
+        let outputs = domain
+            .bind(
+                XlaOperation::Condition(ConditionOperation::new()),
+                [branch(false), branch(true)],
+                &[
+                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)),
+                    ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0])),
+                ],
+            )
+            .unwrap();
+        assert_eq!(program_array(&outputs[0]).shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
     }
 
     #[test]

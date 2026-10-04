@@ -20,7 +20,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver, Member
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
-use crate::operations::collectives::all_gather::{AllGatherOperation, AllGatherOutputVariance};
+use crate::operations::collectives::parallel_all_gather::{
+    ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+};
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
@@ -66,11 +68,11 @@ pub const PARALLEL_SUM_SCATTER_OPERATION_NAME: &str = "parallel_sum_scatter";
 ///
 /// Over a manual mesh axis, every participant receives a different chunk, so the input must vary over the axis
 /// (refer to [`ParallelVary`]) and the output varies over it as well. An input that is instead unreduced over
-/// the operation's own axis (e.g., the cotangent of a reduced [`AllGatherOperation`] result) has its pending
+/// the operation's own axis (e.g., the cotangent of a reduced [`ParallelAllGatherOperation`] result) has its pending
 /// cross-device sum completed by the exchange, and its output varies over the axis too. The collective is linear,
-/// and its transpose is a varying [`AllGatherOperation`] with the same mode, axis, and participant groups. Outside
-/// any binder, the single participant of a degenerate axis keeps its value, with the size-one scatter axis removed
-/// in untiled mode.
+/// and its transpose is a varying [`ParallelAllGatherOperation`] with the same mode, axis, and participant groups.
+/// Outside any binder, the single participant of a degenerate axis keeps its value, with the size-one scatter axis
+/// removed in untiled mode.
 ///
 /// A matching `batch` level consumes the mapped batch axis by summing over it and mapping the scattered chunks back
 /// onto it, so that batch item `i` receives chunk `i` of the sum and a value that is the same for every item counts
@@ -431,13 +433,13 @@ impl ParallelSumScatterOperation {
 
     /// Returns the adjoint collective that transposition stages on the output cotangent.
     #[inline]
-    fn adjoint(&self) -> Result<AllGatherOperation, ProgramError> {
-        Ok(AllGatherOperation::new(
+    fn adjoint(&self) -> Result<ParallelAllGatherOperation, ProgramError> {
+        Ok(ParallelAllGatherOperation::new(
             self.axis_name.clone(),
             self.axis_size,
             self.scatter_axis,
             self.options.clone(),
-            AllGatherOutputVariance::Varying,
+            ParallelAllGatherOutputVariance::Varying,
         ))
     }
 }
@@ -614,10 +616,11 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
 }
 
 // Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
-// same mode, axis, and participant groups, so the input cotangent is an [`AllGatherOperation`] of the output cotangent.
+// same mode, axis, and participant groups, so the input cotangent is a [`ParallelAllGatherOperation`] of the output
+// cotangent.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ParallelSumScatterOperation
 where
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<AllGatherOperation>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllGatherOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -828,7 +831,7 @@ where
 impl<C> MemberDifferentiableOperation<C> for ParallelSumScatterOperation
 where
     C: Context<Type = ArrayIrType>,
-    C::Operation: From<AllGatherOperation>
+    C::Operation: From<ParallelAllGatherOperation>
         + From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<ParallelSumScatterOperation>
@@ -1705,7 +1708,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[4] .
-                let %1:f32[8] = all_gather [
+                let %1:f32[8] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
                     concat_axis=0,
@@ -1739,7 +1742,7 @@ mod tests {
         assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
         assert!(matches!(
             context.builder().borrow().instructions()[0].operation(),
-            ArrayIrOperation::Array(ArrayOperation::AllGather(_)),
+            ArrayIrOperation::Array(ArrayOperation::ParallelAllGather(_)),
         ));
     }
 

@@ -22,15 +22,16 @@ use ryft_mlir::{
 
 use super::{
     CollectiveLoweringState, EffectTokens, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
-    PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
-    lower_assert_to_custom_call, lower_assertion_custom_call, lower_compare_to_mlir,
-    lower_concatenate_extent_assertion, lower_concatenate_tree, lower_constant_elements_attribute,
-    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
-    lower_dynamic_slice_assertion, lower_pad_extent_assertion, lower_pad_to_mlir, lower_parallel_sum_scatter_to_mlir,
-    lower_physical_bound_value, lower_ragged_all_to_all_to_mlir, lower_reshape_element_count_assertion,
-    lower_restore_dynamic_dimensions, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
-    lower_sharding_constraint, lower_static_index_constants, lower_tensor_type, physical_bound_type,
-    reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_assert_to_custom_call,
+    lower_assertion_custom_call, lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_concatenate_tree,
+    lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
+    lower_dimension_arithmetic_assertion, lower_dimension_extent, lower_dynamic_slice_assertion,
+    lower_pad_extent_assertion, lower_pad_to_mlir, lower_parallel_all_gather_to_mlir,
+    lower_parallel_all_to_all_to_mlir, lower_parallel_ragged_all_to_all_to_mlir, lower_parallel_sum_scatter_to_mlir,
+    lower_physical_bound_value, lower_reshape_element_count_assertion, lower_restore_dynamic_dimensions,
+    lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64, lower_sharding_constraint,
+    lower_static_index_constants, lower_tensor_type, physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Constrains a statically allocated constructor result before attaching its runtime dimensions.
@@ -1345,7 +1346,7 @@ where
             }
             lower_rng_bit_generator_to_mlir(operation, input_values, block, context, location)
         }
-        ArrayIrOperation::AllGather(operation) => {
+        ArrayIrOperation::ParallelAllGather(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1354,9 +1355,16 @@ where
             };
             let output_type =
                 <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-            let result =
-                lower_all_gather_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
-                    .remove(0);
+            let result = lower_parallel_all_gather_to_mlir(
+                operation,
+                collective_state,
+                *input,
+                output_type,
+                block,
+                context,
+                location,
+            )?
+            .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayIrOperation::ParallelSumScatter(operation) => {
@@ -1380,7 +1388,7 @@ where
             .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayIrOperation::AllToAll(operation) => {
+        ArrayIrOperation::ParallelAllToAll(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1394,7 +1402,7 @@ where
             };
             let output_type =
                 <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-            let result = lower_all_to_all_to_mlir(
+            let result = lower_parallel_all_to_all_to_mlir(
                 operation,
                 collective_state,
                 *input,
@@ -1407,7 +1415,7 @@ where
             .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayIrOperation::RaggedAllToAll(operation) => {
+        ArrayIrOperation::ParallelRaggedAllToAll(operation) => {
             if input_values.len() != 6 {
                 return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
             }
@@ -1423,7 +1431,7 @@ where
                 return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
             };
             <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-            lower_ragged_all_to_all_to_mlir(
+            lower_parallel_ragged_all_to_all_to_mlir(
                 operation,
                 collective_state,
                 input_values,

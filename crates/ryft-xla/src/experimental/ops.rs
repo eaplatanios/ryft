@@ -8,8 +8,8 @@ use ryft_core::kernels::KernelReferenceOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
-    RaggedAllToAllOperation,
+    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
+    ParallelSumScatterOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
@@ -497,7 +497,7 @@ where
 
     /// Gathers values with one explicit extent per result axis.
     #[ryft(mixed)]
-    AllGather(AllGatherOperation),
+    ParallelAllGather(ParallelAllGatherOperation),
 
     /// Scatters values with one explicit extent per result axis.
     #[ryft(mixed)]
@@ -505,11 +505,11 @@ where
 
     /// Exchanges values with one explicit extent per result axis.
     #[ryft(mixed)]
-    AllToAll(AllToAllOperation),
+    ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Exchanges variable-length leading-axis slices through an XLA FFI custom call.
     #[ryft(mixed)]
-    RaggedAllToAll(RaggedAllToAllOperation),
+    ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
     Condition(ConditionOperation<Constant>),
@@ -693,10 +693,10 @@ where
             ArrayIrOperation::Pad(operation) => Self::Pad(operation),
             ArrayIrOperation::DynamicSlice(operation) => Self::DynamicSlice(operation),
             ArrayIrOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
-            ArrayIrOperation::AllGather(operation) => Self::AllGather(operation),
+            ArrayIrOperation::ParallelAllGather(operation) => Self::ParallelAllGather(operation),
             ArrayIrOperation::ParallelSumScatter(operation) => Self::ParallelSumScatter(operation),
-            ArrayIrOperation::AllToAll(operation) => Self::AllToAll(operation),
-            ArrayIrOperation::RaggedAllToAll(operation) => Self::RaggedAllToAll(operation),
+            ArrayIrOperation::ParallelAllToAll(operation) => Self::ParallelAllToAll(operation),
+            ArrayIrOperation::ParallelRaggedAllToAll(operation) => Self::ParallelRaggedAllToAll(operation),
             ArrayIrOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayIrOperation::While(operation) => Self::While(operation),
             ArrayIrOperation::Scan(operation) => Self::Scan(operation),
@@ -948,10 +948,10 @@ where
             Self::Pad(operation) => ArrayIrOperation::Pad(operation.clone()),
             Self::DynamicSlice(operation) => ArrayIrOperation::DynamicSlice(operation.clone()),
             Self::RngBitGenerator(operation) => ArrayIrOperation::RngBitGenerator(operation.clone()),
-            Self::AllGather(operation) => ArrayIrOperation::AllGather(operation.clone()),
+            Self::ParallelAllGather(operation) => ArrayIrOperation::ParallelAllGather(operation.clone()),
             Self::ParallelSumScatter(operation) => ArrayIrOperation::ParallelSumScatter(operation.clone()),
-            Self::AllToAll(operation) => ArrayIrOperation::AllToAll(operation.clone()),
-            Self::RaggedAllToAll(operation) => ArrayIrOperation::RaggedAllToAll(operation.clone()),
+            Self::ParallelAllToAll(operation) => ArrayIrOperation::ParallelAllToAll(operation.clone()),
+            Self::ParallelRaggedAllToAll(operation) => ArrayIrOperation::ParallelRaggedAllToAll(operation.clone()),
             Self::Kernel(_)
             | Self::Condition(_)
             | Self::While(_)

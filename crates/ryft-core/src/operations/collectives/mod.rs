@@ -4,25 +4,26 @@
 //!
 //! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], and
 //! named axis resolution), while each operation family lives in its own submodule: [`parallel_reduce`],
-//! [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`], [`all_to_all`], and
-//! [`ragged_all_to_all`]. The [`axis_index`] submodule holds the one named-axis operation that exchanges nothing; it
-//! reads the current batch item's or device shard's position along the axis. This module also owns the shared machinery
-//! of the single-input linear collectives ([`ParallelPermuteOperation`], [`AllGatherOperation`],
-//! [`ParallelSumScatterOperation`], and [`AllToAllOperation`]). Each carries the referenced axis name and the
-//! participant count resolved from the active [`NamedAxes`] environment, consumes one statically shaped array input,
-//! and has only degenerate single-participant semantics outside a binder. Its tangent rides the same collective, and
-//! its transpose is another collective over the same axis. The private `define_linear_collective_operation!` macro
-//! generates their common operation structure and the private `impl_differentiable_linear_collective_operation!` macro
-//! their differentiation rules, while shared functions support the generated code and hand-written rules.
+//! [`parallel_vary`], [`parallel_all_gather`], [`parallel_sum_scatter`], [`parallel_permute`], [`parallel_all_to_all`],
+//! and [`parallel_ragged_all_to_all`]. The [`axis_index`] submodule holds the one named-axis operation that exchanges
+//! nothing; it reads the current batch item's or device shard's position along the axis. This module also owns the
+//! shared machinery of the single-input linear collectives ([`ParallelPermuteOperation`],
+//! [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Each carries
+//! the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment, consumes one
+//! statically shaped array input, and has only degenerate single-participant semantics outside a binder. Its tangent
+//! rides the same collective, and its transpose is another collective over the same axis. The private
+//! `define_linear_collective_operation!` macro generates their common operation structure and the private
+//! `impl_differentiable_linear_collective_operation!` macro their differentiation rules, while shared functions support
+//! the generated code and hand-written rules.
 //!
-//! The collectives that resize an array axis ([`AllGatherOperation`], [`ParallelSumScatterOperation`], and
-//! [`AllToAllOperation`]) share additional machinery. Their output shapes depend
+//! The collectives that resize an array axis ([`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and
+//! [`ParallelAllToAllOperation`]) share additional machinery. Their output shapes depend
 //! on the participant count and whether the named axis is materialized as a new array axis or tiled into an existing
 //! one, so they share:
 //!
 //!   - [`CollectiveArrayExtentBatchingPolicy`], the representation boundary that lets one batching kernel per
 //!     collective handle both homogeneous arrays with static extents and composite array/dimension programs with
-//!     first-class extents ([`RaggedAllToAllOperation`] reuses it as well),
+//!     first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well),
 //!   - the first-class extent arithmetic that computes and validates result extents at staging time, and
 //!   - the explicit [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
 //!     its type inference, interpretation, batching, and forward-mode differentiation rules.
@@ -64,34 +65,40 @@ use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,
 };
 
-pub mod all_gather;
-pub mod all_to_all;
 pub mod axis_index;
+pub mod parallel_all_gather;
+pub mod parallel_all_to_all;
 pub mod parallel_permute;
+pub mod parallel_ragged_all_to_all;
 pub mod parallel_reduce;
 pub mod parallel_sum_scatter;
 pub mod parallel_vary;
-pub mod ragged_all_to_all;
 
-pub use all_gather::{ALL_GATHER_OPERATION_NAME, AllGather, AllGatherOperation, AllGatherOutputVariance};
-pub use all_to_all::{ALL_TO_ALL_OPERATION_NAME, AllToAll, AllToAllOperation, ParallelSwapAxes};
 pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
+pub use parallel_all_gather::{
+    PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+};
+pub use parallel_all_to_all::{
+    PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation, ParallelSwapAxes,
+};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
+pub use parallel_ragged_all_to_all::{
+    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
+};
 pub use parallel_reduce::{PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
-pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
 
-/// Shape semantics of the collectives that resize an array axis (e.g., [`AllGatherOperation`],
-/// [`ParallelSumScatterOperation`], and [`AllToAllOperation`]), which determine where the `n` participants of the named
-/// axis appear in the shape of the result. In [`Untiled`](Self::Untiled) mode, the participants get an array dimension
-/// of their own with extent `n`, which an all-gather inserts, a sum-scatter consumes, and an all-to-all moves, so the
-/// rank changes. In [`Tiled`](Self::Tiled) mode, the participants are instead folded into an existing array dimension,
-/// whose extent is multiplied or divided by `n`, so the rank is preserved. These are the analogues of the `tiled=False`
-/// (the default) and `tiled=True` settings of JAX's
+/// Shape semantics of the collectives that resize an array axis (e.g., [`ParallelAllGatherOperation`],
+/// [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]), which determine where the `n` participants of
+/// the named axis appear in the shape of the result. In [`Untiled`](Self::Untiled) mode, the participants get an array
+/// dimension of their own with extent `n`, which an all-gather inserts, a sum-scatter consumes, and an all-to-all
+/// moves, so the rank changes. In [`Tiled`](Self::Tiled) mode, the participants are instead folded into an existing
+/// array dimension, whose extent is multiplied or divided by `n`, so the rank is preserved. These are the analogues of
+/// the `tiled=False` (the default) and `tiled=True` settings of JAX's
 /// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html),
-/// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html),
-/// and [`jax.lax.all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html).
+/// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html), and
+/// [`jax.lax.all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html).
 ///
 /// Both modes compute the same values and differ only in where the participant dimension lives: an untiled result keeps
 /// it as a separate dimension, while a tiled result folds it, participant-major, into an existing one. For example,
@@ -101,11 +108,11 @@ pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, Ra
 /// ```text
 ///   Collective             Participant Input   Untiled Output   Tiled Output
 ///   ------------------------------------------------------------------------
-///   all_gather             f32[3, 5]           f32[4, 3, 5]     f32[12, 5]
+///   parallel_all_gather    f32[3, 5]           f32[4, 3, 5]     f32[12, 5]
 ///   parallel_sum_scatter   f32[4, 5]           f32[5]           f32[1, 5]
 ///   parallel_sum_scatter   f32[12, 5]          (invalid)        f32[3, 5]
-///   all_to_all             f32[4, 6]           f32[6, 4]        f32[1, 24]
-///   all_to_all             f32[8, 6]           (invalid)        f32[2, 24]
+///   parallel_all_to_all    f32[4, 6]           f32[6, 4]        f32[1, 24]
+///   parallel_all_to_all    f32[8, 6]           (invalid)        f32[2, 24]
 /// ```
 ///
 /// The untiled all-gather output stacks the participants' inputs, so index `i` along its new axis 0 holds the input of
@@ -173,8 +180,8 @@ impl CollectiveMode {
     }
 }
 
-/// Shared shape and grouping options for collective operations that resize an array axis (e.g., [`AllGatherOperation`],
-/// [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
+/// Shared shape and grouping options for collective operations that resize an array axis (e.g.,
+/// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]).
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct CollectiveOptions {
     /// [`CollectiveMode`] of the collective.
@@ -242,8 +249,8 @@ impl Debug for CollectiveOptions {
 /// every participant along the axis takes part in one collective, so the effective axis size is `axis_size` itself.
 /// With `groups`, the axis is split into independent collectives, one per group, and the effective axis size is the
 /// common group size. Callers use it wherever shapes or values depend on the participant count (e.g., the gathered
-/// extent of an `all_gather` operation, the chunk extent of a `parallel_sum_scatter` operation, or the divisor of a
-/// mean operation).
+/// extent of a `parallel_all_gather` operation, the chunk extent of a `parallel_sum_scatter` operation, or the divisor
+/// of a mean operation).
 ///
 /// For example, an axis of size 4 split into the groups `[[0, 2], [3, 1]]` runs two independent collectives over two
 /// participants each, so its effective axis size is 2:
@@ -422,8 +429,8 @@ fn infer_explicit_shape_changing_collective_output_type(
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Defines the structural implementations shared by the single-input linear collectives (e.g., `all_gather` and
-/// `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its
+/// Defines the structural implementations shared by the single-input linear collectives (e.g., `parallel_all_gather`
+/// and `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its
 /// `axis_name` and `axis_size` accessors, together with its [`Display`](std::fmt::Display), [`Operation`],
 /// [`InterpretableOperation`](crate::InterpretableOperation), and
 /// [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations:
@@ -442,20 +449,20 @@ fn infer_explicit_shape_changing_collective_output_type(
 /// # Example
 ///
 /// ```rust,ignore
-/// /// Canonical operation name for [`AllToAllOperation`].
-/// pub const ALL_TO_ALL_OPERATION_NAME: &str = "all_to_all";
+/// /// Canonical operation name for [`ParallelAllToAllOperation`].
+/// pub const PARALLEL_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_all_to_all";
 ///
 /// define_linear_collective_operation!(
 ///     /// [`Operation`] that exchanges chunks between the participants along the named axis.
-///     AllToAllOperation,
-///     ALL_TO_ALL_OPERATION_NAME,
+///     ParallelAllToAllOperation,
+///     PARALLEL_ALL_TO_ALL_OPERATION_NAME,
 ///     fields = {
 ///         /// Axis of the input that is split into one chunk per participant.
 ///         split_axis: usize,
 ///     },
 ///     check_array_types = [@no_unreduced],
 ///     infer_output_type = |operation, input_type, dimensions| {
-///         all_to_all_output_type(operation, input_type, dimensions)
+///         parallel_all_to_all_output_type(operation, input_type, dimensions)
 ///     },
 /// );
 /// ```
@@ -463,8 +470,8 @@ fn infer_explicit_shape_changing_collective_output_type(
 /// # Parameters
 ///
 ///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
-///   - `$operation`: Identifier of the generated operation struct (e.g., `AllToAllOperation`).
-///   - `$name`: Identifier of an existing operation-name constant (e.g., `ALL_TO_ALL_OPERATION_NAME`).
+///   - `$operation`: Identifier of the generated operation struct (e.g., `ParallelAllToAllOperation`).
+///   - `$name`: Identifier of an existing operation-name constant (e.g., `PARALLEL_ALL_TO_ALL_OPERATION_NAME`).
 ///   - `fields = { ... }`: Documented payload fields that follow the shared `axis_name` and `axis_size` fields, in the
 ///     order in which the generated `new` function takes them and the operation renders them.
 ///   - `optional_fields = { ... }`: Optional documented payload fields whose declared types are wrapped in [`Option`].
@@ -1474,10 +1481,12 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::MemberDifferentiableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::collectives::all_gather::{
-        AllGatherOperation, AllGatherOutputVariance, infer_explicit_all_gather_output_types,
+    use crate::operations::collectives::parallel_all_gather::{
+        ParallelAllGatherOperation, ParallelAllGatherOutputVariance, infer_explicit_parallel_all_gather_output_types,
     };
-    use crate::operations::collectives::all_to_all::{AllToAllOperation, infer_explicit_all_to_all_output_types};
+    use crate::operations::collectives::parallel_all_to_all::{
+        ParallelAllToAllOperation, infer_explicit_parallel_all_to_all_output_types,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder};
     use crate::tracing::TracingContext;
@@ -1626,35 +1635,39 @@ mod tests {
         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         assert_eq!(options.mode(), CollectiveMode::Tiled);
         assert_eq!(options.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
-        assert_eq!(options.effective_axis_size("all_gather", 4), Ok(2));
+        assert_eq!(options.effective_axis_size("parallel_all_gather", 4), Ok(2));
 
         assert_eq!(
-            CollectiveOptions::default().with_axis_index_groups(Vec::new()).effective_axis_size("all_gather", 4),
-            Err(TypeError::invalid("`all_gather` axis index groups must not be empty")),
+            CollectiveOptions::default()
+                .with_axis_index_groups(Vec::new())
+                .effective_axis_size("parallel_all_gather", 4),
+            Err(TypeError::invalid("`parallel_all_gather` axis index groups must not be empty")),
         );
         assert_eq!(
             CollectiveOptions::default()
                 .with_axis_index_groups(vec![vec![0, 1], vec![2]])
-                .effective_axis_size("all_gather", 3),
-            Err(TypeError::invalid("`all_gather` axis index group 1 has size 1 but every group must have size 2",)),
+                .effective_axis_size("parallel_all_gather", 3),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` axis index group 1 has size 1 but every group must have size 2",
+            )),
         );
         assert_eq!(
             CollectiveOptions::default()
                 .with_axis_index_groups(vec![vec![0, 1], vec![1, 2]])
-                .effective_axis_size("all_gather", 4),
-            Err(TypeError::invalid("`all_gather` axis index groups contain participant 1 more than once",)),
+                .effective_axis_size("parallel_all_gather", 4),
+            Err(TypeError::invalid("`parallel_all_gather` axis index groups contain participant 1 more than once",)),
         );
         assert_eq!(
             CollectiveOptions::default()
                 .with_axis_index_groups(vec![vec![0, 1], vec![2, 4]])
-                .effective_axis_size("all_gather", 4),
-            Err(TypeError::invalid("`all_gather` axis index 4 is out of bounds for axis size 4")),
+                .effective_axis_size("parallel_all_gather", 4),
+            Err(TypeError::invalid("`parallel_all_gather` axis index 4 is out of bounds for axis size 4")),
         );
         assert_eq!(
             CollectiveOptions::default()
                 .with_axis_index_groups(vec![vec![0, 1]])
-                .effective_axis_size("all_gather", 3),
-            Err(TypeError::invalid("`all_gather` axis index groups do not contain participant 2")),
+                .effective_axis_size("parallel_all_gather", 3),
+            Err(TypeError::invalid("`parallel_all_gather` axis index groups do not contain participant 2")),
         );
     }
 
@@ -1663,8 +1676,14 @@ mod tests {
         let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 4, 0, grouped, AllGatherOutputVariance::Varying,),
+            infer_explicit_parallel_all_gather_output_types(
+                &ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    4,
+                    0,
+                    grouped,
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
                 &[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into(),],
             ),
             Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
@@ -1677,11 +1696,11 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
             .with_memory(Memory::Host { pinned: true });
         assert_eq!(
-            infer_linear_collective_operation_output_type("all_gather", &input_type, vec![2, 3]),
+            infer_linear_collective_operation_output_type("parallel_all_gather", &input_type, vec![2, 3]),
             Ok(input_type.clone()),
         );
         assert_eq!(
-            infer_linear_collective_operation_output_type("all_gather", &input_type, vec![4, 3]),
+            infer_linear_collective_operation_output_type("parallel_all_gather", &input_type, vec![4, 3]),
             Ok(ArrayType::new_static(DataType::F32, [4, 3]).with_memory(input_type.memory())),
         );
     }
@@ -1694,27 +1713,27 @@ mod tests {
         // Eager binding validates the shared participant count before it can return an identity value.
         assert_eq!(
             context.bind(
-                AllToAllOperation::new("x".to_string(), 0, 0, 0, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 0, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 std::slice::from_ref(&input),
             ),
-            Err(ProgramError::Type(TypeError::invalid("`all_to_all` axis size must be greater than zero"))),
+            Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` axis size must be greater than zero"))),
         );
 
         // The custom tiled identity rule must also honor its operation-specific axis validation.
         assert_eq!(
             context.bind(
-                AllToAllOperation::new("x".to_string(), 1, 1, 0, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 1, 1, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 std::slice::from_ref(&input),
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "`all_to_all` split axis 1 or concat axis 0 is out of bounds for rank 1",
+                "`parallel_all_to_all` split axis 1 or concat axis 0 is out of bounds for rank 1",
             ))),
         );
         assert_eq!(
             context.bind(
-                AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 std::slice::from_ref(&input),
             ),
@@ -1736,12 +1755,12 @@ mod tests {
         let tangent = context.input(array_type.into());
         let extent = context.input(dimension_type.into());
         let extent_tangent_type = extent.r#type().tangent()?;
-        let outputs = AllGatherOperation::new(
+        let outputs = ParallelAllGatherOperation::new(
             "x".to_string(),
             1,
             0,
             CollectiveOptions::tiled(),
-            AllGatherOutputVariance::Varying,
+            ParallelAllGatherOutputVariance::Varying,
         )
         .jvp_in_parent(
             &DifferentiationContext::fused(context.clone()),
@@ -1769,13 +1788,13 @@ mod tests {
         let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
 
         assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new(
+            infer_explicit_parallel_all_gather_output_types(
+                &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     4,
                     1,
                     CollectiveOptions::default(),
-                    AllGatherOutputVariance::Varying,
+                    ParallelAllGatherOutputVariance::Varying,
                 ),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
@@ -1787,8 +1806,8 @@ mod tests {
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
+            infer_explicit_parallel_all_to_all_output_types(
+                &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
                     DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
@@ -1799,8 +1818,8 @@ mod tests {
             Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
         );
         assert_eq!(
-            infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
+            infer_explicit_parallel_all_to_all_output_types(
+                &ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
@@ -1823,13 +1842,13 @@ mod tests {
         );
 
         assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new(
+            infer_explicit_parallel_all_gather_output_types(
+                &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
                     0,
                     CollectiveOptions::tiled(),
-                    AllGatherOutputVariance::Varying
+                    ParallelAllGatherOutputVariance::Varying
                 ),
                 &[
                     input_type.clone().into(),
@@ -1846,8 +1865,8 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
+            infer_explicit_parallel_all_to_all_output_types(
+                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
                     ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
@@ -1863,8 +1882,8 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
+            infer_explicit_parallel_all_to_all_output_types(
+                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
                 &[
                     ArrayIrType::Array(input_type.clone()),
                     ArrayIrType::Dimension(DimensionType::from(input_axis)),
@@ -1876,13 +1895,13 @@ mod tests {
 
         let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new(
+            infer_explicit_parallel_all_gather_output_types(
+                &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
                     0,
                     CollectiveOptions::tiled(),
-                    AllGatherOutputVariance::Varying
+                    ParallelAllGatherOutputVariance::Varying
                 ),
                 &[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()],
             ),
@@ -1890,18 +1909,18 @@ mod tests {
         );
         let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
         assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new(
+            infer_explicit_parallel_all_gather_output_types(
+                &ParallelAllGatherOperation::new(
                     "x".to_string(),
                     2,
                     0,
                     CollectiveOptions::tiled(),
-                    AllGatherOutputVariance::Varying
+                    ParallelAllGatherOutputVariance::Varying
                 ),
                 &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()],
             ),
             Err(TypeError::invalid(
-                "`all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
+                "`parallel_all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
                  expected 6 \
                  but got 5"
                     .to_string(),
@@ -1917,15 +1936,15 @@ mod tests {
         let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
 
         // Inserting an axis preserves the extents already projected into the base output type on either side.
-        let gather = AllGatherOperation::new(
+        let gather = ParallelAllGatherOperation::new(
             "x".to_string(),
             2,
             1,
             CollectiveOptions::default(),
-            AllGatherOutputVariance::Varying,
+            ParallelAllGatherOutputVariance::Varying,
         );
         assert_eq!(
-            infer_explicit_all_gather_output_types(
+            infer_explicit_parallel_all_gather_output_types(
                 &gather,
                 &[
                     ArrayType::new_static(DataType::F32, [3, 4]).into(),
@@ -1937,7 +1956,7 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
         );
         assert_eq!(
-            infer_explicit_all_gather_output_types(
+            infer_explicit_parallel_all_gather_output_types(
                 &gather,
                 &[
                     ArrayType::new_static(DataType::F32, [3, 4]).into(),
@@ -1946,7 +1965,7 @@ mod tests {
                     exact_five.into(),
                 ],
             ),
-            Err(TypeError::invalid("`all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
+            Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
         );
 
         // Removing an axis or removing then inserting one needs no separate output-to-input axis mapping.
@@ -1963,8 +1982,8 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
         );
         assert_eq!(
-            infer_explicit_all_to_all_output_types(
-                &AllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default()),
+            infer_explicit_parallel_all_to_all_output_types(
+                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default()),
                 &[
                     ArrayType::new_static(DataType::F32, [2, 3, 4]).into(),
                     exact_three.into(),
@@ -1983,12 +2002,12 @@ mod tests {
         let mapped_matrix =
             || ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Some(0)).unwrap();
 
-        let gathered = AllGatherOperation::new(
+        let gathered = ParallelAllGatherOperation::new(
             "x".to_string(),
             2,
             1,
             CollectiveOptions::default(),
-            AllGatherOutputVariance::Varying,
+            ParallelAllGatherOutputVariance::Varying,
         )
         .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
         .unwrap()
@@ -1997,7 +2016,7 @@ mod tests {
         assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
 
-        let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
+        let exchanged = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
             .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
             .unwrap()
             .into_parts()
@@ -2016,7 +2035,7 @@ mod tests {
             .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])));
         let output = builder
             .add_instruction(
-                AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![input],
                 None,
@@ -2025,7 +2044,7 @@ mod tests {
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed_twice =
             program.transpose_with_respect_to(&[0], &[]).unwrap().transpose_with_respect_to(&[0], &[]).unwrap();
-        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::AllToAll(_)));
+        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::ParallelAllToAll(_)));
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
     }
@@ -2038,12 +2057,12 @@ mod tests {
 
         assert_eq!(
             context.bind(
-                AllGatherOperation::new(
+                ParallelAllGatherOperation::new(
                     "x".to_string(),
                     1,
                     0,
                     CollectiveOptions::tiled(),
-                    AllGatherOutputVariance::Varying
+                    ParallelAllGatherOutputVariance::Varying
                 ),
                 Vec::new(),
                 &[input.clone(), extent.clone()],
@@ -2052,7 +2071,7 @@ mod tests {
         );
         assert_eq!(
             context.bind(
-                AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 &[input.clone(), extent.clone()],
             ),
@@ -2060,7 +2079,7 @@ mod tests {
         );
         assert_eq!(
             context.bind(
-                AllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
                 Vec::new(),
                 &[
                     ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()),
@@ -2074,43 +2093,43 @@ mod tests {
         assert_eq!(
             context
                 .bind(
-                    AllGatherOperation::new(
+                    ParallelAllGatherOperation::new(
                         "x".to_string(),
                         1,
                         0,
                         CollectiveOptions::tiled(),
-                        AllGatherOutputVariance::Varying
+                        ParallelAllGatherOutputVariance::Varying
                     ),
                     Vec::new(),
                     &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),],
                 )
                 .unwrap_err()
                 .to_string(),
-            "`all_gather` output axis 0 extent must equal observed result extent 3 but got 4",
+            "`parallel_all_gather` output axis 0 extent must equal observed result extent 3 but got 4",
         );
         assert_eq!(
             context
                 .bind(
-                    AllGatherOperation::new(
+                    ParallelAllGatherOperation::new(
                         "x".to_string(),
                         2,
                         0,
                         CollectiveOptions::tiled(),
-                        AllGatherOutputVariance::Varying
+                        ParallelAllGatherOutputVariance::Varying
                     ),
                     Vec::new(),
                     &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(6).unwrap()),],
                 )
                 .unwrap_err(),
             ProgramError::UnsupportedOperation {
-                message: "cannot interpret `all_gather` over axis `x` of size 2 without an enclosing binder"
+                message: "cannot interpret `parallel_all_gather` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
             },
         );
 
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = AllGatherOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying),
+            operation = ParallelAllGatherOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled(), ParallelAllGatherOutputVariance::Varying),
             cases = [
                 {
                     inputs = [(@known, input.clone()), (@known, extent.clone())],
@@ -2136,12 +2155,12 @@ mod tests {
         let result_extent = builder.add_input(dimension_type.clone().into());
         let output = builder
             .add_instruction(
-                AllGatherOperation::new(
+                ParallelAllGatherOperation::new(
                     "x".to_string(),
                     1,
                     0,
                     CollectiveOptions::tiled(),
-                    AllGatherOutputVariance::Varying,
+                    ParallelAllGatherOutputVariance::Varying,
                 ),
                 Vec::new(),
                 vec![array, result_extent],
@@ -2195,7 +2214,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct `all_gather` transposition with runtime-dependent type metadata requires \
+                if message == "direct `parallel_all_gather` transposition with runtime-dependent type metadata requires \
                     linearization so that the relevant primal information can be retained as residuals",
         ));
     }
@@ -2207,7 +2226,7 @@ mod tests {
         let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
             .add_instruction(
-                AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![array, extent],
                 None,

@@ -11,8 +11,8 @@ use ryft_core::operations::attention::{
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveMode, ParallelPermuteOperation, ParallelSumScatterOperation,
-    RaggedAllToAllOperation,
+    CollectiveMode, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
+    ParallelRaggedAllToAllOperation, ParallelSumScatterOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
@@ -3754,8 +3754,13 @@ fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             .map(|(physical, output)| output.value().or(physical.value()).unwrap())
             .collect::<Vec<_>>();
         let rank = limits.len();
-        let sliced =
-            block.append_operation(stable_hlo::slice(physical_value, &vec![0; rank], &limits, &vec![1; rank], location)?)?;
+        let sliced = block.append_operation(stable_hlo::slice(
+            physical_value,
+            &vec![0; rank],
+            &limits,
+            &vec![1; rank],
+            location,
+        )?)?;
         let mut value = sliced.result(0).expect("stablehlo.slice should return one result").as_ref();
         let mut dimensions = limits.iter().copied().map(Dimension::Static).collect::<Vec<_>>();
         for (axis, size) in runtime_sizes.into_iter().enumerate() {
@@ -6620,11 +6625,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )?;
                 Ok(vec![result])
             }
-            ArrayOperation::AllGather(operation) => {
+            ArrayOperation::ParallelAllGather(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
-                lower_all_gather_to_mlir(
+                lower_parallel_all_gather_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
@@ -6659,11 +6664,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer.location,
                 )
             }
-            ArrayOperation::AllToAll(operation) => {
+            ArrayOperation::ParallelAllToAll(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
-                lower_all_to_all_to_mlir(
+                lower_parallel_all_to_all_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
@@ -6841,9 +6846,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     Ok(values)
                 }
             }
-            ArrayOperation::RaggedAllToAll(operation) => {
+            ArrayOperation::ParallelRaggedAllToAll(operation) => {
                 let collective_state = lowerer.collective_state.clone();
-                lower_ragged_all_to_all_to_mlir(
+                lower_parallel_ragged_all_to_all_to_mlir(
                     operation,
                     &collective_state,
                     input_values,
@@ -7465,6 +7470,40 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
                 op: format!("`{SCAN_OPERATION_NAME}` expected 1 attached region but got {}", scan_regions.len()),
             });
         };
+        // Each iteration reads and writes one slice per stack at a static shape. A body that was not specialized to the
+        // scan's input types may still declare dynamic slice types (refined only at the instruction boundary), which
+        // this lowering does not adapt per iteration. A scan whose length admits no iteration never slices, so it is
+        // lowered without its body.
+        let carry_count = scan_op.carry_count();
+        let body_input_types = body.input_types();
+        let body_output_types = body.output_types();
+        let admits_iterations =
+            scan_op.length().value() != Some(0) && stable_hlo_dynamic_dimension_bound(scan_op.length()) != Some(0);
+        if admits_iterations {
+            let slice_types = body_input_types[1 + carry_count..]
+                .iter()
+                .enumerate()
+                .map(|(index, r#type)| ("input", index, r#type))
+                .chain(
+                    body_output_types[carry_count..]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, r#type)| ("output", index, r#type)),
+                );
+            for (role, index, slice_type) in slice_types {
+                if let ArrayIrType::Array(slice_type) = slice_type
+                    && slice_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none())
+                {
+                    return Err(LoweringError::UnsupportedOp {
+                        op: format!(
+                            "`{SCAN_OPERATION_NAME}` with the dynamic slice type `{slice_type}` for stacked {role} \
+                             {index}; lowering requires static slice types, so specialize the body to the scan's \
+                             input types",
+                        ),
+                    });
+                }
+            }
+        }
         let results = lower_scan_to_while(
             body,
             scan_op.carry_count(),
@@ -7483,10 +7522,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         )?;
         // The lowering produces the carries at their declared types and the stacked outputs stacked over the declared
         // length, which the instruction's output types may refine (e.g., to the trip count of an exact runtime length).
-        let carry_count = scan_op.carry_count();
-        let body_input_types = body.input_types();
         let mut region_output_types = body_input_types[1..1 + carry_count].to_vec();
-        for output_type in &body.output_types()[carry_count..] {
+        for output_type in &body_output_types[carry_count..] {
             region_output_types.push(match output_type {
                 ArrayIrType::Array(slice_type) => {
                     let mut dimensions = vec![scan_op.length().clone()];
@@ -11327,9 +11364,10 @@ fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
 }
 
-/// Lowers one traced `all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica groups.
-pub(super) fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &AllGatherOperation,
+/// Lowers one traced `parallel_all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica
+/// groups.
+pub(super) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelAllGatherOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
@@ -11447,9 +11485,10 @@ fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result.result(0).expect("stablehlo.collective_permute should return one result").as_ref()])
 }
 
-/// Lowers one traced `all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica groups.
-pub(super) fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &AllToAllOperation,
+/// Lowers one traced `parallel_all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica
+/// groups.
+pub(super) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelAllToAllOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
     input_array_type: &ArrayType,
@@ -11515,8 +11554,8 @@ pub(super) fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
-/// Emits one overwrite-mode `ragged_all_to_all` typed-FFI custom call.
-fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
+/// Emits one overwrite-mode `parallel_ragged_all_to_all` typed-FFI custom call.
+fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
     collective_state: &CollectiveLoweringState,
     replica_groups: &[Vec<usize>],
     inputs: &[ValueRef<'b, 'c, 't>],
@@ -11527,7 +11566,7 @@ fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
     let group_size = replica_groups.first().map(Vec::len).unwrap_or(0);
     if replica_groups.iter().any(|group| group.len() != group_size) {
         return Err(ProgramError::MalformedProgram(
-            "`ragged_all_to_all` replica groups must all have the same size".to_string(),
+            "`parallel_ragged_all_to_all` replica groups must all have the same size".to_string(),
         )
         .into());
     }
@@ -11547,7 +11586,7 @@ fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         .map(|&device| {
             i64::try_from(device).map_err(|_| {
                 ProgramError::MalformedProgram(format!(
-                    "`ragged_all_to_all` replica id {device} cannot be represented as an i64 backend attribute",
+                    "`parallel_ragged_all_to_all` replica id {device} cannot be represented as an i64 backend attribute",
                 ))
             })
         })
@@ -11558,7 +11597,7 @@ fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
     let channel_id = collective_state.next_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
-            "`ragged_all_to_all` channel id {channel_id} cannot be represented as an i64 backend attribute",
+            "`parallel_ragged_all_to_all` channel id {channel_id} cannot be represented as an i64 backend attribute",
         ))
     })?;
     let backend_config = context.dictionary_attribute(&[
@@ -11582,14 +11621,17 @@ fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         &[output_type],
         location,
     )?)?;
-    Ok(custom_call.result(0).expect("ragged_all_to_all custom call should return one result").as_ref())
+    Ok(custom_call
+        .result(0)
+        .expect("parallel_ragged_all_to_all custom call should return one result")
+        .as_ref())
 }
 
 /// Rejects target platforms whose runtime does not register the accelerator ragged-collective custom call.
-fn validate_ragged_all_to_all_target(collective_state: &CollectiveLoweringState) -> Result<(), LoweringError> {
+fn validate_parallel_ragged_all_to_all_target(collective_state: &CollectiveLoweringState) -> Result<(), LoweringError> {
     if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
         return Err(ProgramError::UnsupportedOperation {
-            message: "`ragged_all_to_all` is not supported by the XLA CPU backend".to_string(),
+            message: "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend".to_string(),
         }
         .into());
     }
@@ -11601,8 +11643,8 @@ fn validate_ragged_all_to_all_target(collective_state: &CollectiveLoweringState)
 /// The public overwrite operation maps directly to one call. The transpose-only additive form rebases every transfer
 /// into a private lane of an expanded output, then reduces the lanes and adds the supplied output seed. The custom
 /// call therefore still writes disjoint regions while duplicate sends accumulate in the reduction.
-pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &RaggedAllToAllOperation,
+pub(super) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelRaggedAllToAllOperation,
     collective_state: &CollectiveLoweringState,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
@@ -11612,12 +11654,12 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if operation.is_physical() {
         return Err(ProgramError::MalformedProgram(
-            "`ragged_all_to_all` lowering does not support the batching-internal physical operand representation"
+            "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand representation"
                 .to_string(),
         )
         .into());
     }
-    validate_ragged_all_to_all_target(collective_state)?;
+    validate_parallel_ragged_all_to_all_target(collective_state)?;
     check_count!("input", input_values, 6, ProgramError);
     check_count!("input", input_types, 6, ProgramError);
     let (replica_groups, effective_axis_size) = collective_replica_groups(
@@ -11627,7 +11669,7 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
         operation.axis_index_groups(),
     )?;
     if !operation.accumulates_updates() {
-        return Ok(vec![emit_ragged_all_to_all_custom_call(
+        return Ok(vec![emit_parallel_ragged_all_to_all_custom_call(
             collective_state,
             replica_groups.as_slice(),
             input_values,
@@ -11639,12 +11681,12 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
 
     let metadata_length = input_types[2].shape().dimensions()[0].value().ok_or_else(|| {
         ProgramError::MalformedProgram(
-            "`ragged_all_to_all` additive lowering requires a static metadata length".to_string(),
+            "`parallel_ragged_all_to_all` additive lowering requires a static metadata length".to_string(),
         )
     })?;
     if metadata_length % effective_axis_size != 0 {
         return Err(ProgramError::MalformedProgram(format!(
-            "`ragged_all_to_all` metadata length {metadata_length} is not divisible by group size \
+            "`parallel_ragged_all_to_all` metadata length {metadata_length} is not divisible by group size \
              {effective_axis_size}",
         ))
         .into());
@@ -11652,12 +11694,12 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     let transfers_per_participant = metadata_length / effective_axis_size;
     let output_extent = input_types[1].shape().dimensions()[0].value().ok_or_else(|| {
         ProgramError::MalformedProgram(
-            "`ragged_all_to_all` additive lowering requires a static output leading dimension".to_string(),
+            "`parallel_ragged_all_to_all` additive lowering requires a static output leading dimension".to_string(),
         )
     })?;
     let expanded_extent = metadata_length.checked_mul(output_extent).ok_or_else(|| {
         ProgramError::MalformedProgram(
-            "`ragged_all_to_all` additive lowering overflowed its expanded output extent".to_string(),
+            "`parallel_ragged_all_to_all` additive lowering overflowed its expanded output extent".to_string(),
         )
     })?;
     let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
@@ -11698,7 +11740,7 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     let transfers_per_participant_value = lower_u64_scalar_constant(
         u64::try_from(transfers_per_participant).map_err(|_| {
             ProgramError::MalformedProgram(
-                "`ragged_all_to_all` transfers per participant cannot be represented as u64".to_string(),
+                "`parallel_ragged_all_to_all` transfers per participant cannot be represented as u64".to_string(),
             )
         })?,
         block,
@@ -11728,7 +11770,7 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
             for (position, &axis_index) in group.iter().enumerate() {
                 positions[axis_index] = i64::try_from(position).map_err(|_| {
                     ProgramError::MalformedProgram(format!(
-                        "`ragged_all_to_all` group position {position} cannot be represented as an i64 backend \
+                        "`parallel_ragged_all_to_all` group position {position} cannot be represented as an i64 backend \
                          attribute",
                     ))
                 })?;
@@ -11776,7 +11818,7 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
         metadata_tensor_type,
         i64::try_from(output_extent).map_err(|_| {
             ProgramError::MalformedProgram(format!(
-                "`ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
+                "`parallel_ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
             ))
         })?,
         context,
@@ -11788,7 +11830,7 @@ pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     let output_offsets = block.append_operation(stable_hlo::add(metadata[2], lane_offsets, location)?)?;
     let output_offsets = output_offsets.result(0).expect("stablehlo.add should return one result").as_ref();
     let transfer_inputs = [input_values[0], expanded_output, metadata[0], metadata[1], output_offsets, metadata[3]];
-    let expanded = emit_ragged_all_to_all_custom_call(
+    let expanded = emit_parallel_ragged_all_to_all_custom_call(
         collective_state,
         replica_groups.as_slice(),
         transfer_inputs.as_slice(),
@@ -11944,7 +11986,7 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers a scalar `u64` constant. Shared by the ragged-dot group-interval arithmetic, the physical
-/// `ragged_all_to_all` lane arithmetic, and the [`AxisIndexOperation`] coordinate arithmetic.
+/// `parallel_ragged_all_to_all` lane arithmetic, and the [`AxisIndexOperation`] coordinate arithmetic.
 fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     value: u64,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -18848,7 +18890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_lowering_rejects_batching_internal_physical_representation() {
+    fn test_parallel_ragged_all_to_all_lowering_rejects_batching_internal_physical_representation() {
         let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
         let operand = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
         let output = context.input(ArrayType::new_static(DataType::F32, [2, 4]));
@@ -18858,7 +18900,7 @@ mod tests {
             .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
             .collect::<Vec<_>>();
         let batching_context = BatchingContext::new(context.clone(), 2).with_axis_name("x".to_string());
-        let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
             .batch(&batching_context, &EmptyRegionDriver, inputs.as_slice())
             .unwrap()
             .into_parts()
@@ -18871,7 +18913,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::RaggedAllToAll(operation) => Some(operation.clone()),
+                ArrayOperation::ParallelRaggedAllToAll(operation) => Some(operation.clone()),
                 _ => None,
             })
             .unwrap();
@@ -18883,7 +18925,7 @@ mod tests {
         let module = mlir_context.module(location).unwrap();
         let mut block = module.body().unwrap();
         assert!(matches!(
-            lower_ragged_all_to_all_to_mlir(
+            lower_parallel_ragged_all_to_all_to_mlir(
                 &operation,
                 &CollectiveLoweringState::new(),
                 &[],
@@ -18894,7 +18936,7 @@ mod tests {
             ),
             Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
                 if message
-                    == "`ragged_all_to_all` lowering does not support the batching-internal physical operand \
+                    == "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
                         representation",
         ));
     }
@@ -26222,6 +26264,52 @@ mod tests {
                 MixedValue::Array(vec![12.0, 24.0, 36.0], vec![3]),
             ]),
         );
+    }
+
+    #[test]
+    fn test_scan_rejects_a_body_with_a_dynamic_slice_type() {
+        // A static stacked input refines a body that declares the bounded slice type `f64[rows]`, so the scan
+        // instruction type-checks. Its iterations would read slices at a dynamic shape, which this lowering does not
+        // adapt, so it is rejected with a precise error instead of an opaque tensor-type failure. A zero-length scan
+        // never slices, so it still lowers.
+        let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
+        let scan_program = |length: usize| {
+            let body = {
+                let mut builder = CompositeXlaProgramBuilder::new();
+                builder.add_input(ArrayType::scalar(DataType::I64).into());
+                let slice = builder.add_input(slice_type.clone().into());
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap()
+            };
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let body = builder.import_region(body.entry_region_ref());
+            let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]);
+            let stack = builder.add_input(stacked_type.clone().into());
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    vec![body],
+                    vec![stack],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            assert_eq!(program.output_types(), vec![ArrayIrType::Array(stacked_type.clone())]);
+            to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[stacked_type], "main", None, None)
+        };
+        assert_eq!(
+            scan_program(2),
+            Err(LoweringError::UnsupportedOp {
+                op: "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
+                     slice types, so specialize the body to the scan's input types"
+                    .to_string(),
+            }),
+        );
+        assert!(scan_program(0).is_ok());
     }
 
     #[test]

@@ -2873,7 +2873,7 @@ mod tests {
                 #[ryft(projected(DimensionType, structural))]
                 Recursive(WhileOperation<DataType, V, Self>),
                 #[ryft(mixed(ArrayType))]
-                Mixed(AllGatherOperation),
+                Mixed(ParallelAllGatherOperation),
                 #[ryft(mixed(ArrayType, structural))]
                 MixedStructural(ZeroOperation<ArrayType>),
                 Extension(Extension),
@@ -3043,11 +3043,11 @@ mod tests {
             #[ryft(members(ArrayType, structural(DimensionType)))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
-                Mixed(AllGatherOperation),
+                Mixed(ParallelAllGatherOperation),
                 #[ryft(mixed(structural))]
                 MixedStructural(ZeroOperation<ArrayType>),
                 #[ryft(mixed(ArrayType))]
-                ExplicitMixed(AllToAllOperation),
+                ExplicitMixed(ParallelAllToAllOperation),
                 #[ryft(projected(DimensionType, structural))]
                 Dimension(DimensionOperation),
             }
@@ -3086,7 +3086,7 @@ mod tests {
             #[ryft(members(ArrayType))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(DimensionType))]
-                Mixed(AllGatherOperation),
+                Mixed(ParallelAllGatherOperation),
             }
         });
         assert_eq!(
@@ -3105,7 +3105,7 @@ mod tests {
             #[ryft(members(ArrayType, DimensionType))]
             enum Operation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
-                Mixed(AllGatherOperation),
+                Mixed(ParallelAllGatherOperation),
             }
         });
         assert_eq!(
@@ -3232,7 +3232,7 @@ mod tests {
                 #[ryft(projected(DimensionType, structural))]
                 Dimension(DimensionOperation),
                 #[ryft(mixed(ArrayType))]
-                Collective(AllGatherOperation),
+                Collective(ParallelAllGatherOperation),
                 #[ryft(mixed(ArrayType, structural))]
                 DynamicZero(ZeroOperation<ArrayType>),
                 Native(NativeOperation<ArrayIrType>),
@@ -3496,7 +3496,7 @@ mod tests {
             #[ryft(dispatch(batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed(ArrayType))]
-                Collective(AllGatherOperation),
+                Collective(ParallelAllGatherOperation),
                 #[ryft(mixed(ArrayType, structural))]
                 DynamicZero(ZeroOperation<ArrayType>),
                 #[ryft(projected(ArrayType))]
@@ -3511,7 +3511,7 @@ mod tests {
             #[ryft(dispatch(batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(mixed)]
-                Collective(AllGatherOperation),
+                Collective(ParallelAllGatherOperation),
                 #[ryft(mixed(structural))]
                 DynamicZero(ZeroOperation<ArrayType>),
                 #[ryft(projected(ArrayType))]
@@ -3553,7 +3553,7 @@ mod tests {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
                 #[ryft(mixed(ArrayType))]
-                Collective(AllGatherOperation),
+                Collective(ParallelAllGatherOperation),
                 Dot(DotOperation),
                 Tag(Box<TagOperation<ArrayIrType>>),
                 Scan(ScanOperation<A>),
@@ -3589,7 +3589,7 @@ mod tests {
                         Self::Array(operation) => {
                             <ArrayOperation<A> as ryft::OperationPayloadProjection>::project_payload(operation, payload)
                         }
-                        Self::Collective(operation) if payload == ::std::any::TypeId::of::<AllGatherOperation>() => {
+                        Self::Collective(operation) if payload == ::std::any::TypeId::of::<ParallelAllGatherOperation>() => {
                             ::std::option::Option::Some(operation as &dyn ::std::any::Any)
                         }
                         Self::Dot(operation) if payload == ::std::any::TypeId::of::<DotOperation>() => {

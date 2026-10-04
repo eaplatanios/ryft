@@ -1,5 +1,5 @@
-//! Contains the named-axis [`RaggedAllToAllOperation`], which exchanges variable-length leading-axis segments between
-//! participants, together with its type contract, eager reference interpretation, batching gate, and staging
+//! Contains the named-axis [`ParallelRaggedAllToAllOperation`], which exchanges variable-length leading-axis segments
+//! between participants, together with its type contract, eager reference interpretation, batching gate, and staging
 //! capability.
 
 // TODO(eaplatanios): Review this module.
@@ -53,14 +53,14 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::all_to_all::AllToAllOperation;
+use super::parallel_all_to_all::ParallelAllToAllOperation;
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size, resolve_named_axis_size,
 };
 
-/// Input representation carried by [`RaggedAllToAllOperation`].
+/// Input representation carried by [`ParallelRaggedAllToAllOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum RaggedAllToAllRepresentation {
+enum ParallelRaggedAllToAllRepresentation {
     /// Public per-participant representation with rank-one metadata inputs.
     Logical,
 
@@ -71,7 +71,7 @@ enum RaggedAllToAllRepresentation {
 /// Update semantics used by the public forward exchange and by the internal adjoint exchange that computes the
 /// `operand` cotangent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RaggedAllToAllUpdateKind {
+pub(crate) enum ParallelRaggedAllToAllUpdateKind {
     /// Received segments replace the corresponding output seed regions.
     Overwrite,
 
@@ -79,15 +79,15 @@ pub(crate) enum RaggedAllToAllUpdateKind {
     Add,
 }
 
-/// Reference-value capability used by eager interpretation of [`RaggedAllToAllOperation`].
+/// Reference-value capability used by eager interpretation of [`ParallelRaggedAllToAllOperation`].
 ///
-/// The public [`RaggedAllToAll`] trait stages the operation through a named-axis context. This narrower crate-owned
-/// capability instead executes already-materialized values in either the public per-participant representation or
-/// the explicitly marked internal batching representation.
-pub(crate) trait RaggedAllToAllEvaluation: Sized {
+/// The public [`ParallelRaggedAllToAll`] trait stages the operation through a named-axis context. This narrower
+/// crate-owned capability instead executes already-materialized values in either the public per-participant
+/// representation or the explicitly marked internal batching representation.
+pub(crate) trait ParallelRaggedAllToAllEvaluation: Sized {
     /// Executes `operation` over the six inputs in their canonical order.
-    fn evaluate_ragged_all_to_all(
-        operation: &RaggedAllToAllOperation,
+    fn evaluate_parallel_ragged_all_to_all(
+        operation: &ParallelRaggedAllToAllOperation,
         operand: &Self,
         output: &Self,
         input_offsets: &Self,
@@ -99,9 +99,9 @@ pub(crate) trait RaggedAllToAllEvaluation: Sized {
 
 // TODO(eaplatanios): Review this.
 
-impl RaggedAllToAllEvaluation for Array {
-    fn evaluate_ragged_all_to_all(
-        operation: &RaggedAllToAllOperation,
+impl ParallelRaggedAllToAllEvaluation for Array {
+    fn evaluate_parallel_ragged_all_to_all(
+        operation: &ParallelRaggedAllToAllOperation,
         operand: &Self,
         output: &Self,
         input_offsets: &Self,
@@ -130,20 +130,21 @@ impl RaggedAllToAllEvaluation for Array {
             .iter()
             .try_fold(1usize, |count, dimension| count.checked_mul(dimension.value().unwrap()))
             .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`"),
+                message: format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`"
+                ),
             })?;
-        let row_byte_count =
-            row_element_count
-                .checked_mul(ArrayAddressing::new(operand.r#type().into_owned())?.element_byte_width())
-                .ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!(
-                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row byte size does not fit in `usize`",
-                    ),
-                })?;
+        let row_byte_count = row_element_count
+            .checked_mul(ArrayAddressing::new(operand.r#type().into_owned())?.element_byte_width())
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row byte size does not fit in `usize`",
+                ),
+            })?;
 
         // Validate the complete exchange before copying anything. `output_offsets` are sender-owned metadata in the
         // receiver coordinate frame, while `receive_sizes` are indexed receiver-first and sender-second.
-        let overwrite = operation.update_kind() == RaggedAllToAllUpdateKind::Overwrite;
+        let overwrite = operation.update_kind() == ParallelRaggedAllToAllUpdateKind::Overwrite;
         let mut received_regions = overwrite.then(|| vec![Vec::new(); participant_count]);
         let mut transfers = Vec::new();
         for group in &groups {
@@ -162,14 +163,14 @@ impl RaggedAllToAllEvaluation for Array {
                         let input_end =
                             input_offset.checked_add(send_size).ok_or_else(|| ProgramError::InvalidArgument {
                                 message: format!(
-                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region for participant {sender} at \
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region for participant {sender} at \
                                      metadata index {send_index} overflows `usize`",
                                 ),
                             })?;
                         if input_end > input_extent {
                             return Err(ProgramError::InvalidArgument {
                                 message: format!(
-                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region [{input_offset}, {input_end}) \
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region [{input_offset}, {input_end}) \
                                      for participant {sender} exceeds input extent {input_extent}",
                                 ),
                             });
@@ -177,7 +178,7 @@ impl RaggedAllToAllEvaluation for Array {
                         if send_size != receive_size {
                             return Err(ProgramError::InvalidArgument {
                                 message: format!(
-                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` send size {send_size} from participant \
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` send size {send_size} from participant \
                                      {sender} to participant {receiver} does not match receive size {receive_size}",
                                 ),
                             });
@@ -185,14 +186,14 @@ impl RaggedAllToAllEvaluation for Array {
                         let output_end =
                             output_offset.checked_add(receive_size).ok_or_else(|| ProgramError::InvalidArgument {
                                 message: format!(
-                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region for participant {receiver} \
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region for participant {receiver} \
                                      from participant {sender} overflows `usize`",
                                 ),
                             })?;
                         if output_end > output_extent {
                             return Err(ProgramError::InvalidArgument {
                                 message: format!(
-                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region [{output_offset}, \
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region [{output_offset}, \
                                      {output_end}) for participant {receiver} exceeds output extent {output_extent}",
                                 ),
                             });
@@ -208,7 +209,7 @@ impl RaggedAllToAllEvaluation for Array {
                                 .and_then(|offset| offset.checked_add(input_offset))
                                 .ok_or_else(|| ProgramError::InvalidArgument {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
                                          {sender} does not fit in `usize`",
                                     ),
                                 })?;
@@ -217,14 +218,14 @@ impl RaggedAllToAllEvaluation for Array {
                                 .and_then(|offset| offset.checked_add(output_offset))
                                 .ok_or_else(|| ProgramError::InvalidArgument {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
                                          participant {receiver} does not fit in `usize`",
                                     ),
                                 })?;
                             let source_start = source_row.checked_mul(row_byte_count).ok_or_else(|| {
                                 ProgramError::InvalidArgument {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
                                          {sender} does not fit in `usize`",
                                     ),
                                 }
@@ -232,7 +233,7 @@ impl RaggedAllToAllEvaluation for Array {
                             let destination_start = destination_row.checked_mul(row_byte_count).ok_or_else(|| {
                                 ProgramError::InvalidArgument {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
                                          participant {receiver} does not fit in `usize`",
                                     ),
                                 }
@@ -240,7 +241,7 @@ impl RaggedAllToAllEvaluation for Array {
                             let byte_count =
                                 send_size.checked_mul(row_byte_count).ok_or_else(|| ProgramError::InvalidArgument {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transfer byte size does not fit in \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transfer byte size does not fit in \
                                          `usize`",
                                     ),
                                 })?;
@@ -257,7 +258,7 @@ impl RaggedAllToAllEvaluation for Array {
                     if regions[1].0 < regions[0].1 {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
-                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` received output regions [{}, {}) and [{}, {}) \
+                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` received output regions [{}, {}) and [{}, {}) \
                                  overlap for participant {receiver}",
                                 regions[0].0, regions[0].1, regions[1].0, regions[1].1,
                             ),
@@ -287,8 +288,8 @@ impl RaggedAllToAllEvaluation for Array {
     }
 }
 
-/// Canonical name of the [`RaggedAllToAllOperation`].
-pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
+/// Canonical name of the [`ParallelRaggedAllToAllOperation`].
+pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all_to_all";
 
 /// Primitive that exchanges variable-length leading-axis segments between participants of a named axis.
 ///
@@ -302,24 +303,23 @@ pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 ///
 /// `output_offsets` are supplied by each sender but are expressed in the corresponding receiver's
 /// coordinate frame. Runtime metadata must satisfy
-/// `send_sizes == all_to_all(receive_sizes)`, every source and destination region must be in bounds, and received
-/// regions within one output must be disjoint. Send regions may overlap, which intentionally permits resending a
-/// source slice. Concrete eager execution validates these conditions with overflow-safe host arithmetic. Staged XLA
-/// execution treats them as preconditions, matching
-/// [JAX's `ragged_all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_all_to_all.html).
+/// `send_sizes == parallel_all_to_all(receive_sizes)`, every source and destination region must be in bounds, and
+/// received regions within one output must be disjoint. Send regions may overlap, which intentionally permits resending
+/// a source slice. Concrete eager execution validates these conditions with overflow-safe host arithmetic. Staged XLA
+/// execution treats them as preconditions, matching [JAX's
+/// `ragged_all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_all_to_all.html).
 ///
 /// [`RaggedAxis`](crate::arrays::RaggedAxis) is batching-time metadata and does not participate in this explicitly
 /// packed operation contract. Batching rejects inputs that carry it because one per-item logical extent does not
 /// determine the per-source/per-destination sizes and two coordinate-frame offset vectors required by this operation.
 /// A future adapter must therefore accept an explicit routing descriptor; it cannot infer routing from
 /// [`RaggedAxis`](crate::arrays::RaggedAxis) alone. The two representations also describe different frames:
-/// `RaggedAllToAllOperation` metadata describes participant chunks, whereas a `RaggedAxis` describes packed batch
-/// items and has no carrier outside a batching transform.
-/// A batch transform whose named axis matches this operation executes concrete array metadata eagerly. Unresolved
-/// non-constant metadata are deliberately gated: dynamic-length copies cannot use
-/// [`DynamicSliceOperation`](crate::DynamicSliceOperation), whose slice sizes are static payload fields. A future
-/// staged implementation can express the copies with iota-based index arithmetic, gather, and `select` masking at
-/// `O(group_size × M)` staged work.
+/// `ParallelRaggedAllToAllOperation` metadata describes participant chunks, whereas a `RaggedAxis` describes packed
+/// batch items and has no carrier outside a batching transform. A batch transform whose named axis matches this
+/// operation executes concrete array metadata eagerly. Unresolved non-constant metadata are deliberately gated:
+/// dynamic-length copies cannot use [`DynamicSliceOperation`](crate::DynamicSliceOperation), whose slice sizes are
+/// static payload fields. A future staged implementation can express the copies with iota-based index arithmetic,
+/// gather, and `select` masking at `O(group_size × M)` staged work.
 ///
 /// The transpose stages additional collectives rather than performing a local rewrite, and its metadata inputs are
 /// primal residuals: ordinary runtime values retained by linearization, not compile-time constants. Participant groups
@@ -333,7 +333,7 @@ pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 /// trailing extents from both homogeneous and composite carriers. Grouped operation batching is rejected in this case
 /// because merging an unrelated mapped axis would change the meaning of each fixed participant group.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RaggedAllToAllOperation {
+pub struct ParallelRaggedAllToAllOperation {
     /// Axis name referenced by this collective.
     axis_name: String,
 
@@ -344,13 +344,13 @@ pub struct RaggedAllToAllOperation {
     axis_index_groups: Option<Vec<Vec<usize>>>,
 
     /// Public logical or batching-internal physical input representation.
-    representation: RaggedAllToAllRepresentation,
+    representation: ParallelRaggedAllToAllRepresentation,
 
     /// Public overwrite or transpose-internal additive update semantics.
-    update_kind: RaggedAllToAllUpdateKind,
+    update_kind: ParallelRaggedAllToAllUpdateKind,
 }
 
-impl RaggedAllToAllOperation {
+impl ParallelRaggedAllToAllOperation {
     /// Creates an ungrouped operation over the named axis with the provided resolved axis size.
     #[inline]
     pub fn new(axis_name: String, axis_size: usize) -> Self {
@@ -358,8 +358,8 @@ impl RaggedAllToAllOperation {
             axis_name,
             axis_size,
             axis_index_groups: None,
-            representation: RaggedAllToAllRepresentation::Logical,
-            update_kind: RaggedAllToAllUpdateKind::Overwrite,
+            representation: ParallelRaggedAllToAllRepresentation::Logical,
+            update_kind: ParallelRaggedAllToAllUpdateKind::Overwrite,
         }
     }
 
@@ -367,7 +367,7 @@ impl RaggedAllToAllOperation {
     /// `0..axis_size`.
     pub fn grouped(axis_name: String, axis_size: usize, axis_index_groups: Vec<Vec<usize>>) -> Result<Self, TypeError> {
         effective_collective_axis_size(
-            RAGGED_ALL_TO_ALL_OPERATION_NAME,
+            PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
             axis_size,
             Some(axis_index_groups.as_slice()),
         )?;
@@ -375,8 +375,8 @@ impl RaggedAllToAllOperation {
             axis_name,
             axis_size,
             axis_index_groups: Some(axis_index_groups),
-            representation: RaggedAllToAllRepresentation::Logical,
-            update_kind: RaggedAllToAllUpdateKind::Overwrite,
+            representation: ParallelRaggedAllToAllRepresentation::Logical,
+            update_kind: ParallelRaggedAllToAllUpdateKind::Overwrite,
         })
     }
 
@@ -401,7 +401,11 @@ impl RaggedAllToAllOperation {
     /// Validates the participant partition and returns its common group size.
     #[inline]
     pub fn effective_axis_size(&self) -> Result<usize, TypeError> {
-        effective_collective_axis_size(RAGGED_ALL_TO_ALL_OPERATION_NAME, self.axis_size, self.axis_index_groups())
+        effective_collective_axis_size(
+            PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
+            self.axis_size,
+            self.axis_index_groups(),
+        )
     }
 
     /// Returns whether this operation carries the batching-internal physical input representation, in which every input
@@ -409,29 +413,29 @@ impl RaggedAllToAllOperation {
     /// this representation so that one host-side evaluation can exchange segments between all participants.
     ///
     /// Backend lowerings must check this predicate and reject physical operations, because a device-level
-    /// `ragged_all_to_all` expects the public logical representation, in which each device holds only its own data
-    /// inputs and rank-one metadata inputs. Lowering a physical operation as if it were logical would misread its
+    /// `parallel_ragged_all_to_all` expects the public logical representation, in which each device holds only its own
+    /// data inputs and rank-one metadata inputs. Lowering a physical operation as if it were logical would misread its
     /// leading participant axis as data.
     #[inline]
     pub fn is_physical(&self) -> bool {
-        self.representation == RaggedAllToAllRepresentation::Physical
+        self.representation == ParallelRaggedAllToAllRepresentation::Physical
     }
 
     /// Returns a clone marked with the batching-internal physical input representation.
     #[inline]
     fn with_physical_representation(&self) -> Self {
-        Self { representation: RaggedAllToAllRepresentation::Physical, ..self.clone() }
+        Self { representation: ParallelRaggedAllToAllRepresentation::Physical, ..self.clone() }
     }
 
     /// Returns a clone whose received segments add into the output seed.
     #[inline]
     fn with_additive_updates(&self) -> Self {
-        Self { update_kind: RaggedAllToAllUpdateKind::Add, ..self.clone() }
+        Self { update_kind: ParallelRaggedAllToAllUpdateKind::Add, ..self.clone() }
     }
 
     /// Returns the update semantics carried by this operation.
     #[inline]
-    pub(crate) fn update_kind(&self) -> RaggedAllToAllUpdateKind {
+    pub(crate) fn update_kind(&self) -> ParallelRaggedAllToAllUpdateKind {
         self.update_kind
     }
 
@@ -445,22 +449,22 @@ impl RaggedAllToAllOperation {
     /// segments explicitly.
     #[inline]
     pub fn accumulates_updates(&self) -> bool {
-        self.update_kind == RaggedAllToAllUpdateKind::Add
+        self.update_kind == ParallelRaggedAllToAllUpdateKind::Add
     }
 }
 
-impl Display for RaggedAllToAllOperation {
+impl Display for ParallelRaggedAllToAllOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl Operation for RaggedAllToAllOperation {
+impl Operation for ParallelRaggedAllToAllOperation {
     type Type = ArrayType;
 
     #[inline]
     fn name(&self) -> &'static str {
-        RAGGED_ALL_TO_ALL_OPERATION_NAME
+        PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME
     }
 
     fn infer_output_types(
@@ -483,13 +487,13 @@ impl Operation for RaggedAllToAllOperation {
                             input_type.shape().dimensions().first().and_then(|extent| extent.value())
                         else {
                             return Err(TypeError::invalid(format!(
-                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} must have a static \
+                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} must have a static \
                                  leading participant dimension",
                             )));
                         };
                         if participant_extent != self.axis_size {
                             return Err(TypeError::invalid(format!(
-                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} leading participant \
+                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} leading participant \
                                  dimension {participant_extent} must equal axis size {}",
                                 self.axis_size,
                             )));
@@ -508,13 +512,13 @@ impl Operation for RaggedAllToAllOperation {
 
         if operand.rank() == 0 || output.rank() == 0 {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` data inputs must have rank at least 1 but got `{operand}` and \
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` data inputs must have rank at least 1 but got `{operand}` and \
                  `{output}`",
             )));
         }
         if operand.data_type() != output.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` data types must match but got `{}` and \
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` data types must match but got `{}` and \
                  `{}`",
                 operand.data_type(),
                 output.data_type(),
@@ -522,7 +526,7 @@ impl Operation for RaggedAllToAllOperation {
         }
         if operand.shape().dimensions()[1..] != output.shape().dimensions()[1..] {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` trailing dimensions must match but got \
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` trailing dimensions must match but got \
                  `{}` and `{}`",
                 operand.shape(),
                 output.shape(),
@@ -540,33 +544,33 @@ impl Operation for RaggedAllToAllOperation {
         for (name, r#type) in metadata {
             if r#type.rank() != 1 {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must be rank 1 but got `{type}`",
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must be rank 1 but got `{type}`",
                     r#type = r#type,
                 )));
             }
             if !r#type.data_type().is_integer() {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have an integer data type but got `{}`",
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have an integer data type but got `{}`",
                     r#type.data_type(),
                 )));
             }
             if r#type.data_type() != metadata_data_type {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must share one integer data type but \
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must share one integer data type but \
                      `input_offsets` has `{metadata_data_type}` and `{name}` has `{}`",
                     r#type.data_type(),
                 )));
             }
             let Some(length) = r#type.shape().dimensions()[0].value() else {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have a static length but got `{type}`",
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have a static length but got `{type}`",
                     r#type = r#type,
                 )));
             };
             match metadata_length {
                 Some(expected) if length != expected => {
                     return Err(TypeError::invalid(format!(
-                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must have equal lengths but \
+                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must have equal lengths but \
                          `input_offsets` has length {expected} and `{name}` has length {length}",
                     )));
                 }
@@ -577,12 +581,12 @@ impl Operation for RaggedAllToAllOperation {
         let metadata_length = metadata_length.unwrap();
         if metadata_length == 0 {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata length must be greater than zero",
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata length must be greater than zero",
             )));
         }
         if metadata_length % effective_axis_size != 0 {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata length {metadata_length} is not divisible by group \
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata length {metadata_length} is not divisible by group \
                  size {effective_axis_size}",
             )));
         }
@@ -599,7 +603,7 @@ impl Operation for RaggedAllToAllOperation {
             if self.is_physical() {
                 operation.field("representation", "Physical")?;
             }
-            if self.update_kind == RaggedAllToAllUpdateKind::Add {
+            if self.update_kind == ParallelRaggedAllToAllUpdateKind::Add {
                 operation.field("update_kind", "Add")?;
             }
             Ok(())
@@ -607,8 +611,8 @@ impl Operation for RaggedAllToAllOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: RaggedAllToAllEvaluation>> InterpretableOperation<C>
-    for RaggedAllToAllOperation
+impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> InterpretableOperation<C>
+    for ParallelRaggedAllToAllOperation
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -627,13 +631,13 @@ impl<C: Domain<Type = ArrayType, Value: RaggedAllToAllEvaluation>> Interpretable
         if !batched && self.effective_axis_size()? != 1 {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "cannot interpret `{RAGGED_ALL_TO_ALL_OPERATION_NAME}` over axis `{}` of size {} without an \
+                    "cannot interpret `{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` over axis `{}` of size {} without an \
                      enclosing binder",
                     self.axis_name, self.axis_size,
                 ),
             });
         }
-        Ok(vec![C::Value::evaluate_ragged_all_to_all(
+        Ok(vec![C::Value::evaluate_parallel_ragged_all_to_all(
             self,
             operand,
             output,
@@ -647,8 +651,8 @@ impl<C: Domain<Type = ArrayType, Value: RaggedAllToAllEvaluation>> Interpretable
 
 // Partial evaluation uses the default fold-or-residualize behavior. Known metadata remain ordinary runtime values;
 // the rule never assumes that a known primal input is a compile-time literal.
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedAllToAllOperation where
-    C::Operation: From<RaggedAllToAllOperation>
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ParallelRaggedAllToAllOperation where
+    C::Operation: From<ParallelRaggedAllToAllOperation>
 {
 }
 
@@ -658,13 +662,13 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedAl
 // into the packed leading data and metadata axes with sender/receiver offsets rebased by the mapped item index. An
 // all-replicated application can be forwarded unchanged.
 impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for RaggedAllToAllOperation
+    for ParallelRaggedAllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<ConstantOperation<Array>>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<IotaOperation<ArrayType>>
-        + From<RaggedAllToAllOperation>,
+        + From<ParallelRaggedAllToAllOperation>,
     C::Value: Broadcast + Transpose,
     AddOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
     MulOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
@@ -687,16 +691,17 @@ where
             }
             if self.axis_index_groups().is_some() {
                 return Err(BatchingError::UnsupportedOperation {
-                    message: "`ragged_all_to_all` axis index groups are not supported when merging an unrelated \
+                    message:
+                        "`parallel_ragged_all_to_all` axis index groups are not supported when merging an unrelated \
                               mapped axis"
-                        .to_string(),
+                            .to_string(),
                 });
             }
 
             let provenance_context = context.parent().clone();
             return provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("batching"), || {
-                    provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ragged_all_to_all"), || {
+                    provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("parallel_ragged_all_to_all"), || {
                         let participant_axis_count = usize::from(self.is_physical());
                         let input_leading_axis = participant_axis_count;
                         let metadata_batch_axis = participant_axis_count + 1;
@@ -705,7 +710,7 @@ where
                         self.infer_output_types(logical_input_types.as_slice(), &[])?;
                         let batch_size =
                             P::axis_dimension(context)?.value().ok_or_else(|| BatchingError::UnsupportedOperation {
-                                message: "`ragged_all_to_all` merged batching requires a statically known \
+                                message: "`parallel_ragged_all_to_all` merged batching requires a statically known \
                                           mapped-axis extent"
                                     .to_string(),
                             })?;
@@ -717,7 +722,7 @@ where
                             r#type.shape().dimensions()[axis].value().ok_or_else(|| {
                                 BatchingError::UnsupportedOperation {
                                     message: format!(
-                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching requires `{name}` \
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching requires `{name}` \
                                          axis {axis} to have a static extent",
                                     ),
                                 }
@@ -857,8 +862,9 @@ where
             .any(|input| !matches!(context.parent().resolve(input.value()), ValueResolution::Constant(_)))
         {
             return Err(BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
+                        .to_string(),
             });
         }
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -872,11 +878,11 @@ where
 // The two data inputs are jointly linear. Metadata remain primal values and therefore become ordinary residuals
 // whenever the tangent exchange survives partial evaluation.
 impl_differentiable_operation! {
-    RaggedAllToAllOperation,
+    ParallelRaggedAllToAllOperation,
     jvp<C>
     where
         C: Context<Type = ArrayType, Value: ZeroLike>,
-        C::Operation: From<RaggedAllToAllOperation>,
+        C::Operation: From<ParallelRaggedAllToAllOperation>,
     {
         |operation, context, _driver, inputs| {
             check_count!("input", inputs, 6, ProgramError);
@@ -929,7 +935,7 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: From<AllToAllOperation>
+        O: From<ParallelAllToAllOperation>
             + From<BroadcastOperation>
             + From<ConcatenateOperation<ArrayType>>
             + From<CompareOperation<ArrayType>>
@@ -937,7 +943,7 @@ impl_differentiable_operation! {
             + From<CumulativeOperation>
             + From<NegOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
-            + From<RaggedAllToAllOperation>
+            + From<ParallelRaggedAllToAllOperation>
             + From<ReshapeOperation>
             + From<ScatterOperation>
             + From<SelectOperation<ArrayType>>
@@ -952,7 +958,7 @@ impl_differentiable_operation! {
             provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
                     provenance_context.invoke_with_provenance_scope(
-                        ProvenanceScope::new("ragged_all_to_all_transpose"),
+                        ProvenanceScope::new("parallel_ragged_all_to_all_transpose"),
                         || {
                             check_count!("input", inputs, 6, ProgramError);
                             check_count!("output", outputs, 1, ProgramError);
@@ -993,7 +999,7 @@ impl_differentiable_operation! {
                             };
                             let output_cotangent = if !accumulators[1].is_needed() {
                                 MaybeZero::Zero(output.r#type().cotangent()?)
-                            } else if operation.update_kind == RaggedAllToAllUpdateKind::Add {
+                            } else if operation.update_kind == ParallelRaggedAllToAllUpdateKind::Add {
                                 MaybeZero::Value(cotangent.clone())
                             } else {
                                 let permuted_output_offsets = match permuted_output_offsets {
@@ -1020,7 +1026,7 @@ impl_differentiable_operation! {
 
 // This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType` member in
 // `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous operation.
-impl MemberOperation<ArrayIrType> for RaggedAllToAllOperation {
+impl MemberOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
     fn infer_parent_region_input_types(
         &self,
         input_types: &[ArrayIrType],
@@ -1045,11 +1051,11 @@ impl MemberOperation<ArrayIrType> for RaggedAllToAllOperation {
     }
 }
 
-impl<C> MemberInterpretableOperation<C> for RaggedAllToAllOperation
+impl<C> MemberInterpretableOperation<C> for ParallelRaggedAllToAllOperation
 where
     C: Domain<
             Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: RaggedAllToAllEvaluation + Value<Type = ArrayType>>,
+            Value: ValueProjection<ArrayType, Projected: ParallelRaggedAllToAllEvaluation + Value<Type = ArrayType>>,
         >,
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -1062,7 +1068,7 @@ where
     }
 }
 
-impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for RaggedAllToAllOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelRaggedAllToAllOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -1076,7 +1082,7 @@ where
             Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
             Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
         >,
-    RaggedAllToAllOperation:
+    ParallelRaggedAllToAllOperation:
         BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1089,7 +1095,7 @@ where
     }
 }
 
-impl<C> MemberDifferentiableOperation<C> for RaggedAllToAllOperation
+impl<C> MemberDifferentiableOperation<C> for ParallelRaggedAllToAllOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -1098,7 +1104,7 @@ where
             Operation: OperationProjection<ArrayType>,
         >,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
-        DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<RaggedAllToAllOperation>,
+        DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<ParallelRaggedAllToAllOperation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1119,7 +1125,7 @@ fn known_transpose_input<V: Value<Type = ArrayType>, O: Operation<Type = ArrayTy
     input.as_known().cloned().ok_or_else(|| {
         ProgramError::UnsupportedOperation {
             message: format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` to be a known primal residual",
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` to be a known primal residual",
             ),
         }
         .into()
@@ -1128,18 +1134,19 @@ fn known_transpose_input<V: Value<Type = ArrayType>, O: Operation<Type = ArrayTy
 
 /// Stages the logical named-axis exchange that transposes sender-owned offset metadata.
 fn transpose_logical_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
+    operation: &ParallelRaggedAllToAllOperation,
     context: &mut TracingContext<V, O>,
     offsets: &Tracer<TracingContext<V, O>>,
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
+    O: Operation<Type = ArrayType> + From<ParallelAllToAllOperation>,
 {
     let options = operation.axis_index_groups().map_or_else(CollectiveOptions::tiled, |groups| {
         CollectiveOptions::tiled().with_axis_index_groups(groups.to_vec())
     });
-    let exchange = AllToAllOperation::new(operation.axis_name().to_string(), operation.axis_size(), 0, 0, options);
+    let exchange =
+        ParallelAllToAllOperation::new(operation.axis_name().to_string(), operation.axis_size(), 0, 0, options);
     let mut outputs = context.bind(exchange, Vec::new(), std::slice::from_ref(offsets))?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
@@ -1149,7 +1156,7 @@ where
 /// concatenations. Physical batching has already materialized every participant, so no named-axis binder remains in
 /// which a dense collective could run.
 fn transpose_physical_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
+    operation: &ParallelRaggedAllToAllOperation,
     offsets: &Tracer<TracingContext<V, O>>,
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
@@ -1187,14 +1194,14 @@ where
 
 /// Transposes sender-owned offset metadata in the operation's current logical or physical representation.
 fn transpose_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
+    operation: &ParallelRaggedAllToAllOperation,
     context: &mut TracingContext<V, O>,
     offsets: &Tracer<TracingContext<V, O>>,
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
-        + From<AllToAllOperation>
+        + From<ParallelAllToAllOperation>
         + From<ConcatenateOperation<ArrayType>>
         + From<SliceOperation>
         + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
@@ -1236,16 +1243,17 @@ where
 {
     let output_type = cotangent.r#type().into_owned();
     let leading_axis = usize::from(physical);
-    let output_extent =
-        output_type.shape().dimensions()[leading_axis]
-            .value()
-            .ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a static output leading dimension",
-                ),
-            })?;
+    let output_extent = output_type.shape().dimensions()[leading_axis].value().ok_or_else(|| {
+        ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a static output leading dimension",
+            ),
+        }
+    })?;
     let marker_extent = output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
-        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`"),
+        message: format!(
+            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`"
+        ),
     })?;
     let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
     marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
@@ -1323,14 +1331,14 @@ where
 /// Constructs a `u64` scalar array containing `extent` in the memory space of `metadata_type`.
 fn metadata_extent_scalar(metadata_type: &ArrayType, extent: usize) -> Result<Array, ProgramError> {
     let extent = u64::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
-        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {extent} does not fit in `u64`"),
+        message: format!("`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {extent} does not fit in `u64`"),
     })?;
     Array::from_elements(ArrayType::scalar(DataType::U64).with_memory(metadata_type.memory()), &[extent])
 }
 
 /// Stages an explicitly packed ragged all-to-all in any named-axis array operation domain that carries
-/// [`RaggedAllToAllOperation`].
-pub trait RaggedAllToAll: Sized {
+/// [`ParallelRaggedAllToAllOperation`].
+pub trait ParallelRaggedAllToAll: Sized {
     /// Exchanges segments over the full named axis.
     ///
     /// # Parameters
@@ -1341,7 +1349,7 @@ pub trait RaggedAllToAll: Sized {
     ///   - `send_sizes`: Sender-local leading-axis lengths of the segments in `self`.
     ///   - `output_offsets`: Sender-owned offsets expressed in each corresponding receiver's output coordinate frame.
     ///   - `receive_sizes`: Receiver-local leading-axis lengths, indexed by sending participant.
-    fn ragged_all_to_all(
+    fn parallel_ragged_all_to_all(
         &self,
         axis_name: &str,
         output: &Self,
@@ -1362,7 +1370,7 @@ pub trait RaggedAllToAll: Sized {
     ///   - `output_offsets`: Sender-owned offsets expressed in each corresponding receiver's output coordinate frame.
     ///   - `receive_sizes`: Receiver-local leading-axis lengths, indexed by sending participant.
     ///   - `axis_index_groups`: Ordered equal-sized partition of the full axis indices; exchange stays within groups.
-    fn ragged_all_to_all_with_axis_index_groups(
+    fn parallel_ragged_all_to_all_with_axis_index_groups(
         &self,
         axis_name: &str,
         output: &Self,
@@ -1374,13 +1382,13 @@ pub trait RaggedAllToAll: Sized {
     ) -> Result<Self, ProgramError>;
 }
 
-impl<V> RaggedAllToAll for V
+impl<V> ParallelRaggedAllToAll for V
 where
     V: Value,
     V::DispatchDomain: Context + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<RaggedAllToAllOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<ParallelRaggedAllToAllOperation>,
 {
-    fn ragged_all_to_all(
+    fn parallel_ragged_all_to_all(
         &self,
         axis_name: &str,
         output: &Self,
@@ -1392,13 +1400,16 @@ where
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let inputs = [self, output, input_offsets, send_sizes, output_offsets, receive_sizes].map(Clone::clone);
-        let mut outputs =
-            context.bind(RaggedAllToAllOperation::new(axis_name.to_string(), axis_size), Vec::new(), &inputs)?;
+        let mut outputs = context.bind(
+            ParallelRaggedAllToAllOperation::new(axis_name.to_string(), axis_size),
+            Vec::new(),
+            &inputs,
+        )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 
-    fn ragged_all_to_all_with_axis_index_groups(
+    fn parallel_ragged_all_to_all_with_axis_index_groups(
         &self,
         axis_name: &str,
         output: &Self,
@@ -1410,7 +1421,7 @@ where
     ) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let operation = RaggedAllToAllOperation::grouped(axis_name.to_string(), axis_size, axis_index_groups)?;
+        let operation = ParallelRaggedAllToAllOperation::grouped(axis_name.to_string(), axis_size, axis_index_groups)?;
         let inputs = [self, output, input_offsets, send_sizes, output_offsets, receive_sizes].map(Clone::clone);
         let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
@@ -1446,7 +1457,7 @@ mod tests {
     }
 
     // Executes a degenerate single-participant ragged exchange with i64 metadata.
-    fn interpret_single_participant_ragged_all_to_all(
+    fn interpret_single_participant_parallel_ragged_all_to_all(
         input_offsets: Vec<i64>,
         send_sizes: Vec<i64>,
         output_offsets: Vec<i64>,
@@ -1454,7 +1465,7 @@ mod tests {
     ) -> Result<Array, ProgramError> {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let mut outputs = context.bind(
-            RaggedAllToAllOperation::new("x".to_string(), 1),
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
             Vec::new(),
             &[
                 Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap(),
@@ -1489,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_staging_contracts() {
+    fn test_parallel_ragged_all_to_all_staging_contracts() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let input_types = vec![
@@ -1502,7 +1513,7 @@ mod tests {
         ];
         let unbound = TestContext::trace(
             |inputs: Vec<_>| {
-                inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             input_types.clone(),
         )
@@ -1511,7 +1522,7 @@ mod tests {
 
         let (_, program) = TestContext::trace_with_named_axes(
             |inputs: Vec<_>| {
-                inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             input_types,
             vec![(
@@ -1525,10 +1536,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayIrOperation::RaggedAllToAll(operation) = program.instructions()[0].operation() else {
+        let ArrayIrOperation::ParallelRaggedAllToAll(operation) = program.instructions()[0].operation() else {
             panic!("ragged all-to-all must use its direct composite carrier");
         };
-        assert_eq!(operation.to_string(), "ragged_all_to_all [axis_name=\"x\", axis_size=2]");
+        assert_eq!(operation.to_string(), "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2]");
         assert_eq!(program.instructions()[0].inputs().len(), 6);
 
         type HomogeneousTestContext = TracingContext<Array, ArrayOperation<Array>>;
@@ -1547,7 +1558,7 @@ mod tests {
                     .into_iter()
                     .map(|input| ArrayBatch::new(input, BatchAxis::new(0)))
                     .collect::<Result<Vec<_>, _>>()?;
-                let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
                     .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
                     .into_parts()
                     .0;
@@ -1560,8 +1571,9 @@ mod tests {
         assert_eq!(
             error,
             &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
+                        .to_string(),
             },
         );
 
@@ -1583,14 +1595,15 @@ mod tests {
         .collect::<Vec<_>>();
         let batching_context = BatchingContext::new(partial_context, 2).with_axis_name("x".to_string());
         assert_eq!(
-            RaggedAllToAllOperation::new("x".to_string(), 2).batch(
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
                 &batching_context,
                 &EmptyRegionDriver,
                 partial_inputs.as_slice(),
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
+                        .to_string(),
             }),
         );
 
@@ -1614,7 +1627,7 @@ mod tests {
             .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
             .collect::<Vec<_>>();
         let batching_context = BatchingContext::new(partial_context, 2).with_axis_name("x".to_string());
-        let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
             .batch(&batching_context, &EmptyRegionDriver, inputs.as_slice())
             .unwrap()
             .into_parts()
@@ -1624,8 +1637,8 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_physical_ragged_all_to_all_transpose_routes_cotangents() {
-        let operation = RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
+    fn test_grouped_physical_parallel_ragged_all_to_all_transpose_routes_cotangents() {
+        let operation = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
             .unwrap()
             .with_physical_representation();
         let data_type = ArrayType::new_static(DataType::F64, [4, 2]);
@@ -1652,10 +1665,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_transpose_accumulates_resent_source_cotangents() {
+    fn test_parallel_ragged_all_to_all_transpose_accumulates_resent_source_cotangents() {
         check_operation_transposition!(
             @exact,
-            operation = RaggedAllToAllOperation::new("x".to_string(), 1),
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
             cases = [
                 {
                     inputs = [
@@ -1692,10 +1705,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_merges_an_unrelated_mapped_axis() {
+    fn test_parallel_ragged_all_to_all_merges_an_unrelated_mapped_axis() {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("y".to_string());
-        let operation = RaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation();
+        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation();
         let operand = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2, 2, 3]),
             &[10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
@@ -1732,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_logical_ragged_all_to_all_stages_an_unrelated_axis_merge() {
+    fn test_logical_parallel_ragged_all_to_all_stages_an_unrelated_axis_merge() {
         type TestContext = TracingContext<Array, ArrayOperation<Array>>;
 
         let input_types = vec![
@@ -1751,7 +1764,7 @@ mod tests {
                     .enumerate()
                     .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
                     .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
                     .into_parts()
                     .0;
@@ -1766,7 +1779,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::RaggedAllToAll(operation) => Some((operation, instruction)),
+                ArrayOperation::ParallelRaggedAllToAll(operation) => Some((operation, instruction)),
                 _ => None,
             })
             .unwrap();
@@ -1789,7 +1802,7 @@ mod tests {
             ProvenanceScope::new("ryft"),
             Provenance::scope(
                 ProvenanceScope::new("batching"),
-                Provenance::scope(ProvenanceScope::new("ragged_all_to_all"), Provenance::unknown()),
+                Provenance::scope(ProvenanceScope::new("parallel_ragged_all_to_all"), Provenance::unknown()),
             ),
         );
         assert!(
@@ -1799,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_ragged_all_to_all_skips_zero_byte_transfers_without_offset_overflow() {
+    fn test_physical_parallel_ragged_all_to_all_skips_zero_byte_transfers_without_offset_overflow() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let data_type = ArrayType::new_static(DataType::F32, [3, usize::MAX, 0]);
         let data = || Array::from_elements::<f32>(data_type.clone(), &[]).unwrap();
@@ -1808,7 +1821,7 @@ mod tests {
         let sizes = Array::from_elements(metadata_type, &[0_u64; 9]).unwrap();
         let mut outputs = context
             .bind(
-                RaggedAllToAllOperation::new("x".to_string(), 3).with_physical_representation(),
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 3).with_physical_representation(),
                 Vec::new(),
                 &[data(), data(), offsets.clone(), sizes.clone(), offsets, sizes],
             )
@@ -1817,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_ragged_all_to_all_transpose_stages_the_adjoint_sequence() {
+    fn test_grouped_parallel_ragged_all_to_all_transpose_stages_the_adjoint_sequence() {
         let groups = vec![vec![0, 2], vec![3, 1]];
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
@@ -1828,7 +1841,7 @@ mod tests {
         let receive_sizes = builder.add_constant(Array::vector(vec![1_i32, 0, 1, 1]).unwrap());
         let result = builder
             .add_instruction(
-                RaggedAllToAllOperation::grouped("x".to_string(), 4, groups.clone()).unwrap(),
+                ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, groups.clone()).unwrap(),
                 Vec::new(),
                 vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
                 None,
@@ -1839,20 +1852,20 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
 
-        let all_to_all_groups = pullback
+        let parallel_all_to_all_groups = pullback
             .instructions()
             .iter()
             .filter_map(|instruction| match instruction.operation() {
-                ArrayOperation::AllToAll(operation) => operation.options().axis_index_groups(),
+                ArrayOperation::ParallelAllToAll(operation) => operation.options().axis_index_groups(),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(all_to_all_groups, vec![groups.as_slice(), groups.as_slice()]);
+        assert_eq!(parallel_all_to_all_groups, vec![groups.as_slice(), groups.as_slice()]);
         let adjoint = pullback
             .instructions()
             .iter()
             .find_map(|instruction| match instruction.operation() {
-                ArrayOperation::RaggedAllToAll(operation) => Some(operation),
+                ArrayOperation::ParallelRaggedAllToAll(operation) => Some(operation),
                 _ => None,
             })
             .unwrap();
@@ -1861,7 +1874,7 @@ mod tests {
             ProvenanceScope::new("ryft"),
             Provenance::scope(
                 ProvenanceScope::new("differentiation"),
-                Provenance::scope(ProvenanceScope::new("ragged_all_to_all_transpose"), Provenance::unknown()),
+                Provenance::scope(ProvenanceScope::new("parallel_ragged_all_to_all_transpose"), Provenance::unknown()),
             ),
         );
         assert!(
@@ -1876,14 +1889,14 @@ mod tests {
                     %2:i32[4] = const [1, 1, 0, 1]
                     %3:i32[4] = const [0, 2, 1, 3]
                     %4:i32[4] = const [1, 0, 1, 1]
-                    %5:i32[4] = all_to_all [
+                    %5:i32[4] = parallel_all_to_all [
                         axis_name="x",
                         axis_size=4,
                         split_axis=0,
                         concat_axis=0,
                         options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
                     ] %3
-                    %6:i32[4] = all_to_all [
+                    %6:i32[4] = parallel_all_to_all [
                         axis_name="x",
                         axis_size=4,
                         split_axis=0,
@@ -1919,7 +1932,7 @@ mod tests {
             .replace(
                 "__ADJOINT__",
                 concat!(
-                    "%8:f32[3] = ragged_all_to_all [axis_name=\"x\", axis_size=4, ",
+                    "%8:f32[3] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, ",
                     "axis_index_groups=[[0, 2], [3, 1]], update_kind=Add] %0 %7 %5 %4 %6 %2",
                 ),
             )
@@ -1939,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_additive_ragged_all_to_all_output_transpose_does_not_exchange_offsets() {
+    fn test_additive_parallel_ragged_all_to_all_output_transpose_does_not_exchange_offsets() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
         let output = builder.add_input(array_type(DataType::F32, [4]));
@@ -1949,7 +1962,7 @@ mod tests {
         let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
         let result = builder
             .add_instruction(
-                RaggedAllToAllOperation::new("x".to_string(), 1).with_additive_updates(),
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1).with_additive_updates(),
                 Vec::new(),
                 vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
                 None,
@@ -1965,14 +1978,14 @@ mod tests {
             pullback
                 .instructions()
                 .iter()
-                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::AllToAll(_)))
+                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::ParallelAllToAll(_)))
                 .count(),
             0,
         );
     }
 
     #[test]
-    fn test_ragged_all_to_all_transpose_rejects_unavailable_or_unrepresentable_metadata() {
+    fn test_parallel_ragged_all_to_all_transpose_rejects_unavailable_or_unrepresentable_metadata() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = [
             builder.add_input(ArrayType::new_static(DataType::F32, [3])),
@@ -1983,7 +1996,12 @@ mod tests {
             builder.add_input(ArrayType::new_static(DataType::I32, [1])),
         ];
         let result = builder
-            .add_instruction(RaggedAllToAllOperation::new("x".to_string(), 1), Vec::new(), inputs.to_vec(), None)
+            .add_instruction(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+                Vec::new(),
+                inputs.to_vec(),
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(
@@ -1995,7 +2013,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`ragged_all_to_all` transpose requires `input_offsets` to be a known primal residual"
+                if message == "`parallel_ragged_all_to_all` transpose requires `input_offsets` to be a known primal residual"
         ));
 
         let output_extent = DimensionVariable::new("output_extent", DimensionBounds::new(0, Some(8)).unwrap());
@@ -2009,7 +2027,7 @@ mod tests {
         let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
         let result = builder
             .add_instruction(
-                RaggedAllToAllOperation::new("x".to_string(), 1),
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
                 Vec::new(),
                 vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
                 None,
@@ -2021,7 +2039,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`ragged_all_to_all` transpose requires a static output leading dimension"
+                if message == "`parallel_ragged_all_to_all` transpose requires a static output leading dimension"
         ));
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2033,7 +2051,7 @@ mod tests {
         let receive_sizes = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
         let result = builder
             .add_instruction(
-                RaggedAllToAllOperation::new("x".to_string(), 1),
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
                 Vec::new(),
                 vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
                 None,
@@ -2045,12 +2063,12 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "`ragged_all_to_all` transpose marker extent does not fit in `usize`"
+                if message == "`parallel_ragged_all_to_all` transpose marker extent does not fit in `usize`"
         ));
     }
 
     #[test]
-    fn test_ragged_all_to_all_transpose_supports_leading_and_trailing_sharding() {
+    fn test_parallel_ragged_all_to_all_transpose_supports_leading_and_trailing_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         for dimensions in [
             vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
@@ -2068,7 +2086,7 @@ mod tests {
             let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
             let result = builder
                 .add_instruction(
-                    RaggedAllToAllOperation::new("x".to_string(), 1),
+                    ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
                     Vec::new(),
                     vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
                     None,
@@ -2084,14 +2102,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_type_inference() {
+    fn test_parallel_ragged_all_to_all_type_inference() {
         let data = || array_type(DataType::F32, [3, 2]);
         let output = || array_type(DataType::F32, [4, 2]);
         let metadata = || array_type(DataType::I32, [2]);
         let metadata_length = DimensionVariable::new("metadata_length", DimensionBounds::positive(Some(4)).unwrap());
         let dynamic_metadata = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(metadata_length)]));
         check_operation_type_inference!(
-            operation = RaggedAllToAllOperation::new("x".to_string(), 2),
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2),
             cases = [
                 {
                     input_types = [data(), output(), metadata(), metadata(), metadata(), metadata()],
@@ -2106,7 +2124,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` data inputs must have rank at least 1 but got `f32[]` and \
+                    error = "`parallel_ragged_all_to_all` data inputs must have rank at least 1 but got `f32[]` and \
                              `f32[4, 2]`",
                 },
                 {
@@ -2118,7 +2136,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
+                    error = "`parallel_ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
                 },
                 {
                     input_types = [
@@ -2129,7 +2147,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` `operand` and `output` trailing dimensions must match but got \
+                    error = "`parallel_ragged_all_to_all` `operand` and `output` trailing dimensions must match but got \
                              `[3, 2]` and `[4, 3]`",
                 },
                 {
@@ -2141,7 +2159,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 1]`",
+                    error = "`parallel_ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 1]`",
                 },
                 {
                     input_types = [
@@ -2152,7 +2170,7 @@ mod tests {
                         array_type(DataType::I32, [2, 2]),
                         array_type(DataType::I32, [2, 2]),
                     ],
-                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 2]`",
+                    error = "`parallel_ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 2]`",
                 },
                 {
                     input_types = [
@@ -2163,7 +2181,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` `input_offsets` must have an integer data type but got `f32`",
+                    error = "`parallel_ragged_all_to_all` `input_offsets` must have an integer data type but got `f32`",
                 },
                 {
                     input_types = [
@@ -2174,7 +2192,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` metadata inputs must share one integer data type but \
+                    error = "`parallel_ragged_all_to_all` metadata inputs must share one integer data type but \
                              `input_offsets` has `i32` and `send_sizes` has `i64`",
                 },
                 {
@@ -2186,7 +2204,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` metadata inputs must have equal lengths but `input_offsets` has \
+                    error = "`parallel_ragged_all_to_all` metadata inputs must have equal lengths but `input_offsets` has \
                              length 2 and `send_sizes` has length 4",
                 },
                 {
@@ -2199,7 +2217,7 @@ mod tests {
                         dynamic_metadata.clone(),
                     ],
                     error = format!(
-                        "`ragged_all_to_all` `input_offsets` must have a static length but got `{dynamic_metadata}`",
+                        "`parallel_ragged_all_to_all` `input_offsets` must have a static length but got `{dynamic_metadata}`",
                     ),
                 },
                 {
@@ -2211,7 +2229,7 @@ mod tests {
                         array_type(DataType::I32, [0]),
                         array_type(DataType::I32, [0]),
                     ],
-                    error = "`ragged_all_to_all` metadata length must be greater than zero",
+                    error = "`parallel_ragged_all_to_all` metadata length must be greater than zero",
                 },
                 {
                     input_types = [
@@ -2222,75 +2240,79 @@ mod tests {
                         array_type(DataType::I32, [3]),
                         array_type(DataType::I32, [3]),
                     ],
-                    error = "`ragged_all_to_all` metadata length 3 is not divisible by group size 2",
+                    error = "`parallel_ragged_all_to_all` metadata length 3 is not divisible by group size 2",
                 },
             ],
         );
         assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 2]])
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 2]])
                 .unwrap_err()
                 .to_string(),
-            "`ragged_all_to_all` axis index groups contain participant 2 more than once",
+            "`parallel_ragged_all_to_all` axis index groups contain participant 2 more than once",
         );
         assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2]])
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2]])
                 .unwrap_err()
                 .to_string(),
-            "`ragged_all_to_all` axis index group 1 has size 1 but every group must have size 2",
+            "`parallel_ragged_all_to_all` axis index group 1 has size 1 but every group must have size 2",
         );
         assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 4]])
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 4]])
                 .unwrap_err()
                 .to_string(),
-            "`ragged_all_to_all` axis index 4 is out of bounds for axis size 4",
+            "`parallel_ragged_all_to_all` axis index 4 is out of bounds for axis size 4",
         );
         assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1]]).unwrap_err().to_string(),
-            "`ragged_all_to_all` axis index groups do not contain participant 2",
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1]])
+                .unwrap_err()
+                .to_string(),
+            "`parallel_ragged_all_to_all` axis index groups do not contain participant 2",
         );
     }
 
     #[test]
-    fn test_array_ragged_all_to_all_eager_metadata_validation() {
+    fn test_array_parallel_ragged_all_to_all_eager_metadata_validation() {
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![1], vec![2], vec![0], vec![2]),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![1], vec![2], vec![0], vec![2]),
             Ok(Array::vector(vec![2.0_f32, 3.0, 9.0, 9.0]).unwrap()),
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
             ProgramError::InvalidArgument { message: "`input_offsets[0]` must be nonnegative but got -1".to_string() },
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]).unwrap_err(),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]).unwrap_err(),
             ProgramError::InvalidArgument {
-                message: "`ragged_all_to_all` input region [2, 4) for participant 0 exceeds input extent 3".to_string(),
+                message: "`parallel_ragged_all_to_all` input region [2, 4) for participant 0 exceeds input extent 3"
+                    .to_string(),
             },
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![0], vec![2], vec![0], vec![1]).unwrap_err(),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![0], vec![1]).unwrap_err(),
             ProgramError::InvalidArgument {
-                message: "`ragged_all_to_all` send size 2 from participant 0 to participant 0 does not match receive \
+                message: "`parallel_ragged_all_to_all` send size 2 from participant 0 to participant 0 does not match receive \
                           size 1"
                     .to_string(),
             },
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![0], vec![2], vec![3], vec![2]).unwrap_err(),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![3], vec![2]).unwrap_err(),
             ProgramError::InvalidArgument {
-                message: "`ragged_all_to_all` output region [3, 5) for participant 0 exceeds output extent 4"
+                message: "`parallel_ragged_all_to_all` output region [3, 5) for participant 0 exceeds output extent 4"
                     .to_string(),
             },
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![0, 1], vec![1, 1], vec![0, 0], vec![1, 1],)
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0, 1], vec![1, 1], vec![0, 0], vec![1, 1],)
                 .unwrap_err(),
             ProgramError::InvalidArgument {
-                message: "`ragged_all_to_all` received output regions [0, 1) and [0, 1) overlap for participant 0"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` received output regions [0, 1) and [0, 1) overlap for participant 0"
+                        .to_string(),
             },
         );
         assert_eq!(
-            interpret_single_participant_ragged_all_to_all(vec![0, 0], vec![1, 1], vec![0, 1], vec![1, 1]),
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0, 0], vec![1, 1], vec![0, 1], vec![1, 1]),
             Ok(Array::vector(vec![1.0_f32, 1.0, 9.0, 9.0]).unwrap()),
         );
 
@@ -2298,7 +2320,7 @@ mod tests {
         assert_eq!(
             context
                 .bind(
-                    RaggedAllToAllOperation::new("x".to_string(), 1),
+                    ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
                     Vec::new(),
                     &[
                         Array::vector(vec![1.0_f32]).unwrap(),
@@ -2311,14 +2333,15 @@ mod tests {
                 )
                 .unwrap_err(),
             ProgramError::InvalidArgument {
-                message: "`ragged_all_to_all` input region for participant 0 at metadata index 0 overflows `usize`"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` input region for participant 0 at metadata index 0 overflows `usize`"
+                        .to_string(),
             },
         );
     }
 
     #[test]
-    fn test_array_ragged_all_to_all_matches_documented_and_grouped_reference_exchanges() {
+    fn test_array_parallel_ragged_all_to_all_matches_documented_and_grouped_reference_exchanges() {
         type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type TestTracer = BatchingTracer<TestContext, ArrayIrBatchingPolicy>;
 
@@ -2330,7 +2353,7 @@ mod tests {
         let receive_sizes = vec![1_i32, 1, 2, 1];
         let output: ArrayIrValue<Array> = batch(
             |inputs: Vec<TestTracer>| {
-                inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
                 ArrayIrValue::Array(Array::matrix(2, 3, operand.clone()).unwrap()),
@@ -2376,7 +2399,7 @@ mod tests {
         let receive_sizes = vec![1_i32; 16];
         let output: ArrayIrValue<Array> = batch(
             |inputs: Vec<TestTracer>| {
-                inputs[0].ragged_all_to_all_with_axis_index_groups(
+                inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
                     "x",
                     &inputs[1],
                     &inputs[2],
@@ -2444,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_batching_rejects_ragged_inputs() {
+    fn test_parallel_ragged_all_to_all_batching_rejects_ragged_inputs() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
@@ -2454,7 +2477,7 @@ mod tests {
             .with_axis_name("x".to_string());
         let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0_i32; 4]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
-            RaggedAllToAllOperation::new("x".to_string(), 2).batch(
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
                 &context,
                 &EmptyRegionDriver,
                 &[
@@ -2467,14 +2490,14 @@ mod tests {
                 ],
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` does not support bounded ragged dimension `length` on input 0"
+                message: "`parallel_ragged_all_to_all` does not support bounded ragged dimension `length` on input 0"
                     .to_string(),
             }),
         );
     }
 
     #[test]
-    fn test_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
+    fn test_parallel_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
         let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap();
         let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap();
         let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]).unwrap();
@@ -2491,7 +2514,7 @@ mod tests {
                 let receive_sizes = context.lift(receive_sizes.clone())?;
                 let exchanged = batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
+                        operand.parallel_ragged_all_to_all(
                             "x",
                             &output,
                             &input_offsets,
@@ -2529,7 +2552,7 @@ mod tests {
                 let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
                 let exchanged = batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
+                        operand.parallel_ragged_all_to_all(
                             "x",
                             &output,
                             &input_offsets,
@@ -2566,7 +2589,7 @@ mod tests {
                 let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
                 let exchanged = batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
+                        operand.parallel_ragged_all_to_all(
                             "x",
                             &output,
                             &input_offsets,
@@ -2597,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_batch_axis_composes_outside_ragged_all_to_all_differentiation() {
+    fn test_named_batch_axis_composes_outside_parallel_ragged_all_to_all_differentiation() {
         let (values, gradients) = batch(
             |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                 differentiate_at((operand, output))
@@ -2605,7 +2628,7 @@ mod tests {
                     .value_and_gradient(
                         |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
                             Ok(operand
-                                .ragged_all_to_all(
+                                .parallel_ragged_all_to_all(
                                     "x",
                                     &output,
                                     &input_offsets,
@@ -2645,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_composes_named_batch_axes_in_both_orders() {
+    fn test_parallel_ragged_all_to_all_composes_named_batch_axes_in_both_orders() {
         let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
         let inputs = (
             Array::from_elements::<f64>(
@@ -2679,7 +2702,7 @@ mod tests {
             |inputs| {
                 Ok(batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
+                        operand.parallel_ragged_all_to_all(
                             "x",
                             &output,
                             &input_offsets,
@@ -2712,7 +2735,7 @@ mod tests {
             |inputs| {
                 Ok(batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
+                        operand.parallel_ragged_all_to_all(
                             "x",
                             &output,
                             &input_offsets,
@@ -2743,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_packed_extent() {
+    fn test_unrelated_parallel_ragged_all_to_all_batching_rejects_a_dynamic_packed_extent() {
         type TestContext = TracingContext<Array, ArrayOperation<Array>>;
 
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(0, Some(8)).unwrap());
@@ -2755,7 +2778,7 @@ mod tests {
                     .enumerate()
                     .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
                     .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
                     .into_parts()
                     .0;
@@ -2775,8 +2798,9 @@ mod tests {
         assert_eq!(
             error,
             &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
+                        .to_string(),
             },
         );
 
@@ -2789,7 +2813,7 @@ mod tests {
                     .enumerate()
                     .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
                     .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
                     .into_parts()
                     .0;
@@ -2819,14 +2843,15 @@ mod tests {
         assert_eq!(
             error,
             &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
-                    .to_string(),
+                message:
+                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
+                        .to_string(),
             },
         );
     }
 
     #[test]
-    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_mapped_extent() {
+    fn test_unrelated_parallel_ragged_all_to_all_batching_rejects_a_dynamic_mapped_extent() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let context = TestContext::new();
@@ -2861,8 +2886,8 @@ mod tests {
         });
         let error = batching_context
             .bind(
-                ArrayIrOperation::RaggedAllToAll(
-                    RaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
+                ArrayIrOperation::ParallelRaggedAllToAll(
+                    ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
                 ),
                 Vec::new(),
                 &inputs,
@@ -2872,14 +2897,14 @@ mod tests {
         assert_eq!(
             error,
             &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
+                message: "`parallel_ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
                     .to_string(),
             },
         );
     }
 
     #[test]
-    fn test_unrelated_ragged_all_to_all_batching_handles_empty_batches_and_rejects_groups() {
+    fn test_unrelated_parallel_ragged_all_to_all_batching_handles_empty_batches_and_rejects_groups() {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 0)
             .with_axis_name("y".to_string());
         let empty = |r#type: ArrayType| Array::from_elements::<f32>(r#type, &[]).unwrap();
@@ -2892,7 +2917,7 @@ mod tests {
             ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
             ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
         ];
-        let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
             .batch(&context, &EmptyRegionDriver, inputs.as_slice())
             .unwrap()
             .into_parts()
@@ -2900,12 +2925,12 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [0, 4]));
 
-        let grouped = RaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap();
+        let grouped = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap();
         assert_eq!(
             grouped.batch(&context, &EmptyRegionDriver, inputs.as_slice()),
             Err(BatchingError::UnsupportedOperation {
                 message:
-                    "`ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped axis"
+                    "`parallel_ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped axis"
                         .to_string(),
             }),
         );
@@ -2917,18 +2942,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            RaggedAllToAllOperation::new("x".to_string(), 2)
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
                 .batch(&context, &EmptyRegionDriver, invalid_inputs.as_slice())
                 .unwrap_err()
                 .to_string(),
-            "`ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
+            "`parallel_ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
         );
     }
 
     #[test]
-    fn test_ragged_all_to_all_jvp_handles_joint_and_structural_zero_tangents() {
+    fn test_parallel_ragged_all_to_all_jvp_handles_joint_and_structural_zero_tangents() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let operation = RaggedAllToAllOperation::new("x".to_string(), 1);
+        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 1);
         let operand = Array::vector(vec![10.0_f64, 11.0, 12.0]).unwrap();
         let output = Array::vector(vec![100.0_f64, 101.0, 102.0, 103.0]).unwrap();
         let metadata = [

@@ -14,7 +14,8 @@ use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
 };
 use ryft_core::operations::collectives::{
-    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, ParallelSumScatter, ParallelSwapAxes,
+    CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelSumScatter,
+    ParallelSwapAxes,
 };
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
@@ -223,10 +224,15 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
                         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
                         (
                             local_input
-                                .all_gather_with_options("x", 0, options.clone(), AllGatherOutputVariance::Varying)
+                                .parallel_all_gather_with_options(
+                                    "x",
+                                    0,
+                                    options.clone(),
+                                    ParallelAllGatherOutputVariance::Varying,
+                                )
                                 .unwrap(),
                             local_input.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
-                            local_input.all_to_all_with_options("x", 0, 0, options).unwrap(),
+                            local_input.parallel_all_to_all_with_options("x", 0, 0, options).unwrap(),
                         )
                     },
                     input,
@@ -331,7 +337,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     })
 }
 
-/// Emits `parallel_swap_axes` behavior plus its canonical `all_to_all` StableHLO module.
+/// Emits `parallel_swap_axes` behavior plus its canonical `parallel_all_to_all` StableHLO module.
 fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, _) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();

@@ -2185,7 +2185,9 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::collectives::{AllGather, AllGatherOutputVariance, CollectiveOptions, RaggedAllToAll};
+    use ryft_core::operations::collectives::{
+        CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll,
+    };
     use ryft_core::{
         Array as CpuArray, BatchAxis, BatchAxisSpecification, DataType, Device, DeviceMesh, Differentiate,
         DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Reduce, ReductionKind,
@@ -2987,13 +2989,13 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_traces_ragged_all_to_all_body() {
+    fn test_shard_map_traces_parallel_ragged_all_to_all_body() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
             |inputs: Vec<ShardMapTracer>| {
                 inputs[0]
-                    .ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
                     .unwrap()
             },
             vec![
@@ -3021,7 +3023,7 @@ mod tests {
                 %5:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let \
                 %6:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
-                ragged_all_to_all [axis_name=\"x\", axis_size=2] %0 %1 %2 %3 %4 %5
+                parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2] %0 %1 %2 %3 %4 %5
                 in (%6)
             "}
             .trim_end(),
@@ -3062,10 +3064,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_jax_documentation_example_eager_reference() {
+    fn test_parallel_ragged_all_to_all_jax_documentation_example_eager_reference() {
         let result = batch(
             |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                operand.ragged_all_to_all("x", &output, &input_offsets, &send_sizes, &output_offsets, &receive_sizes)
+                operand.parallel_ragged_all_to_all(
+                    "x",
+                    &output,
+                    &input_offsets,
+                    &send_sizes,
+                    &output_offsets,
+                    &receive_sizes,
+                )
             },
             (
                 CpuArray::matrix(2, 3, vec![1_i32, 2, 2, 3, 4, 0]).unwrap(),
@@ -3092,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_target_aware_lowering_rejects_cpu() {
+    fn test_parallel_ragged_all_to_all_target_aware_lowering_rejects_cpu() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let input_types = vec![
@@ -3111,7 +3120,9 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |inputs: Vec<ShardMapTracer>| {
                             inputs[0]
-                                .ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                                .parallel_ragged_all_to_all(
+                                    "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                                )
                                 .unwrap()
                         },
                         inputs,
@@ -3139,12 +3150,12 @@ mod tests {
             ),
             Err(crate::experimental::lowering::LoweringError::Tracing(
                 ProgramError::UnsupportedOperation { message },
-            )) if message == "`ragged_all_to_all` is not supported by the XLA CPU backend",
+            )) if message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
         ));
     }
 
     #[test]
-    fn test_shard_map_lowers_grouped_ragged_all_to_all_transpose_with_group_local_source_lanes() {
+    fn test_shard_map_lowers_grouped_parallel_ragged_all_to_all_transpose_with_group_local_source_lanes() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
@@ -3160,7 +3171,7 @@ mod tests {
                     .value_and_gradient(
                         |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
                             Ok(operand
-                                .ragged_all_to_all_with_axis_index_groups(
+                                .parallel_ragged_all_to_all_with_axis_index_groups(
                                     "x",
                                     &output,
                                     &input_offsets,
@@ -3264,7 +3275,7 @@ mod tests {
                     return %0 : tensor<12xf32> loc(#loc)
                   } loc(#loc)
                 } loc(#loc)
-                #loc1 = loc(\"ragged_all_to_all_transpose\")
+                #loc1 = loc(\"parallel_ragged_all_to_all_transpose\")
                 #loc2 = loc(\"differentiation\"(#loc1))
                 #loc3 = loc(\"ryft\"(#loc2))
             "},
@@ -3273,7 +3284,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_ragged_all_to_all_forward_and_overlapping_send_transpose_execute_on_cuda() {
+    fn test_parallel_ragged_all_to_all_forward_and_overlapping_send_transpose_execute_on_cuda() {
         let plugin = load_cuda_13_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::GPU(GpuClientOptions {
@@ -3313,7 +3324,9 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |inputs: Vec<ShardMapTracer>| {
                             inputs[0]
-                                .ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                                .parallel_ragged_all_to_all(
+                                    "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                                )
                                 .unwrap()
                         },
                         inputs,
@@ -3420,7 +3433,7 @@ mod tests {
                                 .gradient(
                                     |operand, (output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                                         operand
-                                            .ragged_all_to_all(
+                                            .parallel_ragged_all_to_all(
                                                 "x",
                                                 &output,
                                                 &input_offsets,
@@ -6162,7 +6175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
+    fn test_shard_map_parallel_all_gather_lowers_and_executes_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -6181,11 +6194,11 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
-        // `all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full `f32[4]`
-        // concatenation on every device. Its output still varies along the manual axis for VMA purposes (a replicated
-        // out sharding is rejected with `OutputVaryingManualAxisNotInOutSpecs`, mirroring JAX's vma tracking), so the
-        // output stays sharded over `"x"`, giving the global `f32[8]` concatenation of the per-device gathers. The
-        // staged collective lowers to a channeled `stablehlo.all_gather` over the two devices along `"x"`.
+        // `parallel_all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full
+        // `f32[4]` concatenation on every device. Its output still varies along the manual axis for VMA purposes (a
+        // replicated out sharding is rejected with `OutputVaryingManualAxisNotInOutSpecs`, mirroring JAX's vma
+        // tracking), so the output stays sharded over `"x"`, giving the global `f32[8]` concatenation of the per-device
+        // gathers. The staged collective lowers to a channeled `stablehlo.all_gather` over the two devices along `"x"`.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
@@ -6194,11 +6207,11 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             local_x
-                                .all_gather_with_options(
+                                .parallel_all_gather_with_options(
                                     "x",
                                     0,
                                     CollectiveOptions::tiled(),
-                                    AllGatherOutputVariance::Varying,
+                                    ParallelAllGatherOutputVariance::Varying,
                                 )
                                 .unwrap()
                         },
@@ -6207,7 +6220,7 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with all_gather should trace")
+                    .expect("shard_map with parallel_all_gather should trace")
                 }
             },
             global_input_type,
@@ -6280,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_untiled_all_gather_lowers_rank_insertion() {
+    fn test_shard_map_untiled_parallel_all_gather_lowers_rank_insertion() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -6306,11 +6319,11 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             local_x
-                                .all_gather_with_options(
+                                .parallel_all_gather_with_options(
                                     "x",
                                     0,
                                     CollectiveOptions::default(),
-                                    AllGatherOutputVariance::Varying,
+                                    ParallelAllGatherOutputVariance::Varying,
                                 )
                                 .unwrap()
                         },
@@ -6381,7 +6394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_grouped_all_gather_preserves_group_order_across_mesh_coordinates() {
+    fn test_shard_map_grouped_parallel_all_gather_preserves_group_order_across_mesh_coordinates() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
@@ -6395,11 +6408,11 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             local_x
-                                .all_gather_with_options(
+                                .parallel_all_gather_with_options(
                                     "x",
                                     0,
                                     CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
-                                    AllGatherOutputVariance::Varying,
+                                    ParallelAllGatherOutputVariance::Varying,
                                 )
                                 .unwrap()
                         },
@@ -6425,7 +6438,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_shape_changing_collectives_execute_on_cpu() {
-        use ryft_core::operations::collectives::{AllToAll, ParallelSumScatter};
+        use ryft_core::operations::collectives::{ParallelAllToAll, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -6451,10 +6464,15 @@ mod tests {
                                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
                             (
                                 local_x
-                                    .all_gather_with_options("x", 0, options.clone(), AllGatherOutputVariance::Varying)
+                                    .parallel_all_gather_with_options(
+                                        "x",
+                                        0,
+                                        options.clone(),
+                                        ParallelAllGatherOutputVariance::Varying,
+                                    )
                                     .unwrap(),
                                 local_x.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
-                                local_x.all_to_all_with_options("x", 0, 0, options).unwrap(),
+                                local_x.parallel_all_to_all_with_options("x", 0, 0, options).unwrap(),
                             )
                         },
                         x,
@@ -6520,7 +6538,7 @@ mod tests {
             vec![12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 7.0],
         ];
         let expected_scatter = [vec![8.0, 10.0], vec![20.0, 22.0], vec![12.0, 14.0], vec![16.0, 18.0]];
-        let expected_all_to_all = [
+        let expected_parallel_all_to_all = [
             vec![0.0, 1.0, 8.0, 9.0],
             vec![14.0, 15.0, 6.0, 7.0],
             vec![2.0, 3.0, 10.0, 11.0],
@@ -6541,7 +6559,7 @@ mod tests {
                 vec![
                     expected_gather[device_index].clone(),
                     expected_scatter[device_index].clone(),
-                    expected_all_to_all[device_index].clone(),
+                    expected_parallel_all_to_all[device_index].clone(),
                 ],
             );
         }
@@ -6990,8 +7008,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_all_to_all_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{AllToAll, CollectiveOptions};
+    fn test_shard_map_parallel_all_to_all_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::{CollectiveOptions, ParallelAllToAll};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7011,9 +7029,9 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // `all_to_all` over the manual mesh axis `"x"` with split and concat both at axis 0 keeps the local `f32[4]`
-        // shape: each device splits its shard into two chunks, keeps its own chunk, and receives the peer's matching
-        // chunk. The staged collective lowers to a channeled `stablehlo.all_to_all`.
+        // `parallel_all_to_all` over the manual mesh axis `"x"` with split and concat both at axis 0 keeps the local
+        // `f32[4]` shape: each device splits its shard into two chunks, keeps its own chunk, and receives the peer's
+        // matching chunk. The staged collective lowers to a channeled `stablehlo.all_to_all`.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
@@ -7021,14 +7039,14 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x.all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled()).unwrap()
+                            local_x.parallel_all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled()).unwrap()
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with all_to_all should trace")
+                    .expect("shard_map with parallel_all_to_all should trace")
                 }
             },
             global_input_type,
@@ -7104,8 +7122,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_untiled_all_to_all_lowers_rank_exchange() {
-        use ryft_core::operations::collectives::{AllToAll, CollectiveOptions};
+    fn test_shard_map_untiled_parallel_all_to_all_lowers_rank_exchange() {
+        use ryft_core::operations::collectives::ParallelAllToAll;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7126,19 +7144,23 @@ mod tests {
         let output_sharding =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
-        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+        let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType)> = trace(
             {
                 let input_sharding = input_sharding.clone();
                 let output_sharding = output_sharding.clone();
                 move |x: ShardMapTracer| {
-                    shard_map::<_, _, ArrayType, _>(
+                    shard_map::<_, _, (ArrayType, ArrayType), _>(
                         |local_x: ShardMapTracer| {
-                            local_x.all_to_all_with_options("x", 0, 1, CollectiveOptions::default()).unwrap()
+                            // Removing split axis 0 puts the gathered participant axis at output axis 1.
+                            // The inverse exchanges axis 1 back into output axis 0.
+                            let exchanged = local_x.parallel_all_to_all("x", 0, 1).unwrap();
+                            let recovered = exchanged.parallel_all_to_all("x", 1, 0).unwrap();
+                            (exchanged, recovered)
                         },
                         x,
                         mesh.clone(),
                         input_sharding.clone(),
-                        output_sharding.clone(),
+                        (output_sharding.clone(), input_sharding.clone()),
                     )
                     .unwrap()
                 }
@@ -7148,13 +7170,25 @@ mod tests {
         .unwrap();
 
         let module = traced.to_mlir_module("main").unwrap();
-        assert!(module.contains("stablehlo.broadcast_in_dim"), "{module}");
-        assert!(module.contains("stablehlo.all_to_all"), "{module}");
-        assert!(module.contains("stablehlo.reshape"), "{module}");
-        assert!(
-            module.contains("(tensor<2x3xf32>) -> tensor<2x3x1xf32>")
-                && module.contains("(tensor<2x3x1xf32>) -> tensor<1x3x2xf32>"),
-            "{module}",
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<2x6xf32>) -> (tensor<6x2xf32>, tensor<2x6xf32>) {
+                    %0:2 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}, {"x"}]>] out_shardings=[<@mesh, [{"x"}, {}]>, <@mesh, [{}, {"x"}]>] manual_axes={"x"} (%arg1: tensor<2x3xf32>) {
+                      %1 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1] : (tensor<2x3xf32>) -> tensor<2x3x1xf32>
+                      %2 = "stablehlo.all_to_all"(%1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 2 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<2x3x1xf32>) -> tensor<1x3x2xf32>
+                      %3 = stablehlo.reshape %2 : (tensor<1x3x2xf32>) -> tensor<3x2xf32>
+                      %4 = stablehlo.broadcast_in_dim %3, dims = [1, 2] : (tensor<3x2xf32>) -> tensor<1x3x2xf32>
+                      %5 = "stablehlo.all_to_all"(%4) <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, concat_dimension = 0 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 2 : i64}> {use_global_device_ids} : (tensor<1x3x2xf32>) -> tensor<2x3x1xf32>
+                      %6 = stablehlo.reshape %5 : (tensor<2x3x1xf32>) -> tensor<2x3xf32>
+                      sdy.return %3, %6 : tensor<3x2xf32>, tensor<2x3xf32>
+                    } : (tensor<2x6xf32>) -> (tensor<6x2xf32>, tensor<2x6xf32>)
+                    return %0#0, %0#1 : tensor<6x2xf32>, tensor<2x6xf32>
+                  }
+                }
+            "#},
         );
 
         let input_buffers = client_devices
@@ -7198,10 +7232,17 @@ mod tests {
             .unwrap()
             .block_until_ready()
             .unwrap();
-        let expected = [vec![1.0_f32, 10.0, 2.0, 11.0, 3.0, 12.0], vec![4.0_f32, 13.0, 5.0, 14.0, 6.0, 15.0]];
-        for (output, expected) in outputs.into_iter().zip(expected) {
-            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
+        let expected_exchange = [vec![1.0f32, 10.0, 2.0, 11.0, 3.0, 12.0], vec![4.0f32, 13.0, 5.0, 14.0, 6.0, 15.0]];
+        let expected_recovery = [vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![10.0f32, 11.0, 12.0, 13.0, 14.0, 15.0]];
+        assert_eq!(outputs.len(), 2);
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 2);
+            assert_eq!(output.outputs[0].dimensions().unwrap(), vec![3, 2]);
+            assert_eq!(output.outputs[1].dimensions().unwrap(), vec![2, 3]);
+            let exchanged_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let recovered_bytes = output.outputs[1].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(exchanged_bytes.as_slice()), expected_exchange[device_index]);
+            assert_eq!(values_from_bytes::<f32>(recovered_bytes.as_slice()), expected_recovery[device_index]);
         }
     }
 
