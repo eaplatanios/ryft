@@ -3569,6 +3569,80 @@ fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     Ok(value)
 }
 
+/// Converts the lowered value of one loop state input to the lowered type of its loop state, which the input type
+/// refines (refer to the `while` and `scan` type inference rules in `ryft-core`). Loops carry every state at its
+/// declared type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type,
+/// so those inputs are returned unchanged. A static extent that refines a bounded dynamic state dimension lowers to a
+/// different tensor type, so such an input is first padded up to the physical bound of the state type and then given
+/// its static extent as the runtime size of that dimension with `stablehlo.set_dimension_size`.
+fn lower_loop_state_input<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayIrType,
+    state_type: &ArrayIrType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let (ArrayIrType::Array(input_type), ArrayIrType::Array(state_type)) = (input_type, state_type) else {
+        return Ok(value);
+    };
+    let refined_axes = state_type
+        .shape()
+        .dimensions()
+        .iter()
+        .zip(input_type.shape().dimensions())
+        .enumerate()
+        .filter_map(|(axis, dimensions)| match dimensions {
+            (Dimension::Dynamic(_), Dimension::Static(extent)) => Some((axis, *extent)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if refined_axes.is_empty() {
+        return Ok(value);
+    }
+    let physical_type = physical_bound_type(state_type)?;
+    let rank = state_type.rank();
+    let mut high_padding = vec![0; rank];
+    for &(axis, extent) in &refined_axes {
+        let bound = physical_type.shape().dimensions()[axis].value().unwrap();
+        high_padding[axis] = reshape_dimension_i64(bound - extent)?;
+    }
+    let padding_value =
+        lower_unplaced_constant_output(&[ArrayType::scalar(state_type.data_type())], 0, block, context, location)?
+            .remove(0);
+    let padded = block.append_operation(stable_hlo::pad(
+        value,
+        padding_value,
+        &vec![0; rank],
+        &high_padding,
+        &vec![0; rank],
+        location,
+    )?)?;
+    let mut value = padded.result(0).expect("stablehlo.pad should return one result").as_ref();
+    let mut dimensions = physical_type.shape().dimensions().to_vec();
+    for (axis, extent) in refined_axes {
+        let size = lower_unplaced_constant_output(
+            &[ArrayType::scalar(DataType::I32)],
+            reshape_dimension_i64(extent)?,
+            block,
+            context,
+            location,
+        )?
+        .remove(0);
+        dimensions[axis] = state_type.shape().dimensions()[axis].clone();
+        let refined_type = state_type.clone().with_shape(Shape::new(dimensions.clone()));
+        let refined = block.append_operation(stable_hlo::set_dimension_size(
+            value,
+            size,
+            lower_tensor_type(&refined_type, context, location)?,
+            axis,
+            location,
+        )?)?;
+        value = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+    }
+    Ok(value)
+}
+
 /// Converts one Ryft reshape dimension to StableHLO's signed shape element type.
 fn reshape_dimension_i64(value: usize) -> Result<i64, LoweringError> {
     i64::try_from(value).map_err(|_| LoweringError::ReshapeDimensionOutOfRange { value, bit_width: 64 })
@@ -7213,6 +7287,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             while_op,
             loop_regions,
             input_values,
+            self.input_types.as_slice(),
             &mut self.block,
             self.context,
             self.location,
@@ -7242,6 +7317,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             scan_op.reverse(),
             scan_op.unroll(),
             input_values,
+            self.input_types.as_slice(),
             &mut self.block,
             self.context,
             self.location,
@@ -8461,6 +8537,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     while_op: &WhileOperation<ArrayIrType>,
     loop_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayIrType],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -8476,16 +8553,27 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     };
     let state_types = body.input_types();
     let state_count = state_types.len();
-    if input_values.len() != state_count {
+    if input_values.len() != state_count || input_types.len() != state_count {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "{} expected {} lowered inputs but got {}",
+                "`{}` expected {} lowered inputs but got {} lowered inputs with {} input types",
                 WHILE_OPERATION_NAME,
                 state_count,
                 input_values.len(),
+                input_types.len(),
             ),
         });
     }
+    // Inputs only need to refine the state types, so each one is converted to the lowered type of its state first.
+    let input_values = input_values
+        .iter()
+        .zip(input_types)
+        .zip(state_types.iter())
+        .map(|((value, input_type), state_type)| {
+            lower_loop_state_input(*value, input_type, state_type, block, context, location)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_values = input_values.as_slice();
     // A batched (non-scalar) predicate lowers with the masked semantics owned by this primitive, mirroring JAX's
     // `_while_lowering`. Rather than re-evaluating the condition in both regions, the per-item predicate is threaded
     // through the loop state as one extra carried value (JAX's `(pred, ..., carry)` layout): the condition region
@@ -8960,6 +9048,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     reverse: bool,
     unroll: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayIrType],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -9004,6 +9093,22 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         });
     }
     let carry_types = &body_input_types[1..1 + carry_count];
+    // Initial carries only need to refine the carry types, so each one is converted to the lowered type of its carry
+    // first. Stacked inputs need no conversion because the lowering reads statically shaped slices from them.
+    if input_types.len() < carry_count {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "`{SCAN_OPERATION_NAME}` expected at least {carry_count} input types but got {}",
+                input_types.len(),
+            ),
+        });
+    }
+    let mut converted_input_values = input_values.to_vec();
+    for (index, carry_type) in carry_types.iter().enumerate() {
+        converted_input_values[index] =
+            lower_loop_state_input(input_values[index], &input_types[index], carry_type, block, context, location)?;
+    }
+    let input_values = converted_input_values.as_slice();
     let x_slice_types = body_input_types[1 + carry_count..]
         .iter()
         .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -25517,6 +25622,192 @@ mod tests {
         assert_eq!(
             lines,
             vec!["iteration: 1.0".to_string(), "iteration: 2.0".to_string(), "iteration: 3.0".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_while_converts_a_refined_static_state_input_to_its_bounded_state_type() {
+        // A loop input only needs to refine its state type, so a static `f64[3]` initial state feeds a loop state with
+        // the bounded dynamic type `f64[rows]`, whose identity the other, dynamically typed state input supplies. The
+        // static input is padded to the bound of the state type and given its extent as its runtime size before it
+        // enters the loop, and one bounded iteration then computes `[a, a + b]`.
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
+        let condition = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(state_type.clone().into());
+            builder.add_input(state_type.clone().into());
+            let predicate = builder.add_constant(XlaConstant::Boolean(true));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let first = builder.add_input(state_type.clone().into());
+            let second = builder.add_input(state_type.clone().into());
+            let sum = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![first, sum],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let dynamic_input = builder.add_input(state_type.clone().into());
+        let static_input = builder.add_input(static_type.clone().into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
+                vec![condition, body],
+                vec![dynamic_input, static_input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.output_types(),
+            vec![ArrayIrType::Array(state_type.clone()), ArrayIrType::Array(state_type.clone())],
+        );
+
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![state_type.clone(), static_type],
+            &vec![state_type.clone(), state_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<3xf64>, %arg2: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %1 = stablehlo.pad %arg1, %cst, low = [0], high = [1], interior = [0] : (tensor<3xf64>, tensor<f64>) -> tensor<4xf64>
+                    %c = stablehlo.constant dense<3> : tensor<i32>
+                    %2 = stablehlo.set_dimension_size %1, %c, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
+                    %c_1 = stablehlo.constant dense<true> : tensor<i1>
+                    %3:4 = stablehlo.while(%iterArg = %c_0, %iterArg_2 = %0, %iterArg_3 = %2, %iterArg_4 = %c_1) : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
+                    cond {
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %8 = stablehlo.compare LT, %iterArg, %c_5, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %9 = stablehlo.and %iterArg_4, %8 : tensor<i1>
+                      stablehlo.return %9 : tensor<i1>
+                    } do {
+                      %8 = stablehlo.add %iterArg_2, %iterArg_3 : tensor<?xf64, #stablehlo.bounds<4>>
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %9 = stablehlo.add %iterArg, %c_5 : tensor<i64>
+                      %c_6 = stablehlo.constant dense<1> : tensor<i64>
+                      %10 = stablehlo.compare LT, %9, %c_6, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %11 = "stablehlo.if"(%10) ({
+                        %c_7 = stablehlo.constant dense<true> : tensor<i1>
+                        stablehlo.return %c_7 : tensor<i1>
+                      }, {
+                        stablehlo.return %iterArg_4 : tensor<i1>
+                      }) : (tensor<i1>) -> tensor<i1>
+                      stablehlo.return %9, %iterArg_2, %8, %11 : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
+                    }
+                    %4 = stablehlo.get_dimension_size %3#1, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    %6 = stablehlo.get_dimension_size %3#2, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
+                    return %3#1, %3#2, %5, %7 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])
+                ],
+                &[3],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
+                MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_scan_converts_a_refined_static_carry_to_its_bounded_carry_type() {
+        // A scan's initial carries only need to refine the carry types, so a static `f64[3]` initial carry feeds a
+        // carry with the bounded dynamic type `f64[rows]`, whose identity the other, dynamically typed carry supplies.
+        // Two iterations of `(a, b) -> (a, a + b)` then compute `[a, 2a + b]`.
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let first = builder.add_input(carry_type.clone().into());
+            let second = builder.add_input(carry_type.clone().into());
+            let sum = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![first, sum],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let dynamic_input = builder.add_input(carry_type.clone().into());
+        let static_input = builder.add_input(static_type.clone().into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::Scan(ScanOperation::new(2, Dimension::Static(2))),
+                vec![body],
+                vec![dynamic_input, static_input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.output_types(),
+            vec![ArrayIrType::Array(carry_type.clone()), ArrayIrType::Array(carry_type)],
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])
+                ],
+                &[3],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]),
+                MixedValue::Array(vec![12.0, 24.0, 36.0], vec![3]),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+            ]),
         );
     }
 

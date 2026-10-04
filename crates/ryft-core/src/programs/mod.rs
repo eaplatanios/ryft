@@ -151,13 +151,15 @@ pub use references::{
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionLiveness, RegionRef,
+    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef,
     RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed};
-pub use values::{Concretizable, ParameterProjection, ProjectedValue, Value, ValueId, ValueProjection};
+pub use values::{
+    Concretizable, LiteralIdentity, ParameterProjection, ProjectedValue, Value, ValueId, ValueProjection,
+};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

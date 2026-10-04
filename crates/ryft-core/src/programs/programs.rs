@@ -3073,8 +3073,8 @@ mod tests {
         let dynamic_dimension = DimensionVariable::new("elements", DimensionBounds::new(1, Some(8)).unwrap());
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_dimension)]));
 
-        // Build a scan body containing a while loop so unprojection must recursively promote all three control-flow
-        // carriers. The scan capture additionally pins value lifting and capture-order preservation.
+        // Build a scan body containing a while loop so un-projection must recursively promote
+        // all three control-flow carriers.
         let mut while_condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let while_condition_input = while_condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let false_predicate = while_condition_builder.add_constant(Array::scalar(false).unwrap());
@@ -3119,15 +3119,10 @@ mod tests {
             branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input], None).unwrap()[0];
         let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64).unwrap());
         let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]).unwrap());
-        let scan_capture = Array::vector(vec![5.0_f64, 6.0]).unwrap();
         let scan_body_region = branch_builder.import_program(scan_body);
         branch_builder
             .add_instruction(
-                ScanOperation::<Array>::new(1, 2)
-                    .with_reverse(true)
-                    .with_unroll(2)
-                    .unwrap()
-                    .with_captures(vec![scan_capture.clone()]),
+                ScanOperation::<ArrayType>::new(1, 2).with_reverse(true).with_unroll(2).unwrap(),
                 vec![scan_body_region],
                 vec![scan_carry, scan_stack],
                 None,
@@ -3235,7 +3230,6 @@ mod tests {
         assert_eq!(scan.length(), &Dimension::Static(2));
         assert!(scan.reverse());
         assert_eq!(scan.unroll(), 2);
-        assert_eq!(scan.captures(), &[ArrayIrValue::Array(scan_capture)]);
         let scan_body = composite.region(scan_instruction.regions()[0]).unwrap();
         let while_instruction = scan_body
             .instructions()

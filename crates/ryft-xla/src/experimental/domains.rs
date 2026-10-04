@@ -22,7 +22,7 @@ use ryft_core::{
     ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
     ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
-    RegionRef, RegionStructure, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
+    RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
     SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction,
     StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
     TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
@@ -1428,7 +1428,7 @@ impl<'c> XlaDomain<'c> {
         // and its inputs directly to a compiled program, so a repeated application skips tracing, lowering, and
         // compilation-key construction and only revalidates its input placement. Hits are looked up through a
         // borrowed query, and the owned key is only built on a miss.
-        let regions = driver.regions().map(RegionRef::structure).collect::<Vec<_>>();
+        let regions = driver.regions().map(RegionRef::key).collect::<Vec<_>>();
         let query = XlaEagerDispatchQuery {
             operation: &operation,
             regions: regions.as_slice(),
@@ -1893,13 +1893,13 @@ const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// JAX's per-primitive `(primitive, params)` cache in front of its dispatch path.
 ///
 /// The key must capture everything that the eager lowering reads besides the session itself (whose client, and thus
-/// [`XlaTarget`], is fixed): the operation including all of its attributes, the structure of every attached region
+/// [`XlaTarget`], is fixed): the operation including all of its attributes, the contents of every attached region
 /// (for operations such as `condition`, `while`, `scan`, `jit_call`, or `shard_map`), the physical type of every array
 /// input (shardings included), the value of every dimension input (because eager binding bakes dimension inputs into
 /// the traced program as constants), the device mesh that the lowering compiles against, and the domain's compilation
-/// options. Attached regions are keyed structurally (refer to [`RegionStructure`]), so applications whose closures are
+/// options. Attached regions are keyed by their contents (refer to [`RegionKey`]), so applications whose closures are
 /// traced afresh on every call still hit the cache when they trace to the same regions. Instruction provenance is not
-/// part of region structure, so applications that differ only in provenance share one compiled program, whose debug
+/// part of a [`RegionKey`], so applications that differ only in provenance share one compiled program, whose debug
 /// locations are those of the first application.
 ///
 /// Keys are compared and hashed through [`XlaEagerDispatchKeyView`], which they share with the borrowed
@@ -1909,8 +1909,8 @@ struct XlaEagerDispatchKey {
     /// Applied operation, compared and hashed with all of its attributes.
     operation: XlaOperation,
 
-    /// Structures of the regions attached to the application, in operation-defined order.
-    regions: Arc<[RegionStructure<XlaConstant, XlaOperation>]>,
+    /// Keys of the regions attached to the application, in operation-defined order.
+    regions: Arc<[RegionKey<XlaConstant, XlaOperation>]>,
 
     /// Inputs of the application, in order.
     inputs: Arc<[XlaEagerDispatchInput]>,
@@ -1964,8 +1964,8 @@ trait XlaEagerDispatchKeyView {
     /// Returns the applied operation.
     fn operation(&self) -> &XlaOperation;
 
-    /// Returns the structures of the regions attached to the application, in operation-defined order.
-    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>];
+    /// Returns the keys of the regions attached to the application, in operation-defined order.
+    fn regions(&self) -> &[RegionKey<XlaConstant, XlaOperation>];
 
     /// Returns the number of inputs of the application.
     fn input_count(&self) -> usize;
@@ -1985,7 +1985,7 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchKey {
         &self.operation
     }
 
-    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>] {
+    fn regions(&self) -> &[RegionKey<XlaConstant, XlaOperation>] {
         &self.regions
     }
 
@@ -2059,8 +2059,8 @@ struct XlaEagerDispatchQuery<'a, 'c> {
     /// Applied operation.
     operation: &'a XlaOperation,
 
-    /// Structures of the regions attached to the application, in operation-defined order.
-    regions: &'a [RegionStructure<XlaConstant, XlaOperation>],
+    /// Keys of the regions attached to the application, in operation-defined order.
+    regions: &'a [RegionKey<XlaConstant, XlaOperation>],
 
     /// Inputs of the application, which contain no references.
     inputs: &'a [ArrayIrValue<Array<'c>>],
@@ -2077,7 +2077,7 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchQuery<'_, '_> {
         self.operation
     }
 
-    fn regions(&self) -> &[RegionStructure<XlaConstant, XlaOperation>] {
+    fn regions(&self) -> &[RegionKey<XlaConstant, XlaOperation>] {
         self.regions
     }
 
@@ -3267,8 +3267,10 @@ struct XlaExecutionPlan {
     /// Whether any physical array input has the zero-space data type and thus needs a materialized carrier.
     zero_space_inputs: bool,
 
-    /// Placement of every logical output, present when every output has a static type and every output without a
-    /// physical result is zero-space. The outputs of such programs are built directly from the returned buffers.
+    /// Placement of every logical output, present when every output has a static type, every output without a
+    /// physical result is zero-space, and the program runs on a single device or declares a sharding without
+    /// `Unconstrained` dimensions for every output (which XLA must then honor). The outputs of such programs are built
+    /// directly from the returned buffers.
     output_layouts: Option<Vec<ArrayOutputLayout>>,
 }
 
@@ -3306,7 +3308,17 @@ impl XlaExecutionPlan {
             && output_types.iter().zip(signature.output_mapping()).all(|(output_type, physical_index)| {
                 output_type.static_shape().is_some() && (physical_index.is_some() || output_type.data_type().is_zero())
             });
-        let output_layouts = if static_outputs {
+        // Declared shardings only fix output placement when XLA must honor them. Lowering emits no result shardings
+        // when any output lacks one, and Shardy propagation may shard the open dimensions that `Unconstrained` lowers
+        // to, so XLA chooses the placement of such outputs. Their buffers are validated by the general constructor
+        // instead. Every placement on a single device holds the whole array, so it is always fixed.
+        let declared_placement = mesh.devices().len() == 1
+            || output_types.iter().all(|output_type| {
+                output_type.sharding().is_some_and(|sharding| {
+                    !sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Unconstrained))
+                })
+            });
+        let output_layouts = if static_outputs && declared_placement {
             let mesh = Arc::new(mesh.clone());
             Some(
                 output_types
@@ -11033,6 +11045,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shards, vec![vec![0.0, 2.0], vec![4.0, 6.0], vec![8.0, 10.0], vec![12.0, 14.0]]);
+    }
+
+    #[test]
+    fn test_static_program_outputs_without_declared_placement_are_validated_on_multiple_cpu_devices() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let unconstrained_sharding =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
+        let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(unconstrained_sharding)
+            .unwrap();
+        let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+
+        // XLA chooses the placement of outputs with open (`Unconstrained`) dimensions and of outputs without declared
+        // shardings, so their programs plan no trusted output layouts and validate the returned buffers instead.
+        for input_type in [unconstrained_type, unsharded_type] {
+            let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+                |input| input.clone() + input,
+                input_type,
+                &domain,
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+                domain.compile(domain.lower(staged).unwrap()).unwrap();
+            assert!(compiled.compiled_program().plan.output_layouts.is_none());
+        }
     }
 
     #[test]

@@ -158,6 +158,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// | `#[ryft(type = T, constant = V)]`          | inferred | Primary operation type and stored constant type    |
 /// | `#[ryft(members(U [, structural(S)]...))]` | none     | Member universes the operation family declares     |
 /// | `#[ryft(dispatch(...))]`                   | none     | Optional transform dispatchers to generate         |
+/// | `#[ryft(identity)]`                        | none     | Payload-delegating `PartialEq`, `Eq`, and `Hash`   |
 ///
 /// ### Crate Path
 ///
@@ -255,6 +256,18 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [`transpose_mixed_operation`](crate::transpose_mixed_operation), and computational projected variants to
 ///     [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural projected variant contributes
 ///     no cotangents.
+///
+/// ### Operation Identity
+///
+/// `#[ryft(identity)]` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of
+/// each variant, under which two operations are considered equal when they are the same variant with equal payloads,
+/// and the hash covers the variant and its payload. Unlike the standard derives, which bound every generic parameter by
+/// the derived trait, the generated implementations are bounded by the payload types themselves. A family is therefore
+/// comparable exactly when its payloads are, even when a payload needs a different bound on the family's value
+/// parameter (e.g., a [`ConstantOperation`](crate::ConstantOperation) payload, which compares its literal through
+/// [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that payloads must
+/// compare every attribute that affects their semantics or lowering, because consumers such as eager dispatch caches
+/// reuse compiled programs for equal operations.
 ///
 /// ## Variant Classes
 ///
@@ -1098,7 +1111,7 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
 ///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
 ///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
-///     such as `ScanOperation<V>` are not exposed.
+///     such as `ConditionOperation<V>` are not exposed.
 ///   - [`from_payload`](Self::from_payload) tries the family's own (composite-native) variants first, in declaration
 ///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
 ///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
