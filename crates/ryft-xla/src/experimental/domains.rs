@@ -6797,7 +6797,7 @@ mod tests {
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::experimental::shard_map::ShardMap;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -14923,19 +14923,13 @@ mod tests {
             compilation_options: Arc::clone(&domain.compilation_options),
             regions: Arc::new([]),
         };
-        let hash = |view: &dyn XlaEagerDispatchKeyView| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            view.hash(&mut hasher);
-            hasher.finish()
-        };
+        let query_hash = hash_of(&query as &dyn XlaEagerDispatchKeyView);
 
         // Owned keys borrow as views that equal, and hash like, the queries that they were built from.
         let borrowed_key: &dyn XlaEagerDispatchKeyView = std::borrow::Borrow::borrow(&key);
         assert!(borrowed_key == &query as &dyn XlaEagerDispatchKeyView);
-        assert_eq!(hash(borrowed_key), hash(&query));
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        assert_eq!(hasher.finish(), hash(&query));
+        assert_eq!(hash_of(borrowed_key), query_hash);
+        assert_eq!(hash_of(&key), query_hash);
 
         // Compilation options are compared by identity, and every other component by value.
         let other_options = Arc::new(domain.compilation_options.as_ref().clone());

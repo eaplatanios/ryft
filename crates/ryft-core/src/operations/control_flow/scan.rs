@@ -36,7 +36,7 @@ use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
+use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType, validate_output_identities};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
@@ -201,14 +201,14 @@ impl<T: Type> ScanOperation<T> {
     }
 }
 
-impl<T: ScanTypeSemantics> Display for ScanOperation<T> {
+impl<T: ScanType> Display for ScanOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<T: ScanTypeSemantics> Operation for ScanOperation<T> {
+impl<T: ScanType> Operation for ScanOperation<T> {
     type Type = T;
 
     #[inline]
@@ -227,7 +227,7 @@ impl<T: ScanTypeSemantics> Operation for ScanOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
-        let body_input_types = T::scan_body_input_types(
+        let body_input_types = T::infer_scan_body_input_types(
             input_types,
             region_interfaces[0].input_types().len(),
             self.carry_count,
@@ -266,13 +266,15 @@ impl<T: ScanTypeSemantics> Operation for ScanOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
         validate_scan_length(&self.length)?;
-        T::infer_scan_output_types(
+        let output_types = T::infer_scan_output_types(
             region_interfaces[0].input_types(),
             region_interfaces[0].output_types(),
             self.carry_count,
             &self.length,
             input_types,
-        )
+        )?;
+        validate_output_identities(SCAN_OPERATION_NAME, input_types, output_types.as_slice())?;
+        Ok(output_types)
     }
 
     #[inline]
@@ -943,7 +945,7 @@ where
 // are forwarded from their inputs, and a scan where nothing folds residualizes unchanged.
 impl<T, V, O, C> PartiallyEvaluatableOperation<C> for ScanOperation<T>
 where
-    T: ScanTypeSemantics + TemporalResidualType,
+    T: ScanType + TemporalResidualType,
     V: Value<Type = T>,
     C: Context<Type = T, Constant = V, Operation = O>,
     O: Operation<Type = T> + From<ScanOperation<T>> + TemporalResidualOperation<T>,
@@ -1162,11 +1164,11 @@ where
 //      ([`ProgramBatchingOutputAxesPolicy::AlignEachTo`], i.e., JAX's `instantiate=carry_bat`), reusing the program
 //      of the stabilizing pass when its natural axes already are those joined axes.
 //   3. Widened initial carries gain their batch axis through staged broadcasts, and one [`ScanOperation`] over the
-//      batched body is bound into the parent with the same carry count, length, `reverse`, and (lowering-only)
-//      `unroll` factor. Final carries come back at the carry axes, and stacked outputs at their per-iteration axes
-//      shifted right by the new leading scan dimension. The staged stacked outputs carry the scan's *declared* output
-//      types, whose optional sharding metadata is left for sharding propagation to resolve (refer to the documentation
-//      of [`ScanTypeSemantics::infer_scan_output_types`]).
+//      batched body is bound into the parent with the same carry count, length, `reverse`, and (lowering-only) `unroll`
+//      factor. Final carries come back at the carry axes, and stacked outputs at their per-iteration axes shifted right
+//      by the new leading scan dimension. The staged stacked outputs carry the scan's *declared* output types, whose
+//      optional sharding metadata is left for sharding propagation to resolve (refer to the documentation of
+//      [`ScanType::infer_scan_output_types`]).
 //
 // Under an *eager* parent, the scan loop is instead replayed per iteration through `batch_scan_with_interpreter`, with
 // each body instruction re-entering the batching rules of the operation family against the same active context. Its
@@ -1548,7 +1550,7 @@ where
 // reuse the partition reconstruction of partial evaluation, which stacks varying residuals and hoists invariant ones.
 impl<T, C> DifferentiableOperation<C> for ScanOperation<T>
 where
-    T: DifferentiableType + ScanTypeSemantics + TemporalResidualType,
+    T: DifferentiableType + ScanType + TemporalResidualType,
     C: Context<Type = T> + Zero<C::Value>,
     C::Operation:
         ResidualZeroProvider<T, Operation = C::Operation> + From<ScanOperation<T>> + TemporalResidualOperation<T>,
@@ -1841,7 +1843,7 @@ where
 /// creates any per-iteration view explicitly. Stacked outputs must be arrays: neither references nor first-class
 /// dimensions have a stacked value representation. Scan lengths are [`Dimension`]s, so every implementing family uses
 /// [`DimensionVariable`]s as its type identities.
-pub trait ScanTypeSemantics: Type<Identity = DimensionVariable> {
+pub trait ScanType: Type<Identity = DimensionVariable> {
     /// Derives the instantiated body input types, `[index, carry..., x_slice_or_reference...]`, from this scan's
     /// operation input types.
     ///
@@ -1852,7 +1854,7 @@ pub trait ScanTypeSemantics: Type<Identity = DimensionVariable> {
     ///   - `body_input_count`: Number of inputs of the attached body, including its intrinsic index input.
     ///   - `carry_count`: Number of loop-carried state leaves.
     ///   - `length`: Declared scan length.
-    fn scan_body_input_types(
+    fn infer_scan_body_input_types(
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
@@ -1866,10 +1868,10 @@ pub trait ScanTypeSemantics: Type<Identity = DimensionVariable> {
     /// optional layout and sharding metadata, while carries and reference stacks retain their body-declared types.
     /// Actual `input_types` may carry more precise metadata, such as the normalized
     /// [`Sharding`](crate::arrays::Sharding)s that concrete backend array types carry. Validation therefore uses the
-    /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The output types
-    /// are the carry output types of the body followed by its stacked output types, each stacked along a new leading
-    /// scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the body to
-    /// sharded inputs) and leave unspecified the ones that it does not.
+    /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The output
+    /// types are the carry output types of the body followed by its stacked output types, each stacked along a new
+    /// leading scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the body
+    /// to sharded inputs) and leave unspecified the ones that it does not.
     ///
     /// # Parameters
     ///
@@ -1888,8 +1890,8 @@ pub trait ScanTypeSemantics: Type<Identity = DimensionVariable> {
     ) -> Result<Vec<Self>, TypeError>;
 }
 
-impl ScanTypeSemantics for ArrayType {
-    fn scan_body_input_types(
+impl ScanType for ArrayType {
+    fn infer_scan_body_input_types(
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
@@ -1991,8 +1993,8 @@ impl ScanTypeSemantics for ArrayType {
     }
 }
 
-impl ScanTypeSemantics for ArrayIrType {
-    fn scan_body_input_types(
+impl ScanType for ArrayIrType {
+    fn infer_scan_body_input_types(
         input_types: &[Self],
         body_input_count: usize,
         carry_count: usize,
@@ -2435,7 +2437,7 @@ fn split_scan_by_knownness<V, O, C, PartitionRegion>(
     mut partition_region: PartitionRegion,
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
+    V: Value<Type: ScanType + TemporalResidualType>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
     O: Operation<Type = V::Type> + From<ScanOperation<V::Type>> + TemporalResidualOperation<V::Type>,
     PartitionRegion: FnMut(&[bool]) -> Result<PartitionedProgram<V, O>, ProgramError>,
@@ -2600,7 +2602,7 @@ fn reconstruct_partitioned_scan<V, O, Input, LiftKnown, KnownBind, ResidualBind>
     mut bind_residual: ResidualBind,
 ) -> Result<Option<Vec<Input>>, ProgramError>
 where
-    V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
+    V: Value<Type: ScanType + TemporalResidualType>,
     O: Operation<Type = V::Type> + From<ScanOperation<V::Type>> + TemporalResidualOperation<V::Type>,
     Input: Clone,
     LiftKnown: FnMut(V) -> Result<Input, ProgramError>,
@@ -3522,7 +3524,7 @@ fn transpose_primal_scan<T, V, O, D: TranspositionDriver<V, O>>(
     cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>
 where
-    T: DifferentiableType + ScanTypeSemantics,
+    T: DifferentiableType + ScanType,
     V: Value<Type = T>,
     O: Operation<Type = T> + ResidualZeroProvider<T, Operation = O> + From<ScanOperation<T>>,
 {
@@ -4665,6 +4667,40 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_type_inference_rejects_carries_that_refine_away_an_identity() {
+        // Initial carries only need to refine the carry types, but the outputs keep the declared carry types, so a
+        // static carry extent cannot stand in for a dynamic dimension that no input carries and no output defines.
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])));
+        let static_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let operation = ScanOperation::<ArrayIrType>::new(1, 2);
+        let interfaces = vec![RegionInterface::new(
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64)), carry_type.clone()],
+            vec![carry_type.clone()],
+            EffectClasses::NONE,
+        )];
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&static_type), interfaces.as_slice()),
+            Err(TypeError::invalid(
+                "`scan` output 0 has type `f32[rows]`, which refers to the identity `rows` that no input carries and \
+                 no output defines",
+            )),
+        );
+
+        // Another carry whose input still carries the identity makes the same refinement valid.
+        let operation = ScanOperation::<ArrayIrType>::new(2, 2);
+        let interfaces = vec![RegionInterface::new(
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64)), carry_type.clone(), carry_type.clone()],
+            vec![carry_type.clone(), carry_type.clone()],
+            EffectClasses::NONE,
+        )];
+        assert_eq!(
+            operation.infer_output_types(&[carry_type.clone(), static_type], interfaces.as_slice()),
+            Ok(vec![carry_type.clone(), carry_type]),
+        );
+    }
+
+    #[test]
     fn test_scan_type_inference_composite() {
         // A composite scan admits first-class dimension carries. The body is requested at the instantiated input types
         // exactly when the actual inputs carry type identities other than the declared ones.
@@ -4815,7 +4851,7 @@ mod tests {
 
         // References enter as whole roots after the intrinsic index, while array outputs still stack their slice type.
         assert_eq!(
-            ArrayIrType::scan_body_input_types(std::slice::from_ref(&stacked_reference), 2, 0, &length),
+            ArrayIrType::infer_scan_body_input_types(std::slice::from_ref(&stacked_reference), 2, 0, &length),
             Ok(vec![index_type.clone(), stacked_reference.clone()]),
         );
         let body_interface = RegionInterface::new(
@@ -4839,7 +4875,7 @@ mod tests {
         // The stacked referent must be a stack over the scan length, and a first-class dimension is neither an array
         // nor a reference.
         assert_eq!(
-            ArrayIrType::scan_body_input_types(
+            ArrayIrType::infer_scan_body_input_types(
                 &[ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 2])))],
                 2,
                 0,
@@ -4848,7 +4884,7 @@ mod tests {
             Err(TypeError::invalid("`scan` stacked input 0 must have leading dimension 3 but has type ref<f32[4, 2]>")),
         );
         assert_eq!(
-            ArrayIrType::scan_body_input_types(
+            ArrayIrType::infer_scan_body_input_types(
                 &[ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))],
                 2,
                 0,
@@ -4858,7 +4894,7 @@ mod tests {
         );
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         assert_eq!(
-            ArrayIrType::scan_body_input_types(&[DimensionType::from(extent.clone()).into()], 2, 0, &length),
+            ArrayIrType::infer_scan_body_input_types(&[DimensionType::from(extent.clone()).into()], 2, 0, &length),
             Err(TypeError::invalid(
                 "`scan` stacked input 0 must be an array or a reference but got dimension<extent ∈ [1, 8)>",
             )),
@@ -4902,7 +4938,7 @@ mod tests {
         let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         assert_eq!(
-            ArrayIrType::scan_body_input_types(
+            ArrayIrType::infer_scan_body_input_types(
                 &[stacked_reference.clone(), three.into()],
                 2,
                 0,
@@ -4916,7 +4952,7 @@ mod tests {
         )));
         let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
         assert_eq!(
-            ArrayIrType::scan_body_input_types(
+            ArrayIrType::infer_scan_body_input_types(
                 &[symbolic_reference, four.into()],
                 2,
                 0,

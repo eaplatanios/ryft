@@ -3569,24 +3569,25 @@ fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     Ok(value)
 }
 
-/// Converts the lowered value of one loop state input to the lowered type of its loop state, which the input type
-/// refines (refer to the `while` and `scan` type inference rules in `ryft-core`). Loops carry every state at its
-/// declared type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type,
-/// so those inputs are returned unchanged. A static extent that refines a bounded dynamic state dimension lowers to a
-/// different tensor type, so such an input is first padded up to the physical bound of the state type and then given
-/// its static extent as the runtime size of that dimension with `stablehlo.set_dimension_size`.
-fn lower_loop_state_input<'b, 'c: 'b, 't: 'c>(
+/// Converts the lowered value of one control-flow input to the lowered type of the region input that it feeds, which
+/// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`). Regions
+/// receive every input at its declared type, and refinements that only add metadata (e.g., shardings or layouts) lower
+/// to the same tensor type, so those inputs are returned unchanged. A static extent that refines a bounded dynamic
+/// dimension lowers to a different tensor type, so such an input is first padded up to the physical bound of the
+/// declared type and then given its static extent as the runtime size of that dimension with
+/// `stablehlo.set_dimension_size`.
+fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
-    state_type: &ArrayIrType,
+    region_input_type: &ArrayIrType,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let (ArrayIrType::Array(input_type), ArrayIrType::Array(state_type)) = (input_type, state_type) else {
+    let (ArrayIrType::Array(input_type), ArrayIrType::Array(declared_type)) = (input_type, region_input_type) else {
         return Ok(value);
     };
-    let refined_axes = state_type
+    let refined_axes = declared_type
         .shape()
         .dimensions()
         .iter()
@@ -3600,15 +3601,15 @@ fn lower_loop_state_input<'b, 'c: 'b, 't: 'c>(
     if refined_axes.is_empty() {
         return Ok(value);
     }
-    let physical_type = physical_bound_type(state_type)?;
-    let rank = state_type.rank();
+    let physical_type = physical_bound_type(declared_type)?;
+    let rank = declared_type.rank();
     let mut high_padding = vec![0; rank];
     for &(axis, extent) in &refined_axes {
         let bound = physical_type.shape().dimensions()[axis].value().unwrap();
         high_padding[axis] = reshape_dimension_i64(bound - extent)?;
     }
     let padding_value =
-        lower_unplaced_constant_output(&[ArrayType::scalar(state_type.data_type())], 0, block, context, location)?
+        lower_unplaced_constant_output(&[ArrayType::scalar(declared_type.data_type())], 0, block, context, location)?
             .remove(0);
     let padded = block.append_operation(stable_hlo::pad(
         value,
@@ -3629,8 +3630,8 @@ fn lower_loop_state_input<'b, 'c: 'b, 't: 'c>(
             location,
         )?
         .remove(0);
-        dimensions[axis] = state_type.shape().dimensions()[axis].clone();
-        let refined_type = state_type.clone().with_shape(Shape::new(dimensions.clone()));
+        dimensions[axis] = declared_type.shape().dimensions()[axis].clone();
+        let refined_type = declared_type.clone().with_shape(Shape::new(dimensions.clone()));
         let refined = block.append_operation(stable_hlo::set_dimension_size(
             value,
             size,
@@ -7266,6 +7267,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         lower_condition_to_if(
             branch_regions,
             input_values,
+            self.input_types.as_slice(),
             &mut self.block,
             self.context,
             self.location,
@@ -8457,6 +8459,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
 fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
     branch_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayIrType],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -8470,18 +8473,30 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
             op: format!("{} expected 2 attached regions but got {}", CONDITION_OPERATION_NAME, branch_regions.len(),),
         });
     };
-    let expected_input_count = true_branch.input_types().len() + 1;
-    if input_values.len() != expected_input_count {
+    let branch_input_types = true_branch.input_types();
+    let expected_input_count = branch_input_types.len() + 1;
+    if input_values.len() != expected_input_count || input_types.len() != expected_input_count {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "{} expected {} lowered inputs but got {}",
+                "`{}` expected {} lowered inputs but got {} lowered inputs with {} input types",
                 CONDITION_OPERATION_NAME,
                 expected_input_count,
                 input_values.len(),
+                input_types.len(),
             ),
         });
     }
-    let branch_inputs = &input_values[1..];
+    // Branch inputs only need to refine the branch input types, so each one is converted to the lowered type of its
+    // branch input first.
+    let branch_inputs = input_values[1..]
+        .iter()
+        .zip(&input_types[1..])
+        .zip(branch_input_types.iter())
+        .map(|((value, input_type), branch_input_type)| {
+            lower_refined_region_input(*value, input_type, branch_input_type, block, context, location)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let branch_inputs = branch_inputs.as_slice();
     // Each ordered class used by either branch is captured and returned independently. Both branches carry the union
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
     let threaded_effects = true_branch.effects().classes().union(false_branch.effects().classes());
@@ -8570,7 +8585,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         .zip(input_types)
         .zip(state_types.iter())
         .map(|((value, input_type), state_type)| {
-            lower_loop_state_input(*value, input_type, state_type, block, context, location)
+            lower_refined_region_input(*value, input_type, state_type, block, context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let input_values = input_values.as_slice();
@@ -9106,7 +9121,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     let mut converted_input_values = input_values.to_vec();
     for (index, carry_type) in carry_types.iter().enumerate() {
         converted_input_values[index] =
-            lower_loop_state_input(input_values[index], &input_types[index], carry_type, block, context, location)?;
+            lower_refined_region_input(input_values[index], &input_types[index], carry_type, block, context, location)?;
     }
     let input_values = converted_input_values.as_slice();
     let x_slice_types = body_input_types[1 + carry_count..]
@@ -25622,6 +25637,60 @@ mod tests {
         assert_eq!(
             lines,
             vec!["iteration: 1.0".to_string(), "iteration: 2.0".to_string(), "iteration: 3.0".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_condition_converts_a_refined_static_branch_input_to_its_bounded_branch_input_type() {
+        // A branch input only needs to refine its branch input type, so a static `f64[3]` input feeds a branch input
+        // with the bounded dynamic type `f64[rows]`, whose identity the other, dynamically typed input supplies. The
+        // taken branch then computes `a + b`.
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let branch_input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
+        let branch = |add: bool| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let first = builder.add_input(branch_input_type.clone().into());
+            let second = builder.add_input(branch_input_type.clone().into());
+            let output = if add {
+                builder
+                    .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                    .unwrap()[0]
+            } else {
+                first
+            };
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_branch = builder.import_region(branch(true).entry_region_ref());
+        let false_branch = builder.import_region(branch(false).entry_region_ref());
+        let predicate = builder.add_constant(XlaConstant::Boolean(true));
+        let dynamic_input = builder.add_input(branch_input_type.clone().into());
+        let static_input = builder.add_input(static_type.into());
+        let output = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_branch, false_branch],
+                vec![predicate, dynamic_input, static_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.output_types(), vec![ArrayIrType::Array(branch_input_type)]);
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3]),
+                ],
+                &[3],
+            ),
+            Ok(vec![MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]), MixedValue::Dimension(3)]),
         );
     }
 

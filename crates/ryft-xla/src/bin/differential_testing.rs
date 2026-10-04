@@ -14,16 +14,15 @@ use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
 };
 use ryft_core::operations::collectives::{
-    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, ParallelShuffle, ParallelSumScatter,
-    ParallelSwapAxes,
+    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, ParallelSumScatter, ParallelSwapAxes,
 };
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType,
     Device, DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
     DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
-    MeshAxisType, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape,
-    Sharding, ShardingDimension,
+    MeshAxisType, ParallelShuffle, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind,
+    ScaledDot, Shape, Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};

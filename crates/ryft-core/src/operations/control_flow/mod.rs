@@ -1,4 +1,7 @@
-use crate::programs::{Operation, Type, TypeError};
+use crate::arrays::{ArrayIrType, ArrayType};
+use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
+use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition};
 
 // TODO(eaplatanios): Review this module and also add a module docstring that follows our established conventions.
 
@@ -10,7 +13,7 @@ pub mod r#while;
 pub use condition::{CONDITION_OPERATION_NAME, ConditionOperation, transpose_primal_condition};
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
-pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics};
+pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
 
 /// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
 ///
@@ -31,6 +34,107 @@ pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<T
 
     /// Returns the operation that restores a residual from temporal storage, if conversion is required.
     fn residual_from_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
+}
+
+impl TemporalResidualType for ArrayType {
+    #[inline]
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Ok(self.clone())
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O {
+    #[inline]
+    fn residual_to_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn residual_from_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+}
+
+// Composite array IR residuals store arrays directly and first-class dimensions as scalar arrays. A reference never
+// defines temporal storage because the transforms thread references through loops as carries and never save them as
+// residuals.
+impl TemporalResidualType for ArrayIrType {
+    #[inline]
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Ok(match self {
+            Self::Array(r#type) => Self::Array(r#type.clone()),
+            Self::Dimension(_) => Self::Array(ArrayType::scalar(DIMENSION_DATA_TYPE)),
+            Self::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+}
+
+impl<O> TemporalResidualOperation<ArrayIrType> for O
+where
+    O: Operation<Type = ArrayIrType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+{
+    fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+
+    fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(r#type) => {
+                Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
+            }
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+}
+
+/// Validates that every type identity that one of the `output_types` of a control-flow operation refers to is either
+/// carried by one of its `input_types` or defined by one of its `output_types`, so that the instruction only produces
+/// types whose identities it consumes or defines. The outputs of `while`, `scan`, and `condition` keep the declared
+/// types of their regions while their inputs only need to refine the declared region input types, so an input that
+/// refines a dynamic dimension to a static extent removes that dimension's identity from the instruction boundary
+/// unless another input still carries it or an output defines it (e.g., a first-class dimension carry). Checking this
+/// during type inference reports such a refinement at the operation instead of when its enclosing program is built.
+pub(crate) fn validate_output_identities<T: Type>(
+    operation_name: &str,
+    input_types: &[T],
+    output_types: &[T],
+) -> Result<(), TypeError> {
+    let defined_identities = output_types
+        .iter()
+        .flat_map(Type::identities)
+        .filter_map(|(position, identity)| (position == TypeIdentityPosition::Definition).then_some(identity))
+        .collect::<Vec<_>>();
+    let input_identities =
+        input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
+    for (index, output_type) in output_types.iter().enumerate() {
+        if let Some((_, identity)) = output_type
+            .identities()
+            .find(|(_, identity)| !defined_identities.contains(identity) && !input_identities.contains(identity))
+        {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` output {index} has type `{output_type}`, which refers to the identity `{identity}` \
+                 that no input carries and no output defines",
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

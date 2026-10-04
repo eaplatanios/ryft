@@ -40,6 +40,7 @@ pub use telemetry::{constructed_array_count, dropped_array_count, live_array_cou
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
     use std::mem::MaybeUninit;
     use std::sync::Once;
 
@@ -127,6 +128,15 @@ pub(crate) mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Returns the hash of `value` under the standard library's default hasher, so that tests can check that equal
+    /// values hash equally. `value` may be unsized (e.g., a trait object whose [`Hash`] implementation must agree with
+    /// that of an owned type that borrows as it).
+    pub(crate) fn hash_of<T: ?Sized + Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Name of the XLA custom call target registered by [`ensure_add_one_handler_registered`]: an elementwise

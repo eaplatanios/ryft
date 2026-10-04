@@ -6768,7 +6768,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_parallel_permute_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::ParallelPermute;
+        use ryft_core::ParallelPermute;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
