@@ -133,6 +133,60 @@ impl ParallelSumScatterOperation {
         self.options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, self.axis_size)
     }
 
+    /// Infers the statically shaped output, optionally applying mesh-axis reduction and variance semantics. Matching
+    /// named batches bind their own axis independently of the mesh and preserve the mesh state of their local inputs.
+    fn infer_static_output_type(
+        &self,
+        input_type: &ArrayType,
+        dimensions: Vec<usize>,
+        apply_mesh_axis_semantics: bool,
+    ) -> Result<ArrayType, TypeError> {
+        let effective_axis_size = self.effective_axis_size()?;
+        let output_type = match self.options.mode {
+            CollectiveMode::Untiled => {
+                let Some(dimension) = dimensions.get(self.scatter_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` scatter axis {} is out of bounds for rank {}",
+                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                        self.scatter_axis,
+                        dimensions.len(),
+                    )));
+                };
+                if *dimension != effective_axis_size {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` untiled scatter axis {} size {} must equal group size {}",
+                        PARALLEL_SUM_SCATTER_OPERATION_NAME, self.scatter_axis, dimension, effective_axis_size,
+                    )));
+                }
+                input_type.without_dimension(self.scatter_axis)?.0
+            }
+            CollectiveMode::Tiled => {
+                let mut output_dimensions = dimensions;
+                let Some(dimension) = output_dimensions.get_mut(self.scatter_axis) else {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` scatter axis {} is out of bounds for rank {}",
+                        PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                        self.scatter_axis,
+                        output_dimensions.len(),
+                    )));
+                };
+                if *dimension % effective_axis_size != 0 {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` scatter axis {} size {} is not divisible by group size {}",
+                        PARALLEL_SUM_SCATTER_OPERATION_NAME, self.scatter_axis, *dimension, effective_axis_size,
+                    )));
+                }
+                *dimension /= effective_axis_size;
+                infer_linear_collective_operation_output_type(
+                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
+                    input_type,
+                    output_dimensions,
+                )?
+            }
+        };
+        finalize_parallel_sum_scatter_output_type(input_type, output_type, self, apply_mesh_axis_semantics)
+    }
+
     /// Returns the adjoint collective that transposition stages on the output cotangent.
     #[inline]
     fn adjoint(&self) -> Result<AllGatherOperation, ProgramError> {
@@ -186,7 +240,7 @@ impl Operation for ParallelSumScatterOperation {
 
         let dimensions = shape.dimensions().to_vec();
         // TODO(eaplatanios): Review from here onwards.
-        Ok(vec![infer_parallel_sum_scatter_output_type(self, &input_types[0], dimensions, true)?])
+        Ok(vec![self.infer_static_output_type(&input_types[0], dimensions, true)?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -275,8 +329,7 @@ where
         let dimensions = input_type
             .static_shape()
             .ok_or_else(|| TypeError::invalid("`parallel_sum_scatter` does not support dynamically shaped inputs"))?;
-        let output_type =
-            infer_parallel_sum_scatter_output_type(self, &input_type, dimensions.dimensions().to_vec(), false)?;
+        let output_type = self.infer_static_output_type(&input_type, dimensions.dimensions().to_vec(), false)?;
         let output_extents = output_type
             .shape()
             .dimensions()
@@ -728,67 +781,13 @@ where
     }
 }
 
-/// Infers the statically shaped output, optionally applying mesh-axis reduction and variance semantics. Matching
-/// named batches bind their own axis independently of the mesh and preserve the mesh state of their local inputs.
-fn infer_parallel_sum_scatter_output_type(
-    operation: &ParallelSumScatterOperation,
-    input_type: &ArrayType,
-    dimensions: Vec<usize>,
-    apply_mesh_axis_semantics: bool,
-) -> Result<ArrayType, TypeError> {
-    let effective_axis_size = operation.effective_axis_size()?;
-    let output_type = match operation.options.mode {
-        CollectiveMode::Untiled => {
-            let Some(dimension) = dimensions.get(operation.scatter_axis) else {
-                return Err(TypeError::invalid(format!(
-                    "`{}` scatter axis {} is out of bounds for rank {}",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                    operation.scatter_axis,
-                    dimensions.len(),
-                )));
-            };
-            if *dimension != effective_axis_size {
-                return Err(TypeError::invalid(format!(
-                    "`{}` untiled scatter axis {} size {} must equal group size {}",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME, operation.scatter_axis, dimension, effective_axis_size,
-                )));
-            }
-            input_type.without_dimension(operation.scatter_axis)?.0
-        }
-        CollectiveMode::Tiled => {
-            let mut output_dimensions = dimensions;
-            let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
-                return Err(TypeError::invalid(format!(
-                    "`{}` scatter axis {} is out of bounds for rank {}",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                    operation.scatter_axis,
-                    output_dimensions.len(),
-                )));
-            };
-            if *dimension % effective_axis_size != 0 {
-                return Err(TypeError::invalid(format!(
-                    "`{}` scatter axis {} size {} is not divisible by group size {}",
-                    PARALLEL_SUM_SCATTER_OPERATION_NAME, operation.scatter_axis, *dimension, effective_axis_size,
-                )));
-            }
-            *dimension /= effective_axis_size;
-            infer_linear_collective_operation_output_type(
-                PARALLEL_SUM_SCATTER_OPERATION_NAME,
-                input_type,
-                output_dimensions,
-            )?
-        }
-    };
-    parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)
-}
-
 /// Validates the element data type and the manual variation of a sum-scatter input, and applies the reduction-state
 /// transition to the shape-only `output_type` shared by the static and explicit-extent inference paths. Ordinary inputs
 /// preserve their variance metadata. An input that is unreduced over the scattered manual axis is the cotangent of a
 /// reduced all-gather result, so the sum-scatter consumes that pending reduction and returns a value that varies over
 /// the manual axis. A matching local batch passes `apply_mesh_axis_semantics = false` because it does not perform a
 /// mesh exchange, even when it shadows a mesh axis with the same name; it preserves pending mesh sums and variance.
-fn parallel_sum_scatter_output_type(
+fn finalize_parallel_sum_scatter_output_type(
     input_type: &ArrayType,
     mut output_type: ArrayType,
     operation: &ParallelSumScatterOperation,
@@ -891,7 +890,8 @@ fn infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
         )?;
         let output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
         return Ok(vec![
-            parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?.into(),
+            finalize_parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?
+                .into(),
         ]);
     }
     if operation.scatter_axis >= input_type.rank() {
@@ -953,7 +953,10 @@ fn infer_explicit_parallel_sum_scatter_output_types_with_mesh_axis_semantics(
     if output_type.shape() == input_type.shape() {
         output_type = output_type.with_layout(input_type.layout().cloned());
     }
-    Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?.into()])
+    Ok(vec![
+        finalize_parallel_sum_scatter_output_type(input_type, output_type, operation, apply_mesh_axis_semantics)?
+            .into(),
+    ])
 }
 
 /// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
