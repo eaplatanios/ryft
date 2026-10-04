@@ -890,23 +890,18 @@ impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit extent
-// value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a manual mesh
-// axis, an input that neither varies over the axis nor is unreduced over it is first made varying through its array
-// view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
-impl<V> ParallelSumScatter<ArrayIrType> for V
-where
-    V: Value<Type = ArrayIrType>
-        + Assert
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ParallelSumScatterOperation>>
+                                + NamedAxes
+                                + DimensionConstant,
+        > + Assert
         + DimensionSize<V>
-        + ValueProjection<DimensionType>
+        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>>
         + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
-    V::DispatchDomain: DimensionConstant,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelSumScatterOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Rem + Div,
+> ParallelSumScatter<ArrayIrType> for V
+where
     ProjectedValue<ArrayType, V>: ParallelVary,
 {
     fn parallel_sum_scatter_with_options(
@@ -915,6 +910,10 @@ where
         scatter_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
+        // A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit
+        // extent value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a
+        // manual mesh axis, an input that neither varies over the axis nor is unreduced over it is first made varying
+        // through its array view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
@@ -956,6 +955,7 @@ where
                 ],
             )?;
         }
+
         let mut output_extents = (0..rank)
             .filter(|axis| options.mode != CollectiveMode::Untiled || *axis != scatter_axis)
             .map(|axis| input.dimension_size(axis))
@@ -976,6 +976,7 @@ where
             }
             output_extents[scatter_axis] = ValueProjection::<DimensionType>::from_projected(extent.div(&participants)?);
         }
+
         let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
         let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
@@ -983,10 +984,10 @@ where
     }
 }
 
-impl<V> ParallelSumScatter<ArrayType> for ProjectedValue<ArrayType, V>
-where
-    V: ParallelSumScatter<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+impl<V: ParallelSumScatter<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    ParallelSumScatter<ArrayType> for ProjectedValue<ArrayType, V>
 {
+    #[inline]
     fn parallel_sum_scatter_with_options(
         &self,
         axis_name: &str,
@@ -999,6 +1000,8 @@ where
             .map_err(Into::into)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -2142,5 +2145,69 @@ mod tests {
             ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_sum_scatter("x", 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_dimension_extents() {
+        // Groups of two use their own participant count, and an untiled static axis that is consumed needs no literal.
+        let groups = vec![vec![0, 2], vec![3, 1]];
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                input.parallel_sum_scatter_with_options(
+                    "x",
+                    0,
+                    CollectiveOptions::default().with_axis_index_groups(groups.clone()),
+                )
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, [3]).into()]);
+        assert_eq!(program.instructions().len(), 2);
+
+        for mode in [CollectiveMode::Untiled, CollectiveMode::Tiled] {
+            let options = CollectiveOptions::new(mode).with_axis_index_groups(groups.clone());
+            let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_sum_scatter_with_options("x", 0, options.clone()),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 3])),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .unwrap_err();
+            let expected = match mode {
+                CollectiveMode::Untiled => {
+                    "`parallel_sum_scatter` untiled scatter axis 0 size 3 must equal group size 2"
+                }
+                CollectiveMode::Tiled => {
+                    "`parallel_sum_scatter` scatter axis 0 size 3 is not divisible by group size 2"
+                }
+            };
+            assert_eq!(error, ProgramError::Type(TypeError::invalid(expected)));
+
+            // The same invalid extent is rejected by the runtime assertion when it was unknown during tracing.
+            let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_sum_scatter_with_options("x", 0, options),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![dimension.into(), Dimension::Static(3)]),
+                )),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .unwrap();
+            let error =
+                program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
+            let (message, label) = match mode {
+                CollectiveMode::Untiled => ("collective axis extent must match the participant count", "participants"),
+                CollectiveMode::Tiled => ("collective extent must be divisible by the participant count", "divisor"),
+            };
+            assert_eq!(
+                error.downcast_custom::<AssertionError>(),
+                Some(&AssertionError::Failed {
+                    message: message.to_string(),
+                    observations: vec![("extent".to_string(), "3".to_string()), (label.to_string(), "2".to_string())],
+                }),
+            );
+        }
     }
 }
