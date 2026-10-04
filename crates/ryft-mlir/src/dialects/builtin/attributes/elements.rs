@@ -8,7 +8,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, AttributeRef, Context, Error, ShapedType, StringRef, TryFromWithContext, TypeId, VectorTypeDimension,
+    Attribute, AttributeRef, Context, Error, ShapedType, Size, StringRef, TryFromWithContext, TypeId,
     mlir_subtype_trait_impls,
 };
 
@@ -261,6 +261,8 @@ impl<'c, 't> DenseElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_elements!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_elements!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_elements!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_elements!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_elements!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt64, rust_type = u64);
@@ -273,6 +275,8 @@ impl<'c, 't> DenseElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_element!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_element!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_element!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_element!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_element!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_element!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_element!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_element!(mlir_type = UInt64, rust_type = u64);
@@ -566,6 +570,8 @@ impl<'c, 't> DenseIntegerElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_elements!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_elements!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_elements!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_elements!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_elements!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_elements!(mlir_type = UInt64, rust_type = u64);
@@ -575,6 +581,8 @@ impl<'c, 't> DenseIntegerElementsAttributeRef<'c, 't> {
     mlir_dense_elements_attribute_element!(mlir_type = Index, rust_type = usize);
     mlir_dense_elements_attribute_element!(mlir_type = UInt8, rust_type = u8);
     mlir_dense_elements_attribute_element!(mlir_type = Int8, rust_type = i8);
+    mlir_dense_elements_attribute_element!(mlir_type = UInt16, rust_type = u16);
+    mlir_dense_elements_attribute_element!(mlir_type = Int16, rust_type = i16);
     mlir_dense_elements_attribute_element!(mlir_type = UInt32, rust_type = u32);
     mlir_dense_elements_attribute_element!(mlir_type = Int32, rust_type = i32);
     mlir_dense_elements_attribute_element!(mlir_type = UInt64, rust_type = u64);
@@ -610,6 +618,8 @@ mlir_dense_elements_attribute_from_element!(DenseIntegerElementsAttributeRef, ml
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Bool, rust_type = bool);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt8, rust_type = u8);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int8, rust_type = i8);
+mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt16, rust_type = u16);
+mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int16, rust_type = i16);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt32, rust_type = u32);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = Int32, rust_type = i32);
 mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, mlir_type = UInt64, rust_type = u64);
@@ -618,9 +628,10 @@ mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, m
 impl<'c, 't> TryFromWithContext<'c, 't, &[usize]> for DenseIntegerElementsAttributeRef<'c, 't> {
     fn try_from_with_context(value: &[usize], context: &'c Context<'t>) -> Result<Self, Error> {
         context.dense_integer_elements_attribute(
-            context.vector_type(
+            context.tensor_type(
                 context.index_type(),
-                &[VectorTypeDimension::Fixed(value.len())],
+                &[Size::Static(value.len())],
+                None,
                 context.unknown_location(),
             )?,
             &value
@@ -1217,8 +1228,18 @@ mod tests {
     #[test]
     fn test_dense_integer_elements_attribute() {
         let context = Context::new();
+        let i16_type = context.signless_integer_type(16);
         let i32_type = context.signless_integer_type(32);
         let i64_type = context.signless_integer_type(64);
+        let u16_type = context.unsigned_integer_type(16);
+
+        let tensor_type = context.tensor_type(i16_type, &[Size::Static(2)], None, context.unknown_location()).unwrap();
+        let attribute = context.dense_i16_elements_attribute(tensor_type, &[-0x1234, 0x2345]).unwrap();
+        assert_eq!(unsafe { attribute.i16_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![-0x1234, 0x2345]);
+
+        let tensor_type = context.tensor_type(u16_type, &[Size::Static(2)], None, context.unknown_location()).unwrap();
+        let attribute = context.dense_u16_elements_attribute(tensor_type, &[0x1234, 0xfedc]).unwrap();
+        assert_eq!(unsafe { attribute.u16_elements().collect::<Result<Vec<_>, _>>().unwrap() }, vec![0x1234, 0xfedc]);
 
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(3)], None, context.unknown_location()).unwrap();
         let attribute = context.dense_i64_elements_attribute(tensor_type, &[10, 20, 30]).unwrap();
@@ -1305,10 +1326,10 @@ mod tests {
         assert_eq!(unsafe { attribute.f32_elements() }.collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
 
         let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], None, context.unknown_location()).unwrap();
-        let attribute = context.splatted_dense_f64_elements_attribute(tensor_type, 3.14).unwrap();
+        let attribute = context.splatted_dense_f64_elements_attribute(tensor_type, std::f64::consts::PI).unwrap();
         assert_eq!(&context, attribute.context());
         assert!(attribute.is_splat());
-        assert!((unsafe { attribute.f64_splat() }.unwrap() - 3.14).abs() < 1e-6);
+        assert!((unsafe { attribute.f64_splat() }.unwrap() - std::f64::consts::PI).abs() < 1e-6);
     }
 
     #[test]

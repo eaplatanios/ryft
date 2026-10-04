@@ -41,9 +41,9 @@ pub fn extract_element<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>,
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXTRACT_ELEMENT_OPERATION_NAME, location);
-    builder = builder.add_operand(vector);
-    builder = builder.add_operand(position);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(vector)?;
+    builder = builder.add_operand(position)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -102,10 +102,10 @@ pub fn insert_element<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INSERT_ELEMENT_OPERATION_NAME, location);
-    builder = builder.add_operand(vector);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(position);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(vector)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(position)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -163,10 +163,10 @@ pub fn shuffle_vector<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SHUFFLE_VECTOR_OPERATION_NAME, location);
-    builder = builder.add_operand(first_vector);
-    builder = builder.add_operand(second_vector);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("mask", mask);
+    builder = builder.add_operand(first_vector)?;
+    builder = builder.add_operand(second_vector)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("mask", mask)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

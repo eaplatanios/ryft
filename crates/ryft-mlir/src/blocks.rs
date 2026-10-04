@@ -791,7 +791,9 @@ mod tests {
         let condition = block_0.append_argument(i1_type, location).unwrap();
         let branch_op = OperationBuilder::new("cf.cond_br", location)
             .add_operands(&[condition])
+            .unwrap()
             .add_successors(&[&block_1, &block_2])
+            .unwrap()
             .build()
             .unwrap();
         block_0.append_operation(branch_op).unwrap();

@@ -74,10 +74,10 @@ pub fn all_gather<
 ) -> Result<DetachedAllGatherOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.all_gather", location)
-        .add_operand(input)
-        .add_attribute(GATHERING_AXES_ATTRIBUTE, gathering_axes)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(GATHERING_AXES_ATTRIBUTE, gathering_axes)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::all_gather`"))
@@ -168,17 +168,17 @@ pub fn all_reduce<
     let context = location.context();
     context.load_dialect(DialectHandle::shardy()?)?;
     let mut builder = OperationBuilder::new("sdy.all_reduce", location)
-        .add_operand(input)
-        .add_attribute(REDUCTION_AXES_ATTRIBUTE, reduction_axes);
+        .add_operand(input)?
+        .add_attribute(REDUCTION_AXES_ATTRIBUTE, reduction_axes)?;
     if reduction_operation != ReductionOperation::Sum {
         builder = builder.add_attribute(
             REDUCTION_OP_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), reduction_operation as i64),
-        );
+        )?;
     }
     builder
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::all_reduce`"))
@@ -245,10 +245,10 @@ pub fn all_slice<
 ) -> Result<DetachedAllSliceOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.all_slice", location)
-        .add_operand(input)
-        .add_attribute(SLICING_AXES_ATTRIBUTE, slicing_axes)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(SLICING_AXES_ATTRIBUTE, slicing_axes)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::all_slice`"))
@@ -315,10 +315,10 @@ pub fn all_to_all<
 ) -> Result<DetachedAllToAllOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.all_to_all", location)
-        .add_operand(input)
-        .add_attribute(PARAMS_ATTRIBUTE, params)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(PARAMS_ATTRIBUTE, params)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::all_to_all`"))
@@ -362,9 +362,9 @@ pub fn collective_permute<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 
 ) -> Result<DetachedCollectivePermuteOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.collective_permute", location)
-        .add_operand(input)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -446,12 +446,12 @@ pub fn manual_computation<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 
 ) -> Result<DetachedManualComputationOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.manual_computation", location)
-        .add_operands(tensors)
-        .add_attribute(IN_SHARDINGS_ATTRIBUTE, in_shardings)
-        .add_attribute(OUT_SHARDINGS_ATTRIBUTE, out_shardings)
-        .add_attribute(MANUAL_AXES_ATTRIBUTE, manual_axes)
-        .add_results(result_types)
-        .add_region(body)
+        .add_operands(tensors)?
+        .add_attribute(IN_SHARDINGS_ATTRIBUTE, in_shardings)?
+        .add_attribute(OUT_SHARDINGS_ATTRIBUTE, out_shardings)?
+        .add_attribute(MANUAL_AXES_ATTRIBUTE, manual_axes)?
+        .add_results(result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -503,8 +503,8 @@ pub fn mesh<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.mesh", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(symbol_name))
-        .add_attribute(MESH_ATTRIBUTE, mesh)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(symbol_name))?
+        .add_attribute(MESH_ATTRIBUTE, mesh)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::mesh`"))
@@ -591,17 +591,17 @@ pub fn reduce_scatter<
     let context = location.context();
     context.load_dialect(DialectHandle::shardy()?)?;
     let mut builder = OperationBuilder::new("sdy.reduce_scatter", location)
-        .add_operand(input)
-        .add_attribute(REDUCE_SCATTER_AXES_ATTRIBUTE, reduce_scatter_axes);
+        .add_operand(input)?
+        .add_attribute(REDUCE_SCATTER_AXES_ATTRIBUTE, reduce_scatter_axes)?;
     if reduction_operation != ReductionOperation::Sum {
         builder = builder.add_attribute(
             REDUCTION_OP_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), reduction_operation as i64),
-        );
+        )?;
     }
     builder
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -671,10 +671,10 @@ pub fn replicated_to_unreduced<
 ) -> Result<DetachedReplicatedToUnreducedOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.replicated_to_unreduced", location)
-        .add_operand(input)
-        .add_attribute(AXES_ATTRIBUTE, axes)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(AXES_ATTRIBUTE, axes)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -701,7 +701,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.return", location)
-        .add_operands(results)
+        .add_operands(results)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shardy::return`"))
@@ -765,10 +765,10 @@ pub fn sharded_to_unreduced<
 ) -> Result<DetachedShardedToUnreducedOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.sharded_to_unreduced", location)
-        .add_operand(input)
-        .add_attribute(AXES_ATTRIBUTE, axes)
-        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_attribute(AXES_ATTRIBUTE, axes)?
+        .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -813,8 +813,8 @@ pub fn sharding_constraint<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location
 ) -> Result<DetachedShardingConstraintOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.sharding_constraint", location)
-        .add_operand(input)
-        .add_attribute(SHARDING_ATTRIBUTE, sharding)
+        .add_operand(input)?
+        .add_attribute(SHARDING_ATTRIBUTE, sharding)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -856,8 +856,8 @@ pub fn sharding_group<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::shardy()?)?;
     OperationBuilder::new("sdy.sharding_group", location)
-        .add_operand(input)
-        .add_attribute(GROUP_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), group_id))
+        .add_operand(input)?
+        .add_attribute(GROUP_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), group_id))?
         .build()
         .and_then(|operation| unsafe {
             operation

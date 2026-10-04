@@ -171,11 +171,20 @@ impl<'t> Context<'t> {
     /// Returns an [`Error`] if the source cannot be passed to MLIR or if MLIR fails to parse it. MLIR will also emit
     /// diagnostics for parse failures.
     pub fn parse_module<'c, S: AsRef<str>>(&'c self, source: S) -> Result<Module<'c, 't>, Error> {
+        let source = CString::new(source.as_ref())
+            .map_err(|_| Error::invalid_argument("module source cannot contain nul bytes"))?;
+        self.parse_module_from_bytes(source.as_bytes())
+    }
+
+    /// Parses a [`Module`] directly from the provided bytes. The bytes may contain either textual MLIR or MLIR
+    /// bytecode and are passed to the native parser without UTF-8 validation or `nul` termination.
+    ///
+    /// Returns an [`Error`] if MLIR fails to parse the provided bytes. MLIR will also emit structured diagnostics to
+    /// handlers attached with [`Context::attach_diagnostics_handler`].
+    pub fn parse_module_from_bytes<'c, B: AsRef<[u8]>>(&'c self, source: B) -> Result<Module<'c, 't>, Error> {
         unsafe {
-            let source = CString::new(source.as_ref())
-                .map_err(|_| Error::invalid_argument("module source cannot contain nul bytes"))?;
             let module = Module::from_c_api(
-                mlirModuleCreateParse(*self.handle.borrow_mut(), StringRef::from(source.as_c_str()).to_c_api()),
+                mlirModuleCreateParse(*self.handle.borrow_mut(), StringRef::from(source.as_ref()).to_c_api()),
                 self,
             );
             module.map_err(|_| Error::parsing_error("failed to parse MLIR module"))
@@ -202,13 +211,18 @@ impl<'t> Context<'t> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::dialects::{builtin, func};
-    use crate::{Block, Context, DialectHandle, OneRegion, Operation, Region, Symbol, SymbolVisibility, ValueRef};
+    use crate::{
+        Block, Context, DiagnosticSeverity, DialectHandle, OneRegion, Operation, Region, Symbol, SymbolVisibility,
+        ValueRef,
+    };
 
     use super::*;
 
@@ -302,6 +316,58 @@ mod tests {
             module,
             Err(Error::InvalidArgument { message, .. }) if message == "module source cannot contain nul bytes",
         ));
+    }
+
+    #[test]
+    fn test_module_parsing_from_bytes() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+
+        let source = indoc! {"
+            module {
+              func.func @test() {
+                func.return
+              }
+            }
+        "};
+        let module = context.parse_module_from_bytes(source.as_bytes()).unwrap();
+        assert!(module.verify().unwrap());
+        let expected = indoc! {"
+            module {
+              func.func @test() {
+                return
+              }
+            }
+        "};
+        assert_eq!(module.to_string(), expected);
+
+        let bytecode = module.as_operation().unwrap().bytecode();
+        assert!(bytecode.starts_with(b"ML\xefR"));
+        assert_eq!(module.as_operation().unwrap().bytecode(), bytecode);
+        let parsed = context.parse_module_from_bytes(&bytecode).unwrap();
+        assert!(parsed.verify().unwrap());
+        assert_eq!(parsed.to_string(), expected);
+        assert_eq!(parsed.as_operation().unwrap().bytecode(), bytecode);
+
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let diagnostics_clone = diagnostics.clone();
+        let handler = context.attach_diagnostics_handler(move |diagnostic| {
+            diagnostics_clone.borrow_mut().push((
+                diagnostic.severity(),
+                diagnostic.location().unwrap().to_string(),
+                diagnostic.to_string(),
+            ));
+            true
+        });
+        assert!(matches!(
+            context.parse_module_from_bytes([0, 255]),
+            Err(Error::ParsingError { message, .. }) if message == "failed to parse MLIR module",
+        ));
+        assert_eq!(diagnostics.borrow().len(), 1);
+        assert_eq!(diagnostics.borrow()[0].0, DiagnosticSeverity::Error);
+        assert!(!diagnostics.borrow()[0].1.is_empty());
+        assert!(!diagnostics.borrow()[0].2.is_empty());
+        context.detach_diagnostics_handler(handler);
     }
 
     #[test]

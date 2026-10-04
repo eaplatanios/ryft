@@ -34,8 +34,8 @@ pub fn condition<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.condition", location)
-        .add_operand(condition)
-        .add_operands(arguments)
+        .add_operand(condition)?
+        .add_operands(arguments)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::condition`"))
@@ -72,11 +72,11 @@ pub fn execute_region<'c, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedExecuteRegionOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
-    let mut builder = OperationBuilder::new("scf.execute_region", location).add_results(result_types);
+    let mut builder = OperationBuilder::new("scf.execute_region", location).add_results(result_types)?;
     if no_inline {
-        builder = builder.add_attribute(NO_INLINE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(NO_INLINE_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(region).build().and_then(|operation| unsafe {
+    builder.add_region(region)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::execute_region`"))
@@ -164,15 +164,15 @@ pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::scf()?)?;
     let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     let mut builder = OperationBuilder::new("scf.for", location)
-        .add_operand(lower_bound)
-        .add_operand(upper_bound)
-        .add_operand(step)
-        .add_operands(initial_values)
-        .add_results(&result_types);
+        .add_operand(lower_bound)?
+        .add_operand(upper_bound)?
+        .add_operand(step)?
+        .add_operands(initial_values)?
+        .add_results(&result_types)?;
     if unsigned_cmp {
-        builder = builder.add_attribute(UNSIGNED_CMP_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(UNSIGNED_CMP_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::for`"))
     })
 }
@@ -287,19 +287,19 @@ pub fn for_all<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     ];
     let result_types = outputs.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     let mut builder = OperationBuilder::new("scf.forall", location)
-        .add_operands(dynamic_lower_bounds)
-        .add_operands(dynamic_upper_bounds)
-        .add_operands(dynamic_steps)
-        .add_operands(outputs)
-        .add_results(&result_types)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(STATIC_LOWER_BOUND_ATTRIBUTE, context.dense_i64_array_attribute(static_lower_bounds)?)
-        .add_attribute(STATIC_UPPER_BOUND_ATTRIBUTE, context.dense_i64_array_attribute(static_upper_bounds)?)
-        .add_attribute(STATIC_STEP_ATTRIBUTE, context.dense_i64_array_attribute(static_steps)?);
+        .add_operands(dynamic_lower_bounds)?
+        .add_operands(dynamic_upper_bounds)?
+        .add_operands(dynamic_steps)?
+        .add_operands(outputs)?
+        .add_results(&result_types)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(STATIC_LOWER_BOUND_ATTRIBUTE, context.dense_i64_array_attribute(static_lower_bounds)?)?
+        .add_attribute(STATIC_UPPER_BOUND_ATTRIBUTE, context.dense_i64_array_attribute(static_upper_bounds)?)?
+        .add_attribute(STATIC_STEP_ATTRIBUTE, context.dense_i64_array_attribute(static_steps)?)?;
     if let Some(mapping) = mapping {
-        builder = builder.add_attribute(MAPPING_ATTRIBUTE, mapping);
+        builder = builder.add_attribute(MAPPING_ATTRIBUTE, mapping)?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::for_all`"))
     })
 }
@@ -333,7 +333,7 @@ pub fn in_parallel<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.forall.in_parallel", location)
-        .add_region(region)
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::in_parallel`"))
@@ -375,10 +375,10 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::scf()?)?;
     let else_region = else_region.unwrap_or_else(|| context.region());
     OperationBuilder::new("scf.if", location)
-        .add_operand(condition)
-        .add_results(result_types)
-        .add_region(then_region)
-        .add_region(else_region)
+        .add_operand(condition)?
+        .add_results(result_types)?
+        .add_region(then_region)?
+        .add_region(else_region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::if`"))
@@ -456,13 +456,13 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         [lower_bounds.len() as i32, upper_bounds.len() as i32, steps.len() as i32, initial_values.len() as i32];
     let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("scf.parallel", location)
-        .add_operands(lower_bounds)
-        .add_operands(upper_bounds)
-        .add_operands(steps)
-        .add_operands(initial_values)
-        .add_results(&result_types)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_region(body)
+        .add_operands(lower_bounds)?
+        .add_operands(upper_bounds)?
+        .add_operands(steps)?
+        .add_operands(initial_values)?
+        .add_results(&result_types)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::parallel`"))
@@ -496,8 +496,8 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.reduce", location)
-        .add_operands(values)
-        .add_regions(reductions)
+        .add_operands(values)?
+        .add_regions(reductions)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::reduce`"))
@@ -529,7 +529,7 @@ pub fn reduce_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.reduce.return", location)
-        .add_operand(value)
+        .add_operand(value)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::reduce_return`"))
@@ -569,10 +569,10 @@ pub fn r#while<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.while", location)
-        .add_operands(initial_values)
-        .add_results(result_types)
-        .add_region(before_region)
-        .add_region(after_region)
+        .add_operands(initial_values)?
+        .add_results(result_types)?
+        .add_region(before_region)?
+        .add_region(after_region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::while`"))
@@ -624,10 +624,10 @@ pub fn index_switch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     regions.push(default_region);
     regions.extend(case_regions);
     OperationBuilder::new("scf.index_switch", location)
-        .add_operand(argument)
-        .add_results(result_types)
-        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases)?)
-        .add_regions(regions)
+        .add_operand(argument)?
+        .add_results(result_types)?
+        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases)?)?
+        .add_regions(regions)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::index_switch`"))
@@ -660,7 +660,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::scf()?)?;
     OperationBuilder::new("scf.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `scf::yield`"))

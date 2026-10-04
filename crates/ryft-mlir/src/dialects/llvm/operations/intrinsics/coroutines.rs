@@ -28,7 +28,7 @@ pub fn intr_coro_align<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_ALIGN_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -82,9 +82,9 @@ pub fn intr_coro_begin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_BEGIN_OPERATION_NAME, location);
-    builder = builder.add_operand(token);
-    builder = builder.add_operand(memory);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(token)?;
+    builder = builder.add_operand(memory)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -145,10 +145,10 @@ pub fn intr_coro_end<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_END_OPERATION_NAME, location);
-    builder = builder.add_operand(handle);
-    builder = builder.add_operand(unwind);
-    builder = builder.add_operand(return_values);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(handle)?;
+    builder = builder.add_operand(unwind)?;
+    builder = builder.add_operand(return_values)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -202,9 +202,9 @@ pub fn intr_coro_free<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_FREE_OPERATION_NAME, location);
-    builder = builder.add_operand(id);
-    builder = builder.add_operand(handle);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(id)?;
+    builder = builder.add_operand(handle)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -272,11 +272,11 @@ pub fn intr_coro_id<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_ID_OPERATION_NAME, location);
-    builder = builder.add_operand(alignment);
-    builder = builder.add_operand(promise);
-    builder = builder.add_operand(coroutine_address);
-    builder = builder.add_operand(function_addresses);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(alignment)?;
+    builder = builder.add_operand(promise)?;
+    builder = builder.add_operand(coroutine_address)?;
+    builder = builder.add_operand(function_addresses)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_coro_id`"))
     })
@@ -335,10 +335,10 @@ pub fn intr_coro_promise<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_PROMISE_OPERATION_NAME, location);
-    builder = builder.add_operand(handle);
-    builder = builder.add_operand(alignment);
-    builder = builder.add_operand(from);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(handle)?;
+    builder = builder.add_operand(alignment)?;
+    builder = builder.add_operand(from)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -372,7 +372,7 @@ pub fn intr_coro_resume<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_RESUME_OPERATION_NAME, location);
-    builder = builder.add_operand(handle);
+    builder = builder.add_operand(handle)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -412,8 +412,8 @@ pub fn intr_coro_save<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_SAVE_OPERATION_NAME, location);
-    builder = builder.add_operand(handle);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(handle)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -447,7 +447,7 @@ pub fn intr_coro_size<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_SIZE_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -501,9 +501,9 @@ pub fn intr_coro_suspend<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CORO_SUSPEND_OPERATION_NAME, location);
-    builder = builder.add_operand(save);
-    builder = builder.add_operand(final_suspend);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(save)?;
+    builder = builder.add_operand(final_suspend)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

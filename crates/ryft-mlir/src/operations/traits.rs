@@ -273,7 +273,7 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
             .collect::<Result<Vec<_>, _>>()?
             .as_slice()
             .try_into_with_context(builder.context())?;
-        Ok(builder.add_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE, attribute))
+        builder.add_attribute(ARGUMENT_ATTRIBUTES_ATTRIBUTE, attribute)
     }
 
     /// Adds the provided result [`Attribute`]s to the provided [`OperationBuilder`], assuming that it is building
@@ -295,7 +295,7 @@ pub trait HasCallableArgumentAndResultAttributes<'o, 'c: 'o, 't: 'c>: Operation<
             .collect::<Result<Vec<_>, _>>()?
             .as_slice()
             .try_into_with_context(builder.context())?;
-        Ok(builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, attribute))
+        builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, attribute)
     }
 }
 

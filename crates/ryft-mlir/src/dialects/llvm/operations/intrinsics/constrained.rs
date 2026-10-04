@@ -73,11 +73,11 @@ pub fn intr_experimental_constrained_fadd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FADD_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -155,11 +155,11 @@ pub fn intr_experimental_constrained_fdiv<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FDIV_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -244,12 +244,12 @@ pub fn intr_experimental_constrained_fma<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMA_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_operand(argument_2);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_operand(argument_2)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -334,12 +334,12 @@ pub fn intr_experimental_constrained_fmuladd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMUL_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_operand(argument_2);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_operand(argument_2)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| {
             Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fmuladd`")
@@ -417,11 +417,11 @@ pub fn intr_experimental_constrained_fmul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FMUL_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -480,9 +480,9 @@ pub fn intr_experimental_constrained_fpext<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FPEXT_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -553,10 +553,10 @@ pub fn intr_experimental_constrained_fptrunc<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FPTRUNC_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| {
             Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_fptrunc`")
@@ -634,11 +634,11 @@ pub fn intr_experimental_constrained_frem<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FREM_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -716,11 +716,11 @@ pub fn intr_experimental_constrained_fsub<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_FSUB_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_operand(argument_1);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_operand(argument_1)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -791,10 +791,10 @@ pub fn intr_experimental_constrained_sito_fp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_SITO_FP_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| {
             Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_sito_fp`")
@@ -865,10 +865,10 @@ pub fn intr_experimental_constrained_uito_fp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CONSTRAINED_UITO_FP_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_0);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("roundingmode", roundingmode);
-    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior);
+    builder = builder.add_operand(argument_0)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("roundingmode", roundingmode)?;
+    builder = builder.add_attribute("fpExceptionBehavior", fp_exception_behavior)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| {
             Error::invalid_argument("invalid arguments to `llvm::intr_experimental_constrained_uito_fp`")

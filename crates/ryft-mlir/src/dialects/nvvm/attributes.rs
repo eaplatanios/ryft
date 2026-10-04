@@ -187,7 +187,7 @@ nvvm_enum_attribute!(
     attribute_name = MemScopeKindAttributeRef,
     context_method = nvvm_mem_scope_kind_attribute,
     mnemonic = "mem_scope",
-    source = "#nvvm.mem_scope<{}>",
+    source = "#nvvm<mem_scope {}>",
     description = "nvvm memory scope kind",
     variants = {
         Cta => (0, "cta"),
@@ -442,7 +442,7 @@ nvvm_enum_attribute!(
     attribute_name = MmaFragmentAttributeRef,
     context_method = nvvm_mma_fragment_attribute,
     mnemonic = "mma_frag",
-    source = "#nvvm.mma_frag<{}>",
+    source = "#nvvm<mma_frag {}>",
     description = "nvvm mma frag type",
     variants = {
         A => (0, "a"),
@@ -512,7 +512,7 @@ nvvm_enum_attribute!(
     attribute_name = TmaLoadModeAttributeRef,
     context_method = nvvm_tma_load_mode_attribute,
     mnemonic = "tma_load_mode",
-    source = "#nvvm.tma_load_mode<{}>",
+    source = "#nvvm<tma_load_mode {}>",
     description = "nvvm tma load mode",
     variants = {
         Tile => (0, "tile"),
@@ -528,7 +528,7 @@ nvvm_enum_attribute!(
     attribute_name = TmaStoreModeAttributeRef,
     context_method = nvvm_tma_store_mode_attribute,
     mnemonic = "tma_store_mode",
-    source = "#nvvm.tma_store_mode<{}>",
+    source = "#nvvm<tma_store_mode {}>",
     description = "nvvm tma store mode",
     variants = {
         Tile => (0, "tile"),
@@ -568,7 +568,7 @@ nvvm_enum_attribute!(
     attribute_name = TmaReduxKindAttributeRef,
     context_method = nvvm_tma_redux_kind_attribute,
     mnemonic = "tma_redux_kind",
-    source = "#nvvm.tma_redux_kind<{}>",
+    source = "#nvvm<tma_redux_kind {}>",
     description = "nvvm tma redux kind",
     variants = {
         Add => (0, "add"),
@@ -685,7 +685,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05CpShapeAttributeRef,
     context_method = nvvm_tcgen05_cp_shape_attribute,
     mnemonic = "tcgen05_cp_shape",
-    source = "#nvvm.tcgen05_cp_shape<{}>",
+    source = "#nvvm<tcgen05_cp_shape {}>",
     description = "tcgen05 cp shapes",
     variants = {
         Shape128x256b => (0, "shape_128x256b"),
@@ -701,7 +701,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05CpMulticastAttributeRef,
     context_method = nvvm_tcgen05_cp_multicast_attribute,
     mnemonic = "tcgen05_cp_multicast",
-    source = "#nvvm.tcgen05_cp_multicast<{}>",
+    source = "#nvvm<tcgen05_cp_multicast {}>",
     description = "tcgen05 cp multicast",
     variants = {
         None => (0, "none"),
@@ -729,7 +729,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05LdStShapeAttributeRef,
     context_method = nvvm_tcgen05_ld_st_shape_attribute,
     mnemonic = "tcgen05_ldst_shape",
-    source = "#nvvm.tcgen05_ldst_shape<{}>",
+    source = "#nvvm<tcgen05_ldst_shape {}>",
     description = "tcgen05 load/store shape",
     variants = {
         Shape16x64b => (0, "shape_16x64b"),
@@ -773,7 +773,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05MmaKindAttributeRef,
     context_method = nvvm_tcgen05_mma_kind_attribute,
     mnemonic = "tcgen05_mma_kind",
-    source = "#nvvm.tcgen05_mma_kind<{}>",
+    source = "#nvvm<tcgen05_mma_kind {}>",
     description = "tcgen05 mma supported types",
     variants = {
         F16 => (0, "f16"),
@@ -791,7 +791,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05MmaCollectorOperationAttributeRef,
     context_method = nvvm_tcgen05_mma_collector_operation_attribute,
     mnemonic = "tcgen05_mma_collectorop",
-    source = "#nvvm.tcgen05_mma_collectorop<{}>",
+    source = "#nvvm<tcgen05_mma_collectorop {}>",
     description = "tcgen05.mma collector buffer operation",
     variants = {
         Discard => (0, "discard"),
@@ -806,7 +806,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05MmaBlockScaleAttributeRef,
     context_method = nvvm_tcgen05_mma_block_scale_attribute,
     mnemonic = "tcgen05_mma_block_scale",
-    source = "#nvvm.tcgen05_mma_block_scale<{}>",
+    source = "#nvvm<tcgen05_mma_block_scale {}>",
     description = "tcgen05.mma block scale attribute",
     variants = {
         Default => (0, "default"),
@@ -820,7 +820,7 @@ nvvm_enum_attribute!(
     attribute_name = Tcgen05MmaCollectorBBufferAttributeRef,
     context_method = nvvm_tcgen05_mma_collector_b_buffer_attribute,
     mnemonic = "tcgen05_mma_collectorb",
-    source = "#nvvm.tcgen05_mma_collectorb<{}>",
+    source = "#nvvm<tcgen05_mma_collectorb {}>",
     description = "tcgen05 mma collector buffer b attribute",
     variants = {
         B0 => (0, "b0"),

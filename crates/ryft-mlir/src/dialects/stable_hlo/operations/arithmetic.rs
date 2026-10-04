@@ -40,7 +40,7 @@ pub fn sign<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedSignOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sign", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -85,7 +85,7 @@ pub fn abs<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedAbsOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.abs", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -133,7 +133,7 @@ pub fn negate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedNegateOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.negate", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -197,8 +197,8 @@ pub fn add<
 ) -> Result<DetachedAddOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.add", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -262,8 +262,8 @@ pub fn subtract<
 ) -> Result<DetachedSubtractOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.subtract", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -330,8 +330,8 @@ pub fn multiply<
 ) -> Result<DetachedMultiplyOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.multiply", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -396,8 +396,8 @@ pub fn divide<
 ) -> Result<DetachedDivideOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.divide", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -460,8 +460,8 @@ pub fn remainder<
 ) -> Result<DetachedRemainderOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.remainder", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -503,7 +503,7 @@ pub fn is_finite<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedIsFiniteOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.is_finite", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

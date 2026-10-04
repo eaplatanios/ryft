@@ -832,9 +832,9 @@ pub fn dot_general<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.dot_general", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_attribute(DOT_DIMENSIONS_ATTRIBUTE, dimensions);
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_attribute(DOT_DIMENSIONS_ATTRIBUTE, dimensions)?;
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
             DOT_PRECISION_ATTRIBUTE,
@@ -842,12 +842,12 @@ pub fn dot_general<
                 context.stable_hlo_precision(lhs_precision)?,
                 context.stable_hlo_precision(rhs_precision)?,
             ]),
-        );
+        )?;
     }
     if let Some(algorithm) = algorithm {
-        builder = builder.add_attribute(DOT_ALGORITHM_ATTRIBUTE, algorithm);
+        builder = builder.add_attribute(DOT_ALGORITHM_ATTRIBUTE, algorithm)?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dot_general`"))
@@ -1373,44 +1373,46 @@ pub fn convolution<
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.convolution", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE, dimensions)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE, dimensions)?
         .add_attribute(
             CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE,
             context.integer_attribute(i64_type, batch_group_count as i64),
-        )
+        )?
         .add_attribute(
             CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE,
             context.integer_attribute(i64_type, feature_group_count as i64),
-        );
+        )?;
     if let Some(window_strides) = window_strides {
         let window_strides = window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE,
             context.dense_i64_array_attribute(window_strides.as_slice())?,
-        );
+        )?;
     }
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?);
+        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?)?;
     }
     if let Some(lhs_dilation) = lhs_dilation {
         let lhs_dilation = lhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_LHS_DILATION_ATTRIBUTE,
             context.dense_i64_array_attribute(lhs_dilation.as_slice())?,
-        );
+        )?;
     }
     if let Some(rhs_dilation) = rhs_dilation {
         let rhs_dilation = rhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_RHS_DILATION_ATTRIBUTE,
             context.dense_i64_array_attribute(rhs_dilation.as_slice())?,
-        );
+        )?;
     }
     if let Some(window_reversal) = window_reversal {
-        builder = builder
-            .add_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE, context.dense_bool_array_attribute(window_reversal)?);
+        builder = builder.add_attribute(
+            CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE,
+            context.dense_bool_array_attribute(window_reversal)?,
+        )?;
     }
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
@@ -1419,9 +1421,9 @@ pub fn convolution<
                 context.stable_hlo_precision(lhs_precision)?,
                 context.stable_hlo_precision(rhs_precision)?,
             ]),
-        );
+        )?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::convolution`"))
@@ -1518,42 +1520,44 @@ pub fn dynamic_convolution<
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = location.context().signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.dynamic_conv", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_operand(padding)
-        .add_attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE, dimensions)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_operand(padding)?
+        .add_attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE, dimensions)?
         .add_attribute(
             CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE,
             context.integer_attribute(i64_type, batch_group_count as i64),
-        )
+        )?
         .add_attribute(
             CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE,
             context.integer_attribute(i64_type, feature_group_count as i64),
-        );
+        )?;
     if let Some(window_strides) = window_strides {
         let window_strides = window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE,
             context.dense_i64_array_attribute(window_strides.as_slice())?,
-        );
+        )?;
     }
     if let Some(lhs_dilation) = lhs_dilation {
         let lhs_dilation = lhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_LHS_DILATION_ATTRIBUTE,
             context.dense_i64_array_attribute(lhs_dilation.as_slice())?,
-        );
+        )?;
     }
     if let Some(rhs_dilation) = rhs_dilation {
         let rhs_dilation = rhs_dilation.iter().map(|v| *v as i64).collect::<Vec<_>>();
         builder = builder.add_attribute(
             CONVOLUTION_RHS_DILATION_ATTRIBUTE,
             context.dense_i64_array_attribute(rhs_dilation.as_slice())?,
-        );
+        )?;
     }
     if let Some(window_reversal) = window_reversal {
-        builder = builder
-            .add_attribute(CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE, context.dense_bool_array_attribute(window_reversal)?);
+        builder = builder.add_attribute(
+            CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE,
+            context.dense_bool_array_attribute(window_reversal)?,
+        )?;
     }
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
@@ -1562,9 +1566,9 @@ pub fn dynamic_convolution<
                 context.stable_hlo_precision(lhs_precision)?,
                 context.stable_hlo_precision(rhs_precision)?,
             ]),
-        );
+        )?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::dynamic_convolution`"))
@@ -1627,8 +1631,8 @@ pub fn cholesky<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedCholeskyOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.cholesky", location)
-        .add_operand(input)
-        .add_attribute(CHOLESKY_LOWER_ATTRIBUTE, location.context().boolean_attribute(lower))
+        .add_operand(input)?
+        .add_attribute(CHOLESKY_LOWER_ATTRIBUTE, location.context().boolean_attribute(lower))?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1789,15 +1793,15 @@ pub fn triangular_solve<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.triangular_solve", location)
-        .add_operand(a)
-        .add_operand(b)
-        .add_attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE, context.boolean_attribute(left_side))
-        .add_attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE, context.boolean_attribute(lower))
-        .add_attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE, context.boolean_attribute(unit_diagonal))
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE, context.boolean_attribute(left_side))?
+        .add_attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE, context.boolean_attribute(lower))?
+        .add_attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE, context.boolean_attribute(unit_diagonal))?
         .add_attribute(
             TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE,
             context.stable_hlo_triangular_solve_transpose_type(transpose_a)?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1928,12 +1932,12 @@ pub fn fft<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.fft", location)
-        .add_operand(input)
-        .add_attribute(FFT_TYPE_ATTRIBUTE, context.stable_hlo_fft_type(r#type)?)
+        .add_operand(input)?
+        .add_attribute(FFT_TYPE_ATTRIBUTE, context.stable_hlo_fft_type(r#type)?)?
         .add_attribute(
             FFT_LENGTH_ATTRIBUTE,
             context.dense_i64_array_attribute(length.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1948,13 +1952,9 @@ mod tests {
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
     use crate::dialects::func;
-    use crate::{Attribute, Block, Context, Float8TypeRef, FloatTypeRef, Operation, Size, Type};
+    use crate::{Attribute, Block, Context, Float8TypeRef, FloatTypeRef, Operation, Size, Type, Value};
 
-    use super::{
-        CholeskyOperation, DotAlgorithmPreset, DotGeneralOperation, DynamicConvolutionOperation, FftOperation, FftType,
-        HasPadding, Precision, StaticOrDynamicConvolutionOperation, TriangularSolveOperation,
-        TriangularSolveTransposeType, cholesky, convolution, dot_general, dynamic_convolution, fft, triangular_solve,
-    };
+    use super::*;
 
     #[test]
     fn test_precision_attribute() {
@@ -2543,6 +2543,69 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_convolution_mixed_fp8() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let lhs_type = context
+            .tensor_type(
+                context.float8e4m3fn_type(),
+                &[Size::Static(1), Size::Static(4), Size::Static(2)],
+                None,
+                location,
+            )
+            .unwrap();
+        let rhs_type = context
+            .tensor_type(
+                context.float8e5m2_type(),
+                &[Size::Static(1), Size::Static(2), Size::Static(2)],
+                None,
+                location,
+            )
+            .unwrap();
+        let padding_type = context
+            .tensor_type(context.signless_integer_type(64), &[Size::Static(1), Size::Static(2)], None, location)
+            .unwrap();
+        let block = context.block(&[(lhs_type, location), (rhs_type, location), (padding_type, location)]);
+        let dimensions = context.stable_hlo_convolution_dimensions(0, 2, &[1], 1, 2, &[0], 0, 2, &[1]).unwrap();
+        let operation = convolution(
+            block.argument(0).unwrap(),
+            block.argument(1).unwrap(),
+            dimensions,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            lhs_type,
+            location,
+        )
+        .unwrap();
+        assert!(operation.verify());
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), lhs_type.as_ref());
+        let dynamic_operation = dynamic_convolution(
+            block.argument(0).unwrap(),
+            block.argument(1).unwrap(),
+            block.argument(2).unwrap(),
+            dimensions,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            lhs_type,
+            location,
+        )
+        .unwrap();
+        assert!(dynamic_operation.verify());
+        assert_eq!(dynamic_operation.result(0).unwrap().r#type().unwrap(), lhs_type.as_ref());
     }
 
     #[test]

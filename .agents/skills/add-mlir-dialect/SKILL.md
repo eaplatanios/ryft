@@ -12,7 +12,8 @@ the appropriate submodule of `ryft_mlir::dialects`. You should refer to both the
 codebase that you can find on GitHub to understand what is supported in the requested dialect and what the right typing
 constraints are. You must also refer to the documentation and code of that specific dialect wherever that lives. You
 should also use the `ryft_mlir::dialects::gpu` dialect as another reference. Also note that for e.g., the `gpu` dialect,
-we added C++ helpers in `ryft-xla-sys` to avoid the overhead of rendering and parsing custom MLIR attributes and types. You may need to do the same for the requested dialect as well.
+we added C++ helpers in `ryft-xla-sys` to avoid the overhead of rendering and parsing custom MLIR attributes and types.
+You may need to do the same for the requested dialect as well.
 
 When adding a dialect, add a typed `DialectHandle::<dialect>()` constructor and dialect-level registration/loading tests
 whenever the dialect has a native C API handle or can be backed by a small `ryft-xla-sys` C API shim. Prefer typed

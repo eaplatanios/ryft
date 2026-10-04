@@ -85,12 +85,12 @@ pub fn map<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.map", location)
-        .add_operands(inputs)
+        .add_operands(inputs)?
         .add_attribute(
             MAP_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
-        .add_region(computation)
+        )?
+        .add_region(computation)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -194,13 +194,13 @@ pub fn reduce<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reduce", location)
-        .add_operands(inputs)
-        .add_operands(initial_values)
+        .add_operands(inputs)?
+        .add_operands(initial_values)?
         .add_attribute(
             REDUCE_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
-        .add_region(computation)
+        )?
+        .add_region(computation)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -379,21 +379,21 @@ pub fn reduce_window<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.reduce_window", location)
-        .add_operands(inputs)
-        .add_operands(initial_values)
+        .add_operands(inputs)?
+        .add_operands(initial_values)?
         .add_attribute(
             REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(
                 window_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
             )?,
-        );
+        )?;
 
     if let Some(window_strides) = window_strides {
         builder = builder.add_attribute(
             REDUCE_WINDOW_STRIDES_ATTRIBUTE,
             context
                 .dense_i64_array_attribute(window_strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        );
+        )?;
     }
 
     if let Some(base_dilations) = base_dilations {
@@ -401,7 +401,7 @@ pub fn reduce_window<
             REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE,
             context
                 .dense_i64_array_attribute(base_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        );
+        )?;
     }
 
     if let Some(window_dilations) = window_dilations {
@@ -409,18 +409,23 @@ pub fn reduce_window<
             REDUCE_WINDOW_DILATIONS_ATTRIBUTE,
             context
                 .dense_i64_array_attribute(window_dilations.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        );
+        )?;
     }
 
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, location.context().stable_hlo_padding(padding, location)?);
+        builder =
+            builder.add_attribute(PADDING_ATTRIBUTE, location.context().stable_hlo_padding(padding, location)?)?;
     }
 
-    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
-        operation
-            .cast()
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_window`"))
-    })
+    builder
+        .add_region(computation)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_window`"))
+        })
 }
 
 #[cfg(test)]

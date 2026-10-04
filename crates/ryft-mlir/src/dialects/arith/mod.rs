@@ -12,9 +12,11 @@ use crate::{DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
+pub mod passes;
 
 pub use attributes::*;
 pub use operations::*;
+pub use passes::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `arith` [`Dialect`](crate::Dialect).
