@@ -1611,7 +1611,7 @@ mod tests {
                 2,
                 ArrayBatch::new(
                     Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]).unwrap(),
-                    BatchAxis::new(0)
+                    BatchAxis::new(0),
                 )
                 .unwrap(),
             ),
@@ -1623,7 +1623,7 @@ mod tests {
             batch_parallel_sum_scatter(
                 &untiled,
                 2,
-                ArrayBatch::new(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap()
+                ArrayBatch::new(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap(),
             ),
             Ok(vec![ArrayBatch::new(Array::vector(vec![4.0, 6.0]).unwrap(), BatchAxis::new(0)).unwrap()]),
         );
@@ -1682,7 +1682,7 @@ mod tests {
             batch_parallel_sum_scatter(
                 &grouped,
                 2,
-                ArrayBatch::new(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap()
+                ArrayBatch::new(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap(),
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_sum_scatter` axis index groups are not supported when a batch transform binds the \
@@ -1790,103 +1790,137 @@ mod tests {
     #[test]
     fn test_parallel_sum_scatter_batching_shadows_manual_axis() {
         // An inner named batch binds `x` independently of a manual mesh axis with the same name. Its local sums
-        // preserve invariant mesh variance and pending mesh sums instead of introducing or consuming mesh state.
+        // preserve the mesh invariance of the input.
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 2);
-        for (sharding, expected, expected_array_ir) in [
-            (
-                sharding.clone(),
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
-                        %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape [shape=[2, \
-                            2]] %1
-                    in (%2)"
-                },
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
-                    let %1:dimension<2> = constant [value=2]
-                        %2:dimension<4> = constant [value=4]
-                        %3:dimension<2> = constant [value=2]
-                        %4:dimension<2> = dimension_div %2 %3
-                        %5:dimension<2> = constant [value=2]
-                        %6:bool[] = const true
-                        %7:dimension<4> = dimension_mul %4 %1
-                        %8:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
-                        %9:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape %8 %1 %4
-                        %10:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape \
-                            [output_sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] %9 %1 %4
-                    in (%10)"
-                },
-            ),
-            (
-                sharding.with_unreduced_axes(["x"]).unwrap(),
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = reduce \
-                        [kind=sum, axes=[0]] %0
-                        %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
-                            reshape [shape=[2, 2]] %1
-                    in (%2)"
-                },
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
-                    let %1:dimension<2> = constant [value=2]
-                        %2:dimension<4> = constant [value=4]
-                        %3:dimension<2> = constant [value=2]
-                        %4:dimension<2> = dimension_div %2 %3
-                        %5:dimension<2> = constant [value=2]
-                        %6:bool[] = const true
-                        %7:dimension<4> = dimension_mul %4 %1
-                        %8:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = reduce \
-                            [kind=sum, axes=[0]] %0
-                        %9:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
-                            reshape %8 %1 %4
-                        %10:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
-                            reshape [output_sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], \
-                            unreduced={'x'}}] %9 %1 %4
-                    in (%10)"
-                },
-            ),
-        ] {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
-            let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
-            let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+        let expected = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
+            let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
+                %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape [shape=[2, 2]] %1
+            in (%2)"
+        };
+        let expected_array_ir = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
+            let %1:dimension<2> = constant [value=2]
+                %2:dimension<4> = constant [value=4]
+                %3:dimension<2> = constant [value=2]
+                %4:dimension<2> = dimension_div %2 %3
+                %5:dimension<2> = constant [value=2]
+                %6:bool[] = const true
+                %7:dimension<4> = dimension_mul %4 %1
+                %8:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
+                %9:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape %8 %1 %4
+                %10:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = \
+                    reshape [output_sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] %9 %1 %4
+            in (%10)"
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let input = ArrayBatch::new(input, BatchAxis::new(0))?;
+                let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                Ok(outputs.remove(0).into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(program.to_string(), expected);
+
+        // The composite family's explicit output extents use the same local batching rule.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
-                        .with_axis_name("x".to_string());
-                    let input = ArrayBatch::new(input, BatchAxis::new(0))?;
-                    let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
-                    let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
-                    Ok(outputs.remove(0).into_value())
+                    batch(
+                        |item| item.parallel_sum_scatter_tiled("x", 0),
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
                 },
-                input_type.clone(),
+                ArrayIrType::Array(input_type),
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
             )
             .unwrap();
-            assert_eq!(output_type, expected_type);
-            assert_eq!(program.to_string(), expected);
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(program.to_string(), expected_array_ir);
+    }
 
-            // The composite family's explicit output extents use the same local batching rule.
-            let (output_type, program) =
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    |input| {
-                        batch(
-                            |item| item.parallel_sum_scatter_tiled("x", 0),
-                            input,
-                            BatchAxis::new(0),
-                            BatchAxis::new(0),
-                            BatchAxisSpecification::named("x"),
-                        )
-                        .map_err(Into::into)
-                    },
-                    ArrayIrType::Array(input_type),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .unwrap();
-            assert_eq!(output_type, ArrayIrType::Array(expected_type));
-            assert_eq!(program.to_string(), expected_array_ir);
-        }
+    #[test]
+    fn test_parallel_sum_scatter_batching_shadows_manual_axis_unreduced() {
+        // An inner named batch binds `x` independently of a manual mesh axis with the same name. Its local sums
+        // preserve the pending sum over the shadowed manual mesh axis.
+        let mesh = manual_mesh();
+        let sharding = Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let expected = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
+            let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
+                    reduce [kind=sum, axes=[0]] %0
+                %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
+                    reshape [shape=[2, 2]] %1
+            in (%2)"
+        };
+        let expected_array_ir = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
+            let %1:dimension<2> = constant [value=2]
+                %2:dimension<4> = constant [value=4]
+                %3:dimension<2> = constant [value=2]
+                %4:dimension<2> = dimension_div %2 %3
+                %5:dimension<2> = constant [value=2]
+                %6:bool[] = const true
+                %7:dimension<4> = dimension_mul %4 %1
+                %8:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
+                    reduce [kind=sum, axes=[0]] %0
+                %9:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
+                    reshape %8 %1 %4
+                %10:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
+                    reshape [output_sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] %9 %1 %4
+            in (%10)"
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let input = ArrayBatch::new(input, BatchAxis::new(0))?;
+                let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                Ok(outputs.remove(0).into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(program.to_string(), expected);
+
+        // The composite family's explicit output extents use the same local batching rule.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    batch(
+                        |item| item.parallel_sum_scatter_tiled("x", 0),
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(program.to_string(), expected_array_ir);
     }
 
     #[test]
@@ -2039,59 +2073,76 @@ mod tests {
     fn test_parallel_sum_scatter_differentiation_shadows_manual_axis() {
         let mesh = manual_mesh();
         let sharding = Sharding::replicated(mesh.clone(), 2);
-        for (sharding, expected) in [
-            (
-                sharding.clone(),
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
-                        %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape [shape=[2, \
-                            2]] %1
-                    in (%2)"
+        let expected = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] .
+            let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}]}] = reduce [kind=sum, axes=[0]] %0
+                %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}]}] = reshape [shape=[2, 2]] %1
+            in (%2)"
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
+        // Differentiation inside the batch keeps a structural-zero tangent and lets the batch binder resolve
+        // the shadowed name instead of rejecting the primal in standalone operation inference.
+        let (differentiated_output_type, program) =
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                        .with_axis_name("x".to_string());
+                    let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                    let context = DifferentiationContext::fused(batch_context);
+                    let item =
+                        DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context.clone());
+                    let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                    let mut outputs = context.bind(operation, Vec::new(), &[item])?;
+                    let output = outputs.remove(0);
+                    assert!(output.tangent().is_zero());
+                    Ok(output.primal().clone().into_batch().into_value())
                 },
-            ),
-            (
-                sharding.with_unreduced_axes(["x"]).unwrap(),
-                indoc! {"
-                    lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = reduce \
-                        [kind=sum, axes=[0]] %0
-                        %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
-                            reshape [shape=[2, 2]] %1
-                    in (%2)"
+                input_type.clone(),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(differentiated_output_type, expected_type);
+        assert_eq!(program.to_string(), expected);
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_differentiation_shadows_manual_axis_unreduced() {
+        let mesh = manual_mesh();
+        let sharding = Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let expected = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] .
+            let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}], unreduced={'x'}}] = \
+                    reduce [kind=sum, axes=[0]] %0
+                %2:f32[2, 2][sharding={mesh<['x'=2:manual, 'y'=1:manual]>, [{}, {}], unreduced={'x'}}] = \
+                    reshape [shape=[2, 2]] %1
+            in (%2)"
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
+        // Differentiation inside the batch keeps a structural-zero tangent and lets the batch binder resolve
+        // the shadowed name instead of rejecting the primal in standalone operation inference.
+        let (differentiated_output_type, program) =
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                        .with_axis_name("x".to_string());
+                    let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                    let context = DifferentiationContext::fused(batch_context);
+                    let item =
+                        DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context.clone());
+                    let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
+                    let mut outputs = context.bind(operation, Vec::new(), &[item])?;
+                    let output = outputs.remove(0);
+                    assert!(output.tangent().is_zero());
+                    Ok(output.primal().clone().into_batch().into_value())
                 },
-            ),
-        ] {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(sharding.clone()).unwrap();
-            let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
-            // Differentiation inside the batch keeps a structural-zero tangent and lets the batch binder resolve
-            // the shadowed name instead of rejecting the primal in standalone operation inference.
-            let (differentiated_output_type, program) =
-                TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                    |input| {
-                        let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
-                            .with_axis_name("x".to_string());
-                        let item =
-                            BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
-                        let context = DifferentiationContext::fused(batch_context);
-                        let item = DifferentiationTracer::new(
-                            DifferentiationDual::new_with_zero_tangent(item)?,
-                            context.clone(),
-                        );
-                        let operation =
-                            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
-                        let mut outputs = context.bind(operation, Vec::new(), &[item])?;
-                        let output = outputs.remove(0);
-                        assert!(output.tangent().is_zero());
-                        Ok(output.primal().clone().into_batch().into_value())
-                    },
-                    input_type.clone(),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .unwrap();
-            assert_eq!(differentiated_output_type, expected_type);
-            assert_eq!(program.to_string(), expected);
-        }
+                input_type.clone(),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(differentiated_output_type, expected_type);
+        assert_eq!(program.to_string(), expected);
     }
 
     #[test]
@@ -2662,7 +2713,7 @@ mod tests {
             error,
             ProgramError::Type(TypeError::invalid(
                 "`parallel_sum_scatter` untiled scatter axis 0 size 3 must equal group size 2"
-            ))
+            )),
         );
         let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| {
@@ -2680,7 +2731,7 @@ mod tests {
             error,
             ProgramError::Type(TypeError::invalid(
                 "`parallel_sum_scatter` scatter axis 0 size 3 is not divisible by group size 2"
-            ))
+            )),
         );
     }
 
