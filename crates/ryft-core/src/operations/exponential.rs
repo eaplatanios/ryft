@@ -525,6 +525,12 @@ macro_rules! impl_logistic_for_primitive {
 impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
 
+/// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`Log`], [`Ln1p`], [`LogAddExp`], and
+/// [`Logistic`]. It is implemented automatically for every type that implements all of its members.
+pub trait ExponentialOperations: Exp + Log + Ln1p + LogAddExp + Logistic {}
+
+impl<V: Exp + Log + Ln1p + LogAddExp + Logistic> ExponentialOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;

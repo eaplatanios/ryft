@@ -581,6 +581,12 @@ impl Imaginary for Array {
     }
 }
 
+/// Group of the complex-number capabilities [`Complex`], [`Real`], [`Imaginary`], and [`Conjugate`]. It is implemented
+/// automatically for every type that implements all of its members.
+pub trait ComplexOperations: Complex + Real + Imaginary + Conjugate {}
+
+impl<V: Complex + Real + Imaginary + Conjugate> ComplexOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;

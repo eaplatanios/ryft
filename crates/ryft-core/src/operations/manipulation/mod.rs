@@ -107,3 +107,46 @@ pub use slicing::{
     SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
+
+/// Group of the array manipulation capabilities: [`Transpose`], [`Reverse`], [`Reshape`], [`Broadcast`], [`Pad`],
+/// [`Concatenate`], [`Gather`], [`Scatter`], [`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`],
+/// [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`]. It is implemented automatically for every
+/// type that implements all of its members.
+pub trait ManipulationOperations:
+    Transpose
+    + Reverse
+    + Reshape
+    + Broadcast
+    + Pad
+    + Concatenate
+    + Gather
+    + Scatter
+    + Slice
+    + UpdateSlice
+    + DynamicSlice
+    + DynamicUpdateSlice
+    + ConvertElementType
+    + ReducePrecision
+    + TransferToMemory
+{
+}
+
+impl<
+    V: Transpose
+        + Reverse
+        + Reshape
+        + Broadcast
+        + Pad
+        + Concatenate
+        + Gather
+        + Scatter
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + ConvertElementType
+        + ReducePrecision
+        + TransferToMemory,
+> ManipulationOperations for V
+{
+}

@@ -695,6 +695,12 @@ impl ConstrainSharding for Array {
     }
 }
 
+/// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
+/// for every type that implements all of its members.
+pub trait ShardingOperations: Reshard + ConstrainSharding {}
+
+impl<V: Reshard + ConstrainSharding> ShardingOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

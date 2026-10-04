@@ -456,6 +456,12 @@ pub trait DotOps: Dot + Transpose {}
 
 impl<T: Dot + Transpose> DotOps for T {}
 
+/// Group of the dot product capabilities [`Dot`] and [`RaggedDot`]. It is implemented automatically for every type that
+/// implements all of its members.
+pub trait DotOperations: Dot + RaggedDot {}
+
+impl<V: Dot + RaggedDot> DotOperations for V {}
+
 impl Array {
     /// Allocates an array whose logical elements are initialized to the additive identity.
     fn zeroed<T: ArrayElement>(output_type: ArrayType) -> Result<Self, ProgramError> {

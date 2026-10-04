@@ -517,6 +517,12 @@ macro_rules! impl_tanh_for_primitive {
 impl_tanh_for_primitive!(f32);
 impl_tanh_for_primitive!(f64);
 
+/// Group of the elementwise trigonometric capabilities [`Sin`], [`Cos`], [`Tan`], [`Tanh`], and [`Atan2`].
+/// It is implemented automatically for every type that implements all of its members.
+pub trait TrigonometricOperations: Sin + Cos + Tan + Tanh + Atan2 {}
+
+impl<V: Sin + Cos + Tan + Tanh + Atan2> TrigonometricOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use std::f64::consts::{FRAC_PI_4, PI};

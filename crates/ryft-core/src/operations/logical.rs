@@ -397,6 +397,12 @@ impl Array {
     }
 }
 
+/// Group of the elementwise logical and bitwise capabilities [`Not`], [`And`], [`Or`], and [`Xor`]. It is implemented
+/// automatically for every type that implements all of its members.
+pub trait LogicalOperations: Not + And + Or + Xor {}
+
+impl<V: Not + And + Or + Xor> LogicalOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

@@ -745,10 +745,10 @@ mod tests {
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, DifferentiationError, TranspositionContext, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
+        TranspositionContext, differentiate_at,
     };
     use crate::macros::check_operation_type_inference;
-    use crate::operations::manipulation::Transpose;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, Typed, ValueProjection};

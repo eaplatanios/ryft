@@ -619,6 +619,12 @@ impl_clamp_for_primitive!(usize);
 impl_clamp_for_primitive!(f32);
 impl_clamp_for_primitive!(f64);
 
+/// Group of the elementwise extrema capabilities [`Min`], [`Max`], and [`Clamp`]. It is implemented automatically
+/// for every type that implements all of its members.
+pub trait ExtremaOperations: Min + Max + Clamp {}
+
+impl<V: Min + Max + Clamp> ExtremaOperations for V {}
+
 /// Returns the weight with which `candidate` receives the tangent of an extremum of `candidate` and `other`, following
 /// JAX's balanced comparison: `1` where `candidate` wins under `direction` (i.e., [`ComparisonDirection::LessThan`]
 /// for minima and [`ComparisonDirection::GreaterThan`] for maxima), `0.5` where the two tie, and `0` where `other`

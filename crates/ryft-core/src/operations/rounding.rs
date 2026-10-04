@@ -200,6 +200,12 @@ macro_rules! impl_round_for_primitive {
 impl_round_for_primitive!(f32);
 impl_round_for_primitive!(f64);
 
+/// Group of the elementwise rounding capabilities [`Floor`], [`Ceil`], and [`Round`]. It is implemented automatically
+/// for every type that implements all of its members.
+pub trait RoundingOperations: Floor + Ceil + Round {}
+
+impl<V: Floor + Ceil + Round> RoundingOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};

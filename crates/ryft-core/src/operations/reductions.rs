@@ -2305,6 +2305,12 @@ fn batch_index_reduction<
     Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
 }
 
+/// Group of the reduction capabilities [`Reduce`], [`ArgMax`], and [`ArgMin`]. It is implemented automatically
+/// for every type that implements all of its members.
+pub trait ReductionOperations: Reduce + ArgMax + ArgMin {}
+
+impl<V: Reduce + ArgMax + ArgMin> ReductionOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;

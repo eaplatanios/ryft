@@ -56,7 +56,7 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::ArrayType;
+use crate::arrays::{Array, ArrayType};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -227,6 +227,16 @@ pub trait Print: Sized {
     /// and [`EffectClass::UnorderedIo`] lets it run independently of other prints while remaining observable. The
     /// effect class does not determine whether a backend executes the call inline or asynchronously.
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError>;
+}
+
+impl Print for Array {
+    #[inline]
+    fn print_with_effect_class(self, label: &str, _effect_class: EffectClass) -> Result<Self, ProgramError> {
+        // A concrete `Array` executes eagerly, so it prints immediately, which satisfies the ordering
+        // of every effect class.
+        eprintln!("{label}: {self}");
+        Ok(self)
+    }
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>>> Print for V {

@@ -327,6 +327,13 @@ pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
 pub use zero::{DynamicZero, ZERO_OPERATION_NAME, Zero, ZeroOperation};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
+/// Group of the value-driven constant capabilities [`ZeroLike`] and [`OneLike`]. It is implemented automatically for
+/// every type that implements all of its members. The context-side constructors (e.g., [`Zero`] and [`One`]) are
+/// implemented by contexts rather than values and are therefore not members.
+pub trait ConstantOperations: ZeroLike + OneLike {}
+
+impl<V: ZeroLike + OneLike> ConstantOperations for V {}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

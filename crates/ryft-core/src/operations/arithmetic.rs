@@ -1414,6 +1414,50 @@ macro_rules! impl_rsqrt_for_primitive {
 impl_rsqrt_for_primitive!(f32);
 impl_rsqrt_for_primitive!(f64);
 
+/// Group of the elementwise arithmetic capabilities, including both the fallible capabilities (e.g., [`Add`]) and the
+/// panicking [`std::ops`] operator sugar for negation, addition, subtraction, multiplication, and division. It is
+/// implemented automatically for every type that implements all of its members.
+pub trait ArithmeticOperations:
+    Sign
+    + Neg
+    + std::ops::Neg<Output = Self>
+    + Add
+    + std::ops::Add<Output = Self>
+    + Sub
+    + std::ops::Sub<Output = Self>
+    + Mul
+    + std::ops::Mul<Output = Self>
+    + Div
+    + std::ops::Div<Output = Self>
+    + Rem
+    + Pow
+    + Sqrt
+    + Rsqrt
+    + Abs
+{
+}
+
+impl<
+    V: Sign
+        + Neg
+        + std::ops::Neg<Output = V>
+        + Add
+        + std::ops::Add<Output = V>
+        + Sub
+        + std::ops::Sub<Output = V>
+        + Mul
+        + std::ops::Mul<Output = V>
+        + Div
+        + std::ops::Div<Output = V>
+        + Rem
+        + Pow
+        + Sqrt
+        + Rsqrt
+        + Abs,
+> ArithmeticOperations for V
+{
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
