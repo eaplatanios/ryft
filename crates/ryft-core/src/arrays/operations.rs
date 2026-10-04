@@ -523,11 +523,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ),
 }
 
-/// Value-level capability bundle that groups every operation Ryft supports on composite array IR values, so that generic
-/// composite code can state one bound instead of listing each capability it uses. Its members are the capability
-/// groups, member projections, and individual capabilities through which values stage or execute [`ArrayIrOperation`]
-/// variants, listed in variant order. It is implemented automatically for every value that implements all of its
-/// members, and so it must never be implemented manually.
+/// Value-level capability bundle that groups every operation Ryft supports on composite array IR values, so that
+/// generic composite code can state one bound instead of listing each capability it uses. Its members are the
+/// capability groups, member projections, and individual capabilities through which values stage or execute
+/// [`ArrayIrOperation`] variants, listed in variant order. It is implemented automatically for every value that
+/// implements all of its members, and so it must never be implemented manually.
 ///
 /// The homogeneous [`ArrayIrOperation::Array`] and [`ArrayIrOperation::Dimension`] variants are reached through member
 /// projections, so the bundle requires that the [`ValueProjection<ArrayType>`](ValueProjection) of a value satisfies

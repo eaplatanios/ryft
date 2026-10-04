@@ -23,8 +23,6 @@
 //! dataset. The differentiated closure takes only the model as its active argument; the dataset and loss scale are
 //! supplied separately as nondifferentiated runtime captures.
 
-use std::ops::{Add, Mul, Sub};
-
 use ryft::*;
 
 #[derive(Clone, Parameterized)]
@@ -40,7 +38,7 @@ impl<P: Parameter> Linear<P> {
 
     fn forward(&self, inputs: &P) -> Result<P, ProgramError>
     where
-        P: Clone + Add<Output = P> + Dot,
+        P: ArrayOperations,
     {
         let outputs = inputs.dot(&self.weights, &DotDimensionNumbers::matmul())?;
         Ok(match &self.bias {
@@ -59,7 +57,7 @@ impl<P: Parameter> Mlp<P> {
     /// Applies each hidden layer followed by a hyperbolic tangent, then applies the final linear output layer.
     fn forward(&self, inputs: &P) -> Result<P, ProgramError>
     where
-        P: Clone + Add<Output = P> + Dot + Tanh,
+        P: ArrayOperations,
     {
         let (output_layer, hidden_layers) = self.layers.split_last().ok_or_else(|| ProgramError::InvalidArgument {
             message: "an MLP must contain at least one layer".to_string(),
@@ -78,19 +76,17 @@ const STEP_COUNT: usize = 300;
 type ExampleResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Computes the mean squared error of the MLP predictions.
-fn loss<A>(model: &Mlp<A>, inputs: &A, targets: &A, mean_scale: &A) -> Result<A, ProgramError>
-where
-    A: Clone + Parameter + Add<Output = A> + Sub<Output = A> + Mul<Output = A> + Dot + Reduce + Tanh,
-{
+fn loss<A: ArrayOperations>(model: &Mlp<A>, inputs: &A, targets: &A, mean_scale: &A) -> Result<A, ProgramError> {
     let residuals = model.forward(inputs)? - targets.clone();
     Ok((residuals.clone() * residuals).reduce(&[0, 1], ReductionKind::Sum)? * mean_scale.clone())
 }
 
 /// Applies one gradient-descent update to all trainable arrays.
-fn gradient_descent_step<A>(model: Mlp<A>, gradients: Mlp<A>, learning_rate: &A) -> Result<Mlp<A>, ProgramError>
-where
-    A: Clone + Parameter + Mul<Output = A> + Sub<Output = A>,
-{
+fn gradient_descent_step<A: ArrayOperations>(
+    model: Mlp<A>,
+    gradients: Mlp<A>,
+    learning_rate: &A,
+) -> Result<Mlp<A>, ProgramError> {
     // TODO(eaplatanios): Support our value capability traits over parameterized structures.
     let structure = model.parameter_structure();
     let gradients = Mlp::from_named_parameters(structure.clone(), gradients.into_named_parameters())?;
