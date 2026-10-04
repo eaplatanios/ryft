@@ -23,8 +23,9 @@
 //! for applications with no attached regions.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::ops::Index;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -42,7 +43,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{LiteralIdentity, Value};
 
 /// Unique identifier for a [`Region`] within a [`Program`]. [`RegionId`]s are stable indexes into a [`Program`]'s
 /// region arena. Like [`AtomId`]s, they are meaningful only against the [`Program`] they were derived from.
@@ -823,6 +824,50 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             .with_deferred_work(effects.has_deferred_work())
     }
 
+    /// Returns the owned [`RegionKey`] of this [`Region`] and every region reachable from it through attached regions,
+    /// including dormant rule regions. Refer to the documentation of [`RegionKey`] for information on what the key
+    /// captures.
+    pub fn key(self) -> RegionKey<V, O> {
+        // Regions are numbered when they are first attached and visited in that same order,
+        // so each region's position in `regions` equals the number that its attachments refer to.
+        let mut positions = HashMap::from([(self.id, 0usize)]);
+        let mut pending = VecDeque::from([self.id]);
+        let mut regions = Vec::new();
+        while let Some(region_id) = pending.pop_front() {
+            let region = &self.arena[region_id.index()];
+            let instructions = region
+                .instructions()
+                .iter()
+                .map(|instruction| {
+                    let attached = instruction
+                        .regions()
+                        .iter()
+                        .map(|attached| {
+                            let next_position = positions.len();
+                            *positions.entry(*attached).or_insert_with(|| {
+                                pending.push_back(*attached);
+                                next_position
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        instruction.operation().clone(),
+                        instruction.inputs().to_vec(),
+                        instruction.outputs().to_vec(),
+                        attached,
+                    )
+                })
+                .collect();
+            regions.push(RegionKeyNode {
+                atoms: region.atoms().to_vec(),
+                input_ids: region.input_ids().to_vec(),
+                output_ids: region.output_ids().to_vec(),
+                instructions,
+            });
+        }
+        RegionKey { regions }
+    }
+
     /// Returns the recursively derived [`EffectsSummary`] of the rooted [`Region`]. The resulting summary accounts
     /// for the region's instructions and their attached computation regions, while excluding dormant rule regions.
     #[inline]
@@ -1216,6 +1261,79 @@ impl<T: Type> RegionInterface<T> {
     pub fn has_deferred_work(&self) -> bool {
         self.has_deferred_work
     }
+}
+
+/// Owned cache key that identifies a [`Region`], together with every [`Region`] reachable from it through attached
+/// regions, by its contents. Keys are produced by [`RegionRef::key`], and two keys are equal exactly when their regions
+/// have equal [`Atom`]s (i.e., variable types, and constant values compared through [`LiteralIdentity`]), equal input
+/// and output [`AtomId`]s, and equal [`Instruction`]s (i.e., operations, input and output [`AtomId`]s, and attached
+/// regions), recursively, with the same sharing of attached regions.
+///
+/// Region identifiers are replaced by the breadth-first order in which regions are first attached, so the key is
+/// independent of where the regions live in their source [`RegionArena`]. [`AtomId`]s are kept as they are, so regions
+/// that are equal up to a renumbering of their atoms compare unequal. Instruction [`Provenance`](crate::Provenance)s
+/// are excluded because they are diagnostic-only and do not affect type inference, effects, interpretation, or
+/// transformation legality. This makes the key faithful for caches of artifacts derived from region semantics
+/// (e.g., compiled programs), as long as operations and constant values have faithful identities.
+#[derive(Clone, Debug)]
+pub struct RegionKey<V: Typed, O> {
+    /// Nodes of the reachable regions, in breadth-first first-attachment order starting with the root.
+    regions: Vec<RegionKeyNode<V, O>>,
+}
+
+impl<V: Typed<Type: Eq> + LiteralIdentity, O: Eq> PartialEq for RegionKey<V, O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.regions.len() == other.regions.len()
+            && self.regions.iter().zip(other.regions.iter()).all(|(left, right)| {
+                left.atoms.len() == right.atoms.len()
+                    && left.atoms.iter().zip(right.atoms.iter()).all(|atoms| match atoms {
+                        (Atom::Constant(left), Atom::Constant(right)) => left.literal_eq(right),
+                        (Atom::Variable(left), Atom::Variable(right)) => left == right,
+                        _ => false,
+                    })
+                    && left.input_ids == right.input_ids
+                    && left.output_ids == right.output_ids
+                    && left.instructions == right.instructions
+            })
+    }
+}
+
+impl<V: Typed<Type: Eq> + LiteralIdentity, O: Eq> Eq for RegionKey<V, O> {}
+
+impl<V: Typed<Type: Eq + Hash> + LiteralIdentity, O: Eq + Hash> Hash for RegionKey<V, O> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.regions.len().hash(state);
+        for region in &self.regions {
+            region.atoms.len().hash(state);
+            for atom in &region.atoms {
+                std::mem::discriminant(atom).hash(state);
+                match atom {
+                    Atom::Constant(value) => value.literal_hash(state),
+                    Atom::Variable(r#type) => r#type.hash(state),
+                }
+            }
+            region.input_ids.hash(state);
+            region.output_ids.hash(state);
+            region.instructions.hash(state);
+        }
+    }
+}
+
+/// Contents of one [`Region`] inside a [`RegionKey`].
+#[derive(Clone, Debug)]
+struct RegionKeyNode<V: Typed, O> {
+    /// [`Atom`]s of the [`Region`].
+    atoms: Vec<Atom<V>>,
+
+    /// Input [`AtomId`]s of the [`Region`].
+    input_ids: Vec<AtomId>,
+
+    /// Output [`AtomId`]s of the [`Region`].
+    output_ids: Vec<AtomId>,
+
+    /// Instructions of the [`Region`], as their operations, input and output [`AtomId`]s, and the positions of their
+    /// attached regions in [`RegionKey::regions`].
+    instructions: Vec<(O, Vec<AtomId>, Vec<AtomId>, Vec<usize>)>,
 }
 
 /// [`RegionDriver`]s provide structural access to the nested [`Region`]s of [`Operation`] applications.
@@ -1888,7 +2006,7 @@ mod tests {
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
     use crate::programs::references::ReferenceType;
-    use crate::tests::TestRegionOperation;
+    use crate::tests::{TestRegionOperation, hash_of};
 
     use super::*;
 
@@ -2633,6 +2751,81 @@ mod tests {
         let summary = RegionRef::new(&arena, rule).unwrap().instruction_effects(0).unwrap();
         assert!(!summary.has_deferred_work());
         assert!(!summary.is_retained_when_unused());
+    }
+
+    #[test]
+    fn test_region_ref_key() {
+        // Independently constructed arenas with equal contents have equal keys, so keys compare regions by their
+        // contents rather than by their identity.
+        let (arena, [_, first, _, root]) = diamond_closure_arena();
+        let (other_arena, [_, _, _, other_root]) = diamond_closure_arena();
+        let key = RegionRef::new(&arena, root).unwrap().key();
+        let other_key = RegionRef::new(&other_arena, other_root).unwrap().key();
+        assert_eq!(key, other_key);
+        assert_eq!(hash_of(&key), hash_of(&other_key));
+        assert_eq!(key.regions.len(), 4);
+        assert_eq!(key.regions[0].instructions[0].3, vec![1, 2]);
+        assert_eq!(key.regions[1].instructions[0].3, vec![3]);
+        assert_eq!(key.regions[2].instructions[0].3, vec![3]);
+        assert_ne!(key, RegionRef::new(&arena, first).unwrap().key());
+
+        // Keys distinguish shared attached regions from distinct regions with equal contents.
+        let shared_slot = const { &[RegionSlot::computation("shared")] };
+        let effectful = || {
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            )
+        };
+        let calling = |callee: usize| {
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    Instruction::new(
+                        TestRegionOperation::WithRegions(shared_slot),
+                        Vec::new(),
+                        Vec::new(),
+                        vec![RegionId::new(0)],
+                    ),
+                    Instruction::new(
+                        TestRegionOperation::WithRegions(shared_slot),
+                        Vec::new(),
+                        Vec::new(),
+                        vec![RegionId::new(callee)],
+                    ),
+                ],
+            )
+        };
+        let shared_arena = RegionArena::from_regions(vec![effectful(), calling(0)]).unwrap();
+        let distinct_arena = RegionArena::from_regions(vec![effectful(), effectful(), calling(1)]).unwrap();
+        let shared_key = RegionRef::new(&shared_arena, RegionId::new(1)).unwrap().key();
+        let distinct_key = RegionRef::new(&distinct_arena, RegionId::new(2)).unwrap().key();
+        assert_ne!(shared_key, distinct_key);
+
+        // Constants compare through their literal identity, so `-0.0` and `0.0` constants have different keys.
+        let constant = |value: f32| {
+            Region::<Array, TestRegionOperation>::new(
+                vec![Atom::Constant(Array::scalar(value).unwrap())],
+                Vec::new(),
+                vec![AtomId::new(0)],
+                Vec::new(),
+            )
+        };
+        let positive_arena = RegionArena::from_regions(vec![constant(0.0)]).unwrap();
+        let negative_arena = RegionArena::from_regions(vec![constant(-0.0)]).unwrap();
+        let positive_key = RegionRef::new(&positive_arena, RegionId::new(0)).unwrap().key();
+        let negative_key = RegionRef::new(&negative_arena, RegionId::new(0)).unwrap().key();
+        assert_eq!(positive_key, positive_key.clone());
+        assert_ne!(positive_key, negative_key);
     }
 
     #[test]
