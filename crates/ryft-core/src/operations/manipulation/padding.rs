@@ -3519,8 +3519,16 @@ mod tests {
         .unwrap();
         assert_eq!(output_type, varying(&[6]));
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "pad"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                    %3:f32[6][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = pad \
+                        [edge_padding_low=[1], edge_padding_high=[1], interior_padding=[0]] %0 %2
+                in (%3)"
+            },
         );
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
@@ -3532,10 +3540,19 @@ mod tests {
         .unwrap();
         assert_eq!(output_type, varying(&[6]));
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", "parallel_vary", "pad"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], %1:f32[] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %1
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %2
+                    %4:f32[6][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = pad \
+                        [edge_padding_low=[1], edge_padding_high=[1], interior_padding=[0]] %0 %3
+                in (%4)"
+            },
         );
-        let (output_type, _) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 input.pad(&padding_value, &[0], &[0], &[0])
             },
@@ -3544,6 +3561,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, varying(&[4]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                in (%0)"
+            },
+        );
     }
 
     #[test]
@@ -5896,8 +5923,16 @@ mod tests {
             )],
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "pad"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, []}], %2:dimension<output_size ∈ [3, 7)> .
+                let %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                    %4:f32[output_size][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = pad \
+                        [edge_padding_low=[1], edge_padding_high=[1], interior_padding=[0]] %0 %3 %2
+                in (%4)"
+            },
         );
     }
 
@@ -6171,26 +6206,48 @@ mod tests {
             )],
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec![
-                "parallel_vary",
-                "constant",
-                "dimension_add",
-                "compare",
-                "assert",
-                "iota",
-                "dimension_to_scalar",
-                "transfer_to_memory",
-                "broadcast",
-                "add",
-                "constant",
-                "constant",
-                "reshape",
-                "broadcast",
-                "broadcast",
-                "parallel_vary",
-                "scatter",
-            ],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, []}], %2:dimension<low ∈ [0, 3)>, %3:dimension<extent ∈ \
+                    [2, 5)> .
+                let %4:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                    %5:dimension<2> = constant [value=2]
+                    %6:dimension<low + 2 ∈ [2, 5)> = dimension_add %2 %5
+                    %7:bool[] = compare [direction=LessThanOrEqual] %6 %3
+                    () = assert [
+                        message=\"padding end must not exceed the output extent\",
+                        labels=[\"end\", \"extent\"],
+                    ] %7 %6 %3
+                    %8:i64[2] = iota [type=i64[2], dimension=0]
+                    %9:i64[] = dimension_to_scalar %2
+                    %10:i64[] = transfer_to_memory [destination=Device] %9
+                    %11:i64[2] = broadcast [output_axes=[]] %10 %5
+                    %12:i64[2] = add %8 %11
+                    %13:dimension<2> = constant [value=2]
+                    %14:dimension<1> = constant [value=1]
+                    %15:i64[2, 1] = reshape [requires_runtime_assertion=false] %12 %13 %14
+                    %16:f32[extent][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = broadcast [
+                        output_axes=[],
+                        output_sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}},
+                    ] %4 %3
+                    %17:i64[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}]}] = broadcast [
+                        output_type=i64[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}]}],
+                        output_axes=[0, 1],
+                    ] %15
+                    %18:i64[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %17
+                    %19:f32[extent][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = scatter [
+                        kind=overwrite,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                        indices_are_sorted=true,
+                        unique_indices=true,
+                        output_sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}},
+                    ] %16 %18 %0
+                in (%19)"
+            },
         );
     }
 

@@ -6765,9 +6765,6 @@ mod tests {
                 )
                 .unwrap()
         };
-        let extent = ArrayOperation::Constant(ConstantOperation::new(
-            Array::from_elements(varying(DataType::I64, &[]), &[4i64]).unwrap(),
-        ));
         let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
@@ -6787,7 +6784,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, varying(DataType::F64, &[2, 2]));
-        assert_eq!(program.instructions()[0].operation(), &extent);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] .
+                let %2:i64[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = constant [value=4]
+                    %3:i32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = convert_element_type \
+                        [data_type=i32] %2
+                    %4:i32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = transfer_to_memory \
+                        [destination=Device] %3
+                    %5:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
+                        output_axes=[],
+                    ] %4
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
+                        [direction=LessThan] %1 %6
+                    %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
+                    %9:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %7 %8 %1
+                    %10:i32[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = reshape \
+                        [shape=[2, 1]] %9
+                    %11:f64[2, 2][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = gather [
+                        dimensions=(offset=[1], collapsed_slice=[], start_index_map=[0], batching=[]),
+                        slice_sizes=[2],
+                        mode=clip,
+                        output_sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}},
+                    ] %0 %10
+                in (%11)"
+            },
+        );
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.dispatch_domain(), 2);
@@ -6806,7 +6832,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, varying(DataType::F64, &[2, 2]));
-        assert_eq!(program.instructions()[0].operation(), &extent);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 4][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}], \
+                    %1:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] .
+                let %2:i64[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = constant [value=4]
+                    %3:i32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = convert_element_type \
+                        [data_type=i32] %2
+                    %4:i32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = transfer_to_memory \
+                        [destination=Device] %3
+                    %5:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
+                        output_axes=[],
+                    ] %4
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
+                        [direction=LessThan] %1 %6
+                    %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
+                    %9:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %7 %8 %1
+                    %10:i32[2, 1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = reshape \
+                        [shape=[2, 1]] %9
+                    %11:f64[2, 2][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = gather [
+                        dimensions=(offset=[1], collapsed_slice=[], start_index_map=[1], batching=[(0, 0)]),
+                        slice_sizes=[1, 2],
+                        mode=clip,
+                        output_sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}},
+                    ] %0 %10
+                in (%11)"
+            },
+        );
     }
 
     #[test]

@@ -6058,11 +6058,57 @@ mod tests {
         let jvp = program.to_flat_program().jvp_with_respect_to(&[0, 2]).unwrap();
         assert_eq!(jvp.output_types(), vec![varying(DataType::F64, &[4]), varying(DataType::F64, &[4])]);
         assert_eq!(
-            jvp.instructions()
-                .iter()
-                .find(|instruction| instruction.operation().name() == "iota")
-                .map(|instruction| instruction.operation()),
-            Some(&ArrayOperation::Iota(IotaOperation::new(varying(DataType::U64, &[2]), 0).unwrap())),
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], %1:i32[2, \
+                    1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}], \
+                    %2:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %3:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %4:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] .
+                let %5:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %3
+                    %6:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %4
+                    %7:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = iota [
+                        type=u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
+                        dimension=0,
+                    ]
+                    %8:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = one_like %7
+                    %9:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %7 %8
+                    %10:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %0
+                    %11:u64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = convert_element_type \
+                        [data_type=u64] %10
+                    %12:u64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = scatter [
+                        kind=overwrite,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                        output_sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}},
+                    ] %11 %1 %9
+                    %13:u64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
+                        slice_sizes=[1],
+                        output_sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}},
+                    ] %12 %1
+                    %14:bool[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
+                        [direction=Equal] %12 %11
+                    %15:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
+                        [direction=Equal] %9 %13
+                    %16:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %0
+                    %17:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %14 %0 %16
+                    %18:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %2
+                    %19:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %15 %2 %18
+                    %20:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %14 %3 %5
+                    %21:f64[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = select %15 %4 %6
+                    %22:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %1 %19
+                    %23:f64[4][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %20 %1 %21
+                in (%22, %23)"
+            },
         );
     }
 

@@ -4754,8 +4754,20 @@ mod tests {
             .unwrap();
         assert_eq!(output_types, vec![ArrayIrType::Array(varying(&[0]))]);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "constant", "constant", "broadcast", "zero"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:i32[0][sharding={mesh<['m'=2:manual]>, [{}]}] .
+                let %2:i32[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                    %3:dimension<0> = constant [value=0]
+                    %4:dimension<1> = constant [value=1]
+                    %5:i32[0, 1][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = broadcast \
+                        [output_axes=[0]] %2 %3 %4
+                    %6:f64[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero \
+                        [type=f64[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
+                in (%6)"
+            },
         );
 
         // The same alignment applies to the empty shortcut for mixed values that wrap context-carrying arrays.
@@ -4774,8 +4786,16 @@ mod tests {
         .unwrap();
         assert_eq!(output_type, varying(&[0]));
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "zero"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}], \
+                    %1:i32[0][sharding={mesh<['m'=2:manual]>, [{}]}] .
+                let %2:i32[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %1
+                    %3:f64[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero \
+                        [type=f64[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
+                in (%3)"
+            },
         );
     }
 

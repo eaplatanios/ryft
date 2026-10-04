@@ -548,6 +548,7 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Manual
 mod tests {
     use std::collections::BTreeSet;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
@@ -559,7 +560,6 @@ mod tests {
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::operations::arithmetic::Add;
-    use crate::operations::collectives::parallel_reduce::PARALLEL_REDUCE_OPERATION_NAME;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, ValueProjection};
@@ -669,13 +669,13 @@ mod tests {
         let evaluation = program.to_flat_program().partially_evaluate(&[PartialValue::Known(constant)]).unwrap();
         assert_eq!(evaluation.program().output_types(), vec![varying]);
         assert_eq!(
-            evaluation
-                .program()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec![PARALLEL_VARY_OPERATION_NAME],
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %0
+                in (%1)"
+            },
         );
         assert!(evaluation.outputs()[0].is_unknown());
     }
@@ -791,28 +791,26 @@ mod tests {
         let zero_tangent = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
         assert_eq!(zero_tangent.output_types(), vec![varying.clone(), varying]);
         assert_eq!(
-            zero_tangent
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == PARALLEL_VARY_OPERATION_NAME)
-                .count(),
-            1
+            zero_tangent.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %0
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = zero \
+                        [type=f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]]
+                in (%1, %2)"
+            },
         );
         assert_eq!(
-            zero_tangent
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == PARALLEL_REDUCE_OPERATION_NAME)
-                .count(),
-            0
-        );
-        assert_eq!(
-            differentiated
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec![PARALLEL_VARY_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME]
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}], %1:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %0
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %1
+                in (%2, %3)"
+            },
         );
     }
 
@@ -829,15 +827,14 @@ mod tests {
         assert_eq!(transposed.input_types(), vec![varying.clone()]);
         assert_eq!(transposed.output_types(), vec![invariant]);
         assert_eq!(
-            transposed
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec![PARALLEL_REDUCE_OPERATION_NAME],
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", \
+                    mesh=['m'=2:manual]] %0
+                in (%1)"
+            },
         );
-        assert!(matches!(transposed.instructions()[0].operation(), ArrayOperation::ParallelReduce(operation)
-            if operation.mesh() == Some(varying.sharding().unwrap().mesh())));
         let twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(twice.to_string(), program.to_string());
     }
@@ -854,8 +851,13 @@ mod tests {
         .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec![PARALLEL_VARY_OPERATION_NAME],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %0
+                in (%1)"
+            },
         );
 
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
@@ -866,8 +868,15 @@ mod tests {
         .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %1
+                in (%2)"
+            },
         );
     }
 
@@ -883,8 +892,13 @@ mod tests {
         .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec![PARALLEL_VARY_OPERATION_NAME],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                    [axis_name=\"m\"] %0
+                in (%1)"
+            },
         );
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| input.parallel_vary_on_mesh("m", &mesh),
@@ -893,8 +907,15 @@ mod tests {
         .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %1
+                in (%2)"
+            },
         );
 
         // The axis must be a non-empty manual axis of the provided mesh.
@@ -929,8 +950,15 @@ mod tests {
             .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "add"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['devices'=2:manual]>, []}], \
+                    %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
+                let %2:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
+                    [axis_name=\"devices\"] %0
+                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = add %2 %1
+                in (%3)"
+            },
         );
     }
 
@@ -946,8 +974,16 @@ mod tests {
         .unwrap();
         assert_eq!(output, varying);
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME, "add"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %2
+                    %4:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = add %3 %1
+                in (%4)"
+            },
         );
     }
 
@@ -966,8 +1002,15 @@ mod tests {
             .unwrap();
         assert_eq!(output, ArrayIrType::Array(varying));
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", "parallel_vary"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
+                let %2:f32[][sharding={mesh<['devices'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
+                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
+                        [axis_name=\"devices\"] %2
+                in (%3)"
+            },
         );
     }
 
@@ -1001,8 +1044,16 @@ mod tests {
             (ArrayIrType::Array(varying.clone()), ArrayIrType::Dimension(extent), ArrayIrType::Array(varying)),
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["broadcast", "parallel_vary"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:dimension<extent ∈ [1, 4)>, %2:f32[][sharding={mesh<['devices'=2:manual]>, [], \
+                    varying_manual={'devices'}}] .
+                let %3:f32[][sharding={mesh<['devices'=2:manual]>, []}] = broadcast \
+                    [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
+                    %4:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
+                        [axis_name=\"devices\"] %3
+                in (%4, %1, %2)"
+            },
         );
     }
 }

@@ -2086,7 +2086,6 @@ mod tests {
     use crate::differentiation::differentiate_at;
     use crate::operations::references::{ReferenceFreeze, ReferenceNew};
     use crate::partial::PartialValue;
-    use crate::programs::Operation;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -2668,8 +2667,22 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["constant", "reshape", "broadcast", "parallel_vary", "constant", "broadcast", "parallel_vary"],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[0][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] .
+                let %1:i64[] = constant [value=0]
+                    %2:i64[1] = reshape [shape=[1]] %1
+                    %3:i64[1][sharding={mesh<['m'=2:manual]>, [{}]}] = broadcast \
+                        [output_type=i64[1][sharding={mesh<['m'=2:manual]>, [{}]}], output_axes=[0]] %2
+                    %4:i64[1][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %3
+                    %5:f32[] = constant [value=-1.0]
+                    %6:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                        [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %5
+                    %7:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %6
+                in (%7)"
+            },
         );
     }
 

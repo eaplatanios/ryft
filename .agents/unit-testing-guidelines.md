@@ -105,6 +105,10 @@ Use this file as the single detailed reference for `ryft` testing conventions.
     output with `indoc!` and `pretty_assertions::assert_eq`.
   - Test operations individually where possible. Prefer full-string equality assertions over partial `.contains(...)`
     checks for rendered IR.
+  - When a test stages or transforms a program, assert its complete rendering (i.e., `program.to_string()` against an
+    `indoc!` string) rather than lists of operation names, individual instructions, or the payload of one found
+    instruction. The full rendering also pins types, shardings, and any dead or extra instructions that partial
+    checks miss.
   - Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
     `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
     and `check_operation_transposition!`.

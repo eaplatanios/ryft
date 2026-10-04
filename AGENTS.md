@@ -388,6 +388,17 @@ Consult that file before writing or revising unit tests.
 
 ## Crate-Specific Conventions
 
+### `ryft-core`
+
+- In transformation rules (e.g., batching, differentiation, transposition, or partial evaluation), give every value
+  that the rule creates (e.g., a constant, `iota`, `zero`, or `one`) and then combines with existing values the
+  placement and manual variation of those values. Operation-level rules and `Context::bind` assume inputs that were
+  aligned when the program was staged, so they do not insert `parallel_vary` the way the value-level capabilities do.
+  Create such a value with that variation directly only when it is a non-differentiable constant, and say so in a
+  comment, because the transpose of the skipped `parallel_vary` is a cross-device sum. Stage any value that can carry
+  a tangent through the value-level capabilities, which call `align_manual_variation`. Cover such rules with a test
+  that runs them inside a manual region with varying inputs.
+
 ### `ryft-mlir`
 
 - Use this crate and `ryft-pjrt` as the reference style for macro-driven hierarchy modeling over third-party C APIs.

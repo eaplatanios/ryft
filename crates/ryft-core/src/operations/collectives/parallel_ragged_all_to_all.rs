@@ -2724,15 +2724,19 @@ mod tests {
         .unwrap();
         assert_eq!(output_type, typed(DataType::F32, [2, 4]));
         assert_eq!(
-            program
-                .instructions()
-                .iter()
-                .filter_map(|instruction| match instruction.operation() {
-                    ArrayOperation::ParallelRaggedAllToAll(operation) => Some(operation.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation()],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}], %1:f32[2, \
+                    4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] .
+                let %2:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %3:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %4:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %5:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %6:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] = \
+                        parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, representation=Physical] %0 %1 %2 \
+                        %3 %4 %5
+                in (%6)"
+            },
         );
 
         // An exchange over the manual mesh axis itself belongs to its manual region and requires devices, so a
@@ -3864,16 +3868,81 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(pullback.output_types(), &[typed(DataType::F32, 3), typed(DataType::F32, 4)]);
-        let meshes = pullback
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction.operation() {
-                ArrayOperation::ParallelAllToAll(operation) => Some(operation.mesh()),
-                ArrayOperation::ParallelRaggedAllToAll(operation) => Some(operation.mesh()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(meshes, vec![Some(&mesh), Some(&mesh), Some(&mesh)]);
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %1:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %2:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %3:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %4:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %5:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    split_axis=0,
+                    concat_axis=0,
+                    options=Tiled,
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                ] %3
+                    %6:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_all_to_all [
+                        axis_name=\"x\",
+                        axis_size=2,
+                        split_axis=0,
+                        concat_axis=0,
+                        options=Tiled,
+                        mesh=['x'=2:manual, 'y'=2:manual],
+                    ] %1
+                    %7:f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = zero [
+                        type=f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}],
+                    ]
+                    %8:f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, update_kind=Add, \
+                        mesh=['x'=2:manual, 'y'=2:manual]] %0 %7 %5 %4 %6 %2
+                    %9:u64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u64] %5
+                    %10:u64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        convert_element_type [data_type=u64] %4
+                    %11:i64[5][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = zero [
+                        type=i64[5][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}],
+                    ]
+                    %12:i64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = one [
+                        type=i64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}],
+                    ]
+                    %13:i64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = neg %12
+                    %14:u64[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = add %9 %10
+                    %15:u64[2, 1][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape [shape=[2, 1]] %9
+                    %16:u64[2, 1][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape [shape=[2, 1]] %14
+                    %17:i64[5][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %11 %15 %12
+                    %18:i64[5][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %16 %13
+                    %19:i64[5][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        cumulative [kind=sum, axis=0] %18
+                    %20:i64[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = slice \
+                        [start_indices=[0], limits=[4]] %19
+                    %21:i64[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = zero [
+                        type=i64[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}],
+                    ]
+                    %22:bool[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = compare \
+                        [direction=NotEqual] %20 %21
+                    %23:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = zero [
+                        type=f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}],
+                    ]
+                    %24:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = select \
+                        %22 %23 %0
+                in (%8, %24)"
+            },
+        );
     }
 
     #[test]
@@ -3970,15 +4039,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(typed(DataType::F32, 4, &["x"])));
-        let operations = program
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction.operation() {
-                ArrayIrOperation::ParallelRaggedAllToAll(operation) => Some(operation.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(operations, vec![ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_mesh(mesh.clone())]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f32[4], %2:i32[2], %3:i32[2], %4:i32[2], %5:i32[2] .
+                let %6:f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                    output_type=f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                    output_axes=[0],
+                ] %0
+                    %7:f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %6
+                    %8:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                        output_type=f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                        output_axes=[0],
+                    ] %1
+                    %9:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %8
+                    %10:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                        output_axes=[0],
+                    ] %2
+                    %11:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %10
+                    %12:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                        output_axes=[0],
+                    ] %3
+                    %13:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %12
+                    %14:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                        output_axes=[0],
+                    ] %4
+                    %15:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %14
+                    %16:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] = broadcast [
+                        output_type=i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}],
+                        output_axes=[0],
+                    ] %5
+                    %17:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %16
+                    %18:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                        parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, mesh=['x'=2:manual, 'y'=2:manual]] \
+                        %7 %9 %11 %13 %15 %17
+                in (%18)"
+            },
+        );
 
         // A pending sum over the participating manual mesh axis is rejected before any input is made varying.
         assert_eq!(
@@ -4055,14 +4161,25 @@ mod tests {
         };
         let (output_type, program) = trace(vec![vec![1], vec![0]]).unwrap();
         assert_eq!(output_type, typed(DataType::F32, 4));
-        assert_eq!(program.instructions().len(), 1);
-        assert!(matches!(
-            program.instructions()[0].operation(),
-            ArrayOperation::ParallelRaggedAllToAll(operation)
-                if operation == &ParallelRaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![1], vec![0]])
-                    .unwrap()
-                    .with_mesh(mesh.clone())
-        ));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %2:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %3:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %4:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %5:i32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %6:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_ragged_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    axis_index_groups=[[1], [0]],
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                ] %0 %1 %2 %3 %4 %5
+                in (%6)"
+            },
+        );
 
         // Groups that do not partition the full axis are rejected before anything is staged.
         assert_eq!(
