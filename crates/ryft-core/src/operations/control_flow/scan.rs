@@ -1619,7 +1619,8 @@ where
                 .collect::<Vec<_>>();
             let output_has_slot = body.tangent_output_mask(&input_indices)?;
             let jvp_body = driver.jvp_program(body, &input_indices)?;
-            let mut output_depends = derived_tangent_output_dependence(&jvp_body, body_input_count, body_output_count);
+            let tangent_inputs = (body_input_count..jvp_body.input_count()).collect::<Vec<_>>();
+            let mut output_depends = jvp_body.output_dependence(&tangent_inputs)?.into_iter().skip(body_output_count);
             let output_has_tangent = output_has_slot
                 .iter()
                 .map(|&has_slot| has_slot && output_depends.next().unwrap())
@@ -1650,7 +1651,7 @@ where
                             .map(|(slot, _)| body_output_count + slot),
                     )
                     .collect::<Vec<_>>();
-                break (input_indices, project_program_outputs(&jvp_body, &kept_outputs)?, output_has_tangent);
+                break (input_indices, jvp_body.with_outputs(&kept_outputs)?, output_has_tangent);
             }
         };
         let live_carry_count = input_has_tangent[1..1 + carry_count].iter().filter(|&&live| live).count();
@@ -1697,7 +1698,7 @@ where
                 .filter(|(_, index)| output_has_tangent[*index])
                 .map(|(slot, _)| slot)
                 .collect::<Vec<_>>();
-            let tangent_program = project_program_outputs(&tangent_program, &kept_tangent_outputs)?;
+            let tangent_program = tangent_program.with_outputs(&kept_tangent_outputs)?;
             let mut fused_input_types = body.input_types();
             fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
             let reordered_input_types =
@@ -3365,56 +3366,6 @@ pub(crate) fn validate_reference_carry_axis(
              the axis the body produces",
         ),
     })
-}
-
-/// Returns, for every output of the derived body `program` from `first_output` on, whether it depends on any input of
-/// `program` from `first_input` on. Derived JVP and tangent programs list their primal inputs and outputs before their
-/// tangent ones, so this identifies the tangent outputs that are structural zeros because no tangent input reaches
-/// them. The analysis follows instruction dataflow conservatively, treating every output of an instruction as
-/// dependent on all of its inputs. Tangents can also flow through writes into references, which dataflow alone does
-/// not track, so every output of a program whose entry region holds a reference counts as dependent.
-fn derived_tangent_output_dependence<V: Value, O: Operation<Type = V::Type>>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    first_input: usize,
-    first_output: usize,
-) -> impl Iterator<Item = bool> {
-    let region = program.entry_region_ref();
-    let has_references = region.atoms().iter().any(|atom| atom.r#type().is_reference());
-    let mut dependent = vec![has_references; region.atoms().len()];
-    for input in &region.input_ids()[first_input..] {
-        dependent[input.index()] = true;
-    }
-    for instruction in region.instructions() {
-        if instruction.inputs().iter().any(|input| dependent[input.index()]) {
-            for output in instruction.outputs() {
-                dependent[output.index()] = true;
-            }
-        }
-    }
-    region.output_ids()[first_output..]
-        .iter()
-        .map(|output| dependent[output.index()])
-        .collect::<Vec<_>>()
-        .into_iter()
-}
-
-/// Returns `program` restricted to the outputs at the positions listed in `outputs`, keeping its whole input boundary.
-fn project_program_outputs<V: Value, O: Operation<Type = V::Type> + Clone>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    outputs: &[usize],
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-    if outputs.iter().copied().eq(0..program.output_count()) {
-        return Ok(program.clone());
-    }
-    let input_ids = program.input_ids().to_vec();
-    let output_ids = outputs.iter().map(|&output| program.output_ids()[output]).collect::<Vec<_>>();
-    let (projected, live_inputs) = program.clone().into_filtered(&input_ids, &output_ids, &input_ids)?;
-    if !live_inputs.iter().copied().eq(0..input_ids.len()) {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{SCAN_OPERATION_NAME}` output projection dropped an input of its derived body",
-        )));
-    }
-    Ok(projected)
 }
 
 /// Returns the permutation that converts one side of a compact fused JVP body signature from JVP order
@@ -11836,68 +11787,6 @@ mod tests {
                           at the axis the body produces"
                     .to_string(),
             }),
-        );
-    }
-
-    #[test]
-    fn test_derived_tangent_output_dependence() {
-        // The program maps `[index, left, right]` to `[index, left + right, index * index, right]`. From output 1 on,
-        // the outputs that depend on input 2 (`right`) or later are `left + right` and `right`, while `index * index`
-        // depends on no such input.
-        let program = scalar_body(2, |builder, inputs| {
-            let sum =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
-            let square =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![inputs[0], inputs[0]], None).unwrap()[0];
-            vec![inputs[0], sum, square, inputs[2]]
-        });
-        assert_eq!(derived_tangent_output_dependence(&program, 2, 1).collect::<Vec<_>>(), vec![true, false, true]);
-        assert_eq!(derived_tangent_output_dependence(&program, 0, 0).collect::<Vec<_>>(), vec![true; 4]);
-        assert_eq!(derived_tangent_output_dependence(&program, 3, 0).collect::<Vec<_>>(), vec![false; 4]);
-
-        // Tangents can flow through writes into references, which dataflow does not track, so every output of a
-        // program that holds a reference counts as dependent, including `index`, which reads no input from `value` on.
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let _value = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let read =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![index, read], vec![Placeholder; 3], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(derived_tangent_output_dependence(&program, 1, 0).collect::<Vec<_>>(), vec![true, true]);
-    }
-
-    #[test]
-    fn test_project_program_outputs() {
-        // Projection keeps the whole input boundary, even inputs that the kept outputs no longer read, and the identity
-        // projection returns the program unchanged.
-        let program = scalar_body(2, |builder, inputs| {
-            let sum =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None).unwrap()[0];
-            let square =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![inputs[1], inputs[1]], None).unwrap()[0];
-            vec![sum, square, inputs[2]]
-        });
-        assert_eq!(project_program_outputs(&program, &[0, 1, 2]).unwrap().to_string(), program.to_string());
-        assert_eq!(
-            project_program_outputs(&program, &[1]).unwrap().to_string(),
-            indoc! {"
-                lambda %0:i64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = mul %1 %1
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            project_program_outputs(&program, &[2, 0]).unwrap().to_string(),
-            indoc! {"
-                lambda %0:i64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = add %1 %2
-                in (%2, %3)
-            "}
-            .trim_end(),
         );
     }
 

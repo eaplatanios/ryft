@@ -47,6 +47,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - In a test that covers several related behavior groups, use concise comments to identify what each group verifies.
   Explain the semantic contract or edge case rather than restating individual assertions.
 - Use `pub(crate) mod tests` only when the module intentionally exposes shared test helpers to sibling modules.
+  When only the module's own descendants (e.g., the submodules of a `mod.rs`) use its helpers, keep `mod tests`
+  private and mark the helpers `pub(super)`, which is the narrowest visibility that reaches those descendants.
 - Put local test helpers near the top of the test module, before the first `#[test]`.
 - Define test-only types inside the single test that uses them; keep module-level test types for shared test fixtures.
 - Inline a type alias used by only one test. When the same alias is used by multiple tests, define it once near the top

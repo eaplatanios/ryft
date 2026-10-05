@@ -3083,9 +3083,8 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
         if !tangents_only {
             return Ok((jvp, output_tangent_mask));
         }
-        let inputs = jvp.input_ids();
-        let tangent_outputs = &jvp.output_ids()[program.output_types().len()..];
-        Ok((jvp.filtered(&inputs, tangent_outputs, &inputs)?.0, output_tangent_mask))
+        let tangent_outputs = (program.output_count()..jvp.output_count()).collect::<Vec<_>>();
+        Ok((jvp.with_outputs(&tangent_outputs)?, output_tangent_mask))
     }
 
     /// Validates that the source rule's batched program has live tangents for exactly the outputs whose tangents the

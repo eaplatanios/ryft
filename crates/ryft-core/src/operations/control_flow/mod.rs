@@ -185,7 +185,7 @@ pub(crate) fn validate_output_identities<T: Type>(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::cell::Cell;
 
     use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionType, DimensionValue};
@@ -200,12 +200,12 @@ pub(crate) mod tests {
     use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Value};
 
     /// Wraps an [`Array`] as an array [`ArrayIrValue`].
-    pub(crate) fn array(value: Array) -> ArrayIrValue<Array> {
+    pub(super) fn array(value: Array) -> ArrayIrValue<Array> {
         ArrayIrValue::Array(value)
     }
 
     /// Returns a first-class dimension [`ArrayIrValue`] of type `r#type` whose runtime extent is `extent`.
-    pub(crate) fn dimension(r#type: &DimensionType, extent: usize) -> ArrayIrValue<Array> {
+    pub(super) fn dimension(r#type: &DimensionType, extent: usize) -> ArrayIrValue<Array> {
         ArrayIrValue::Dimension(DimensionValue::new(r#type.clone(), extent).unwrap())
     }
 
@@ -214,7 +214,7 @@ pub(crate) mod tests {
     /// region's capture constants into leading inputs but keeps the capture constants of attached regions, which a
     /// backend resolves against the same leading capture arguments while lowering, and eager interpretation has no
     /// capture table to resolve them against.
-    pub(crate) fn resolve_captures<O: Operation<Type = ArrayIrType>>(
+    pub(super) fn resolve_captures<O: Operation<Type = ArrayIrType>>(
         program: &Program<
             CaptureReference<ArrayIrType>,
             O,
@@ -258,7 +258,7 @@ pub(crate) mod tests {
     /// them at reconciled targets, and reuse a discovery program when its axes already match. This fixture lets rule
     /// tests pin how many structural passes such a rule actually performs, which a program rendering alone cannot
     /// observe.
-    pub(crate) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+    pub(super) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
         /// [`Region`](crate::programs::Region)s attached to the operation application under test,
         /// in operation-defined order.
         regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>,
@@ -269,12 +269,12 @@ pub(crate) mod tests {
 
     impl<'r, V: Value, O: Operation<Type = V::Type>> CountingBatchingDriver<'r, V, O> {
         /// Creates a new [`CountingBatchingDriver`] over the provided attached regions.
-        pub(crate) fn new(regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
+        pub(super) fn new(regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
             Self { regions, batch_program_calls: Cell::new(0) }
         }
 
         /// Returns the number of structural program-batching requests observed so far.
-        pub(crate) fn batch_program_calls(&self) -> usize {
+        pub(super) fn batch_program_calls(&self) -> usize {
             self.batch_program_calls.get()
         }
     }

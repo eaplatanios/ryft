@@ -456,6 +456,45 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Ok(live_sets)
     }
 
+    /// Returns, for every output of this [`Program`], whether it may depend on any of the inputs at the positions
+    /// listed in `inputs`. This is the forward counterpart of [`Self::live_sets`]: it propagates dependence from the
+    /// selected inputs through the instructions of the entry region in program order.
+    ///
+    /// The analysis is conservative. It never reports an output as independent when it may depend on a selected input,
+    /// but it may report a dependence that does not exist. Every output of an [`Instruction`] counts as dependent on
+    /// all of its inputs, including instructions with nested regions, whose region contents are not inspected. Values
+    /// can also flow through writes into and reads from references, which dataflow alone does not track, so every
+    /// output of a program whose entry region holds a reference counts as dependent.
+    ///
+    /// For example, forward-mode differentiation rules use this function on a derived program, whose tangent inputs
+    /// and outputs follow its primal ones, to find the tangent outputs that depend on no live tangent input and are
+    /// therefore structural zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when a position in `inputs` is out of range.
+    pub fn output_dependence(&self, inputs: &[usize]) -> Result<Vec<bool>, ProgramError> {
+        let input_count = self.input_count();
+        if let Some(index) = inputs.iter().find(|&&index| index >= input_count) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("input index {index} is out of range for a program with {input_count} inputs"),
+            });
+        }
+        let has_references = self.atoms().iter().any(|atom| atom.r#type().is_reference());
+        let mut dependent = vec![has_references; self.atoms().len()];
+        for &index in inputs {
+            dependent[self.input_ids()[index].index()] = true;
+        }
+        for instruction in self.instructions() {
+            if instruction.inputs().iter().any(|input| dependent[input.index()]) {
+                for output in instruction.outputs() {
+                    dependent[output.index()] = true;
+                }
+            }
+        }
+        Ok(self.output_ids().iter().map(|output| dependent[output.index()]).collect())
+    }
+
     /// Returns the [`EffectsSummary`] of this [`Program`]'s entry region. The summary combines the effect classes and
     /// unused-result observability of the entry region's instructions and all attached computation regions. Attached
     /// [`RegionRole::Rule`](crate::RegionRole::Rule) regions are excluded because they are dormant during ordinary
@@ -3006,6 +3045,46 @@ mod tests {
             ],
         );
         assert_eq!(live_sets.instructions(), &[true, false, false]);
+    }
+
+    #[test]
+    fn test_program_output_dependence() {
+        // The program maps `[index, left, right]` to `[index, left + right, index * index, right]`. The outputs that
+        // depend on `right` are `left + right` and `right`, while `index * index` depends only on `index`.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let index = builder.add_input(ArrayType::scalar(DataType::F64));
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![index, index], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![index, sum, square, right],
+                vec![Placeholder; 3],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        assert_eq!(program.output_dependence(&[2]), Ok(vec![false, true, false, true]));
+        assert_eq!(program.output_dependence(&[0, 2]), Ok(vec![true, true, true, true]));
+        assert_eq!(program.output_dependence(&[]), Ok(vec![false; 4]));
+        assert!(matches!(
+            program.output_dependence(&[3]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "input index 3 is out of range for a program with 3 inputs",
+        ));
+
+        // Values can flow through writes into references, which dataflow does not track, so every output of a program
+        // that holds a reference counts as dependent, including `index`, which reads no selected input.
+        let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
+        let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![index, read], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(program.output_dependence(&[1]), Ok(vec![true, true]));
     }
 
     #[test]

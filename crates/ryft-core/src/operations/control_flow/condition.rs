@@ -887,19 +887,41 @@ where
         let output_count = output_types.len();
 
         // The instruction inputs after the predicate map onto the branch region inputs positionally, so each branch's
-        // activity mask is the activity of their duals: a numeric input is active (a symbolic zero is materialized
-        // below), while a plumbing reference input (a captured or inactive reference reaching the branch at any region
-        // input position) and a zero-space input are inactive and receive no tangent input.
-        let activity = branch_inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
-
+        // activity mask is the liveness of their tangents: an input with a live tangent is active, while a structural
+        // zero, a plumbing reference input (a captured or inactive reference reaching the branch at any region input
+        // position), and a zero-space input are inactive and receive no tangent input. An output tangent is live when
+        // it depends on an active input in either branch. The others are structural zeros, so the branch derivatives
+        // are projected to the live output tangents and linearization never sees a tangent that depends on no tangent
+        // input.
+        let activity = branch_inputs
+            .iter()
+            .map(|input| input.is_tangent_active() && !input.tangent().is_zero())
+            .collect::<Vec<_>>();
         let primal_input_count = branch_inputs.len();
         let input_indices = activity
             .iter()
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
-        let output_activity = true_branch.tangent_output_mask(&input_indices)?;
-        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
+        let false_branch = driver.region(1)?;
+        let true_jvp = driver.jvp_program(true_branch, &input_indices)?;
+        let false_jvp = driver.jvp_program(false_branch, &input_indices)?;
+        let tangent_slots = true_branch.tangent_output_mask(&input_indices)?;
+        let tangent_inputs = (primal_input_count..true_jvp.input_count()).collect::<Vec<_>>();
+        let mut true_depends = true_jvp.output_dependence(&tangent_inputs)?.into_iter().skip(output_count);
+        let mut false_depends = false_jvp.output_dependence(&tangent_inputs)?.into_iter().skip(output_count);
+        let output_activity = tangent_slots
+            .iter()
+            // Both branch iterators yield one entry per tangent slot, so neither may be skipped by short-circuiting.
+            .map(|&has_slot| has_slot && (true_depends.next().unwrap() | false_depends.next().unwrap()))
+            .collect::<Vec<_>>();
+        let live_tangent_slots = (0..output_count)
+            .filter(|&index| tangent_slots[index])
+            .enumerate()
+            .filter(|(_, index)| output_activity[*index])
+            .map(|(slot, _)| slot)
+            .collect::<Vec<_>>();
+        let tangent_output_count = live_tangent_slots.len();
         let live_input_count = input_indices.len();
         let mut condition_inputs = vec![predicate_primal];
         condition_inputs.extend(branch_inputs.iter().map(|input| input.primal().clone()));
@@ -914,24 +936,33 @@ where
             }
         }
         let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-            let branches = [
-                driver.jvp_program(true_branch, &input_indices)?,
-                driver.jvp_program(driver.region(1)?, &input_indices)?,
-            ];
+            let jvp_outputs = (0..output_count)
+                .chain(live_tangent_slots.iter().map(|&slot| output_count + slot))
+                .collect::<Vec<_>>();
+            let branches = [true_jvp, false_jvp]
+                .map(|program| {
+                    if jvp_outputs.iter().copied().eq(0..program.output_count()) {
+                        Ok(program)
+                    } else {
+                        program.with_outputs(&jvp_outputs).map(Arc::new)
+                    }
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>, ProgramError>>()?;
             context
                 .primal()
                 .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
         } else {
             let mut partitions = Vec::with_capacity(2);
             let mut branch_input_types = true_branch.input_types();
-            for branch in [true_branch, driver.region(1)?] {
+            for branch in [true_branch, false_branch] {
                 let (primal, tangent, residual_count) = driver.linearize_program(branch, &input_indices)?.into_parts();
                 if partitions.is_empty() {
                     branch_input_types.extend(tangent.input_types().into_iter().take(live_input_count));
                 }
                 partitions.push(PartitionedProgram::from_parts(
                     Arc::unwrap_or_clone(primal),
-                    Arc::unwrap_or_clone(tangent),
+                    tangent.with_outputs(&live_tangent_slots)?,
                     (0..primal_input_count).collect(),
                     (primal_input_count..primal_input_count + live_input_count)
                         .map(PartialEvaluationInput::Unknown)
@@ -2694,7 +2725,11 @@ mod tests {
     }
 
     #[test]
-    fn test_zz_probe_condition_zero_tangents() {
+    fn test_condition_differentiation_keeps_tangents_of_inactive_outputs_structural() {
+        // The true branch maps `(a, b, c)` to `(sin(a), sin(c))` and the false branch maps it to `(sin(b), sin(c))`.
+        // Only `a` has a live tangent, so the first output's tangent is live because the true branch depends on it,
+        // while the second output depends on `a` in neither branch and keeps a structural-zero tangent. The branch
+        // derivatives therefore take one tangent input and return one tangent output, and linearization succeeds.
         let scalar = ArrayType::scalar(DataType::F64);
         let branch = |first: usize| {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2706,7 +2741,7 @@ mod tests {
                 .unwrap()
         };
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let inputs = (0..3).map(|_| builder.add_input(scalar.clone())).collect::<Vec<_>>();
         let true_branch = builder.import_program(branch(0));
         let false_branch = builder.import_program(branch(1));
@@ -2714,7 +2749,7 @@ mod tests {
             .add_instruction(
                 ConditionOperation::<ArrayType>::new(),
                 vec![true_branch, false_branch],
-                vec![p, inputs[0], inputs[1], inputs[2]],
+                vec![predicate, inputs[0], inputs[1], inputs[2]],
                 None,
             )
             .unwrap()
@@ -2722,8 +2757,52 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
-        println!("PROBE condition jvp: {:?}", program.jvp_with_respect_to(&[1]).map(|program| program.to_string()));
-        println!("PROBE condition linearize: {:?}", program.linearize_with_respect_to(&[1]).map(|_| ()));
+        assert_eq!(
+            program.jvp_with_respect_to(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                let %5:f64[], %6:f64[], %7:f64[] = condition %0 %1 %2 %3 %4 [
+                    true={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = sin %0
+                            %5:f64[] = sin %2
+                            %6:f64[] = cos %0
+                            %7:f64[] = mul %6 %3
+                        in (%4, %5, %7)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = sin %1
+                            %5:f64[] = sin %2
+                            %6:f64[] = zero [type=f64[]]
+                        in (%4, %5, %6)
+                    },
+                ]
+                    %8:f64[] = zero [type=f64[]]
+                in (%5, %6, %7, %8)
+            "}
+            .trim_end(),
+        );
+
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        for (predicate, expected_tangent) in [(true, 0.5f64.cos()), (false, 0.0)] {
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    Array::scalar(predicate).unwrap(),
+                    Array::scalar(0.5f64).unwrap(),
+                    Array::scalar(1.5f64).unwrap(),
+                    Array::scalar(2.5f64).unwrap(),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(2);
+            let mut tangent_inputs = vec![Array::scalar(1f64).unwrap()];
+            tangent_inputs.extend(residuals);
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![Array::scalar(expected_tangent).unwrap(), Array::scalar(0f64).unwrap()]),
+            );
+        }
     }
 
     #[test]

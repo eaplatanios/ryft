@@ -970,7 +970,11 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// [`DifferentiationDual::is_tangent_active`]; it need not match the user's original input selection. Selection
     /// describes which tangent arguments the child receives, not whether their numerical values are non-zero. A live
     /// tangent can contain zeros, and some structural zeros are classified as active because they can be materialized
-    /// as tangent arguments from their types alone.
+    /// as tangent arguments from their types alone. A rule that rebinds the derived tangents as values in a context
+    /// that partial evaluation inspects (e.g., the `scan`, `while`, and `condition` rules) must also leave structural
+    /// zeros unselected and return structural zeros for the outputs whose tangents depend on no selected input (which
+    /// [`Program::output_dependence`] over the derived program's tangent inputs identifies), because a tangent
+    /// computed only from known zeros is known and linearization rejects it.
     ///
     /// The result is shared rather than owned because rules commonly re-attach the derived program as a nested region.
     /// An [`Arc`] lets a caching driver serve one artifact for a region that several programs share instead of

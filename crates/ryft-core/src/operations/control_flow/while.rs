@@ -2051,18 +2051,16 @@ where
     let state_types = driver.region(1)?.input_types();
     let state_count = state_types.len();
 
-    // Linearize the body once under the instruction input duals' activity (state elements keep positional identity, so
-    // the body's region input mask is the instruction input mask). The nonlinear half returns the next state followed
-    // by ordinary residuals, and the linear half consumes the live state tangents followed by those residuals.
+    // Linearize the body once under the converged tangent liveness of the state (state elements keep positional
+    // identity, so the body's region input mask is the live state mask). The nonlinear half returns the next state
+    // followed by ordinary residuals, and the linear half consumes the live state tangents followed by those residuals
+    // and returns the tangents of the live state elements alone.
     check_count!("input", inputs, state_count, ProgramError);
-    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
-    let input_indices = element_has_tangent
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &active)| active.then_some(index))
-        .collect::<Vec<_>>();
+    let body = driver.region(1)?;
+    let (element_has_tangent, input_indices, live_tangent_slots) = while_tangent_liveness(driver, body, inputs)?;
     let (primal_program, tangent_program, residual_count) =
-        driver.linearize_program(driver.region(1)?, &input_indices)?.into_parts();
+        driver.linearize_program(body, &input_indices)?.into_parts();
+    let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
     let residual_types = primal_program.output_types().split_off(state_count);
     check_count!("output", residual_types, residual_count, ProgramError);
 
@@ -2307,6 +2305,58 @@ where
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// Returns the tangent liveness of the state of a `while` loop whose body is `body`, given the instruction input duals
+/// `inputs`: whether each state element carries a live tangent, the body input indices of the live elements, and the
+/// positions of their tangents among the tangent outputs of the body's derivative at those indices (one per output
+/// that [`RegionRef::tangent_output_mask`] gives a tangent).
+///
+/// A state element starts live when its tangent is live (structural zeros are not) and becomes live once the body
+/// makes its next value depend on a live tangent, so that its tangent slot exists from the first iteration on. Because
+/// every round that does not converge enlivens at least one element, this monotone fixed point takes at most one more
+/// round than there are state elements. Elements that stay inactive keep structural-zero tangents, so linearization
+/// never sees a tangent that depends on no tangent input. A live element keeps its tangent slot even when the body
+/// resets it to a value that depends on no tangent, because state tangent slots must pair across iterations. This is
+/// the carry fixed point of
+/// [JAX's `while_loop` JVP](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html).
+fn while_tangent_liveness<C: Context<Type: DifferentiableType>, D: DifferentiationDriver<C>>(
+    driver: &D,
+    body: RegionRef<'_, C::Constant, C::Operation>,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<(Vec<bool>, Vec<usize>, Vec<usize>), DifferentiationError> {
+    let state_count = inputs.len();
+    let mut element_has_tangent = inputs
+        .iter()
+        .map(|input| input.is_tangent_active() && !input.tangent().is_zero())
+        .collect::<Vec<_>>();
+    loop {
+        let input_indices = element_has_tangent
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &live)| live.then_some(index))
+            .collect::<Vec<_>>();
+        let tangent_slots = body.tangent_output_mask(&input_indices)?;
+        let jvp_body = driver.jvp_program(body, &input_indices)?;
+        let tangent_inputs = (state_count..jvp_body.input_count()).collect::<Vec<_>>();
+        let mut output_depends = jvp_body.output_dependence(&tangent_inputs)?.into_iter().skip(state_count);
+        let mut converged = true;
+        for (index, &has_slot) in tangent_slots.iter().enumerate() {
+            if has_slot && output_depends.next().unwrap() && !element_has_tangent[index] {
+                element_has_tangent[index] = true;
+                converged = false;
+            }
+        }
+        if converged {
+            let live_tangent_slots = (0..state_count)
+                .filter(|&index| tangent_slots[index])
+                .enumerate()
+                .filter(|(_, index)| element_has_tangent[*index])
+                .map(|(slot, _)| slot)
+                .collect();
+            return Ok((element_has_tangent, input_indices, live_tangent_slots));
+        }
+    }
+}
+
 /// Stages **one fused** doubled-state forward-mode `while` as an ordinary primal-enum operation over the shared
 /// builder — the analogue of
 /// [JAX's `jvp` of `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), which
@@ -2335,25 +2385,27 @@ where
     let state_count = inputs.len();
 
     // Build the fused body over the compact state `[primal_state..., live(tangent_state)...]` through the
-    // instruction-scoped driver (region 1 is the loop body). The fused body carries a tangent boundary input exactly
-    // for the active state elements, so the liveness mask is the instruction input duals' activity: a numeric element
-    // is active (a symbolic zero is materialized below), while a plumbing reference element and a zero-space element
-    // are inactive and receive no tangent input. State elements keep positional identity across iterations, so the
-    // activity fixed point is trivial: a numeric element's activity is fixed by its type, and a reference element's
-    // tangent can only come from its input, so it cannot become active through iteration.
+    // instruction-scoped driver (region 1 is the loop body). The fused body carries a tangent exactly for the state
+    // elements whose tangent is live after the carry fixed point (refer to `while_tangent_liveness`), so inactive
+    // elements, such as a pass-through loop limit, keep structural-zero tangents instead of threading materialized
+    // zeros through the loop.
     let body = driver.region(1)?;
     check_count!("input", inputs, body.input_types().len(), ProgramError);
-    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
-    let input_indices = element_has_tangent
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &active)| active.then_some(index))
-        .collect::<Vec<_>>();
+    let (element_has_tangent, input_indices, live_tangent_slots) = while_tangent_liveness(driver, body, inputs)?;
     let tangent_state_count = input_indices.len();
     let fused_state_count = state_count + tangent_state_count;
     // The body is differentiated through its region's retained transform cache, so a body shared by several programs
-    // is differentiated once and repeated attachments of the result intern by `Arc` identity.
+    // is differentiated once and repeated attachments of the result intern by `Arc` identity. Its tangent outputs are
+    // projected to the live state elements only when some state element is inactive.
     let fused_body = driver.jvp_program(body, &input_indices)?;
+    let fused_outputs = (0..state_count)
+        .chain(live_tangent_slots.iter().map(|&slot| state_count + slot))
+        .collect::<Vec<_>>();
+    let fused_body = if fused_outputs.iter().copied().eq(0..fused_body.output_count()) {
+        fused_body
+    } else {
+        Arc::new(fused_body.with_outputs(&fused_outputs)?)
+    };
     let fused_state_types = fused_body.input_types();
     check_count!("input", fused_state_types, fused_state_count, ProgramError);
 
@@ -3202,8 +3254,10 @@ mod tests {
     }
 
     /// Builds a loop over `[counter, first, second, source]` whose body returns
-    /// `[counter - 1, second, source, source]` while the counter is positive.
-    fn chained_carry_while_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+    /// `[counter - 1, second, source, source]` while the counter is positive, under the optional `iteration_bound`.
+    fn chained_carry_while_program(
+        iteration_bound: Option<usize>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let condition_inputs = (0..4).map(|_| condition_builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
@@ -3236,8 +3290,9 @@ mod tests {
         let inputs = (0..4).map(|_| builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
+        let operation = WhileOperation::new().with_iteration_bound(iteration_bound).unwrap();
         let outputs = builder
-            .add_instruction(WhileOperation::new(), vec![condition_region, body_region], inputs, None)
+            .add_instruction(operation, vec![condition_region, body_region], inputs, None)
             .unwrap()
             .to_vec();
         builder
@@ -7250,7 +7305,7 @@ mod tests {
         // With initially known `first` and `second`, the body first discovers that `second` depends on the unknown
         // `source`. Only another round discovers that `first` must also become unknown. Equal initial values keep
         // `first` provisionally invariant as well, exercising both constant-invariance and symbolic-knownness probes.
-        let program = chained_carry_while_program();
+        let program = chained_carry_while_program(None);
         let arguments = vec![
             Array::scalar(3.0).unwrap(),
             Array::scalar(1.0).unwrap(),
@@ -7284,7 +7339,7 @@ mod tests {
 
     #[test]
     fn test_while_partition_propagates_unknown_carries_across_multiple_rounds() {
-        let program = chained_carry_while_program();
+        let program = chained_carry_while_program(None);
         let arguments = vec![
             Array::scalar(3.0).unwrap(),
             Array::scalar(1.0).unwrap(),
@@ -7331,7 +7386,7 @@ mod tests {
     fn test_while_differentiation_linearization_propagates_tangent_carries_across_multiple_rounds() {
         // Only `source` has a nonzero tangent. That tangent reaches `second` after one iteration and `first` after
         // two, so the linearized body must retain the entire dependent carry chain across repeated applications.
-        let linearization = chained_carry_while_program().linearize().unwrap();
+        let linearization = chained_carry_while_program(None).linearize().unwrap();
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
@@ -7387,15 +7442,217 @@ mod tests {
     }
 
     #[test]
-    fn test_zz_probe_zero_tangent_carries() {
-        for bound in [Some(3), None] {
-            let program = pass_through_while_program(bound);
-            println!("PROBE jvp {bound:?}: {:?}", program.jvp_with_respect_to(&[0]).map(|program| program.to_string()));
-            println!("PROBE linearize {bound:?}: {:?}", program.linearize_with_respect_to(&[0]).map(|_| ()));
-        }
-        let program = chained_carry_while_program();
-        println!("PROBE chained linearize: {:?}", program.linearize_with_respect_to(&[3]).map(|_| ()));
-        println!("PROBE chained jvp: {:?}", program.jvp_with_respect_to(&[3]).map(|program| program.to_string()));
+    fn test_while_differentiation_keeps_tangents_of_inactive_state_structural() {
+        // `limit` passes through the loop without a tangent, so both forward-mode rules keep its tangent a structural
+        // zero instead of threading a materialized zero through the loop, and linearization succeeds. At `x = 2` with
+        // limit `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and derivative `4 x³ = 32`.
+        let check = |iteration_bound: Option<usize>, expected_jvp: &str| {
+            let program = pass_through_while_program(iteration_bound);
+            assert_eq!(program.jvp_with_respect_to(&[0]).unwrap().to_string(), expected_jvp);
+            let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(10.0).unwrap()])
+                .unwrap();
+            let residuals = primal_outputs.split_off(2);
+            assert_eq!(primal_outputs, vec![Array::scalar(16.0).unwrap(), Array::scalar(10.0).unwrap()]);
+            let mut tangent_inputs = vec![Array::scalar(1.0).unwrap()];
+            tangent_inputs.extend(residuals);
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![Array::scalar(32.0).unwrap(), Array::scalar(0.0).unwrap()]),
+            );
+        };
+
+        // The bounded rule stores residuals and carries tangents for `x` alone.
+        check(
+            Some(3),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:i64[] = zero [type=i64[]]
+                    %4:f64[3] = zero [type=f64[3]]
+                    %5:bool[3] = zero [type=bool[3]]
+                    %6:f64[], %7:f64[], %8:i64[], %9:f64[3], %10:bool[3] = while [iteration_bound=3] %0 %1 %3 %4 %5 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:i64[], %3:f64[3], %4:bool[3] .
+                            let %5:bool[] = compare [direction=LessThan] %0 %1
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:i64[], %3:f64[3], %4:bool[3] .
+                            let %5:f64[] = mul %0 %0
+                                %6:f64[1] = broadcast [output_type=f64[1], output_axes=[]] %0
+                                %7:f64[3] = dynamic_update_slice %3 %6 %2
+                                %8:bool[] = one [type=bool[]]
+                                %9:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %8
+                                %10:bool[3] = dynamic_update_slice %4 %9 %2
+                                %11:i64[] = one [type=i64[]]
+                                %12:i64[] = add %2 %11
+                            in (%5, %1, %12, %7, %10)
+                        },
+                    ]
+                    %11:f64[] = scan [carry_count=1, length=3, reverse=false] %2 %9 %10 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[], %3:bool[] .
+                            let %4:f64[] = condition %3 %1 %2 [
+                                true={
+                                    lambda %0:f64[], %1:f64[] .
+                                    let %2:f64[] = mul %1 %0
+                                        %3:f64[] = mul %1 %0
+                                        %4:f64[] = add %2 %3
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f64[], %1:f64[] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%4)
+                        },
+                    ]
+                    %12:f64[] = zero [type=f64[]]
+                in (%6, %7, %11, %12)
+            "}
+            .trim_end(),
+        );
+
+        // The unbounded rule's fused loop doubles only `x`.
+        check(
+            None,
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[], %5:f64[] = while %0 %1 %2 [
+                    condition={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:bool[] = compare [direction=LessThan] %0 %1
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %0 %0
+                            %4:f64[] = mul %0 %2
+                            %5:f64[] = mul %0 %2
+                            %6:f64[] = add %4 %5
+                        in (%3, %1, %6)
+                    },
+                ]
+                    %6:f64[] = zero [type=f64[]]
+                in (%3, %4, %5, %6)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_while_differentiation_enlivens_state_whose_tangents_become_live() {
+        // Only `source` has a live tangent. It reaches `second` after one iteration and `first` after two, so the carry
+        // fixed point takes two rounds to enliven them, while `counter` never depends on a live tangent and keeps a
+        // structural-zero tangent. Both forward-mode rules carry tangents for exactly `first`, `second`, and `source`.
+        let check = |iteration_bound: Option<usize>, expected_jvp: &str| {
+            let program = chained_carry_while_program(iteration_bound);
+            assert_eq!(program.jvp_with_respect_to(&[3]).unwrap().to_string(), expected_jvp);
+            let linearization = program.linearize_with_respect_to(&[3]).unwrap();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    Array::scalar(3.0).unwrap(),
+                    Array::scalar(1.0).unwrap(),
+                    Array::scalar(1.0).unwrap(),
+                    Array::scalar(7.0).unwrap(),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(4);
+            let mut tangent_inputs = vec![Array::scalar(2.0).unwrap()];
+            tangent_inputs.extend(residuals);
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![
+                    Array::scalar(0.0).unwrap(),
+                    Array::scalar(2.0).unwrap(),
+                    Array::scalar(2.0).unwrap(),
+                    Array::scalar(2.0).unwrap(),
+                ]),
+            );
+        };
+
+        // The bounded rule's tangent scan carries the three live tangents through its guarded steps.
+        check(
+            Some(4),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                let %5:i64[] = zero [type=i64[]]
+                    %6:bool[4] = zero [type=bool[4]]
+                    %7:f64[], %8:f64[], %9:f64[], %10:f64[], %11:i64[], %12:bool[4] = while [iteration_bound=4] %0 %1 \
+                        %2 %3 %5 %6 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:i64[], %5:bool[4] .
+                            let %6:f64[] = const 0.0
+                                %7:bool[] = compare [direction=GreaterThan] %0 %6
+                            in (%7)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:i64[], %5:bool[4] .
+                            let %6:f64[] = const 1.0
+                                %7:f64[] = sub %0 %6
+                                %8:bool[] = one [type=bool[]]
+                                %9:bool[1] = broadcast [output_type=bool[1], output_axes=[]] %8
+                                %10:bool[4] = dynamic_update_slice %5 %9 %4
+                                %11:i64[] = one [type=i64[]]
+                                %12:i64[] = add %4 %11
+                            in (%7, %2, %3, %3, %12, %10)
+                        },
+                    ]
+                    %13:f64[] = zero [type=f64[]]
+                    %14:f64[] = zero [type=f64[]]
+                    %15:f64[], %16:f64[], %17:f64[] = scan [carry_count=3, length=4, reverse=false] %13 %14 %4 %12 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:bool[] .
+                            let %5:f64[], %6:f64[], %7:f64[] = condition %4 %1 %2 %3 [
+                                true={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    in (%1, %2, %2)
+                                },
+                                false={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    in (%0, %1, %2)
+                                },
+                            ]
+                            in (%5, %6, %7)
+                        },
+                    ]
+                    %18:f64[] = zero [type=f64[]]
+                in (%7, %8, %9, %10, %18, %15, %16, %17)
+            "}
+            .trim_end(),
+        );
+
+        // The unbounded rule's fused loop doubles the three live state elements.
+        check(
+            None,
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
+                let %5:f64[] = zero [type=f64[]]
+                    %6:f64[] = zero [type=f64[]]
+                    %7:f64[], %8:f64[], %9:f64[], %10:f64[], %11:f64[], %12:f64[], %13:f64[] = while %0 %1 %2 %3 %5 %6 \
+                        %4 [
+                        condition={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
+                            let %7:f64[] = const 0.0
+                                %8:bool[] = compare [direction=GreaterThan] %0 %7
+                            in (%8)
+                        },
+                        body={
+                            lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[], %6:f64[] .
+                            let %7:f64[] = const 1.0
+                                %8:f64[] = sub %0 %7
+                            in (%8, %2, %3, %3, %5, %6, %6)
+                        },
+                    ]
+                    %14:f64[] = zero [type=f64[]]
+                in (%7, %8, %9, %10, %14, %11, %12, %13)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

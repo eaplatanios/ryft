@@ -2579,15 +2579,26 @@ where
     validate_custom_function_replay(name, non_differentiated_count, context.primal(), inputs, output_types.as_slice())?;
     check_count!("input", inputs, primal_region.input_types().len(), ProgramError);
 
-    // Differentiate with respect to the differentiated inputs whose tangents are active. Inactive inputs (e.g.,
-    // zero-space inputs) receive no tangent input, and outputs that depend on no active input have no tangent.
+    // Differentiate with respect to the differentiated inputs whose tangents are live. Inactive inputs (e.g.,
+    // structural zeros and zero-space inputs) receive no tangent input. The derivative has a tangent for every output
+    // in `output_activity`, which also keys the derived rules, but only the outputs whose derivative depends on a live
+    // tangent input carry a live tangent. The others are structural zeros, so linearization never sees a tangent that
+    // depends on no tangent input. Their liveness comes from the derivative program that produces the tangents, so
+    // that a custom JVP rule may give an output a tangent that the derivative of the primal would not.
     let input_indices = inputs
         .iter()
         .enumerate()
         .skip(non_differentiated_count)
-        .filter_map(|(index, input)| input.is_tangent_active().then_some(index))
+        .filter_map(|(index, input)| (input.is_tangent_active() && !input.tangent().is_zero()).then_some(index))
         .collect::<Vec<_>>();
     let output_activity = primal_region.tangent_output_mask(&input_indices)?;
+    let jvp_program = driver.jvp_program(primal_region, &input_indices)?;
+    let tangent_inputs = (inputs.len()..jvp_program.input_count()).collect::<Vec<_>>();
+    let mut output_depends = jvp_program.output_dependence(&tangent_inputs)?.into_iter().skip(output_count);
+    let output_liveness = output_activity
+        .iter()
+        .map(|&has_slot| has_slot && output_depends.next().unwrap())
+        .collect::<Vec<_>>();
     let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
     let mut tangents = Vec::with_capacity(input_indices.len());
     for &index in &input_indices {
@@ -2624,7 +2635,7 @@ where
     // replays there directly. Otherwise, the linearized primal replays in the primal context and its tangent map
     // replays in the tangent context over the residuals.
     let (outputs, output_tangents) = if std::ptr::eq(context.primal(), context.tangent()) {
-        let program = driver.jvp_program(primal_region, &input_indices)?;
+        let program = jvp_program;
         let mut values = primals;
         values.extend(tangents);
         let mut outputs = match derived_call(CustomRuleDerivationKind::Jvp)? {
@@ -2638,10 +2649,7 @@ where
         // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
         // valid for a pure primal: the effects of any other primal (e.g., reference updates, or reference reads that
         // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
-        let program = driver.jvp_program(primal_region, &input_indices)?;
-        let program_inputs = program.input_ids().to_vec();
-        let (pushforward, _) =
-            program.filtered(&program_inputs, &program.output_ids()[output_count..], &program_inputs)?;
+        let pushforward = jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
         let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
         let mut tangent_inputs =
             primals.into_iter().map(|primal| context.primal_to_tangent(primal)).collect::<Result<Vec<_>, _>>()?;
@@ -2660,15 +2668,17 @@ where
     };
     check_count!("output", outputs, output_count, ProgramError);
     check_count!("output", output_tangents, output_activity.iter().filter(|&&active| active).count(), ProgramError);
+    // The tangents of outputs that are not live are unused zeros, which dead-code elimination removes.
     let mut output_tangents = output_tangents.into_iter();
     outputs
         .into_iter()
         .zip(output_activity)
-        .map(|(primal, active)| {
-            if active {
-                DifferentiationDual::new(primal, MaybeZero::Value(output_tangents.next().unwrap()))
-            } else {
-                DifferentiationDual::new_with_zero_tangent(primal)
+        .zip(output_liveness)
+        .map(|((primal, has_tangent), live)| {
+            let tangent = has_tangent.then(|| output_tangents.next().unwrap());
+            match tangent.filter(|_| live) {
+                Some(tangent) => DifferentiationDual::new(primal, MaybeZero::Value(tangent)),
+                None => DifferentiationDual::new_with_zero_tangent(primal),
             }
         })
         .collect::<Result<Vec<_>, _>>()
@@ -6149,7 +6159,9 @@ mod tests {
     }
 
     #[test]
-    fn test_zz_probe_custom_function_zero_tangents() {
+    fn test_custom_function_differentiation_keeps_tangents_of_inactive_outputs_structural() {
+        // The primal maps `(x, y)` to `(sin(x), sin(y))` and only `x` has a live tangent, so the second output depends
+        // on no live tangent and keeps a structural-zero tangent, which lets linearization succeed.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -6168,8 +6180,19 @@ mod tests {
             vec![primal],
             vec![scalar_type.clone(), scalar_type],
         );
-        println!("PROBE custom mixed linearize: {:?}", program.linearize_with_respect_to(&[0]).map(|_| ()));
-        println!("PROBE custom mixed jvp: {:?}", program.jvp_with_respect_to(&[0]).map(|p| p.to_string()));
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![Array::scalar(0.7f64).unwrap(), Array::scalar(1.1f64).unwrap()])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        assert_eq!(primal_outputs, vec![Array::scalar(0.7f64.sin()).unwrap(), Array::scalar(1.1f64.sin()).unwrap()]);
+        let mut tangent_inputs = vec![Array::scalar(2f64).unwrap()];
+        tangent_inputs.extend(residuals);
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![Array::scalar(2.0 * 0.7f64.cos()).unwrap(), Array::scalar(0f64).unwrap()]),
+        );
     }
 
     #[test]
