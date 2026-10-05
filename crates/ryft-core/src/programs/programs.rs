@@ -506,10 +506,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// program, rebuilding and structurally reclosing the complete [`RegionArena`]. Static refinements are validated
     /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
     /// program.
-    pub fn with_instantiated_type_identities<'p, 't>(
-        &'p self,
-        input_types: &'t [V::Type],
-    ) -> Result<Cow<'p, Self>, ProgramError> {
+    pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<Self>, ProgramError> {
         let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));
@@ -1267,6 +1264,36 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             )?,
             live_input_indices,
         ))
+    }
+
+    /// Returns the flat subprogram of this [`Program`] that keeps its whole input boundary and exposes the outputs at
+    /// the positions listed in `outputs`, in that order. This is [`Self::filtered`] over output positions rather than
+    /// [`AtomId`]s for the common case of restricting a program to some of its outputs (e.g., restricting a derived
+    /// program to its live tangent outputs). Every input is kept alive, so the input boundary is unchanged even when
+    /// the selected outputs no longer read some inputs, while instructions that no longer contribute to a selected
+    /// output are removed unless they have observable effects or deferred work. Selecting every output in order returns
+    /// an unchanged flat copy of this program, which also keeps the transform caches of its entry region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] when a position in `outputs` is out of range.
+    pub fn with_outputs(&self, outputs: &[usize]) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+    where
+        O: Clone,
+    {
+        let output_count = self.output_count();
+        if let Some(index) = outputs.iter().find(|&&index| index >= output_count) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("output index {index} is out of range for a program with {output_count} outputs"),
+            });
+        }
+
+        if outputs.iter().copied().eq(0..output_count) {
+            return Ok(self.to_flat_program());
+        }
+
+        let output_ids = outputs.iter().map(|&index| self.output_ids()[index]).collect::<Vec<_>>();
+        Ok(self.filtered(self.input_ids(), &output_ids, self.input_ids())?.0)
     }
 
     /// Analyzes entry-region liveness for a filtered program boundary. `inputs` must be a deduplicated collection of
@@ -4488,6 +4515,57 @@ mod tests {
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_with_outputs() {
+        // Selection keeps the whole input boundary, even inputs that the selected outputs no longer read,
+        // removes the instructions that no selected output needs, and follows the requested output order.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64));
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, left], None).unwrap()[0];
+        let program = builder
+            .build::<(Array, Array, Array), (Array, Array, Array)>(
+                vec![sum, square, right],
+                (Placeholder, Placeholder, Placeholder),
+                (Placeholder, Placeholder, Placeholder),
+            )
+            .unwrap();
+        assert_eq!(program.with_outputs(&[0, 1, 2]).unwrap().to_string(), program.to_string());
+        assert_eq!(
+            program.with_outputs(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = mul %1 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.with_outputs(&[2, 0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = add %1 %2
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.with_outputs(&[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:f64[], %2:f64[] .
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(matches!(
+            program.with_outputs(&[3]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "output index 3 is out of range for a program with 3 outputs",
+        ));
     }
 
     #[test]
