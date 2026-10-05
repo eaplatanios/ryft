@@ -331,10 +331,10 @@ impl Array {
     /// Returns an error if either array type cannot describe materialized storage, if `Input` or `Output` represents
     /// a different [`DataType`] than the corresponding array type, if the logical element counts differ, or if
     /// `function` fails.
-    pub fn map_elements<Input: ArrayElement, Output: ArrayElement, F: Fn(Input) -> Result<Output, ProgramError>>(
+    pub fn map_elements<Input: ArrayElement, Output: ArrayElement>(
         &self,
         output_type: ArrayType,
-        function: F,
+        function: impl Fn(Input) -> Result<Output, ProgramError>,
     ) -> Result<Self, ProgramError> {
         if self.r#type.data_type() != Input::data_type() {
             return Err(TypeError::invalid(format!(
@@ -384,15 +384,11 @@ impl Array {
     ///   - `output_type`: Result type, including its element type, broadcast shape, and storage layout.
     ///     Operation-specific sharding and reduction metadata constraints must be checked by the caller.
     ///   - `function`: Function applied to each decoded pair of `Input` elements.
-    pub fn map_element_pairs<
-        Input: ArrayElement,
-        Output: ArrayElement,
-        F: Fn(Input, Input) -> Result<Output, ProgramError>,
-    >(
+    pub fn map_element_pairs<Input: ArrayElement, Output: ArrayElement>(
         &self,
         rhs: &Self,
         output_type: ArrayType,
-        function: F,
+        function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
     ) -> Result<Self, ProgramError> {
         if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
             return Err(TypeError::invalid(format!(
