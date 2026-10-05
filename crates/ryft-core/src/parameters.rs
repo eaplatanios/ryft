@@ -97,6 +97,8 @@ use half::{bf16, f16};
 use paste::paste;
 use thiserror::Error;
 
+use crate::programs::ProgramError;
+
 /// Represents [`Parameter`]-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParameterError {
@@ -591,6 +593,9 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// reference Ryft types from the generated code. This is primarily meant for deriving implementations inside wrapper
 /// crates that re-export `ryft` under a different path. It should not be needed for the majority of use cases. Note
 /// also that the `#[ryft(...)]` attribute is not supported on individual struct fields or enum variants.
+///
+/// The derived implementations only traverse and rebuild containers. To apply capabilities or arithmetic to every
+/// parameter of a container (e.g., `model - gradients * learning_rate`), wrap it in a [`Parameterwise`].
 ///
 /// ## Examples
 ///
@@ -2419,19 +2424,159 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
     }
 }
 
+/// Parameterwise view of a [`Parameterized`] structure `S` over parameters of type `P`, which applies capabilities and
+/// arithmetic to every parameter of the structure.
+///
+/// [`Parameterized`] is responsible for traversal and reconstruction only. Wrapping a structure in a [`Parameterwise`]
+/// selects parameterwise semantics explicitly: [`map`](Self::map) applies a function to every parameter, and
+/// [`zip_map`](Self::zip_map) applies a function to the corresponding parameters of two structures. Any leaf function
+/// can be applied this way, including user-defined ones, without registering it anywhere. On top of these, the wrapper
+/// implements the elementwise capabilities (e.g., [`Add`](crate::Add), [`Tanh`](crate::Tanh), etc.) whenever `P`
+/// implements them, together with the panicking `std::ops` operators `Add`, `Sub`, `Mul`, `Div`, and `Neg`. Those
+/// operators combine two wrappers, or a wrapper with a single parameter that is broadcast to every parameter on the
+/// right. They delegate to the corresponding operators of `P`, so that staged tracers keep their deferred error
+/// reporting. A parameter cannot appear on the left (e.g., `rate * model`) because
+/// `impl<P> std::ops::Mul<Parameterwise<P, S>> for P` would violate the orphan rules (E0210). The wrapper belongs to
+/// the [`Capability`](crate::Capability) universe of `P`, so that default universe parameters resolve exactly as they
+/// do for `P`.
+///
+/// Two structures correspond when they have the same sequence of [`ParameterPath`]s (refer to
+/// [`Parameterized::parameter_paths`]), which mirrors the structure-equality rule of JAX's
+/// [`jax.tree.map`](https://docs.jax.dev/en/latest/_autosummary/jax.tree.map.html) without its static auxiliary data:
+/// non-parameter (i.e., static) fields are not compared, and outputs take them from the left input. Equal parameter
+/// counts alone are not sufficient, but differences that parameter paths cannot observe (e.g., static metadata) are
+/// not detected.
+///
+/// [`Parameterwise`] owns its structure, and converting a structure into it (e.g., through [`From`] or [`Into`])
+/// or back (through [`into_inner`](Self::into_inner)) neither traverses nor clones it. Functions that accept
+/// `impl Into<Parameterwise<P, S>>` therefore accept both plain and already-wrapped structures.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, Parameterwise};
+/// let model = vec![Array::scalar(1.0f32).unwrap(), Array::scalar(2.0f32).unwrap()];
+/// let gradients = vec![Array::scalar(10.0f32).unwrap(), Array::scalar(20.0f32).unwrap()];
+/// let learning_rate = Array::scalar(0.1f32).unwrap();
+/// let model = Parameterwise::from(model) - Parameterwise::from(gradients) * learning_rate;
+/// assert_eq!(model.into_inner(), vec![Array::scalar(0.0f32).unwrap(), Array::scalar(0.0f32).unwrap()]);
+/// ```
+pub struct Parameterwise<P, S> {
+    /// Wrapped parameterized value.
+    value: S,
+
+    /// Marker for the parameter type that selects how [`Self::value`] is traversed.
+    parameter: PhantomData<fn() -> P>,
+}
+
+impl<P, S> Parameterwise<P, S> {
+    /// Wraps `value`, selecting `P` as the parameter type through which it is traversed.
+    #[inline]
+    pub fn new(value: S) -> Self {
+        Self { value, parameter: PhantomData }
+    }
+
+    /// Returns a reference to the wrapped structure.
+    #[inline]
+    pub fn as_inner(&self) -> &S {
+        &self.value
+    }
+
+    /// Consumes this [`Parameterwise`] and returns the wrapped structure.
+    #[inline]
+    pub fn into_inner(self) -> S {
+        self.value
+    }
+}
+
+impl<P: Parameter, S: Parameterized<P>> Parameterwise<P, S> {
+    /// Applies `function` to every parameter of this structure in parameter order, and returns the structure that
+    /// holds the outputs, with the static fields of this structure. Stops at the first error that `function` returns.
+    /// A structure without parameters is reconstructed without calling `function`.
+    pub fn map<F: FnMut(&P) -> Result<P, ProgramError>>(&self, mut function: F) -> Result<Self, ProgramError> {
+        let parameters = self.value.parameters().map(|parameter| function(parameter)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(S::from_parameters(self.value.parameter_structure(), parameters)?))
+    }
+
+    /// Applies `function` to the corresponding parameters of this structure and `right` in parameter order, and returns
+    /// the structure that holds the outputs, with the static fields of this structure. Stops at the first error that
+    /// `function` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::InvalidArgument`] without calling `function` if the two structures do not have the
+    /// same parameter paths.
+    pub fn zip_map<F: FnMut(&P, &P) -> Result<P, ProgramError>>(
+        &self,
+        right: &Self,
+        mut function: F,
+    ) -> Result<Self, ProgramError> {
+        self.check_matching_parameter_paths(right)?;
+        let parameters = self
+            .value
+            .parameters()
+            .zip(right.value.parameters())
+            .map(|(left, right)| function(left, right))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(S::from_parameters(self.value.parameter_structure(), parameters)?))
+    }
+
+    /// Returns an error if this structure and `right` do not have the same parameter paths.
+    pub(crate) fn check_matching_parameter_paths(&self, right: &Self) -> Result<(), ProgramError> {
+        if self.value.parameter_paths().eq(right.value.parameter_paths()) {
+            Ok(())
+        } else {
+            Err(ProgramError::InvalidArgument {
+                message: "parameterwise inputs must have the same parameter structure".to_string(),
+            })
+        }
+    }
+}
+
+impl<P, S: Clone> Clone for Parameterwise<P, S> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(self.value.clone())
+    }
+}
+
+impl<P, S: Debug> Debug for Parameterwise<P, S> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Parameterwise").field(&self.value).finish()
+    }
+}
+
+impl<P, S: PartialEq> PartialEq for Parameterwise<P, S> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<P: Parameter, S: Parameterized<P>> From<S> for Parameterwise<P, S> {
+    #[inline]
+    fn from(value: S) -> Self {
+        Self::new(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
+    // TODO(eaplatanios): Do we still need this given the `extern` bits in `lib.rs`?
     /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
     pub mod ryft {
         pub use ryft_macros::Parameterized;
 
         pub use crate::parameters::{
             Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
-            PathPrefixedParameterIterator, Placeholder,
+            Parameterwise, PathPrefixedParameterIterator, Placeholder,
         };
     }
+
+    use crate::programs::ProgramError;
 
     use ryft::*;
 
@@ -2991,5 +3136,156 @@ mod tests {
                 "$[\"right\"].1".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn test_parameterwise() {
+        // Wrapping and unwrapping neither traverse nor clone the structure.
+        let wrapped = Parameterwise::<i32, _>::new(vec![1i32, 2]);
+        assert_eq!(wrapped.as_inner(), &vec![1, 2]);
+        assert_eq!(wrapped.clone().into_inner(), vec![1, 2]);
+        assert_eq!(format!("{wrapped:?}"), "Parameterwise([1, 2])");
+        assert_eq!(wrapped, Parameterwise::from(vec![1i32, 2]));
+        assert_ne!(wrapped, Parameterwise::from(vec![1i32, 3]));
+
+        // `Into` accepts both plain and already-wrapped structures at function boundaries.
+        fn sum<L: Into<Parameterwise<i32, Vec<i32>>>, R: Into<Parameterwise<i32, Vec<i32>>>>(
+            left: L,
+            right: R,
+        ) -> Vec<i32> {
+            (left.into() + right.into()).into_inner()
+        }
+
+        assert_eq!(sum(vec![1, 2], vec![10, 20]), vec![11, 22]);
+        assert_eq!(sum(vec![1, 2], Parameterwise::from(vec![10, 20])), vec![11, 22]);
+        assert_eq!(sum(Parameterwise::from(vec![1, 2]), vec![10, 20]), vec![11, 22]);
+        assert_eq!(sum(Parameterwise::from(vec![1, 2]), Parameterwise::from(vec![10, 20])), vec![11, 22]);
+    }
+
+    #[test]
+    fn test_parameterwise_map() {
+        #[derive(Clone, Debug, PartialEq, Parameterized)]
+        enum Branch<P: Parameter> {
+            Leaf(P),
+            Pair { left: P, right: Option<P> },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Parameterized)]
+        struct Model<P: Parameter> {
+            weights: Vec<P>,
+            scales: (P, Option<P>),
+            branches: BTreeMap<String, Branch<P>>,
+            name: &'static str,
+        }
+
+        let model = Model {
+            weights: vec![1i32, 2],
+            scales: (3, None),
+            branches: BTreeMap::from([
+                ("a".to_string(), Branch::Leaf(4)),
+                ("b".to_string(), Branch::Pair { left: 5, right: Some(6) }),
+            ]),
+            name: "model",
+        };
+
+        // Mapping preserves the container shape, enum variants, optional fields, and static fields.
+        assert_eq!(
+            Parameterwise::from(model.clone())
+                .map(|parameter| Ok(parameter * 10))
+                .map(Parameterwise::into_inner),
+            Ok(Model {
+                weights: vec![10, 20],
+                scales: (30, None),
+                branches: BTreeMap::from([
+                    ("a".to_string(), Branch::Leaf(40)),
+                    ("b".to_string(), Branch::Pair { left: 50, right: Some(60) }),
+                ]),
+                name: "model",
+            }),
+        );
+
+        // A single leaf is its own structure, and an empty structure is rebuilt without calling the function.
+        assert_eq!(Parameterwise::<i32, i32>::from(7).map(|parameter| Ok(parameter + 1)), Ok(Parameterwise::new(8)));
+        assert_eq!(
+            Parameterwise::<i32, Vec<i32>>::from(Vec::new()).map(|_| panic!("the function must not be called")),
+            Ok(Parameterwise::new(Vec::new())),
+        );
+
+        // Mapping stops at the first error.
+        let mut visited = Vec::new();
+        assert_eq!(
+            Parameterwise::from(model).map(|parameter| {
+                visited.push(*parameter);
+                if *parameter == 2 {
+                    Err(ProgramError::InvalidArgument { message: "rejected parameter".to_string() })
+                } else {
+                    Ok(*parameter)
+                }
+            }),
+            Err(ProgramError::InvalidArgument { message: "rejected parameter".to_string() }),
+        );
+        assert_eq!(visited, vec![1, 2]);
+
+        // Neither the leaves nor the container need to implement `Clone`.
+        #[derive(Debug, PartialEq)]
+        struct Leaf(i32);
+
+        impl Parameter for Leaf {}
+
+        assert_eq!(
+            Parameterwise::<Leaf, _>::from(vec![Leaf(1), Leaf(2)])
+                .map(|parameter| Ok(Leaf(-parameter.0)))
+                .map(Parameterwise::into_inner),
+            Ok(vec![Leaf(-1), Leaf(-2)]),
+        );
+    }
+
+    #[test]
+    fn test_parameterwise_zip_map() {
+        #[derive(Clone, Debug, PartialEq, Parameterized)]
+        enum Branch<P: Parameter> {
+            First(P),
+            Second(P),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Parameterized)]
+        struct Model<P: Parameter> {
+            weights: Vec<P>,
+            bias: Option<P>,
+            branch: Branch<P>,
+            name: &'static str,
+        }
+
+        let model = |weights: Vec<i32>, bias: Option<i32>, branch: Branch<i32>, name: &'static str| {
+            Parameterwise::from(Model { weights, bias, branch, name })
+        };
+        let left = model(vec![1, 2], Some(3), Branch::First(4), "left");
+
+        // Corresponding parameters are combined in parameter order, and static fields come from the left input.
+        assert_eq!(
+            left.zip_map(&model(vec![10, 20], Some(30), Branch::First(40), "right"), |left, right| Ok(left + right)),
+            Ok(model(vec![11, 22], Some(33), Branch::First(44), "left")),
+        );
+
+        // Structures with different parameter paths are rejected before the function is called, including structures
+        // with different optional fields, different parameter counts, and equal counts but different enum variants.
+        let mismatch = Err(ProgramError::InvalidArgument {
+            message: "parameterwise inputs must have the same parameter structure".to_string(),
+        });
+        let reject = |_: &i32, _: &i32| -> Result<i32, ProgramError> { panic!("the function must not be called") };
+        assert_eq!(left.zip_map(&model(vec![10, 20], None, Branch::First(40), "left"), reject), mismatch);
+        assert_eq!(left.zip_map(&model(vec![10], Some(30), Branch::First(40), "left"), reject), mismatch);
+        assert_eq!(left.zip_map(&model(vec![10, 20], Some(30), Branch::Second(40), "left"), reject), mismatch);
+
+        // Combining stops at the first error.
+        let mut visited = Vec::new();
+        assert_eq!(
+            left.zip_map(&left, |left, right| {
+                visited.push((*left, *right));
+                Err(ProgramError::InvalidArgument { message: "rejected parameter".to_string() })
+            }),
+            Err(ProgramError::InvalidArgument { message: "rejected parameter".to_string() }),
+        );
+        assert_eq!(visited, vec![(1, 1)]);
     }
 }
