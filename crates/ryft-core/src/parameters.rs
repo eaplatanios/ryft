@@ -2511,7 +2511,11 @@ impl<P: Parameter, S: Parameterized<P>> Parameterwise<P, S> {
         right: &Self,
         mut function: F,
     ) -> Result<Self, ProgramError> {
-        self.check_matching_parameter_paths(right)?;
+        if !self.value.parameter_paths().eq(right.value.parameter_paths()) {
+            return Err(ProgramError::InvalidArgument {
+                message: "parameterwise inputs must have the same parameter structure".to_string(),
+            });
+        }
         let parameters = self
             .value
             .parameters()
@@ -2519,17 +2523,6 @@ impl<P: Parameter, S: Parameterized<P>> Parameterwise<P, S> {
             .map(|(left, right)| function(left, right))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self::new(S::from_parameters(self.value.parameter_structure(), parameters)?))
-    }
-
-    /// Returns an error if this structure and `right` do not have the same parameter paths.
-    pub(crate) fn check_matching_parameter_paths(&self, right: &Self) -> Result<(), ProgramError> {
-        if self.value.parameter_paths().eq(right.value.parameter_paths()) {
-            Ok(())
-        } else {
-            Err(ProgramError::InvalidArgument {
-                message: "parameterwise inputs must have the same parameter structure".to_string(),
-            })
-        }
     }
 }
 
@@ -2565,20 +2558,9 @@ impl<P: Parameter, S: Parameterized<P>> From<S> for Parameterwise<P, S> {
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    // TODO(eaplatanios): Do we still need this given the `extern` bits in `lib.rs`?
-    /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
-    pub mod ryft {
-        pub use ryft_macros::Parameterized;
+    use ryft_macros::Parameterized;
 
-        pub use crate::parameters::{
-            Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
-            Parameterwise, PathPrefixedParameterIterator, Placeholder,
-        };
-    }
-
-    use crate::programs::ProgramError;
-
-    use ryft::*;
+    use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum TestMappingError {
