@@ -2513,7 +2513,7 @@ impl<P: Parameter, S: Parameterized<P>> Parameterwise<P, S> {
     ) -> Result<Self, ProgramError> {
         if !self.value.parameter_paths().eq(right.value.parameter_paths()) {
             return Err(ProgramError::InvalidArgument {
-                message: "parameterwise inputs must have the same parameter structure".to_string(),
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
             });
         }
         let parameters = self
@@ -3252,7 +3252,7 @@ mod tests {
         // Structures with different parameter paths are rejected before the function is called, including structures
         // with different optional fields, different parameter counts, and equal counts but different enum variants.
         let mismatch = Err(ProgramError::InvalidArgument {
-            message: "parameterwise inputs must have the same parameter structure".to_string(),
+            message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
         });
         let reject = |_: &i32, _: &i32| -> Result<i32, ProgramError> { panic!("the function must not be called") };
         assert_eq!(left.zip_map(&model(vec![10, 20], None, Branch::First(40), "left"), reject), mismatch);

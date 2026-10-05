@@ -1267,12 +1267,6 @@ macro_rules! define_elementwise_capability {
             }
         }
 
-        $crate::impl_array_ir_projected_capability! {
-            $capability {
-                fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Self;
-            }
-        }
-
         impl<
             __T,
             __P: $crate::Parameter + $capability<__T>,
@@ -1282,6 +1276,12 @@ macro_rules! define_elementwise_capability {
             #[inline]
             fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError> {
                 self.map(|parameter| <__P as $capability<__T>>::$accuracy_method(parameter, accuracy))
+            }
+        }
+
+        $crate::arrays::macros::impl_array_ir_projected_capability! {
+            $capability {
+                fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Self;
             }
         }
     };
@@ -1341,12 +1341,6 @@ macro_rules! define_elementwise_capability {
             }
         }
 
-        $crate::impl_array_ir_projected_capability! {
-            $capability {
-                fn $method(&self) -> Self;
-            }
-        }
-
         impl<
             __T,
             __P: $crate::Parameter + $capability<__T>,
@@ -1356,6 +1350,12 @@ macro_rules! define_elementwise_capability {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
                 self.map(|parameter| <__P as $capability<__T>>::$method(parameter))
+            }
+        }
+
+        $crate::arrays::macros::impl_array_ir_projected_capability! {
+            $capability {
+                fn $method(&self) -> Self;
             }
         }
     };
@@ -1419,12 +1419,6 @@ macro_rules! define_elementwise_capability {
             }
         }
 
-        $crate::impl_array_ir_projected_capability! {
-            $capability {
-                fn $method(&self, $argument: &Self) -> Self;
-            }
-        }
-
         impl<
             __T,
             __P: $crate::Parameter + $capability<__T>,
@@ -1436,307 +1430,13 @@ macro_rules! define_elementwise_capability {
                 self.zip_map($argument, |left, right| <__P as $capability<__T>>::$method(left, right))
             }
         }
-    };
-}
 
-// TODO(eaplatanios): Review this.
-/// Implements an array capability for composite array IR values by delegating to their array members.
-///
-/// Every capability `X<T>` that is parameterized by its universe `T` (see
-/// [`Capability`](crate::operations::Capability)) and implemented for homogeneous array values (`X<ArrayType>`) gains
-/// two composite implementations (`X<ArrayIrType>`):
-///
-///   - a blanket implementation for every [`Value`](crate::Value) over [`ArrayIrType`](crate::arrays::ArrayIrType)
-///     whose [`ValueProjection`](crate::ValueProjection) into [`ArrayType`](crate::arrays::ArrayType) is a
-///     [`ProjectedValue`](crate::ProjectedValue) (i.e., every composite tracer), which projects the receiver and the
-///     `&Self` inputs, applies `X<ArrayType>` to the projections, and lifts the output back, and
-///   - a concrete implementation for [`ArrayIrValue<A>`](crate::arrays::ArrayIrValue) that applies `X<ArrayType>` to
-///     its array members.
-///
-/// Projecting a first-class dimension or reference member fails with the projection's
-/// [`TypeError`](crate::TypeError), exactly as an explicit projection does. Staged composite programs therefore contain
-/// the same array instructions that homogeneous programs contain, and batching and differentiation reach the
-/// homogeneous rules through the composite member projection.
-///
-/// The blanket implementation requires that no generic implementation of `X` applies to composite values, which holds
-/// for provider-backed and closed elementwise capabilities (whose operations implement
-/// [`Operation`](crate::Operation) and [`OperationProvider`](crate::OperationProvider) only for
-/// [`DataType`](crate::arrays::DataType) and [`ArrayType`](crate::arrays::ArrayType)) and for capabilities whose
-/// generic implementation is bounded by `Value<Type = ArrayType>`. Adding an `ArrayIrType` provider for such an
-/// operation would make the implementations overlap.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// impl_array_ir_projected_capability! {
-///     Dot<Self> {
-///         fn dot(&self, right: &Self, dimension_numbers: &DotDimensionNumbers) -> Self;
-///     }
-/// }
-/// ```
-///
-/// # Parameters
-///
-///   - `$capability`: Universe-parameterized capability trait, optionally followed by `<Self>` when the trait takes a
-///     right-input type parameter before its universe (e.g., `Dot<Rhs = Self, T>`).
-///   - `fn ...;`: Required functions of the capability, with any function generics written in brackets after the name
-///     (e.g., `fn reverse[A: Into<Axes>](&self, axes: A) -> Self;`, because declarative macros cannot match `<...>`
-///     lists). Each function takes `&self`, any number of `&Self`, `&[Self]`, and `Option<&Self>` inputs (which are
-///     projected), and any number of other inputs (which are passed through unchanged), and returns `Self`,
-///     `(Self, Self)`, `Vec<Self>`, or `(Self, Vec<Self>)`.
-#[macro_export]
-macro_rules! impl_array_ir_projected_capability {
-    // This branch accepts a capability whose only type parameter is its universe.
-    ($capability:ident { $($functions:tt)* }) => {
-        $crate::impl_array_ir_projected_capability!(
-            @implementation
-            [__V: $crate::Value<Type = $crate::arrays::ArrayIrType>
-                + $crate::ValueProjection<
-                    $crate::arrays::ArrayType,
-                    Projected = $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
-                >]
-            [$capability<$crate::arrays::ArrayIrType>]
-            [__V]
-            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>:
-                $capability<$crate::arrays::ArrayType>]
-            [$capability<$crate::arrays::ArrayType>]
-            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>]
-            { $($functions)* }
-        );
-        $crate::impl_array_ir_projected_capability!(
-            @implementation
-            [__A: $crate::Value<Type = $crate::arrays::ArrayType> + $capability<$crate::arrays::ArrayType>]
-            [$capability<$crate::arrays::ArrayIrType>]
-            [$crate::arrays::ArrayIrValue<__A>]
-            []
-            [$capability<$crate::arrays::ArrayType>]
-            [__A]
-            { $($functions)* }
-        );
-    };
-
-    // This branch accepts a capability whose right-input type parameter precedes its universe and defaults to `Self`.
-    ($capability:ident<Self> { $($functions:tt)* }) => {
-        $crate::impl_array_ir_projected_capability!(
-            @implementation
-            [__V: $crate::Value<Type = $crate::arrays::ArrayIrType>
-                + $crate::ValueProjection<
-                    $crate::arrays::ArrayType,
-                    Projected = $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
-                >]
-            [$capability<__V, $crate::arrays::ArrayIrType>]
-            [__V]
-            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>: $capability<
-                $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
-                $crate::arrays::ArrayType,
-            >]
-            [$capability<$crate::ProjectedValue<$crate::arrays::ArrayType, __V>, $crate::arrays::ArrayType>]
-            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>]
-            { $($functions)* }
-        );
-        $crate::impl_array_ir_projected_capability!(
-            @implementation
-            [__A: $crate::Value<Type = $crate::arrays::ArrayType> + $capability<__A, $crate::arrays::ArrayType>]
-            [$capability<$crate::arrays::ArrayIrValue<__A>, $crate::arrays::ArrayIrType>]
-            [$crate::arrays::ArrayIrValue<__A>]
-            []
-            [$capability<__A, $crate::arrays::ArrayType>]
-            [__A]
-            { $($functions)* }
-        );
-    };
-
-    // This branch generates one implementation from its generics, trait references, implementing type, bounds on the
-    // projected value, and functions.
-    (
-        @implementation
-        [$($generics:tt)*]
-        [$($composite_trait:tt)*]
-        [$self_type:ty]
-        [$($where_clause:tt)*]
-        $projected_trait:tt
-        $projected_type:tt
-        { $($functions:tt)* }
-    ) => {
-        impl<$($generics)*> $($composite_trait)* for $self_type
-        where
-            $($where_clause)*
-        {
-            $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($functions)*);
+        $crate::arrays::macros::impl_array_ir_projected_capability! {
+            $capability {
+                fn $method(&self, $argument: &Self) -> Self;
+            }
         }
     };
-
-    // This branch munches one function that returns `Self`.
-    (
-        @functions $projected_trait:tt $projected_type:tt
-        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> Self; $($rest:tt)*
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type [single] $function [$($($generics)*)?] [] []
-            $($($inputs)*)?
-        );
-        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
-    };
-
-    // This branch munches one function that returns a pair of values.
-    (
-        @functions $projected_trait:tt $projected_type:tt
-        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> (Self, Self); $($rest:tt)*
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type [pair] $function [$($($generics)*)?] [] []
-            $($($inputs)*)?
-        );
-        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
-    };
-
-    // This branch munches one function that returns a vector of values.
-    (
-        @functions $projected_trait:tt $projected_type:tt
-        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> Vec<Self>; $($rest:tt)*
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type [vector] $function [$($($generics)*)?] [] []
-            $($($inputs)*)?
-        );
-        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
-    };
-
-    // This branch munches one function that returns a value and a vector of values.
-    (
-        @functions $projected_trait:tt $projected_type:tt
-        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> (Self, Vec<Self>); $($rest:tt)*
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type [value_and_vector] $function [$($($generics)*)?] [] []
-            $($($inputs)*)?
-        );
-        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
-    };
-
-    // This branch ends the function munching.
-    (@functions $projected_trait:tt $projected_type:tt) => {};
-
-    // This branch munches a projected `&Self` input.
-    (
-        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
-        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: &Self $(, $($rest:tt)*)?
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type $output $function $generics
-            [$($parameters)* $input: &Self,] [$($arguments)* [projected $input]] $($($rest)*)?
-        );
-    };
-
-    // This branch munches a projected `&[Self]` input.
-    (
-        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
-        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: &[Self] $(, $($rest:tt)*)?
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type $output $function $generics
-            [$($parameters)* $input: &[Self],] [$($arguments)* [projected_slice $input]] $($($rest)*)?
-        );
-    };
-
-    // This branch munches a projected `Option<&Self>` input.
-    (
-        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
-        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: Option<&Self> $(, $($rest:tt)*)?
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type $output $function $generics
-            [$($parameters)* $input: Option<&Self>,] [$($arguments)* [projected_option $input]] $($($rest)*)?
-        );
-    };
-
-    // This branch munches a passed-through input.
-    (
-        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
-        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: $input_type:ty $(, $($rest:tt)*)?
-    ) => {
-        $crate::impl_array_ir_projected_capability!(
-            @function $projected_trait $projected_type $output $function $generics
-            [$($parameters)* $input: $input_type,] [$($arguments)* [passed $input]] $($($rest)*)?
-        );
-    };
-
-    // This branch emits a function once every input has been munched. Projected inputs are projected into their array
-    // members before the array capability is applied, and its outputs are lifted back into composite values.
-    (
-        @function [$($projected_trait:tt)*] [$projected_type:ty] $output:tt $function:ident [$($generics:tt)*]
-        [$($parameters:tt)*] [$([$kind:ident $argument:ident])*]
-    ) => {
-        #[inline]
-        fn $function<$($generics)*>(
-            &self,
-            $($parameters)*
-        ) -> Result<$crate::impl_array_ir_projected_capability!(@output $output), $crate::ProgramError> {
-            let receiver = $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(self.clone())?;
-            $($crate::impl_array_ir_projected_capability!(@argument $kind $argument);)*
-            let output = <$projected_type as $($projected_trait)*>::$function(
-                &receiver,
-                $($crate::impl_array_ir_projected_capability!(@pass $kind $argument)),*
-            )?;
-            Ok($crate::impl_array_ir_projected_capability!(@lift $output output))
-        }
-    };
-
-    // These branches name the output type of a function.
-    (@output [single]) => { Self };
-    (@output [pair]) => { (Self, Self) };
-    (@output [vector]) => { Vec<Self> };
-    (@output [value_and_vector]) => { (Self, Vec<Self>) };
-
-    // These branches lift the projected output of a function back into composite values.
-    (@lift [single] $output:ident) => {
-        <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected($output)
-    };
-    (@lift [pair] $output:ident) => {{
-        let (first, second) = $output;
-        (
-            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(first),
-            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(second),
-        )
-    }};
-    (@lift [vector] $output:ident) => {
-        $output
-            .into_iter()
-            .map(<Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected)
-            .collect()
-    };
-    (@lift [value_and_vector] $output:ident) => {{
-        let (first, rest) = $output;
-        (
-            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(first),
-            rest.into_iter()
-                .map(<Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected)
-                .collect(),
-        )
-    }};
-
-    // These branches project one input, rebinding it under its own name.
-    (@argument projected $argument:ident) => {
-        let $argument = $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected($argument.clone())?;
-    };
-    (@argument projected_slice $argument:ident) => {
-        let $argument = $argument
-            .iter()
-            .map(|value| $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(value.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-    };
-    (@argument projected_option $argument:ident) => {
-        let $argument = $argument
-            .map(|value| $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(value.clone()))
-            .transpose()?;
-    };
-    (@argument passed $argument:ident) => {};
-
-    // These branches pass one (possibly projected) input to the array capability.
-    (@pass projected $argument:ident) => { &$argument };
-    (@pass projected_slice $argument:ident) => { $argument.as_slice() };
-    (@pass projected_option $argument:ident) => { $argument.as_ref() };
-    (@pass passed $argument:ident) => { $argument };
 }
 
 /// Implements [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) by delegating to one of
@@ -4165,7 +3865,7 @@ macro_rules! impl_parameterwise_operator {
             fn $method(self, right: Self) -> Self {
                 let (left, right) = (self.into_inner(), right.into_inner());
                 if !left.parameter_paths().eq(right.parameter_paths()) {
-                    panic!("binary parameterwise operator inputs must have the same parameter structure");
+                    panic!("binary parameterwise operation inputs must have the same parameter structure");
                 }
                 let structure = left.parameter_structure();
                 let parameters = left
@@ -5738,9 +5438,9 @@ mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, Capability,
-        DivOperation, ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation,
-        Reduce, ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
+        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
+        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation, Reduce,
+        ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -5749,7 +5449,7 @@ mod tests {
     use crate::programs::{
         EmptyRegionDriver, MaybeZero, NoReferenceTransform, Operation, OperationProvider, ProgramError,
         ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -6817,88 +6517,6 @@ mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_impl_array_ir_projected_capability() {
-        // Two test capabilities cover the supported signature shapes: projected `&Self` inputs, passed-through inputs,
-        // functions without inputs, several functions per capability, and a right-input type parameter that precedes
-        // the universe.
-        trait Scale<T = <Self as Capability>::Universe>: Capability + Sized {
-            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError>;
-            fn double(&self) -> Result<Self, ProgramError>;
-        }
-
-        trait Combine<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Sized {
-            fn combine(&self, right: &Rhs) -> Result<Self, ProgramError>;
-        }
-
-        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Scale<ArrayType> for V {
-            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError> {
-                (0..count).try_fold(self.clone(), |sum, _| sum.add(right))
-            }
-
-            fn double(&self) -> Result<Self, ProgramError> {
-                self.add(self)
-            }
-        }
-
-        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Combine<V, ArrayType> for V {
-            fn combine(&self, right: &V) -> Result<Self, ProgramError> {
-                self.add(right)
-            }
-        }
-
-        impl_array_ir_projected_capability! {
-            Scale {
-                fn scale(&self, right: &Self, count: usize) -> Self;
-                fn double(&self) -> Self;
-            }
-        }
-
-        impl_array_ir_projected_capability! {
-            Combine<Self> {
-                fn combine(&self, right: &Self) -> Self;
-            }
-        }
-
-        // Composite tracers stage the homogeneous array instructions of every generated function.
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
-        let (_, program) = CompositeContext::trace(
-            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].scale(&inputs[1], 2)?.double()?.combine(&inputs[1]),
-            vec![array_type.clone(), array_type],
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:f32[2] .
-                let %2:f32[2] = add %0 %1
-                    %3:f32[2] = add %2 %1
-                    %4:f32[2] = add %3 %3
-                    %5:f32[2] = add %4 %1
-                in (%5)"
-            },
-        );
-
-        // Concrete composite values apply the capabilities to their array members, while first-class dimension
-        // members are rejected by the projection.
-        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
-        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
-        assert_eq!(left.scale(&right, 2), Ok(ArrayIrValue::Array(Array::vector(vec![7.0f32, 10.0]).unwrap())));
-        assert_eq!(left.double(), Ok(ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap())));
-        assert_eq!(left.combine(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
-        assert_eq!(
-            left.scale(&dimension, 1),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
-        );
-        assert_eq!(
-            dimension.combine(&left),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
-        );
     }
 
     #[test]
