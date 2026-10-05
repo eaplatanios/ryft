@@ -3948,7 +3948,7 @@ macro_rules! impl_nullary_batchable_operation {
 ///   - `$capability_method`: Identifier of the capability function that implements the operator (e.g., `add`). It
 ///     differs from `$method` for operators such as `std::ops::BitAnd`, whose `bitand` is implemented by `And::and`.
 #[macro_export]
-macro_rules! define_tracer_operator {
+macro_rules! impl_tracer_operator {
     // This branch layers panicking unary operator sugar over one fallible value capability for every tracer family.
     (@unary $trait:path, $method:ident, $capability:path, $capability_method:ident $(,)?) => {
         impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
@@ -4120,7 +4120,6 @@ macro_rules! define_tracer_operator {
     };
 }
 
-// TODO(eaplatanios): Review this.
 /// Implements a foreign `std::ops` operator trait as panicking sugar for [`Parameterwise`](crate::Parameterwise)
 /// structures by applying the operator of their parameter type to every parameter. Binary operators are implemented
 /// both between two structures, whose parameter paths must match, and between a structure and a single parameter on
@@ -4137,7 +4136,7 @@ macro_rules! define_tracer_operator {
 ///   - `$trait`: Name of the foreign `std::ops` operator trait to implement (e.g., `Add`).
 ///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
 #[macro_export]
-macro_rules! define_parameterwise_operator {
+macro_rules! impl_parameterwise_operator {
     // This branch applies a unary operator to every parameter of a structure.
     (@unary $trait:ident, $method:ident $(,)?) => {
         impl<__P: $crate::Parameter + std::ops::$trait<Output = __P>, __S: $crate::Parameterized<__P>> std::ops::$trait
@@ -4166,7 +4165,7 @@ macro_rules! define_parameterwise_operator {
             fn $method(self, right: Self) -> Self {
                 let (left, right) = (self.into_inner(), right.into_inner());
                 if !left.parameter_paths().eq(right.parameter_paths()) {
-                    panic!("parameterwise inputs must have the same parameter structure");
+                    panic!("binary parameterwise operator inputs must have the same parameter structure");
                 }
                 let structure = left.parameter_structure();
                 let parameters = left
@@ -5707,11 +5706,11 @@ pub use crate::{
     check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_arithmetic_dimension_capability, define_dimension_arithmetic_operation,
-    define_elementwise_capability, define_elementwise_operation, define_parameterwise_operator, define_tracer_operator,
-    dispatch_on_array_element_type, impl_array_elementwise_operation, impl_array_ir_projected_capability,
-    impl_differentiable_elementwise_operation, impl_differentiable_operation, impl_non_differentiable_operation,
-    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
-    impl_reference_dischargeable_operation,
+    define_elementwise_capability, define_elementwise_operation, dispatch_on_array_element_type,
+    impl_array_elementwise_operation, impl_array_ir_projected_capability, impl_differentiable_elementwise_operation,
+    impl_differentiable_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_nullary_batchable_operation, impl_nullary_transposable_operation, impl_parameterwise_operator,
+    impl_reference_dischargeable_operation, impl_tracer_operator,
 };
 
 #[cfg(test)]
@@ -6055,7 +6054,7 @@ mod tests {
         }
     }
 
-    /// Unary operator used to test [`define_tracer_operator!`].
+    /// Unary operator used to test [`impl_tracer_operator!`].
     trait TestUnaryOperator {
         /// Result of applying this operator.
         type Output;
@@ -6064,7 +6063,7 @@ mod tests {
         fn apply_unary(self) -> Self::Output;
     }
 
-    /// Binary operator used to test [`define_tracer_operator!`].
+    /// Binary operator used to test [`impl_tracer_operator!`].
     trait TestBinaryOperator {
         /// Result of applying this operator.
         type Output;
@@ -6073,7 +6072,7 @@ mod tests {
         fn apply_binary(self, right: Self) -> Self::Output;
     }
 
-    /// Binary operator used to test type-directed operation selection in [`define_tracer_operator!`].
+    /// Binary operator used to test type-directed operation selection in [`impl_tracer_operator!`].
     trait TestProvidedBinaryOperator {
         /// Result of applying this operator.
         type Output;
@@ -6109,21 +6108,21 @@ mod tests {
         TestBinaryOperation,
     );
 
-    define_tracer_operator!(
+    impl_tracer_operator!(
         @unary TestUnaryOperator,
         apply_unary,
         TestUnaryCapability,
         apply_unary_fallible,
     );
 
-    define_tracer_operator!(
+    impl_tracer_operator!(
         @binary TestBinaryOperator,
         apply_binary,
         TestBinaryCapability,
         apply_binary_fallible,
     );
 
-    define_tracer_operator!(
+    impl_tracer_operator!(
         @binary TestProvidedBinaryOperator,
         apply_provided_binary,
         TestProvidedBinaryCapability,
@@ -7578,7 +7577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_define_tracer_operator_unary() {
+    fn test_impl_tracer_operator_unary() {
         let context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
         let input_id = input.atom_id().unwrap();
@@ -7622,7 +7621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_define_tracer_operator_binary() {
+    fn test_impl_tracer_operator_binary() {
         let context = TracingContext::<Array, TestBinaryOperation<ArrayType>>::new();
         let left = context.input(ArrayType::scalar(DataType::F32));
         let right = context.input(ArrayType::scalar(DataType::F32));
@@ -7674,9 +7673,8 @@ mod tests {
         ));
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_define_tracer_operator_binary_composite_values() {
+    fn test_impl_tracer_operator_binary_composite_values() {
         type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
@@ -7726,17 +7724,16 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
     #[should_panic(expected = "expected array type but got dimension type")]
-    fn test_define_tracer_operator_binary_composite_value_failure() {
+    fn test_impl_tracer_operator_binary_composite_value_failure() {
         // Concrete composite values have no deferral point, and so a failed capability panics immediately.
         let _ = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())
             + ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
     }
 
     #[test]
-    fn test_define_tracer_operator_binary_with_provider() {
+    fn test_impl_tracer_operator_binary_with_provider() {
         // The array universe selects the ordinary elementwise test operation.
         let context = TracingContext::<Array, TestBinaryOperation<ArrayType>>::new();
         let left = context.input(ArrayType::scalar(DataType::F32));
