@@ -29,9 +29,9 @@ use crate::batching::{
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
-    ReplicatedBatchingPolicy,
+    ReplicatedBatchingPolicyProjection,
 };
-use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, DomainProjection, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
@@ -2040,128 +2040,6 @@ where
     }
 }
 
-/// [`BatchingPolicy`] used while a homogeneous first-class-dimension operation runs inside an array IR batching
-/// transform. A dimension is shared shape metadata and so its projected value is itself the complete batch carrier.
-/// Replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
-/// item would require a ragged array representation.
-///
-/// The policy is a [`ReplicatedBatchingPolicy`], and so composite dispatchers batch a dimension operation through
-/// [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation), which binds the operation
-/// once in the parent context: every batch item shares the same dimension, so one evaluation is the result for every
-/// batch item, and [`DimensionOperation`](crate::DimensionOperation) needs no batching rules of its own. The policy
-/// still shares the outer transform's first-class mapped extent and ragged-dimension evidence representations, because
-/// [`BatchingPolicyProjection`] requires projected policies to preserve both. A dimension operation never consumes a
-/// ragged dimension, and so its evidence is always empty.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ReplicatedDimensionBatchingPolicy;
-
-impl<C: Context<Type = ArrayIrType>> BatchingPolicy<ProjectedContext<C, DimensionType>>
-    for ReplicatedDimensionBatchingPolicy
-where
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType>,
-{
-    type Batch = <C::Value as ValueProjection<DimensionType>>::Projected;
-    type Extent = C::Value;
-    type Evidence = Vec<DimensionVariable>;
-    type BatchedProgram = BoundaryPreservingBatchedProgram<
-        <C::Constant as ValueProjection<DimensionType>>::Projected,
-        <C::Operation as OperationProjection<DimensionType>>::Projected,
-    >;
-
-    #[inline]
-    fn batch(
-        value: <C::Value as ValueProjection<DimensionType>>::Projected,
-        batch_axis: BatchAxis,
-    ) -> Result<Self::Batch, BatchingError> {
-        if !batch_axis.is_replicated() {
-            return Err(BatchingError::MappedDimension {
-                r#type: Box::new(value.r#type().into_owned()),
-                axis: batch_axis,
-            });
-        }
-        Ok(value)
-    }
-
-    #[inline]
-    fn replicated(value: <C::Value as ValueProjection<DimensionType>>::Projected) -> Self::Batch {
-        value
-    }
-
-    #[inline]
-    fn value(batch: &Self::Batch) -> &<C::Value as ValueProjection<DimensionType>>::Projected {
-        batch
-    }
-
-    #[inline]
-    fn batch_axis(_batch: &Self::Batch) -> BatchAxis {
-        BatchAxis::replicated()
-    }
-
-    #[inline]
-    fn unbatched_type(batch: &Self::Batch) -> Cow<'_, DimensionType> {
-        batch.r#type()
-    }
-
-    #[inline]
-    fn adapt_batched_program<CollapseFn>(
-        program: Self::BatchedProgram,
-        required_output_axes: Option<&[BatchAxis]>,
-        collapse_fn: CollapseFn,
-    ) -> Result<
-        BoundaryPreservingBatchedProgram<
-            <C::Constant as ValueProjection<DimensionType>>::Projected,
-            <C::Operation as OperationProjection<DimensionType>>::Projected,
-        >,
-        BatchingError,
-    >
-    where
-        CollapseFn: Fn(
-            &TracingContext<
-                <C::Constant as ValueProjection<DimensionType>>::Projected,
-                <C::Operation as OperationProjection<DimensionType>>::Projected,
-            >,
-            Tracer<
-                TracingContext<
-                    <C::Constant as ValueProjection<DimensionType>>::Projected,
-                    <C::Operation as OperationProjection<DimensionType>>::Projected,
-                >,
-            >,
-            Axis,
-        ) -> Result<
-            Tracer<
-                TracingContext<
-                    <C::Constant as ValueProjection<DimensionType>>::Projected,
-                    <C::Operation as OperationProjection<DimensionType>>::Projected,
-                >,
-            >,
-            BatchingError,
-        >,
-    {
-        let (program, output_axes) = program.into_parts();
-        BoundaryPreservingBatchedProgram::from_widened_boundary(
-            program,
-            output_axes,
-            required_output_axes,
-            0,
-            collapse_fn,
-        )
-    }
-}
-
-// Every dimension carrier is the replicated dimension value itself: `batch` rejects mapped axes, `batch_axis` always
-// reports replication, and there is no carrier metadata beyond the value. Binding a dimension operation once in the
-// parent context is therefore its batched application.
-impl<C: Context<Type = ArrayIrType>> ReplicatedBatchingPolicy<ProjectedContext<C, DimensionType>>
-    for ReplicatedDimensionBatchingPolicy
-where
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType>,
-{
-}
-
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayExtentBatchingPolicy`]. The default
 /// [`StaticArrayExtentBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use the
 /// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this nominal
@@ -2634,13 +2512,27 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, DimensionType> for ArrayIrBatchingPolicy
-where
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType>,
+// A first-class dimension is shared shape metadata, so every batch item observes the same dimension and a dimension
+// operation bound once in the parent context is its batched application. A different extent per batch item would
+// require a ragged array representation, so a mapped dimension carrier is rejected. The member value is projected
+// before the axis is checked, so a well-formed mapped dimension, which stores its per-item extents as a packed
+// integer array, keeps failing with its type-projection error, while a malformed mapped dimension carrier reports
+// `MappedDimension`.
+impl<C: Context<Type = ArrayIrType> + DomainProjection<DimensionType>>
+    ReplicatedBatchingPolicyProjection<C, DimensionType> for ArrayIrBatchingPolicy
 {
-    type Projected = ReplicatedDimensionBatchingPolicy;
+    fn project_replicated_batch(
+        batch: &ArrayIrBatch<C::Value>,
+    ) -> Result<<C::Value as ValueProjection<DimensionType>>::Projected, BatchingError> {
+        let value = ValueProjection::<DimensionType>::into_projected(batch.value().clone())?;
+        if !batch.batch_axis().is_replicated() {
+            return Err(BatchingError::MappedDimension {
+                r#type: Box::new(value.r#type().into_owned()),
+                axis: batch.batch_axis(),
+            });
+        }
+        Ok(value)
+    }
 }
 
 impl<C: Context<Type = ArrayIrType>> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
@@ -6075,42 +5967,6 @@ mod tests {
     }
 
     #[test]
-    fn test_replicated_dimension_batching_policy() {
-        // First-class dimensions have no axes to map, so the carrier is the projected dimension value itself: `batch`
-        // admits only the replicated axis, `batch_axis` always reports it, and the per-item type is the value's type.
-        type Projected = ProjectedContext<ArrayIrTraceContext, DimensionType>;
-        let trace = ArrayIrTraceContext::new();
-        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
-        let dimension = trace.input(DimensionType::from(variable.clone()).into()).into_projected().unwrap();
-        let batch = <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::batch(
-            dimension.clone(),
-            BatchAxis::replicated(),
-        )
-        .unwrap();
-        assert_eq!(batch, dimension);
-        assert_eq!(<ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::value(&batch), &dimension);
-        assert_eq!(
-            <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::batch_axis(&batch),
-            BatchAxis::replicated(),
-        );
-        assert_eq!(
-            <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::unbatched_type(&batch).into_owned(),
-            DimensionType::from(variable.clone()),
-        );
-        assert_eq!(
-            <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::replicated(dimension.clone()),
-            dimension,
-        );
-        assert_eq!(
-            <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::batch(dimension, BatchAxis::new(0)),
-            Err(BatchingError::MappedDimension {
-                r#type: Box::new(DimensionType::from(variable)),
-                axis: BatchAxis::new(0)
-            }),
-        );
-    }
-
-    #[test]
     fn test_array_batching_policy() {
         // The wrapper is a zero-sized nominal marker that lends the homogeneous array rules a policy type of their own.
         // It renders without its extent-policy parameter, since that parameter only selects the extent discipline.
@@ -7005,6 +6861,59 @@ mod tests {
             ),
             Err(BatchingError::Type(TypeError::Invalid {
                 message: "expected array type but got dimension type".to_string(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_project_replicated_batch() {
+        // A replicated dimension carrier projects onto its bare dimension member value.
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let dimension = DimensionValue::new(dimension_type.clone(), 4).unwrap();
+        assert_eq!(
+            <ArrayIrBatchingPolicy as ReplicatedBatchingPolicyProjection<
+                ArrayIrEagerContext,
+                DimensionType,
+            >>::project_replicated_batch(
+                &ArrayIrBatch::replicated(ArrayIrValue::<Array>::Dimension(dimension.clone())),
+            ),
+            Ok(dimension.clone()),
+        );
+
+        // A malformed carrier that maps a dimension value reports the mapped dimension. It is built through the private
+        // fields on purpose, since `ArrayIrBatch::new` would already reject it.
+        let malformed = ArrayIrBatch {
+            value: ArrayIrValue::<Array>::Dimension(dimension),
+            batch_axis: BatchAxis::new(0),
+            member: ArrayIrBatchMember::Dimension,
+        };
+        assert_eq!(
+            <ArrayIrBatchingPolicy as ReplicatedBatchingPolicyProjection<
+                ArrayIrEagerContext,
+                DimensionType,
+            >>::project_replicated_batch(
+                &malformed,
+            ),
+            Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) }),
+        );
+
+        // A well-formed mapped dimension stores its per-item extents as a packed integer array, which has no dimension
+        // member value to project onto.
+        let mapped = ArrayIrBatch::mapped_dimension(
+            ArrayIrValue::<Array>::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            BatchAxis::new(0),
+            dimension_type,
+        )
+        .unwrap();
+        assert_eq!(
+            <ArrayIrBatchingPolicy as ReplicatedBatchingPolicyProjection<
+                ArrayIrEagerContext,
+                DimensionType,
+            >>::project_replicated_batch(
+                &mapped,
+            ),
+            Err(BatchingError::Type(TypeError::Invalid {
+                message: "expected dimension type but got array type".to_string(),
             })),
         );
     }

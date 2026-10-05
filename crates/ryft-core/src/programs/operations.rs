@@ -266,10 +266,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [`batch_projected_operation`](crate::batch_projected_operation), while structural projected variants bind the
 ///     payload once in the parent context through
 ///     [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation). The structural path
-///     requires the projected policy to implement [`ReplicatedBatchingPolicy`](crate::ReplicatedBatchingPolicy) and
-///     the payload to be region-free, and it reports default evidence; the payload family needs no batching rules of
-///     its own. A structural role alone never implies replication, so a family whose projected policy has not opted
-///     in fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
+///     requires the family's policy to implement
+///     [`ReplicatedBatchingPolicyProjection`](crate::ReplicatedBatchingPolicyProjection) for the member type instead of
+///     [`BatchingPolicyProjection`](crate::BatchingPolicyProjection), requires the payload to be region-free, and
+///     reports default evidence; the payload family needs no batching rules or member policy of its own. A structural
+///     role alone never implies replication, so a family whose policy does not implement the replicated projection
+///     fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
 ///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
 ///     by [`BatchableType`](crate::BatchableType).
 ///   - `differentiation` delegates native variants to the payload's own forward-mode rule and computational member

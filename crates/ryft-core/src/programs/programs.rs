@@ -545,7 +545,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// program, rebuilding and structurally reclosing the complete [`RegionArena`]. Static refinements are validated
     /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
     /// program.
-    pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<Self>, ProgramError> {
+    pub fn with_instantiated_type_identities(&self, input_types: &[V::Type]) -> Result<Cow<'_, Self>, ProgramError> {
         let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
         if renaming.is_identity() {
             return Ok(Cow::Borrowed(self));

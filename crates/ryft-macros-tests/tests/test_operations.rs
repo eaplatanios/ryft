@@ -3670,7 +3670,7 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_removed_identity_attribute.rs");
     test_cases.compile_fail("tests/operations/error_removed_structural_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_removed_type_attribute_form.rs");
-    test_cases.compile_fail("tests/operations/error_structural_batching_without_replicated_policy.rs");
+    test_cases.compile_fail("tests/operations/error_structural_batching_without_replicated_projection.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute_arguments.rs");
     test_cases.compile_fail("tests/operations/error_undeclared_variant_member_type.rs");

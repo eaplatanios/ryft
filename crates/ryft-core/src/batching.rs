@@ -73,8 +73,8 @@
 //! elementwise path only for genuinely elementwise semantics; write a dedicated rule whenever dimensions, mapped axes,
 //! nested regions, named axes, or sharding require operation-specific handling. Composite member operations can reuse
 //! homogeneous rules through [`batch_projected_operation`] only when they are region-free and projectable. Member
-//! operations over shared bookkeeping values whose projected policy is a [`ReplicatedBatchingPolicy`] need no rules at
-//! all: [`batch_replicated_projected_operation`] binds them once in the parent context.
+//! operations over shared bookkeeping values whose outer policy implements [`ReplicatedBatchingPolicyProjection`]
+//! need no rules at all as [`batch_replicated_projected_operation`] binds them once in the parent context.
 //!
 //! A new value universe supplies a [`BatchingPolicy`] and, for the public entry point, a
 //! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] only when its region programs can be transformed and
@@ -778,10 +778,11 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
 /// [`Context`] `C`. A [`BatchingPolicy`] determines one context's batch carrier, mapped-extent representation, and
 /// structurally batched program boundary. It cannot by itself determine how each member type of a composite context
 /// should represent those concepts. For example, an array member needs an [`ArrayBatch`](crate::ArrayBatch) carrier
-/// that may hold a mapped axis, whereas a first-class dimension member must remain replicated because a different
-/// dimension per batch item would require a ragged value model. Both projected policies must nevertheless preserve
-/// the outer policy's exact mapped-extent and validation-evidence representations. This type-indexed relation records
-/// that choice independently for every supported `(C, T)` pair.
+/// that may hold a mapped axis. Every projected policy must nevertheless preserve the outer policy's exact
+/// mapped-extent and validation-evidence representations. This type-indexed relation records that choice independently
+/// for every supported `(C, T)` pair. A member whose values are shared by every batch item (e.g., a first-class
+/// dimension, since a different dimension per batch item would require a ragged value model) needs no member policy
+/// at all and implements [`ReplicatedBatchingPolicyProjection`] instead.
 ///
 /// Note that this trait carries no runtime state. Implementing it only establishes the associated
 /// [`Projected`](Self::Projected) policy used by [`batch_projected_operation`]. Unsupported member projections simply
@@ -844,30 +845,42 @@ where
     }
 }
 
-/// [`BatchingPolicy`] whose carriers are always replicated and carry nothing but their value, which lets
-/// [`batch_replicated_projected_operation`] batch a region-free member operation by binding it once in the parent
-/// context instead of applying a member batching rule. This is the batching contract of shared bookkeeping values such
-/// as first-class dimensions: every batch item observes the same value, so evaluating the operation once yields the
-/// result for every batch item. A value that differs per batch item (e.g., one extent per batch item) cannot be
-/// represented by such a policy and needs a mapped or ragged representation instead.
+/// Projection of an outer [`BatchingPolicy`] `Self` onto member type `T` of composite [`Context`] `C` for members whose
+/// values are shared by every batch item (i.e., replicated), which lets [`batch_replicated_projected_operation`] batch
+/// a region-free member operation by binding it once in the parent context instead of applying a member batching rule.
+/// This is the batching contract of shared bookkeeping values such as first-class dimensions: every batch item observes
+/// the same value, so evaluating the operation once yields the result for every batch item. A value that differs per
+/// batch item (e.g., one extent per batch item) cannot cross this projection and needs a mapped or ragged
+/// representation instead.
 ///
-/// The `Batch = C::Value` equality makes the projected context's value the entire batch carrier, but it does not by
-/// itself prove the contract. An implementation explicitly promises that:
+/// Unlike [`BatchingPolicyProjection`], this projection selects no member [`BatchingPolicy`]: a replicated member
+/// value needs no batch axis, extent, evidence, or structurally batched program of its own, so the member side of the
+/// boundary is the bare projected value. Lifting a member result back is always [`BatchingPolicy::replicated`] applied
+/// to the embedded value, and so it needs no hook. An implementation explicitly promises that:
 ///
-///   1. Every supported carrier is replicated. [`BatchingPolicy::batch_axis`] always reports [`BatchAxis::replicated`],
-///      and [`BatchingPolicy::batch`] rejects mapped axes with an exact [`BatchingError`].
-///   2. [`BatchingPolicy::replicated`] and [`BatchingPolicy::value`] preserve the value exactly.
-///   3. There is no carrier metadata beyond the value that forwarding values and rebuilding replicated outputs
-///      would discard.
-///   4. A region-free operation over such values may be bound unchanged, once, in the parent context. Its result
-///      carriers remain replicated, and default [`BatchingPolicy::Evidence`] suffices for output validation.
+///   1. [`Self::project_replicated_batch`] returns the member value of a replicated carrier and rejects every carrier
+///      that is mapped, or whose metadata the bare value cannot represent, with an exact [`BatchingError`].
+///   2. A region-free operation over such values may be bound unchanged, once, in the parent context. Its results are
+///      replicated, and default [`BatchingPolicy::Evidence`] suffices for output validation.
 ///
-/// Implement this trait only for policies that make these promises. Never implement it for every policy whose carrier
-/// happens to equal its value. A structural member's zero differential space does not imply this contract either:
-/// differentiation and batching are independent transforms, and a structural value could still vary per batch item.
-/// [`batch_replicated_projected_operation`] additionally checks the first promise at runtime, so a policy that
-/// breaks it fails with a diagnostic rather than silently replicating a mapped value.
-pub trait ReplicatedBatchingPolicy<C: Context>: BatchingPolicy<C, Batch = C::Value> {}
+/// Implement this trait only for member types whose values are genuinely shared by every batch item. A structural
+/// member's zero differential space does not imply this contract: differentiation and batching are independent
+/// transforms, and a structural value could still vary per batch item. [`batch_replicated_projected_operation`]
+/// additionally checks the first promise at runtime, so an implementation that breaks it fails with a diagnostic rather
+/// than silently replicating a mapped value.
+pub trait ReplicatedBatchingPolicyProjection<C: Context + DomainProjection<T>, T: Type>: BatchingPolicy<C> {
+    /// Converts one outer carrier into the bare member value that it replicates, rejecting a mapped carrier or one with
+    /// metadata that the member value cannot represent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an exact [`BatchingError`] naming what the member value cannot carry (e.g.,
+    /// [`BatchingError::MappedDimension`] for a mapped first-class dimension), or the [`TypeError`]
+    /// of a carrier whose value does not belong to member type `T`.
+    fn project_replicated_batch(
+        batch: &Self::Batch,
+    ) -> Result<<C::Value as ValueProjection<T>>::Projected, BatchingError>;
+}
 
 /// Policy capability for recursively applying batching to nested [`Program`] [`Region`](crate::Region)s. This is
 /// separate from [`BatchingPolicy`] because a carrier can be useful for region-free batching before its program
@@ -2153,32 +2166,30 @@ pub fn batch_projected_operation<
     Ok(BatchedOutputs::new(outputs, evidence))
 }
 
-/// Batches a region-free member [`Operation`] whose projected [`BatchingPolicy`] is a [`ReplicatedBatchingPolicy`]
-/// by binding the operation once in the parent context through a [`ProjectedContext`] instead of applying a member
-/// batching rule. Use this function from a composite operation dispatcher for a projected member whose values are
-/// shared bookkeeping (e.g., first-class dimensions), so that its operation family needs no [`BatchableOperation`]
-/// implementation of its own. `#[derive(Operation)]` uses it for every `#[ryft(projected(T, structural))]` variant.
-/// Values that are the same for every batch item yield results that are the same for every batch item, so a single
-/// evaluation is the batched result.
+/// Batches a region-free member [`Operation`] over replicated member values by binding the operation once in the parent
+/// context through a [`ProjectedContext`] instead of applying a member batching rule. Use this function from a
+/// composite operation dispatcher for a projected member whose values are shared bookkeeping (e.g., first-class
+/// dimensions) and whose outer policy implements [`ReplicatedBatchingPolicyProjection`] for it, so that its operation
+/// family needs no [`BatchableOperation`] implementation of its own. `#[derive(Operation)]` uses it for every
+/// `#[ryft(projected(T, structural))]` variant. Values that are the same for every batch item yield results that are
+/// the same for every batch item, so a single evaluation is the batched result.
 ///
 /// The steps run in the following order, and each failure stops the remaining steps:
 ///
 ///   1. An operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected before any input is projected,
 ///      because the attached regions are programs in the composite universe that this function cannot rebind.
-///   2. Every input carrier is converted through [`BatchingPolicyProjection::project_batch`], which lets the outer
-///      policy enforce its carrier checks and lets the projected policy reject mapped values.
-///   3. Every projected carrier must be replicated. A correct [`ReplicatedBatchingPolicy`] already guarantees this,
-///      so this check only turns a broken policy promise into an exact diagnostic.
+///   2. Every input carrier is converted into its member value through
+///      [`ReplicatedBatchingPolicyProjection::project_replicated_batch`], which rejects mapped carriers.
+///   3. Every input carrier must be replicated. A correct [`ReplicatedBatchingPolicyProjection`] already guarantees
+///      this, so this check only turns a broken implementation into an exact diagnostic.
 ///   4. The complete operation payload is bound once in [`ProjectedContext`] over the parent context, with no regions.
 ///      Binding through the real parent keeps eager execution, staging, enclosing transforms, placement, manual
 ///      variation, and operation effects on their established execution paths, regardless of the batch size.
-///   5. Every result is wrapped with [`BatchingPolicy::replicated`] and converted back through
-///      [`BatchingPolicyProjection::lift_batch`], preserving output count and order.
+///   5. Every result is embedded back into the composite value family and wrapped with [`BatchingPolicy::replicated`],
+///      preserving output count and order.
 ///
 /// The outputs are returned with default [`BatchingPolicy::Evidence`], which the active [`BatchingContext`] then
-/// validates through [`BatchingPolicy::validate_operation_outputs`] like the outputs of any other rule. A lift failure
-/// happens after the operation was bound, as it can with [`batch_projected_operation`]; this function does not roll
-/// back the parent context.
+/// validates through [`BatchingPolicy::validate_operation_outputs`] like the outputs of any other rule.
 ///
 /// # Parameters
 ///
@@ -2188,14 +2199,15 @@ pub fn batch_projected_operation<
 ///
 /// # Errors
 ///
-/// Returns [`BatchingError::UnsupportedOperation`] when `operation` declares regions or when a projected input
-/// is not replicated, propagates projection and lift failures from the [`BatchingPolicyProjection`] hooks (e.g.,
-/// [`BatchingError::MappedDimension`] for a mapped first-class dimension), and propagates failures of the parent
-/// context's [`Context::bind`] as [`BatchingError::Program`].
+/// Returns [`BatchingError::UnsupportedOperation`] when `operation` declares regions or
+/// when a projected input carrier is not replicated, propagates projection failures from
+/// [`ReplicatedBatchingPolicyProjection::project_replicated_batch`] (e.g., [`BatchingError::MappedDimension`]
+/// for a mapped first-class dimension), and propagates failures of the parent context's [`Context::bind`] as
+/// [`BatchingError::Program`].
 pub fn batch_replicated_projected_operation<
     T: Type,
     C: Context + DomainProjection<T>,
-    P: BatchingPolicyProjection<C, T, Projected: ReplicatedBatchingPolicy<ProjectedContext<C, T>>>,
+    P: ReplicatedBatchingPolicyProjection<C, T>,
 >(
     context: &BatchingContext<C, P>,
     operation: &<C::Operation as OperationProjection<T>>::Projected,
@@ -2211,25 +2223,25 @@ pub fn batch_replicated_projected_operation<
         });
     }
 
-    let inputs = inputs.iter().map(P::project_batch).collect::<Result<Vec<_>, BatchingError>>()?;
-    if let Some(input) = inputs.iter().find(|input| !P::Projected::batch_axis(input).is_replicated()) {
+    let values = inputs.iter().map(P::project_replicated_batch).collect::<Result<Vec<_>, BatchingError>>()?;
+    if let Some(input) = inputs.iter().find(|input| !P::batch_axis(input).is_replicated()) {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
-                "projected operation `{}` requires replicated inputs, but its replicated batching policy produced \
+                "projected operation `{}` requires replicated inputs, but its replicated batching projection accepted \
                  an input of type `{}` with batch axis `{}`",
                 operation.name(),
-                P::Projected::unbatched_type(input),
-                P::Projected::batch_axis(input),
+                P::unbatched_type(input),
+                P::batch_axis(input),
             ),
         });
     }
 
-    let outputs = ProjectedContext::new(context.parent().clone()).bind(operation.clone(), Vec::new(), &inputs)?;
-    let outputs = outputs
+    let outputs = ProjectedContext::new(context.parent().clone()).bind(operation.clone(), Vec::new(), &values)?;
+    Ok(outputs
         .into_iter()
-        .map(|output| P::lift_batch(&P::Projected::replicated(output)))
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    Ok(outputs.into())
+        .map(|output| P::replicated(<C::Value as ValueProjection<T>>::from_projected(output)))
+        .collect::<Vec<_>>()
+        .into())
 }
 
 #[cfg(test)]
@@ -2448,79 +2460,30 @@ mod tests {
         }
     }
 
-    /// Replicated projected-member policy whose carrier is the member value itself, used to prove that replicated
-    /// forwarding does not depend on array carriers. When `MISREPORTS_AXES` is set, the policy breaks its replicated
-    /// promise by reporting every carrier as mapped, which pins the runtime check that turns such a broken promise
-    /// into a diagnostic.
-    #[derive(Copy, Clone, Debug)]
-    struct ReplicatedProjectedMemberBatching<const MEMBER: u8, const MISREPORTS_AXES: bool>;
-
-    impl<const MEMBER: u8, const MISREPORTS_AXES: bool, C: Context<Type = ProjectedMemberType<MEMBER>>>
-        BatchingPolicy<C> for ReplicatedProjectedMemberBatching<MEMBER, MISREPORTS_AXES>
-    {
-        type Batch = C::Value;
-        type Extent = usize;
-        type Evidence = ();
-        type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
-
-        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
-            if !batch_axis.is_replicated() {
+    // The first member's values are shared by every batch item: projection returns the member value and rejects a
+    // mapped carrier before the operation is bound.
+    impl ReplicatedBatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<0>> for ProjectedProgramBatching {
+        fn project_replicated_batch(
+            batch: &ProjectedBatch<ProjectedProgramValue>,
+        ) -> Result<ProjectedMemberValue<0>, BatchingError> {
+            let value = ValueProjection::<ProjectedMemberType<0>>::into_projected(batch.value.clone())?;
+            if !batch.batch_axis.is_replicated() {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!("{} values must remain replicated under batching", value.r#type()),
                 });
             }
             Ok(value)
         }
-
-        fn replicated(value: C::Value) -> Self::Batch {
-            value
-        }
-
-        fn value(batch: &Self::Batch) -> &C::Value {
-            batch
-        }
-
-        fn batch_axis(_batch: &Self::Batch) -> BatchAxis {
-            if MISREPORTS_AXES { BatchAxis::new(0) } else { BatchAxis::replicated() }
-        }
-
-        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
-            batch.r#type()
-        }
-
-        fn adapt_batched_program<
-            CollapseFn: Fn(
-                &TracingContext<C::Constant, C::Operation>,
-                Tracer<TracingContext<C::Constant, C::Operation>>,
-                Axis,
-            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
-        >(
-            program: Self::BatchedProgram,
-            required_output_axes: Option<&[BatchAxis]>,
-            collapse_fn: CollapseFn,
-        ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
-            let (program, output_axes) = program.into_parts();
-            BoundaryPreservingBatchedProgram::from_widened_boundary(
-                program,
-                output_axes,
-                required_output_axes,
-                0,
-                collapse_fn,
-            )
-        }
     }
 
-    impl<const MEMBER: u8, const MISREPORTS_AXES: bool, C: Context<Type = ProjectedMemberType<MEMBER>>>
-        ReplicatedBatchingPolicy<C> for ReplicatedProjectedMemberBatching<MEMBER, MISREPORTS_AXES>
-    {
-    }
-
-    impl BatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<0>> for ProjectedProgramBatching {
-        type Projected = ReplicatedProjectedMemberBatching<0, false>;
-    }
-
-    impl BatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<1>> for ProjectedProgramBatching {
-        type Projected = ReplicatedProjectedMemberBatching<1, true>;
+    // The second member's projection deliberately breaks the replicated promise by ignoring the carrier's axis, which
+    // pins the runtime check that turns such a broken implementation into a diagnostic.
+    impl ReplicatedBatchingPolicyProjection<ProjectedProgramContext, ProjectedMemberType<1>> for ProjectedProgramBatching {
+        fn project_replicated_batch(
+            batch: &ProjectedBatch<ProjectedProgramValue>,
+        ) -> Result<ProjectedMemberValue<1>, BatchingError> {
+            Ok(ValueProjection::<ProjectedMemberType<1>>::into_projected(batch.value.clone())?)
+        }
     }
 
     #[test]
@@ -3167,8 +3130,8 @@ mod tests {
 
     #[test]
     fn test_batch_replicated_projected_operation_rejects_mapped_inputs() {
-        // The outer policy accepts a mapped first member, so projection reaches the replicated member policy,
-        // whose `batch` rejects the mapped axis before the operation is bound.
+        // The outer policy accepts a mapped first member, so the carrier reaches the replicated projection, which
+        // rejects the mapped axis before the operation is bound.
         let context = BatchingContext::<_, ProjectedProgramBatching>::with_policy(ProjectedProgramContext::new(), 5);
         let mapped = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::batch(
             ProjectedProgramValue::First(ProjectedMemberValue::<0>(3)),
@@ -3185,11 +3148,13 @@ mod tests {
                 if message == "member_0 values must remain replicated under batching",
         ));
 
-        // A policy that breaks its replicated promise by reporting a mapped carrier is caught by the runtime check
-        // instead of having its value silently replicated.
-        let input = <ProjectedProgramBatching as BatchingPolicy<ProjectedProgramContext>>::replicated(
-            ProjectedProgramValue::Second(ProjectedMemberValue::<1>(3)),
-        );
+        // A projection that breaks its replicated promise by accepting a mapped carrier is caught by the runtime check
+        // instead of having its value silently replicated. The outer policy's constructor rejects a mapped second
+        // member, so the malformed carrier is built directly.
+        let input = ProjectedBatch {
+            value: ProjectedProgramValue::Second(ProjectedMemberValue::<1>(3)),
+            batch_axis: BatchAxis::new(0),
+        };
         assert!(matches!(
             batch_replicated_projected_operation::<ProjectedMemberType<1>, _, _>(
                 &context,
@@ -3199,7 +3164,7 @@ mod tests {
             Err(BatchingError::UnsupportedOperation { message })
                 if message == format!(
                     "projected operation `projected_member` requires replicated inputs, but its replicated batching \
-                     policy produced an input of type `member_1` with batch axis `{}`",
+                     projection accepted an input of type `member_1` with batch axis `{}`",
                     BatchAxis::new(0),
                 ),
         ));

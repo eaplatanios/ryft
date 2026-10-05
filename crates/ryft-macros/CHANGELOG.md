@@ -14,10 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `constant(V)` (which declare a composite family's operation and stored constant types), `members(...)`, and
   `dispatch(...)`, which selects the payload-delegating `identity` implementations together with the `discharge`,
   `batching`, `differentiation`, and `transposition` dispatchers. Structural projected member variants (i.e.,
-  `#[ryft(projected(U, structural))]`) are batched by binding their payload once under the projected policy's
-  `ReplicatedBatchingPolicy`, so their member operation families need no batching rules of their own. The earlier
-  `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` spellings are rejected with diagnostics that
-  name their replacements.
+  `#[ryft(projected(U, structural))]`) are batched by binding their payload once under the policy's
+  `ReplicatedBatchingPolicyProjection`, so their member operation families need no batching rules of their own. The
+  earlier `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` spellings are rejected with diagnostics
+  that name their replacements.
 
 ### Fixed
 

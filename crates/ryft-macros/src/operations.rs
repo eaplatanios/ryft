@@ -1318,9 +1318,9 @@ impl OperationEnum {
     /// families remain generic over their array batching mode. Explicitly declared families use the canonical policy
     /// selected by [`BatchableType`](ryft_core::BatchableType). Composite-native variants delegate directly,
     /// computational projected members use `batch_projected_operation`, structural projected members bind their payload
-    /// once through `batch_replicated_projected_operation` under a
-    /// [`ReplicatedBatchingPolicy`](ryft_core::ReplicatedBatchingPolicy), and mixed members use their parent-universe
-    /// rule.
+    /// once through `batch_replicated_projected_operation` under the policy's
+    /// [`ReplicatedBatchingPolicyProjection`](ryft_core::ReplicatedBatchingPolicyProjection), and mixed members use
+    /// their parent-universe rule.
     fn generate_batchable_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
@@ -1406,22 +1406,17 @@ impl OperationEnum {
                             Projected = #operation_type,
                         >
                     });
-                    batching_where_clause.predicates.push(syn::parse_quote! {
-                        #batching_policy: #ryft::BatchingPolicyProjection<__ParentContext, #member_type>
-                    });
 
                     // A structural member is batched by binding its payload once in the parent context, which requires
-                    // the projected policy's explicit replicated opt-in instead of a member batching rule.
+                    // the outer policy's explicit replicated projection instead of a member policy and batching rule.
                     if *structural {
                         batching_where_clause.predicates.push(syn::parse_quote! {
-                            <#batching_policy as #ryft::BatchingPolicyProjection<
-                                __ParentContext,
-                                #member_type,
-                            >>::Projected: #ryft::ReplicatedBatchingPolicy<
-                                #ryft::ProjectedContext<__ParentContext, #member_type>,
-                            >
+                            #batching_policy: #ryft::ReplicatedBatchingPolicyProjection<__ParentContext, #member_type>
                         });
                     } else {
+                        batching_where_clause.predicates.push(syn::parse_quote! {
+                            #batching_policy: #ryft::BatchingPolicyProjection<__ParentContext, #member_type>
+                        });
                         batching_where_clause.predicates.push(syn::parse_quote! {
                             #operation_type: #ryft::BatchableOperation<
                                 #ryft::ProjectedContext<__ParentContext, #member_type>,
@@ -3344,8 +3339,8 @@ mod tests {
 
         // Both projected roles share projection-based base dispatch, while their batching, differentiation, and
         // transposition contracts remain intentionally distinct. A computational member applies its member batching
-        // rule, whereas a structural member binds its payload once under the projected policy's replicated opt-in and
-        // therefore requires no member batching rule.
+        // rule under its member policy, whereas a structural member binds its payload once under the outer policy's
+        // replicated projection and therefore requires neither a member policy nor a member batching rule.
         assert!(generated.contains("infer_projected_operation_output_types(operation,input_types,region_interfaces,)"));
         assert!(
             generated.contains("Self::Array(operation)=>{ryft::batch_projected_operation(context,operation,inputs)}")
@@ -3359,10 +3354,12 @@ mod tests {
                 "ArrayOperation<A>:ryft::BatchableOperation<ryft::ProjectedContext<__ParentContext,ArrayType>,",
             )
         );
-        assert!(generated.contains(
-            "<__BatchingPolicyasryft::BatchingPolicyProjection<__ParentContext,DimensionType,>>::Projected:\
-             ryft::ReplicatedBatchingPolicy<ryft::ProjectedContext<__ParentContext,DimensionType>,>",
-        ));
+        assert!(
+            generated
+                .contains("__BatchingPolicy:ryft::ReplicatedBatchingPolicyProjection<__ParentContext,DimensionType>",)
+        );
+        assert!(generated.contains("__BatchingPolicy:ryft::BatchingPolicyProjection<__ParentContext,ArrayType>"));
+        assert!(!generated.contains("ryft::BatchingPolicyProjection<__ParentContext,DimensionType>"));
         assert!(!generated.contains("DimensionOperation:ryft::BatchableOperation"));
         assert!(generated.contains("OperationProjection<ArrayType>forCompositeOperation<A>"));
         assert!(generated.contains("OperationProjection<DimensionType>forCompositeOperation<A>"));
