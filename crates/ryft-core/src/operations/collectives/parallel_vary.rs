@@ -346,7 +346,8 @@ pub trait ParallelVary: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if `axis_name` is not bound by an enclosing manual region, if the axis is empty,
-    /// or if this value already varies over it or carries reduction state along it.
+    /// or if this value carries a sharding on a mesh other than that of the region, already varies over the axis, or
+    /// carries reduction state along it.
     fn parallel_vary(&self, axis_name: &str) -> Result<Self, ProgramError>;
 
     /// Returns this value marked as varying across the manual axis `axis_name` of `mesh`, like
@@ -422,9 +423,19 @@ impl<
             ))
             .into());
         }
+
         let context = self.dispatch_domain();
         let mut input = self.clone();
         let input_type = input.r#type().into_owned();
+        if let Some(sharding) = input_type.sharding()
+            && sharding.mesh() != mesh
+        {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_VARY_OPERATION_NAME}` input mesh does not match the mesh of manual axis `{axis_name}`",
+            ))
+            .into());
+        }
+
         if input_type.sharding().is_none() {
             let rank = input_type.rank();
             let mesh_type = input_type
@@ -553,16 +564,15 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis,
-        RaggedAxis, Shape, Sharding,
+        ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable, MeshAxis, RaggedAxis, Shape,
     };
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::check_operation_type_inference;
-    use crate::operations::arithmetic::Add;
+    use crate::operations::collectives::tests::eager_collective_context;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, ValueProjection};
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
@@ -592,7 +602,7 @@ mod tests {
         check_operation_type_inference!(
             operation = ParallelVaryOperation::new("m".to_string()),
             cases = [{
-                input_types = [invariant.clone()],
+                input_types = [invariant],
                 output_types = [varying.clone()],
             }, {
                 input_types = [varying],
@@ -600,13 +610,17 @@ mod tests {
             }, {
                 input_types = [ArrayType::scalar(DataType::F32)],
                 error = "`parallel_vary` input must carry a mesh containing manual axis `m`",
+            }, {
+                input_types = [],
+                error = "expected 1 input but got 0",
             }],
         );
-        assert_eq!(ParallelVaryOperation::new("m".to_string()).fold(&[invariant], &[]), Ok(None));
     }
 
     #[test]
     fn test_parallel_vary_type_inference_preserves_unrelated_state() {
+        // Only the variation over the selected axis changes. Variation over other manual axes and the reduction state
+        // of other axes are preserved.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("outer", 2, MeshAxisType::Manual).unwrap(),
@@ -619,45 +633,90 @@ mod tests {
             .with_unreduced_axes(["explicit"])
             .unwrap();
         let input = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
-        let output = ParallelVaryOperation::new("m".to_string())
-            .infer_output_types(std::slice::from_ref(&input), &[])
-            .unwrap();
-        assert_eq!(
-            output,
-            vec![
-                input
-                    .clone()
-                    .with_sharding(sharding.clone().with_varying_manual_axes(["m", "outer"]).unwrap())
-                    .unwrap(),
-            ],
+        check_operation_type_inference!(
+            operation = ParallelVaryOperation::new("m".to_string()),
+            cases = [{
+                input_types = [input.clone()],
+                output_types = [
+                    input.with_sharding(sharding.with_varying_manual_axes(["m", "outer"]).unwrap()).unwrap(),
+                ],
+            }],
         );
-        assert!(matches!(
-            ParallelVaryOperation::new("explicit".to_string()).infer_output_types(&[input.clone()], &[]),
-            Err(TypeError::Invalid { message }) if message == "`parallel_vary` axis `explicit` must be manual",
-        ));
-        let reduced = input.with_sharding(sharding.with_reduced_axes(["m"]).unwrap()).unwrap();
-        assert!(matches!(
-            ParallelVaryOperation::new("m".to_string()).infer_output_types(&[reduced], &[]),
-            Err(TypeError::Invalid { message }) if message == "`parallel_vary` axis `m` must not carry reduction state",
-        ));
+    }
+
+    #[test]
+    fn test_parallel_vary_type_inference_rejects_invalid_axis() {
+        // The selected axis must be a manual axis of the input's mesh and must not carry reduction state.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("outer", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("explicit", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh, 0)
+            .with_varying_manual_axes(["outer"])
+            .unwrap()
+            .with_unreduced_axes(["explicit"])
+            .unwrap();
+        let input = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelVaryOperation::new("explicit".to_string()),
+            cases = [{
+                input_types = [input.clone()],
+                error = "`parallel_vary` axis `explicit` must be manual",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelVaryOperation::new("missing".to_string()),
+            cases = [{
+                input_types = [input.clone()],
+                error = "`parallel_vary` axis `missing` must be manual",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelVaryOperation::new("m".to_string()),
+            cases = [{
+                input_types = [input.with_sharding(sharding.with_reduced_axes(["m"]).unwrap()).unwrap()],
+                error = "`parallel_vary` axis `m` must not carry reduction state",
+            }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_vary_provider() {
+        // Any array family that contains `ParallelVaryOperation` provides the transition for exactly one input.
+        let (invariant, _) = scalar_types();
+        let request = ParallelVaryOperation::new("m".to_string());
+        let operation = ArrayOperation::<Array>::provide(request.clone(), &[&invariant]).unwrap();
+        assert!(matches!(&operation, ArrayOperation::ParallelVary(operation) if operation.axis_name() == "m"));
+        assert_eq!(operation.to_string(), "parallel_vary [axis_name=\"m\"]");
+        assert_eq!(
+            ArrayOperation::<Array>::provide(request, &[]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 1, actual: 0 },
+        );
     }
 
     #[test]
     fn test_parallel_vary_interpretation() {
+        // A concrete `Array` never executes inside a manual region, so eager interpretation reports unsupported
+        // execution.
         let (invariant, _) = scalar_types();
-        assert!(matches!(
+        assert_eq!(
             ParallelVaryOperation::new("m".to_string()).interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[Array::from_elements(invariant, &[2.0f32]).unwrap()],
             ),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "`parallel_vary` requires an active non-empty manual mesh axis `m`",
-        ));
+            Err(ProgramError::UnsupportedOperation {
+                message: "`parallel_vary` requires an active non-empty manual mesh axis `m`".to_string(),
+            }),
+        );
     }
 
     #[test]
     fn test_parallel_vary_partial_evaluation() {
+        // Folding a known input would interpret the transition eagerly, which a concrete `Array` does not support, so
+        // partial evaluation retains the transition for the backend that owns the mesh.
         let (invariant, varying) = scalar_types();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(invariant.clone());
@@ -677,36 +736,28 @@ mod tests {
                 in (%1)"
             },
         );
-        assert!(evaluation.outputs()[0].is_unknown());
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
     }
 
     #[test]
-    fn test_parallel_vary_partial_evaluation_composite() {
+    fn test_parallel_vary_partial_evaluation_known_staging() {
+        // Under a staging known-side context, a known input is a tracer, so folding stages the transition into the
+        // outer trace and its output stays known.
         let (invariant, varying) = scalar_types();
-        let operation = ArrayIrOperation::<Array>::from(ParallelVaryOperation::new("m".to_string()));
-        let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
-        let input = PartialEvaluationValue::known(ArrayIrValue::Array(
-            Array::from_elements(invariant.clone(), &[2.0f32]).unwrap(),
-        ));
-        let outputs = operation.partially_evaluate(&eager, &EmptyRegionDriver, &[input]).unwrap();
-        assert!(outputs[0].is_unknown());
-        assert_eq!(outputs[0].r#type().as_ref(), &varying.clone().into());
-
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(invariant.into()));
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = PartialEvaluationValue::known(trace.input(invariant));
         let context = PartialEvaluationContext::new(trace.clone());
-        let outputs = operation.partially_evaluate(&context, &EmptyRegionDriver, &[input]).unwrap();
+        let outputs = ParallelVaryOperation::new("m".to_string())
+            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
+            .unwrap();
         assert!(outputs[0].is_known());
-        assert_eq!(outputs[0].r#type().as_ref(), &varying.into());
+        assert_eq!(outputs[0].r#type().as_ref(), &varying);
         let builder = trace.builder().borrow().clone();
-        let input_count = builder.input_ids().len();
-        let output_ids = vec![outputs[0].as_known().unwrap().atom_id().unwrap()];
-        let output_count = output_ids.len();
         let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                output_ids,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![outputs[0].as_known().unwrap().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
@@ -721,25 +772,32 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_vary_partial_evaluation_known_staging() {
+    fn test_parallel_vary_partial_evaluation_array_ir() {
         let (invariant, varying) = scalar_types();
-        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(invariant));
+        let operation = ArrayIrOperation::<Array>::from(ParallelVaryOperation::new("m".to_string()));
+
+        // Through the composite `ArrayIrOperation`, an eager known side residualizes the transition.
+        let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let input = PartialEvaluationValue::known(ArrayIrValue::Array(
+            Array::from_elements(invariant.clone(), &[2.0f32]).unwrap(),
+        ));
+        let outputs = operation.partially_evaluate(&eager, &EmptyRegionDriver, &[input]).unwrap();
+        assert!(outputs[0].is_unknown());
+        assert_eq!(outputs[0].r#type().as_ref(), &varying.clone().into());
+
+        // A staging known side stages the transition and keeps its output known.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = PartialEvaluationValue::known(trace.input(invariant.into()));
         let context = PartialEvaluationContext::new(trace.clone());
-        let outputs = ParallelVaryOperation::new("m".to_string())
-            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
-            .unwrap();
+        let outputs = operation.partially_evaluate(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert!(outputs[0].is_known());
-        assert_eq!(outputs[0].r#type().as_ref(), &varying);
+        assert_eq!(outputs[0].r#type().as_ref(), &varying.into());
         let builder = trace.builder().borrow().clone();
-        let input_count = builder.input_ids().len();
-        let output_ids = vec![outputs[0].as_known().unwrap().atom_id().unwrap()];
-        let output_count = output_ids.len();
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                output_ids,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[0].as_known().unwrap().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
@@ -755,6 +813,8 @@ mod tests {
 
     #[test]
     fn test_parallel_vary_batching() {
+        // A `batch` level that does not bind the axis name forwards the transition to its parent, preserving the
+        // mapped and ragged axes of the input.
         let (invariant, _) = scalar_types();
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3])
@@ -768,9 +828,11 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
             .unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
-        let operation = ParallelVaryOperation::new("m".to_string());
-        let outputs =
-            operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
+        let outputs = ParallelVaryOperation::new("m".to_string())
+            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), input.batch_axis());
         assert_eq!(outputs[0].ragged_axes(), input.ragged_axes());
         assert_eq!(
@@ -779,14 +841,11 @@ mod tests {
         );
 
         let builder = trace.builder().borrow().clone();
-        let input_count = builder.input_ids().len();
-        let output_ids = vec![outputs[0].value().atom_id().unwrap()];
-        let output_count = output_ids.len();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
-                output_ids,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
+                vec![outputs[0].value().atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
@@ -798,17 +857,11 @@ mod tests {
                 in (%2)"
             },
         );
-        let named_batch =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(context.parent().clone(), 2).with_axis_name("m".to_string());
-        assert!(matches!(
-            operation.batch(&named_batch, &EmptyRegionDriver, std::slice::from_ref(&input)),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`parallel_vary` requires a manual mesh axis, not a named batch axis",
-        ));
     }
 
     #[test]
     fn test_parallel_vary_batching_dynamic_extent() {
+        // Forwarding also preserves a mapped axis whose extent is a dynamic dimension input.
         let (invariant, _) = scalar_types();
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let length = DimensionVariable::new("items", DimensionBounds::new(0, Some(4)).unwrap());
@@ -822,26 +875,23 @@ mod tests {
             ProjectedContext::new(trace.clone()),
             extent,
         );
-        let output = ParallelVaryOperation::new("m".to_string())
+        let outputs = ParallelVaryOperation::new("m".to_string())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap()
             .into_parts()
             .0;
-        assert_eq!(output[0].batch_axis(), input.batch_axis());
+        assert_eq!(outputs[0].batch_axis(), input.batch_axis());
         assert_eq!(
-            output[0].value().r#type().sharding().unwrap().varying_manual_axes(),
+            outputs[0].value().r#type().sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["m".to_string()]),
         );
-        let value: Tracer<_> = ValueProjection::<ArrayType>::from_projected(output[0].value().clone());
+        let value: Tracer<_> = ValueProjection::<ArrayType>::from_projected(outputs[0].value().clone());
         let builder = trace.builder().borrow().clone();
-        let input_count = builder.input_ids().len();
-        let output_ids = vec![value.atom_id().unwrap()];
-        let output_count = output_ids.len();
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                output_ids,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
+                vec![value.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
             )
             .unwrap();
         assert_eq!(
@@ -856,47 +906,69 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_vary_batching_rejects_named_batch_axis() {
+        // A `batch` level that binds the axis name shadows the manual mesh axis and does not establish the full-axis
+        // invariance that the transition weakens, so the transition is rejected.
+        let (invariant, _) = scalar_types();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = ArrayBatch::replicated(trace.input(invariant));
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2).with_axis_name("m".to_string());
+        assert_eq!(
+            ParallelVaryOperation::new("m".to_string())
+                .batch(&context, &EmptyRegionDriver, &[input])
+                .map(|outputs| outputs.into_parts().0),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation {
+                message: "`parallel_vary` requires a manual mesh axis, not a named batch axis".to_string(),
+            })),
+        );
+    }
+
+    #[test]
     fn test_parallel_vary_differentiation() {
         let (invariant, varying) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_vary("m"),
             invariant,
-            vec![(
-                "m".to_string(),
-                NamedAxis::Mesh { axis: 0, size: 2, mesh: scalar_types().0.sharding().unwrap().mesh().clone() },
-            )],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
         )
         .unwrap();
+
+        // Forward-mode differentiation repeats the transition on the tangent.
         let differentiated = program.to_flat_program().jvp().unwrap();
         assert_eq!(differentiated.output_types(), vec![varying.clone(), varying.clone()]);
+        assert_eq!(
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}], %1:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %1
+                in (%2, %3)"
+            },
+        );
+
+        // A structural-zero tangent still receives the varying output type.
         let zero_tangent = program.to_flat_program().jvp_with_respect_to(&[]).unwrap();
         assert_eq!(zero_tangent.output_types(), vec![varying.clone(), varying]);
         assert_eq!(
             zero_tangent.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                    [axis_name=\"m\"] %0
-                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = zero \
-                        [type=f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]]
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        zero [type=f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]]
                 in (%1, %2)"
-            },
-        );
-        assert_eq!(
-            differentiated.to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}], %1:f32[][sharding={mesh<['m'=2:manual]>, []}] .
-                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                    [axis_name=\"m\"] %0
-                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                        [axis_name=\"m\"] %1
-                in (%2, %3)"
             },
         );
     }
 
     #[test]
     fn test_parallel_vary_transposition() {
+        // The transpose sums the cotangent over the axis through a mesh-form `parallel_reduce`, and transposing that
+        // sum recovers the original transition.
         let (invariant, varying) = scalar_types();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(invariant.clone());
@@ -911,17 +983,18 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", \
-                    mesh=['m'=2:manual]] %0
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=2:manual]] %0
                 in (%1)"
             },
         );
-        let twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(twice.to_string(), program.to_string());
+        let transposed_twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(transposed_twice.to_string(), program.to_string());
     }
 
     #[test]
     fn test_parallel_vary_parallel_vary() {
+        // A mesh-bound axis varies an invariant value directly.
         let (invariant, varying) = scalar_types();
         let mesh = invariant.sharding().unwrap().mesh().clone();
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
@@ -935,12 +1008,13 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                    [axis_name=\"m\"] %0
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
                 in (%1)"
             },
         );
 
+        // An unsharded value is first broadcast to a replicated placement on the axis's mesh.
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_vary("m"),
             ArrayType::scalar(DataType::F32),
@@ -954,10 +1028,67 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
                     [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
-                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                        [axis_name=\"m\"] %1
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                            parallel_vary [axis_name=\"m\"] %1
                 in (%2)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_vary_parallel_vary_rejects_invalid_axis() {
+        // Only an enclosing manual region with a non-empty axis establishes the axis. In a staged trace that does
+        // not bind the name, binds it as a batch axis, or binds it to an empty mesh axis, the capability rejects
+        // the transition with a `TypeError` before anything is staged.
+        let (invariant, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(|input| input.parallel_vary("m"), invariant.clone())
+                .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_vary` requires an active non-empty manual mesh axis `m`",
+            ))),
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_vary("m"),
+                invariant.clone(),
+                vec![("m".to_string(), NamedAxis::Batched { size: Some(2) })],
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_vary` requires an active non-empty manual mesh axis `m`",
+            ))),
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_vary("m"),
+                invariant.clone(),
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 0, mesh })],
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_vary` requires an active non-empty manual mesh axis `m`",
+            ))),
+        );
+
+        // An eager context that does not bind the name executes outside of any manual region, so the transition is
+        // unsupported rather than ill-typed.
+        let input =
+            BatchingTracer::new(eager_collective_context("x", 2), ArrayBatch::replicated(Array::scalar(2f32).unwrap()));
+        assert_eq!(
+            input.parallel_vary("m"),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`parallel_vary` requires an active non-empty manual mesh axis `m`".to_string(),
+            }),
+        );
+
+        // A concrete `Array` has no manual region at all, so the transition is unsupported.
+        assert_eq!(
+            Array::from_elements(invariant, &[2.0f32]).unwrap().parallel_vary("m"),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`parallel_vary` requires an active non-empty manual mesh axis `m`".to_string(),
+            }),
         );
     }
 
@@ -976,8 +1107,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                    [axis_name=\"m\"] %0
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
                 in (%1)"
             },
         );
@@ -993,79 +1124,147 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
                     [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
-                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                        [axis_name=\"m\"] %1
+                    %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %1
                 in (%2)"
             },
         );
+    }
 
+    #[test]
+    fn test_parallel_vary_parallel_vary_on_mesh_rejects_invalid_axis() {
         // The axis must be a non-empty manual axis of the provided mesh.
+        let (invariant, _) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        for (axis_name, mesh) in [("m", &explicit_mesh), ("n", &mesh)] {
-            assert_eq!(
-                TracingContext::<Array, ArrayOperation<Array>>::trace(
-                    |input| input.parallel_vary_on_mesh(axis_name, mesh),
-                    ArrayType::scalar(DataType::F32),
-                )
-                .map(|(output, _)| output),
-                Err(ProgramError::Type(TypeError::invalid(format!(
-                    "`parallel_vary` requires a non-empty manual mesh axis `{axis_name}`",
-                )))),
-            );
-        }
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |input| input.parallel_vary_on_mesh("m", &explicit_mesh),
+                ArrayType::scalar(DataType::F32),
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid("`parallel_vary` requires a non-empty manual mesh axis `m`"))),
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |input| input.parallel_vary_on_mesh("n", &mesh),
+                ArrayType::scalar(DataType::F32),
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid("`parallel_vary` requires a non-empty manual mesh axis `n`"))),
+        );
+
+        // A value already sharded on a different mesh is rejected, even when that mesh has a manual axis of the same
+        // name, because the supplied mesh does not describe the value's placement.
+        let other_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("n", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |input| input.parallel_vary_on_mesh("m", &mesh),
+                ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(other_mesh, 0)).unwrap(),
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_vary` input mesh does not match the mesh of manual axis `m`",
+            ))),
+        );
+
+        // A concrete `Array` has no manual region, even when the caller supplies the mesh.
+        assert_eq!(
+            Array::from_elements(invariant, &[2.0f32]).unwrap().parallel_vary_on_mesh("m", &mesh),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`parallel_vary` requires an active non-empty manual mesh axis `m`".to_string(),
+            }),
+        );
     }
 
     #[test]
     fn test_manual_variation_alignment_align_manual_variation() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        let varying = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
-            .unwrap();
-        let (output, program) =
-            DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
-                |(left, right)| Add::add(&left, &right),
-                (invariant, varying.clone()),
-                vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-            )
-            .unwrap();
-        assert_eq!(output, varying);
+        // An input that lacks the variation of its peers gains a transition, while an input that already varies over
+        // every axis passes through unchanged.
+        let (invariant, varying) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let (outputs, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation(&inputs),
+            vec![invariant, varying.clone()],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![varying.clone(), varying]);
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[][sharding={mesh<['devices'=2:manual]>, []}], \
-                    %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
-                let %2:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
-                    [axis_name=\"devices\"] %0
-                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = add %2 %1
-                in (%3)"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                in (%2, %1)"
             },
         );
     }
 
     #[test]
-    fn test_manual_variation_alignment_align_manual_variation_array_ir() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    fn test_manual_variation_alignment_align_manual_variation_axis_union() {
+        // Every input is weakened to the union of the axes that any input varies over, so inputs that vary over
+        // different axes each gain the axes that they lack.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let varying_over_a = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["a"]).unwrap())
+            .unwrap();
+        let varying_over_b = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["b"]).unwrap())
+            .unwrap();
         let varying = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["a", "b"]).unwrap())
             .unwrap();
-        let (output, program) =
-            DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::trace_with_named_axes(
-                |(left, right)| Ok(ManualVariationAlignment::align_manual_variation(&[left, right])?.remove(0)),
-                (ArrayIrType::Array(ArrayType::scalar(DataType::F32)), ArrayIrType::Array(varying.clone())),
-                vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-            )
-            .unwrap();
-        assert_eq!(output, ArrayIrType::Array(varying));
+        let (outputs, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation(&inputs),
+            vec![varying_over_a, varying_over_b],
+            vec![
+                ("a".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() }),
+                ("b".to_string(), NamedAxis::Mesh { axis: 1, size: 2, mesh }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![varying.clone(), varying]);
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[], %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
-                let %2:f32[][sharding={mesh<['devices'=2:manual]>, []}] = broadcast \
-                    [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
-                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
-                        [axis_name=\"devices\"] %2
-                in (%3)"
+                lambda %0:f32[][sharding={mesh<['a'=2:manual, 'b'=2:manual]>, [], varying_manual={'a'}}], \
+                    %1:f32[][sharding={mesh<['a'=2:manual, 'b'=2:manual]>, [], varying_manual={'b'}}] .
+                let %2:f32[][sharding={mesh<['a'=2:manual, 'b'=2:manual]>, [], varying_manual={'a', 'b'}}] = \
+                        parallel_vary [axis_name=\"b\"] %0
+                    %3:f32[][sharding={mesh<['a'=2:manual, 'b'=2:manual]>, [], varying_manual={'a', 'b'}}] = \
+                        parallel_vary [axis_name=\"a\"] %1
+                in (%2, %3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_align_manual_variation_batch_axis() {
+        // A name that a `batch` level binds shadows the manual mesh axis, so no transition is inserted for it.
+        let (invariant, varying) = scalar_types();
+        let (outputs, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation(&inputs),
+            vec![invariant.clone(), varying.clone()],
+            vec![("m".to_string(), NamedAxis::Batched { size: Some(2) })],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![invariant, varying]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}], \
+                    %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                in (%0, %1)"
             },
         );
     }
@@ -1075,12 +1274,12 @@ mod tests {
         // A trace that does not bind an axis name (e.g., the fresh trace of `Region` transposition) still aligns over
         // it, using the mesh of the input whose type varies over the axis.
         let (_, varying) = scalar_types();
-        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(left, right)| Add::add(&left, &right),
-            (ArrayType::scalar(DataType::F32), varying.clone()),
+        let (outputs, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation(&inputs),
+            vec![ArrayType::scalar(DataType::F32), varying.clone()],
         )
         .unwrap();
-        assert_eq!(output, varying);
+        assert_eq!(outputs, vec![varying.clone(), varying]);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1089,40 +1288,42 @@ mod tests {
                         broadcast [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
                     %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
                         parallel_vary [axis_name=\"m\"] %2
-                    %4:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = add %3 %1
-                in (%4)"
+                in (%3, %1)"
             },
         );
     }
 
     #[test]
-    fn test_manual_variation_alignment_align_manual_variation_array_ir_preserves_positions() {
+    fn test_manual_variation_alignment_align_manual_variation_dimension_type() {
+        // Dimension values carry no manual variation, so they pass through unchanged and in order.
+        let inputs = vec![DimensionValue::constant(3).unwrap(), DimensionValue::constant(5).unwrap()];
+        assert_eq!(ManualVariationAlignment::align_manual_variation(&inputs), Ok(inputs));
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_align_manual_variation_array_ir() {
+        // Array members of a composite `ArrayIrType` value align like plain array values, including the placement of
+        // an unsharded member on the axis's mesh. A dimension member passes through at its position, while the array
+        // members around it are aligned.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
             .unwrap();
         let extent = DimensionType::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
-
-        // A dimension member passes through at its position, while the array members around it are aligned.
         let (outputs, program) =
             DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::trace_with_named_axes(
-                |(left, extent, right)| {
-                    let mut outputs = ManualVariationAlignment::align_manual_variation(&[left, extent, right])?;
-                    let right = outputs.pop().unwrap();
-                    let extent = outputs.pop().unwrap();
-                    Ok((outputs.pop().unwrap(), extent, right))
-                },
-                (
+                |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation(&inputs),
+                vec![
                     ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
                     ArrayIrType::Dimension(extent.clone()),
                     ArrayIrType::Array(varying.clone()),
-                ),
+                ],
                 vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
             )
             .unwrap();
         assert_eq!(
             outputs,
-            (ArrayIrType::Array(varying.clone()), ArrayIrType::Dimension(extent), ArrayIrType::Array(varying)),
+            vec![ArrayIrType::Array(varying.clone()), ArrayIrType::Dimension(extent), ArrayIrType::Array(varying)],
         );
         assert_eq!(
             program.to_string(),

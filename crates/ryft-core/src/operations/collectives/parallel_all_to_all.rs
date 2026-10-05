@@ -256,13 +256,15 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
     fn infer_array_ir_output_types(&self, input_types: &[ArrayIrType]) -> Result<Vec<ArrayIrType>, TypeError> {
         let effective_axis_size = self.effective_axis_size()?;
         let Some(input_type) = input_types.first() else {
-            return Err(TypeError::invalid("`parallel_all_to_all` expects an array followed by its output extents"));
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` expects an array followed by its output extents",
+            )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         if self.options.mode == CollectiveMode::Untiled {
             let Some(input_extent) = input_type.shape().dimensions().get(self.split_axis) else {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` split axis {} is out of bounds for rank {}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} is out of bounds for rank {}",
                     self.split_axis,
                     input_type.rank(),
                 )));
@@ -271,8 +273,8 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
                 && *input_extent != effective_axis_size
             {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` untiled split axis {} size {input_extent} must equal group size \
-                     {effective_axis_size}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` untiled split axis {} size {input_extent} must equal group \
+                     size {effective_axis_size}",
                     self.split_axis,
                 )));
             }
@@ -289,8 +291,8 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
                     let output_extent = &output_extents[self.concat_axis];
                     if output_extent != &Dimension::Static(effective_axis_size) {
                         return Err(TypeError::invalid(format!(
-                            "`parallel_all_to_all` inserted output axis {} extent must equal axis group size \
-                             {effective_axis_size} but got {output_extent}",
+                            "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` inserted output axis {} extent must equal axis \
+                             group size {effective_axis_size} but got {output_extent}",
                             self.concat_axis,
                         )));
                     }
@@ -303,7 +305,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
         if self.split_axis == self.concat_axis {
             let Some(input_extent) = input_type.shape().dimensions().get(self.split_axis) else {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` split axis {} is out of bounds for rank {}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} is out of bounds for rank {}",
                     self.split_axis,
                     input_type.rank(),
                 )));
@@ -312,8 +314,8 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
                 && *input_extent % effective_axis_size != 0
             {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` split axis {} size {input_extent} is not divisible by group size \
-                     {effective_axis_size}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} size {input_extent} is not divisible by \
+                     group size {effective_axis_size}",
                     self.split_axis,
                 )));
             }
@@ -329,7 +331,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
         }
         if self.split_axis >= input_type.rank() || self.concat_axis >= input_type.rank() {
             return Err(TypeError::invalid(format!(
-                "`parallel_all_to_all` split axis {} or concat axis {} is out of bounds for rank {}",
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} or concat axis {} is out of bounds for rank {}",
                 self.split_axis,
                 self.concat_axis,
                 input_type.rank(),
@@ -339,15 +341,17 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
             && *input_extent % effective_axis_size != 0
         {
             return Err(TypeError::invalid(format!(
-                "`parallel_all_to_all` split axis {} size {input_extent} is not divisible by group size \
-                 {effective_axis_size}",
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} size {input_extent} is not divisible by group \
+                 size {effective_axis_size}",
                 self.split_axis,
             )));
         }
         let expected_concat_extent = match input_type.shape().dimensions()[self.concat_axis] {
             Dimension::Static(input_extent) => {
                 Some(input_extent.checked_mul(effective_axis_size).ok_or_else(|| {
-                    TypeError::invalid("`parallel_all_to_all` concatenation result extent does not fit in usize")
+                    TypeError::invalid(format!(
+                        "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` concatenation result extent does not fit in usize",
+                    ))
                 })?)
             }
             Dimension::Dynamic(_) => None,
@@ -371,8 +375,9 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
                     let expected = *input_extent / effective_axis_size;
                     if *output_extent != expected {
                         return Err(TypeError::invalid(format!(
-                            "`parallel_all_to_all` split result extent must equal input axis {} extent {input_extent} \
-                             divided by group size {effective_axis_size}; expected {expected} but got {output_extent}",
+                            "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split result extent must equal input axis {} \
+                             extent {input_extent} divided by group size {effective_axis_size}; expected {expected} \
+                             but got {output_extent}",
                             self.split_axis,
                         )));
                     }
@@ -383,9 +388,9 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
                     let input_extent = &input_type.shape().dimensions()[self.concat_axis];
                     if *output_extent != expected {
                         return Err(TypeError::invalid(format!(
-                            "`parallel_all_to_all` concat result extent must equal input axis {} extent {input_extent} \
-                             multiplied by group size {effective_axis_size}; expected {expected} but got \
-                             {output_extent}",
+                            "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` concat result extent must equal input axis {} \
+                             extent {input_extent} multiplied by group size {effective_axis_size}; expected {expected} \
+                             but got {output_extent}",
                             self.concat_axis,
                         )));
                     }
@@ -426,15 +431,16 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         let logical_input_rank = input.unbatched_type().rank();
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_all_to_all` axis index groups are not supported when a batch transform binds the \
-                     collective axis"
-                    .to_string(),
+                message: format!(
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` axis index groups are not supported when a batch transform \
+                     binds the collective axis",
+                ),
             });
         }
         if self.split_axis >= logical_input_rank || self.concat_axis >= logical_input_rank {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`parallel_all_to_all` split axis {} or concat axis {} is out of bounds for rank \
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} or concat axis {} is out of bounds for rank \
                      {logical_input_rank}",
                     self.split_axis, self.concat_axis,
                 ),
@@ -529,14 +535,15 @@ impl Operation for ParallelAllToAllOperation {
         let rank = output_dimensions.len();
         if self.split_axis >= rank || self.concat_axis >= rank {
             return Err(TypeError::invalid(format!(
-                "`parallel_all_to_all` split axis {} or concat axis {} is out of bounds for rank {rank}",
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} or concat axis {} is out of bounds for rank \
+                 {rank}",
                 self.split_axis, self.concat_axis,
             )));
         }
         let output_type = if self.options.mode == CollectiveMode::Untiled {
             if output_dimensions[self.split_axis] != effective_axis_size {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` untiled split axis {} size {} must equal group size {}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` untiled split axis {} size {} must equal group size {}",
                     self.split_axis, output_dimensions[self.split_axis], effective_axis_size,
                 )));
             }
@@ -547,16 +554,16 @@ impl Operation for ParallelAllToAllOperation {
         } else {
             if output_dimensions[self.split_axis] % effective_axis_size != 0 {
                 return Err(TypeError::invalid(format!(
-                    "`parallel_all_to_all` split axis {} size {} is not divisible by group size {}",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} size {} is not divisible by group size {}",
                     self.split_axis, output_dimensions[self.split_axis], effective_axis_size,
                 )));
             }
             output_dimensions[self.split_axis] /= effective_axis_size;
             output_dimensions[self.concat_axis] =
                 output_dimensions[self.concat_axis].checked_mul(effective_axis_size).ok_or_else(|| {
-                    TypeError::invalid(
-                        "`parallel_all_to_all` concatenation result extent does not fit in usize".to_string(),
-                    )
+                    TypeError::invalid(format!(
+                        "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` concatenation result extent does not fit in usize",
+                    ))
                 })?;
             infer_linear_collective_operation_output_type(
                 PARALLEL_ALL_TO_ALL_OPERATION_NAME,
@@ -947,7 +954,10 @@ where
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
             let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
             if array.r#type().unreduced_axes().contains(axis_name) {
-                return Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs").into());
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
             }
             if !array.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
@@ -959,8 +969,8 @@ where
         let rank = input_type.rank();
         if split_axis >= rank || concat_axis >= rank {
             return Err(TypeError::invalid(format!(
-                "`parallel_all_to_all` split axis {split_axis} or concat axis {concat_axis} is out of bounds for rank \
-                 {rank}",
+                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {split_axis} or concat axis {concat_axis} is out of \
+                 bounds for rank {rank}",
             ))
             .into());
         }
@@ -1066,7 +1076,10 @@ where
             ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concat_axis, options);
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
             if input.r#type().unreduced_axes().contains(axis_name) {
-                return Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs").into());
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
             }
             if !input.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 input = input.parallel_vary(axis_name)?;
@@ -1133,57 +1146,29 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, RaggedAxis, Shape, ShardingDimension, StridedLayout,
+        ArrayIrOperation, ArrayOperation, DataType, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType,
+        RaggedAxis, ShardingDimension, StridedLayout,
     };
-    use crate::axes::NamedAxis;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
+    use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-    use crate::interpretation::InterpretableOperation;
-    use crate::macros::{check_gradient, check_operation_type_inference};
+    use crate::differentiation::DifferentiationTracer;
+    use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::assertions::AssertionError;
+    use crate::operations::collectives::tests::{batch_collective, collective_program, eager_collective_context};
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
-    use crate::partial::{
-        PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
-        PartiallyEvaluatableOperation,
-    };
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramError};
-    use crate::tracing::TracingContext;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
-
-    /// Builds a single-instruction homogeneous all-to-all program.
-    fn parallel_all_to_all_program(
-        operation: ParallelAllToAllOperation,
-        input_type: ArrayType,
-    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(input_type);
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap().to_vec();
-        builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    /// Applies the matching-axis rule under an eager two-participant batch named `"x"`.
-    fn batch_parallel_all_to_all(
-        operation: &ParallelAllToAllOperation,
-        input: ArrayBatch<Array>,
-    ) -> Result<Vec<ArrayBatch<Array>>, BatchingError> {
-        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
-            EagerContext::new(),
-            2,
-        )
-        .with_axis_name("x".to_string());
-        Ok(operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0)
-    }
 
     #[test]
     fn test_parallel_all_to_all() {
         let operation = ParallelAllToAllOperation::new("x".to_string(), 4, 0, 1, CollectiveOptions::tiled());
         assert_eq!(operation.name(), PARALLEL_ALL_TO_ALL_OPERATION_NAME);
+        assert_eq!(operation.axis_name(), "x");
+        assert_eq!(operation.axis_size(), 4);
         assert_eq!(operation.split_axis(), 0);
         assert_eq!(operation.concat_axis(), 1);
         assert_eq!(operation.options(), &CollectiveOptions::tiled());
@@ -1194,6 +1179,8 @@ mod tests {
         );
         assert_eq!(operation.effective_axis_size(), Ok(4));
 
+        // Ordered participant groups exchange chunks within each group, so the common group size replaces the axis
+        // size as the participant count.
         let grouped = ParallelAllToAllOperation::new(
             "x".to_string(),
             4,
@@ -1229,6 +1216,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_type_inference() {
+        // Tiled exchanges divide the split extent and multiply the concatenation extent by the participant count, so
+        // they require static, in-bounds, divisible extents and a concatenation extent that does not overflow.
         check_operation_type_inference!(
             operation = ParallelAllToAllOperation::new("x".to_string(), 4, 0, 1, CollectiveOptions::tiled()),
             cases = [
@@ -1240,8 +1229,29 @@ mod tests {
                     input_types = [ArrayType::new_static(DataType::F32, [6, 3])],
                     error = "`parallel_all_to_all` split axis 0 size 6 is not divisible by group size 4",
                 },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [4, usize::MAX])],
+                    error = "`parallel_all_to_all` concatenation result extent does not fit in usize",
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [8])],
+                    error = "`parallel_all_to_all` split axis 0 or concat axis 1 is out of bounds for rank 1",
+                },
+                {
+                    input_types = [ArrayType::new(
+                        DataType::F32,
+                        Shape::new(vec![
+                            DimensionVariable::new("length", DimensionBounds::unbounded()).into(),
+                            Dimension::Static(3),
+                        ]),
+                    )],
+                    error = "`parallel_all_to_all` does not support dynamically shaped inputs",
+                },
             ],
         );
+
+        // Untiled exchanges replace the split axis, whose extent must equal the participant count, with a sender axis
+        // at the concatenation position, for any element data type.
         check_operation_type_inference!(
             operation = ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default()),
             cases = [
@@ -1255,9 +1265,16 @@ mod tests {
                 },
             ],
         );
+
+        // Participant groups use the common group size, rather than the axis size, as the participant count.
         check_operation_type_inference!(
-            operation = ParallelAllToAllOperation::new("x".to_string(), 4, 0, 1,
-                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),),
+            operation = ParallelAllToAllOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                1,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+            ),
             cases = [{
                 input_types = [ArrayType::new_static(DataType::C64, [6, 3])],
                 output_types = [ArrayType::new_static(DataType::C64, [3, 6])],
@@ -1266,76 +1283,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_to_all_type_inference_array_ir() {
-        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-        let split = DimensionVariable::new("split", DimensionBounds::unbounded());
-        let concat = DimensionVariable::new("concat", DimensionBounds::unbounded());
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [4, 3]).into(),
-                DimensionType::from(split.clone()).into(),
-                DimensionType::from(concat.clone()).into(),
-            ],),
-            Ok(vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![split.clone().into(), concat.clone().into()])).into()
-            ],),
-        );
-
-        // A known invalid split extent is rejected even when both result extents are dynamic.
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [3, 3]).into(),
-                DimensionType::from(split.clone()).into(),
-                DimensionType::from(concat.clone()).into(),
-            ],),
-            Err(TypeError::invalid("`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2")),
-        );
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [4, usize::MAX]).into(),
-                DimensionType::from(split).into(),
-                DimensionType::from(concat).into(),
-            ],),
-            Err(TypeError::invalid("`parallel_all_to_all` concatenation result extent does not fit in usize")),
-        );
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [4, 3]).into(),
-                DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
-            ],),
-            Err(TypeError::invalid(
-                "`parallel_all_to_all` split result extent must equal input axis 0 extent 4 divided by group size 2; \
-                 expected 2 but got 1",
-            ),),
-        );
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [4, 3]).into(),
-                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(5).unwrap().r#type().into_owned().into(),
-            ],),
-            Err(TypeError::invalid(
-                "`parallel_all_to_all` concat result extent must equal input axis 1 extent 3 multiplied by group size \
-                 2; expected 6 but got 5",
-            ),),
-        );
-
-        // Untiled geometry retains unaffected dynamic dimensions and inserts a statically known sender axis.
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default())
-                .infer_array_ir_output_types(&[
-                    ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into(), 2.into()])).into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionType::from(length.clone()).into(),
-                ],),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.into()])).into()]),
-        );
-    }
-
-    #[test]
     fn test_parallel_all_to_all_type_inference_metadata() {
+        // A shape-preserving exchange retains the complete input type, including its layout and memory space, in both
+        // type representations.
         let input = ArrayType::new_static(DataType::F32, [4, 3])
             .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
             .with_memory(Memory::Host { pinned: true });
@@ -1346,7 +1296,7 @@ mod tests {
                 input.clone().into(),
                 DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
                 DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-            ],),
+            ]),
             Ok(vec![input.into()]),
         );
 
@@ -1364,13 +1314,16 @@ mod tests {
                     input.into(),
                     DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
-                ],),
+                ]),
             Err(TypeError::invalid(
                 "`parallel_all_to_all` on a dimension sharded over explicit mesh axes requires the output size (1) at \
                  axis 0 to be divisible by the mesh-axis product (2)",
-            ),),
+            )),
         );
+    }
 
+    #[test]
+    fn test_parallel_all_to_all_type_inference_manual_mesh() {
         // An exchange over a manual mesh axis keeps a varying input varying, but rejects an invariant input, which
         // would wrongly type the exchanged output as invariant, and an input with a pending cross-device sum. The
         // input must carry the operation's mesh.
@@ -1418,7 +1371,7 @@ mod tests {
                 with_sharding([2, 3], &unreduced).into(),
                 DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
                 DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
-            ],),
+            ]),
             Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs")),
         );
 
@@ -1455,6 +1408,146 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_to_all_type_inference_preserves_unrelated_pending_sums() {
+        // Exchanging chunks along `x` preserves a pending sum over the independent `y` axis in both type
+        // representations.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
+            .with_mesh(mesh.clone());
+        let sharding = Sharding::replicated(mesh.clone(), 2)
+            .with_unreduced_axes(["y"])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding.clone()).unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [1, 6]).with_sharding(sharding).unwrap();
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                input_type.into(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
+            ]),
+            Ok(vec![output_type.into()]),
+        );
+
+        // A pending sum over the exchanged `x` axis itself is rejected in both type representations.
+        let sharding = Sharding::replicated(mesh, 2).with_unreduced_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding).unwrap();
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&input_type), &[]),
+            Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs")),
+        );
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                input_type.into(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
+            ]),
+            Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs")),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_type_inference_array_ir() {
+        // Explicit dimension inputs supply the tiled result extents.
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
+        let split = DimensionVariable::new("split", DimensionBounds::unbounded());
+        let concat = DimensionVariable::new("concat", DimensionBounds::unbounded());
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [4, 3]).into(),
+                DimensionType::from(split.clone()).into(),
+                DimensionType::from(concat.clone()).into(),
+            ]),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![split.clone().into(), concat.clone().into()])).into()
+            ]),
+        );
+
+        // A known invalid split extent is rejected even when both result extents are dynamic.
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 3]).into(),
+                DimensionType::from(split.clone()).into(),
+                DimensionType::from(concat.clone()).into(),
+            ]),
+            Err(TypeError::invalid("`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2")),
+        );
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [4, usize::MAX]).into(),
+                DimensionType::from(split).into(),
+                DimensionType::from(concat).into(),
+            ]),
+            Err(TypeError::invalid("`parallel_all_to_all` concatenation result extent does not fit in usize")),
+        );
+
+        // Static result extents must equal the extents implied by the input and the participant count.
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [4, 3]).into(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
+            ]),
+            Err(TypeError::invalid(
+                "`parallel_all_to_all` split result extent must equal input axis 0 extent 4 divided by group size 2; \
+                 expected 2 but got 1",
+            )),
+        );
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [4, 3]).into(),
+                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(5).unwrap().r#type().into_owned().into(),
+            ]),
+            Err(TypeError::invalid(
+                "`parallel_all_to_all` concat result extent must equal input axis 1 extent 3 multiplied by group size \
+                 2; expected 6 but got 5",
+            )),
+        );
+
+        // A missing array input and out-of-bounds axes are rejected before any result extent is read.
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[]),
+            Err(TypeError::invalid("`parallel_all_to_all` expects an array followed by its output extents")),
+        );
+        assert_eq!(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::tiled())
+                .infer_array_ir_output_types(&[
+                    ArrayType::new_static(DataType::F32, [4, 3]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
+                ]),
+            Err(TypeError::invalid("`parallel_all_to_all` split axis 0 or concat axis 2 is out of bounds for rank 2")),
+        );
+
+        // Coincident tiled axes preserve the shape but still validate the split axis and its divisibility.
+        assert_eq!(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 2, 2, CollectiveOptions::tiled())
+                .infer_array_ir_output_types(&[
+                    ArrayType::new_static(DataType::F32, [4, 3]).into(),
+                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                ]),
+            Err(TypeError::invalid("`parallel_all_to_all` split axis 2 is out of bounds for rank 2")),
+        );
+        assert_eq!(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled())
+                .infer_array_ir_output_types(&[
+                    ArrayType::new_static(DataType::F32, [3, 3]).into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                ]),
+            Err(TypeError::invalid("`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2")),
+        );
+    }
+
+    #[test]
     fn test_parallel_all_to_all_type_inference_array_ir_dynamic() {
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
         let split_result = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
@@ -1470,14 +1563,14 @@ mod tests {
                     input_type.clone().into(),
                     ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
                     ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
-                ],),
+                ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
                     Shape::new(vec![Dimension::Dynamic(split_result), Dimension::Dynamic(concat_result),]),
                 )
                 .into()
-            ],),
+            ]),
         );
         assert_eq!(
             ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled())
@@ -1485,13 +1578,15 @@ mod tests {
                     ArrayIrType::Array(input_type.clone()),
                     ArrayIrType::Dimension(DimensionType::from(input_axis)),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],),
+                ]),
             Ok(vec![input_type.into()]),
         );
     }
 
     #[test]
     fn test_parallel_all_to_all_type_inference_array_ir_untiled() {
+        // Untiled exchanges remove the split axis and insert a statically known sender axis at the concatenation
+        // position, which may follow, precede, or coincide with the split axis.
         let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
         let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
         let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
@@ -1502,13 +1597,9 @@ mod tests {
                     exact_three.into(),
                     exact_four.into(),
                     exact_two.into(),
-                ],),
+                ]),
             Ok(vec![ArrayType::new_static(DataType::F32, [3, 4, 2]).into()]),
         );
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_type_inference_array_ir_untiled_same_axis() {
         assert_eq!(
             ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default())
                 .infer_array_ir_output_types(&[
@@ -1520,14 +1611,14 @@ mod tests {
                     DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],),
+                ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
                     Shape::new(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]),
                 )
                 .into()
-            ],),
+            ]),
         );
         assert_eq!(
             ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default())
@@ -1540,59 +1631,58 @@ mod tests {
                     DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ],),
+                ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
                     Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]),
                 )
                 .into()
-            ],),
+            ]),
         );
-    }
 
-    #[test]
-    fn test_parallel_all_to_all_type_inference_preserves_unrelated_pending_sums() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
-            .with_mesh(mesh.clone());
-        for pending_axis in ["x", "y"] {
-            let sharding = Sharding::replicated(mesh.clone(), 2).with_unreduced_axes([pending_axis]).unwrap();
-            let invariant = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding.clone()).unwrap();
-            let sharding =
-                if pending_axis == "y" { sharding.with_varying_manual_axes(["x"]).unwrap() } else { sharding };
-            let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding.clone()).unwrap();
-            let output_type = ArrayType::new_static(DataType::F32, [1, 6]).with_sharding(sharding).unwrap();
-            let expected = if pending_axis == "y" {
-                Ok(vec![output_type])
-            } else {
-                Err(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))
-            };
-            // Exchanging chunks along `x` preserves a sum over independent `y` in both type representations.
-            assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), expected);
-            assert_eq!(
-                operation.infer_array_ir_output_types(&[
-                    input_type.into(),
-                    DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(6).unwrap().r#type().into_owned().into(),
-                ],),
-                expected.clone().map(|outputs| outputs.into_iter().map(ArrayIrType::Array).collect()),
-            );
-            // The public capability also makes an invariant input varying over `x` without dropping pending `y`.
-            assert_eq!(
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    |input| input.parallel_all_to_all_tiled("x", 0, 1),
-                    ArrayIrType::Array(invariant),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .map(|(output, _)| output),
-                expected.map(|mut outputs| ArrayIrType::Array(outputs.remove(0))).map_err(ProgramError::Type),
-            );
-        }
+        // Untiled geometry retains unaffected dynamic dimensions.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
+        assert_eq!(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default())
+                .infer_array_ir_output_types(&[
+                    ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into(), 2.into()])).into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionType::from(length.clone()).into(),
+                ]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.into()])).into()]),
+        );
+
+        // The split axis must exist and have the participant count as its extent, and the inserted sender axis must
+        // have that count as its explicit result extent.
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default());
+        assert_eq!(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 2, 0, CollectiveOptions::default())
+                .infer_array_ir_output_types(&[
+                    ArrayType::new_static(DataType::F32, [3, 2]).into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                ]),
+            Err(TypeError::invalid("`parallel_all_to_all` split axis 2 is out of bounds for rank 2")),
+        );
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ]),
+            Err(TypeError::invalid("`parallel_all_to_all` untiled split axis 1 size 4 must equal group size 2")),
+        );
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 2]).into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ]),
+            Err(TypeError::invalid(
+                "`parallel_all_to_all` inserted output axis 0 extent must equal axis group size 2 but got 3",
+            )),
+        );
     }
 
     #[test]
@@ -1627,35 +1717,7 @@ mod tests {
             Err(ProgramError::UnsupportedOperation {
                 message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
-            },),
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_interpretation_array_ir() {
-        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                &[input.clone(), extent.clone()],
-            ),
-            Ok(vec![input.clone()]),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
-                Vec::new(),
-                &[
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
-                ],
-            ),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())]),
+            }),
         );
     }
 
@@ -1683,7 +1745,7 @@ mod tests {
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`parallel_all_to_all` split axis 1 or concat axis 0 is out of bounds for rank 1",
-            ),),),
+            ),)),
         );
         assert_eq!(
             context.bind(
@@ -1695,12 +1757,11 @@ mod tests {
         );
 
         // Outside any binder, only collectives whose instances each combine a single participant are defined. Groups
-        // with one participant each qualify even over a larger axis, in both array families, while ungrouped
-        // collectives over that axis do not.
+        // with one participant each therefore qualify even over a larger axis, unlike an ungrouped exchange over it.
         let singleton_groups = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]);
         assert_eq!(
             context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, singleton_groups.clone()),
+                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, singleton_groups),
                 Vec::new(),
                 std::slice::from_ref(&input),
             ),
@@ -1715,35 +1776,91 @@ mod tests {
             Err(ProgramError::UnsupportedOperation {
                 message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
-            },),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_interpretation_array_ir() {
+        // Composite values apply the same degenerate rules to their array input after validating the explicit result
+        // extents against the observed input.
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
+                Vec::new(),
+                &[input.clone(), extent.clone()],
+            ),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    0,
+                    CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]),
+                ),
+                Vec::new(),
+                &[input.clone(), extent],
+            ),
+            Ok(vec![input]),
+        );
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
+                Vec::new(),
+                &[
+                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())]),
+        );
+
+        // A degenerate untiled exchange relocates its size-one split axis to the concatenation position.
+        assert_eq!(
+            context.bind(
+                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default()),
+                Vec::new(),
+                &[
+                    ArrayIrValue::Array(Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 1, vec![1.0f32, 2.0, 3.0]).unwrap())]),
         );
     }
 
     #[test]
     fn test_parallel_all_to_all_partial_evaluation() {
-        // A degenerate untiled exchange folds a known input through the corresponding rank-preserving reshape.
-        let input = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
-        let program = parallel_all_to_all_program(
-            ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default()),
-            ArrayType::new_static(DataType::F32, [1, 3]),
-        );
-        assert_eq!(
-            program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap().outputs(),
-            &[PartialEvaluationOutput::Known(Array::matrix(3, 1, vec![1.0f32, 2.0, 3.0]).unwrap())],
+        // A degenerate untiled exchange folds a known input through the corresponding rank-preserving reshape and
+        // residualizes an unknown one.
+        check_operation_partial_evaluation!(
+            operation = ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default()),
+            inputs = [Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap()],
+            expected = Array::matrix(3, 1, vec![1.0f32, 2.0, 3.0]).unwrap(),
         );
 
         // An exchange with other participants has no eager per-item value and therefore residualizes.
+        let input = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
         let operation = ParallelAllToAllOperation::new("x".to_string(), 3, 1, 0, CollectiveOptions::tiled());
-        let program = parallel_all_to_all_program(operation.clone(), ArrayType::new_static(DataType::F32, [1, 3]));
+        let program = collective_program(operation.clone(), ArrayType::new_static(DataType::F32, [1, 3]));
         let evaluation = program.partially_evaluate(&[PartialValue::Known(input)]).unwrap();
-        assert!(evaluation.outputs()[0].is_unknown());
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             evaluation.program().to_string(),
-            indoc! {
-                "lambda %0:f32[1, 3] .
-             let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, concat_axis=0, \
-                 options=Tiled] %0
-             in (%1)"
+            indoc! {"
+                lambda %0:f32[1, 3] .
+                let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, concat_axis=0, \
+                options=Tiled] %0
+                in (%1)"
             },
         );
     }
@@ -1772,11 +1889,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             program.to_string(),
-            indoc! {
-                "lambda %0:f32[1, 3] .
-             let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, concat_axis=0, \
-                 options=Tiled] %0
-             in (%1)"
+            indoc! {"
+                lambda %0:f32[1, 3] .
+                let %1:f32[3, 1] = parallel_all_to_all [axis_name=\"x\", axis_size=3, split_axis=1, concat_axis=0, \
+                options=Tiled] %0
+                in (%1)"
             },
         );
     }
@@ -1786,7 +1903,7 @@ mod tests {
         // Replicated senders still route destination-specific chunks: each destination receives its chunk twice.
         let tiled = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         let output =
-            batch_parallel_all_to_all(&tiled, ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()))
+            batch_collective(&tiled, "x", 2, ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()))
                 .unwrap()
                 .remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
@@ -1798,8 +1915,10 @@ mod tests {
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
         )
         .unwrap();
-        let output = batch_parallel_all_to_all(
+        let output = batch_collective(
             &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::default()),
+            "x",
+            2,
             ArrayBatch::new(input, BatchAxis::new(0)).unwrap(),
         )
         .unwrap()
@@ -1816,8 +1935,10 @@ mod tests {
             &[1.0, 7.0, 4.0, 10.0, 2.0, 8.0, 5.0, 11.0, 3.0, 9.0, 6.0, 12.0],
         )
         .unwrap();
-        let output = batch_parallel_all_to_all(
+        let output = batch_collective(
             &ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default()),
+            "x",
+            2,
             ArrayBatch::new(input, BatchAxis::new(2)).unwrap(),
         )
         .unwrap()
@@ -1830,7 +1951,7 @@ mod tests {
 
         // Participant groups belong to a mesh exchange and are unsupported when this batch binds the named axis.
         assert_eq!(
-            batch_parallel_all_to_all(
+            batch_collective(
                 &ParallelAllToAllOperation::new(
                     "x".to_string(),
                     2,
@@ -1838,30 +1959,52 @@ mod tests {
                     0,
                     CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]),
                 ),
+                "x",
+                2,
                 ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap()),
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_all_to_all` axis index groups are not supported when a batch transform binds the \
                      collective axis"
                     .to_string(),
-            },),
+            }),
         );
 
         // An exchange over a manual mesh axis cannot be consumed by a level that binds a batch axis with its name.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         assert_eq!(
-            batch_parallel_all_to_all(
+            batch_collective(
                 &tiled.with_mesh(mesh),
+                "x",
+                2,
                 ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap()),
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_all_to_all` over a manual mesh axis cannot bind a named batch axis".to_string(),
-            },),
+            }),
         );
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_ragged() {
+    fn test_parallel_all_to_all_batching_untiled_coincident_axes() {
+        // Coincident untiled axes exchange the per-item split axis with the batch axis, so batch item `i` receives
+        // element `i` of every item, in sender order.
+        let output = batch_collective(
+            &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default()),
+            "x",
+            2,
+            ArrayBatch::new(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value(), &Array::matrix(2, 2, vec![1.0f32, 3.0, 2.0, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_rejects_ragged_inputs() {
+        // A matching level rejects bounded ragged inputs in both array families, because one extent per item does not
+        // determine how each sender partitions its live prefix among the receivers.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap(), BatchAxis::new(0))
             .unwrap()
@@ -1872,20 +2015,18 @@ mod tests {
                 vec![0],
             )])
             .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-
         assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch(
-                &context,
-                &EmptyRegionDriver,
-                &[input],
+            batch_collective(
+                &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
+                "x",
+                2,
+                input,
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_all_to_all` cannot route bounded ragged dimension `length` without explicit \
                           per-destination offsets and sizes; use `parallel_ragged_all_to_all`"
                     .to_string(),
-            },),
+            }),
         );
 
         let extents = ArrayIrValue::Array(Array::vector(vec![2i32, 4]).unwrap());
@@ -1911,63 +2052,457 @@ mod tests {
                 message: "`parallel_all_to_all` cannot route bounded ragged dimension `length` without explicit \
                           per-destination offsets and sizes; use `parallel_ragged_all_to_all`"
                     .to_string(),
-            },),
+            }),
         );
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_untiled() {
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let exchanged = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
-            .batch(&context, &EmptyRegionDriver, &[input])
+    fn test_parallel_all_to_all_batching_forwards_unbound_axis() {
+        // A non-matching batch level shifts both array axes around its mapped dimension. Removing the split axis
+        // can move that mapped dimension, and insertion at the concat axis can move it a second time.
+        let context = eager_collective_context("items", 2);
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default());
+
+        // A leading mapped dimension stays in front of both array axes.
+        let input = Array::from_elements::<f32>(
+            ArrayType::new_static(DataType::F32, [2, 1, 3]),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let output = operation
+            .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0)).unwrap()])
             .unwrap()
             .into_parts()
-            .0;
-        assert_eq!(exchanged[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0f32, 3.0, 2.0, 4.0]).unwrap());
+            .0
+            .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3, 1]));
+        assert_eq!(output.value().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Removing the split axis in front of the mapped dimension moves that dimension to the front.
+        let input = Array::from_elements::<f32>(
+            ArrayType::new_static(DataType::F32, [1, 2, 3]),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let output = operation
+            .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(1)).unwrap()])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3, 1]));
+        assert_eq!(output.value().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // A trailing mapped dimension stays behind both array axes.
+        let input = Array::from_elements::<f32>(
+            ArrayType::new_static(DataType::F32, [1, 3, 2]),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let output = operation
+            .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(2)).unwrap()])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::new(2));
+        assert_eq!(output.value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [3, 1, 2]));
+        assert_eq!(output.value().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_same_axes() {
-        // Block exchange with `split_axis == concat_axis == 0`: each item splits its vector into two chunks and
-        // receives its own chunk index from every item, concatenated item-major. With items `[1, 2, 3, 4]` and
-        // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
-        // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
-        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+    fn test_parallel_all_to_all_batching_forwards_unbound_axis_validates_manual_inputs() {
+        // An exchange over a manual mesh axis forwarded through an unrelated batch level rejects invariant inputs and
+        // pending mesh sums at that level, before forwarding. Bind the operation directly so the capability cannot
+        // insert `parallel_vary` first.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 3);
+
+        // An invariant input would type the exchanged output as invariant.
+        let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let parent = input.dispatch_domain();
+                let context =
+                    BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.dimension_constant(2)?)
+                        .with_axis_name("y".to_string());
+                let input = ArrayIrBatch::new(input, BatchAxis::new(0))?;
+                let split_extent = ArrayIrBatch::replicated(parent.dimension_constant(1)?);
+                let concatenation_extent = ArrayIrBatch::replicated(parent.dimension_constant(6)?);
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
+                    .with_mesh(mesh.clone());
+                let mut outputs = operation
+                    .batch_in_parent(&context, &EmptyRegionDriver, &[input, split_extent, concatenation_extent])?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            ArrayIrType::Array(
+                ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap(),
+            ),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::Type(TypeError::invalid(
+                "`parallel_all_to_all` input must vary over manual axis `x`; pass an invariant value through \
+                 `parallel_vary` first so that the exchanged output is typed as varying",
+            ))),
+        );
+
+        // A pending sum over the exchanged mesh axis is rejected.
+        let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let parent = input.dispatch_domain();
+                let context =
+                    BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.dimension_constant(2)?)
+                        .with_axis_name("y".to_string());
+                let input = ArrayIrBatch::new(input, BatchAxis::new(0))?;
+                let split_extent = ArrayIrBatch::replicated(parent.dimension_constant(1)?);
+                let concatenation_extent = ArrayIrBatch::replicated(parent.dimension_constant(6)?);
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
+                    .with_mesh(mesh.clone());
+                let mut outputs = operation
+                    .batch_in_parent(&context, &EmptyRegionDriver, &[input, split_extent, concatenation_extent])?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            ArrayIrType::Array(
+                ArrayType::new_static(DataType::F32, [2, 2, 3])
+                    .with_sharding(sharding.with_unreduced_axes(["x"]).unwrap())
+                    .unwrap(),
+            ),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_shadows_manual_axis() {
+        // The inner batch named `x` exchanges local chunks independently of the manual mesh axis also named `x`.
+        // The local exchange preserves the manual invariance of the input.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 3);
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let input = ArrayBatch::new(input, BatchAxis::new(0))?;
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                Ok(outputs.remove(0).into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
+                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape [shape=[2, 2, 1, \
+                3]] %0
+                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[1, 0, 2, 3]] %1
+                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[0, 2, 1, 3]] %2
+                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape [shape=[2, 1, 6], \
+                output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %3
+                in (%4)"
+            },
+        );
+
+        // The composite family's explicit result extents use the same local batching rule.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    batch(
+                        |item| item.parallel_all_to_all_tiled("x", 0, 1),
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<3> = constant [value=3]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<1> = dimension_div %2 %4
+                    %6:dimension<6> = dimension_mul %3 %4
+                    %7:dimension<2> = constant [value=2]
+                    %8:bool[] = const true
+                    %9:dimension<3> = dimension_div %6 %1
+                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape %0 %1 %1 %5 %9
+                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[1, 0, 2, 3]] %10
+                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[0, 2, 1, 3]] %11
+                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape \
+                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %12 %1 %5 %6
+                in (%13)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_shadows_manual_axis_unreduced() {
+        // The inner batch named `x` exchanges local chunks independently of the manual mesh axis also named `x`.
+        // The local exchange preserves the pending sum over the shadowed mesh axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 3).with_unreduced_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let input = ArrayBatch::new(input, BatchAxis::new(0))?;
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
+                let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
+                Ok(outputs.remove(0).into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
+                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
+                [shape=[2, 2, 1, 3]] %0
+                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[1, 0, 2, 3]] %1
+                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[0, 2, 1, 3]] %2
+                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] = reshape [
+                        shape=[2, 1, 6],
+                        output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}},
+                    ] %3
+                in (%4)"
+            },
+        );
+
+        // The composite family's explicit result extents use the same local batching rule.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    batch(
+                        |item| item.parallel_all_to_all_tiled("x", 0, 1),
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<3> = constant [value=3]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<1> = dimension_div %2 %4
+                    %6:dimension<6> = dimension_mul %3 %4
+                    %7:dimension<2> = constant [value=2]
+                    %8:bool[] = const true
+                    %9:dimension<3> = dimension_div %6 %1
+                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
+                %0 %1 %1 %5 %9
+                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[1, 0, 2, 3]] %10
+                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[0, 2, 1, 3]] %11
+                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] = reshape \
+                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] %12 %1 %5 %6
+                in (%13)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_shadows_manual_axis_through_unrelated_batch() {
+        // The unrelated inner batch forwards to the outer batch named `x`. That outer batch shadows the mesh axis,
+        // so forwarding must leave mesh validation to the level that handles the exchange, which preserves the
+        // manual invariance of the input.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 4);
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    batch(
+                        |item| {
+                            batch(
+                                |item| item.parallel_all_to_all_tiled("x", 0, 1),
+                                item,
+                                BatchAxis::new(0),
+                                BatchAxis::new(0),
+                                BatchAxisSpecification::named("y"),
+                            )
+                            .map_err(Into::into)
+                        },
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<3> = constant [value=3]
+                    %5:dimension<2> = constant [value=2]
+                    %6:dimension<1> = dimension_div %3 %5
+                    %7:dimension<6> = dimension_mul %4 %5
+                    %8:dimension<2> = constant [value=2]
+                    %9:bool[] = const true
+                    %10:dimension<3> = dimension_div %7 %1
+                    %11:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = reshape %0 %1 %2 \
+                %1 %6 %10
+                    %12:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = transpose \
+                [permutation=[2, 1, 0, 3, 4]] %11
+                    %13:f32[2, 2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = transpose \
+                [permutation=[0, 1, 3, 2, 4]] %12
+                    %14:f32[2, 2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape \
+                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] %13 %1 %2 %6 %7
+                in (%14)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_shadows_manual_axis_through_unrelated_batch_unreduced() {
+        // The unrelated inner batch forwards to the outer batch named `x`. That outer batch shadows the mesh axis,
+        // so forwarding must leave mesh validation to the level that handles the exchange, which preserves the
+        // pending sum over the shadowed mesh axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 4).with_unreduced_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    batch(
+                        |item| {
+                            batch(
+                                |item| item.parallel_all_to_all_tiled("x", 0, 1),
+                                item,
+                                BatchAxis::new(0),
+                                BatchAxis::new(0),
+                                BatchAxisSpecification::named("y"),
+                            )
+                            .map_err(Into::into)
+                        },
+                        input,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("x"),
+                    )
+                    .map_err(Into::into)
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<3> = constant [value=3]
+                    %5:dimension<2> = constant [value=2]
+                    %6:dimension<1> = dimension_div %3 %5
+                    %7:dimension<6> = dimension_mul %4 %5
+                    %8:dimension<2> = constant [value=2]
+                    %9:bool[] = const true
+                    %10:dimension<3> = dimension_div %7 %1
+                    %11:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
+                reshape %0 %1 %2 %1 %6 %10
+                    %12:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[2, 1, 0, 3, 4]] %11
+                    %13:f32[2, 2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
+                transpose [permutation=[0, 1, 3, 2, 4]] %12
+                    %14:f32[2, 2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
+                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] %13 %1 %2 %6 %7
+                in (%14)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_batching_array_ir_coincident_axes() {
+        // Block exchange with `split_axis == concat_axis == 0`: each item splits its vector into two chunks, and item
+        // `i` receives chunk `i` of every item, concatenated in sender order. With items `[1, 2, 3, 4]` and
+        // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`.
+        let input = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let output: ArrayIrValue<Array> = batch(
             |item: BatchingTracer<
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
                 ArrayIrBatchingPolicy,
             >| { item.parallel_all_to_all_tiled("x", 0, 0) },
-            ArrayIrValue::Array(x),
+            ArrayIrValue::Array(input),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
         )
         .unwrap();
         assert_eq!(
-            output.r#type().into_owned(),
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
-            ),),
+            output,
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]).unwrap()),
         );
-        let ArrayIrValue::Array(output) = output else {
-            panic!("`parallel_all_to_all` must preserve the array member kind");
-        };
-        assert_eq!(output.elements::<f64>().unwrap(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_distinct_axes() {
+    fn test_parallel_all_to_all_batching_array_ir_distinct_axes() {
         // Distinct split and concatenation axes over per-item `[2, 2]` matrices: each item splits its rows across
         // the items and receives its own row index from every item, concatenated item-major along the columns. With
         // item 0 = `[[1, 2], [3, 4]]` and item 1 = `[[5, 6], [7, 8]]`, item 0 receives `[[1, 2, 5, 6]]` and item 1
         // receives `[[3, 4, 7, 8]]` (per-item shape `[1, 4]`).
-        let x = Array::from_elements::<f64>(
+        let input = Array::from_elements::<f64>(
             ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
@@ -1980,41 +2515,43 @@ mod tests {
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
                 ArrayIrBatchingPolicy,
             >| { item.parallel_all_to_all_tiled("x", 0, 1) },
-            ArrayIrValue::Array(x),
+            ArrayIrValue::Array(input),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
         )
         .unwrap();
         assert_eq!(
-            output.r#type().into_owned(),
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(1), Dimension::Static(4)]),
-            ),),
+            output,
+            ArrayIrValue::Array(
+                Array::from_elements::<f64>(
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![Dimension::Static(2), Dimension::Static(1), Dimension::Static(4)]),
+                    ),
+                    &[1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0],
+                )
+                .unwrap(),
+            ),
         );
-        let ArrayIrValue::Array(output) = output else {
-            panic!("`parallel_all_to_all` must preserve the array member kind");
-        };
-        assert_eq!(output.elements::<f64>().unwrap(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
     #[test]
-    fn test_parallel_all_to_all_batching_dynamic_extents() -> Result<(), ProgramError> {
+    fn test_parallel_all_to_all_batching_array_ir_dynamic_extents() {
         // Distinct-axis all-to-all derives its temporary pre-exchange shape from the supplied result extents and the
         // mapped extent using ordinary dimension arithmetic; it never reads the source array shape.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
-        let input_split = DimensionVariable::new("input_split", DimensionBounds::new(1, Some(65))?);
-        let input_concat = DimensionVariable::new("input_concat", DimensionBounds::new(1, Some(65))?);
-        let output_split = DimensionVariable::new("output_split", DimensionBounds::new(1, Some(65))?);
-        let output_concat = DimensionVariable::new("output_concat", DimensionBounds::new(1, Some(129))?);
+        let batch_dimension = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_extent = trace.input(DimensionType::from(batch_dimension.clone()).into());
+        let input_split = DimensionVariable::new("input_split", DimensionBounds::new(1, Some(65)).unwrap());
+        let input_concat = DimensionVariable::new("input_concat", DimensionBounds::new(1, Some(65)).unwrap());
+        let output_split = DimensionVariable::new("output_split", DimensionBounds::new(1, Some(65)).unwrap());
+        let output_concat = DimensionVariable::new("output_concat", DimensionBounds::new(1, Some(129)).unwrap());
         let input = trace.input(
             ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![
-                    Dimension::Dynamic(batch),
+                    Dimension::Dynamic(batch_dimension),
                     Dimension::Dynamic(input_split),
                     Dimension::Dynamic(input_concat),
                 ]),
@@ -2036,19 +2573,25 @@ mod tests {
                 )),
                 Vec::new(),
                 &[
-                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap()),
                     BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(output_split)),
                     BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(output_concat)),
                 ],
-            )?
+            )
+            .unwrap()
             .try_into()
             .unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![output.batch().value().atom_id()?],
-            vec![Placeholder; 4],
-            vec![Placeholder],
-        )?;
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.batch().value().atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -2079,299 +2622,12 @@ mod tests {
             "}
             .trim_end(),
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_batching_shadows_manual_axis() {
-        // The inner batch named `x` exchanges local chunks independently of the manual mesh axis also named `x`.
-        // Local exchange preserves the manual mesh variance and any pending mesh reductions.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 3);
-        for (unreduced, sharding) in [(false, sharding.clone()), (true, sharding.with_unreduced_axes(["x"]).unwrap())] {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
-            let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
-            let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |input| {
-                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
-                        .with_axis_name("x".to_string());
-                    let input = ArrayBatch::new(input, BatchAxis::new(0))?;
-                    let operation =
-                        ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-                    let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
-                    Ok(outputs.remove(0).into_value())
-                },
-                input_type.clone(),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-            )
-            .unwrap();
-            assert_eq!(output_type, expected_type);
-            let expected = if unreduced {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
-                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
-                [shape=[2, 2, 1, 3]] %0
-                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[1, 0, 2, 3]] %1
-                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[0, 2, 1, 3]] %2
-                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] = reshape [
-                        shape=[2, 1, 6],
-                        output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}},
-                    ] %3
-                in (%4)"
-                }
-            } else {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
-                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape [shape=[2, 2, 1, \
-                3]] %0
-                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[1, 0, 2, 3]] %1
-                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[0, 2, 1, 3]] %2
-                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape [shape=[2, 1, 6], \
-                output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %3
-                in (%4)"
-                }
-            };
-            assert_eq!(program.to_string(), expected);
-
-            let (output_type, program) =
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    |input| {
-                        batch(
-                            |item| item.parallel_all_to_all_tiled("x", 0, 1),
-                            input,
-                            BatchAxis::new(0),
-                            BatchAxis::new(0),
-                            BatchAxisSpecification::named("x"),
-                        )
-                        .map_err(Into::into)
-                    },
-                    ArrayIrType::Array(input_type),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .unwrap();
-            assert_eq!(output_type, ArrayIrType::Array(expected_type));
-            let expected = if unreduced {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
-                let %1:dimension<2> = constant [value=2]
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<3> = constant [value=3]
-                    %4:dimension<2> = constant [value=2]
-                    %5:dimension<1> = dimension_div %2 %4
-                    %6:dimension<6> = dimension_mul %3 %4
-                    %7:dimension<2> = constant [value=2]
-                    %8:bool[] = const true
-                    %9:dimension<3> = dimension_div %6 %1
-                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
-                %0 %1 %1 %5 %9
-                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[1, 0, 2, 3]] %10
-                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[0, 2, 1, 3]] %11
-                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] = reshape \
-                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] %12 %1 %5 %6
-                in (%13)"
-                }
-            } else {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
-                let %1:dimension<2> = constant [value=2]
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<3> = constant [value=3]
-                    %4:dimension<2> = constant [value=2]
-                    %5:dimension<1> = dimension_div %2 %4
-                    %6:dimension<6> = dimension_mul %3 %4
-                    %7:dimension<2> = constant [value=2]
-                    %8:bool[] = const true
-                    %9:dimension<3> = dimension_div %6 %1
-                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape %0 %1 %1 %5 %9
-                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[1, 0, 2, 3]] %10
-                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[0, 2, 1, 3]] %11
-                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape \
-                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %12 %1 %5 %6
-                in (%13)"
-                }
-            };
-            assert_eq!(program.to_string(), expected);
-        }
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_batching_forwards_untiled_axes() {
-        // A non-matching batch level shifts both array axes around its mapped dimension. Removing the split axis
-        // can move that mapped dimension, and insertion at the concat axis can move it a second time.
-        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
-            EagerContext::new(),
-            2,
-        )
-        .with_axis_name("items".to_string());
-        let operation = ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::default());
-        for (input_shape, input_batch_axis, output_shape, output_batch_axis) in
-            [([2, 1, 3], 0, [2, 3, 1], 0), ([1, 2, 3], 1, [2, 3, 1], 0), ([1, 3, 2], 2, [3, 1, 2], 2)]
-        {
-            let input = Array::from_elements::<f32>(
-                ArrayType::new_static(DataType::F32, input_shape),
-                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            )
-            .unwrap();
-            let output = operation
-                .batch(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[ArrayBatch::new(input, BatchAxis::new(input_batch_axis)).unwrap()],
-                )
-                .unwrap()
-                .into_parts()
-                .0
-                .remove(0);
-            assert_eq!(output.batch_axis(), BatchAxis::new(output_batch_axis));
-            assert_eq!(output.value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, output_shape));
-            assert_eq!(output.value().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        }
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_batching_forwards_manual_axis_validation() {
-        // An exchange over a manual mesh axis forwarded through an unrelated batch level rejects invariant inputs and
-        // pending mesh sums at that level, before forwarding. Bind the operation directly so the capability cannot
-        // insert `parallel_vary` first.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 3);
-        for (sharding, expected_message) in [
-            (
-                sharding.clone(),
-                "`parallel_all_to_all` input must vary over manual axis `x`; pass an invariant value through \
-                 `parallel_vary` first so that the exchanged output is typed as varying",
-            ),
-            (sharding.with_unreduced_axes(["x"]).unwrap(), "`parallel_all_to_all` does not support unreduced inputs"),
-        ] {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding).unwrap();
-            let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                |input| {
-                    let parent = input.dispatch_domain();
-                    let context =
-                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.dimension_constant(2)?)
-                            .with_axis_name("y".to_string());
-                    let input = ArrayIrBatch::new(input, BatchAxis::new(0))?;
-                    let split_extent = ArrayIrBatch::replicated(parent.dimension_constant(1)?);
-                    let concat_extent = ArrayIrBatch::replicated(parent.dimension_constant(6)?);
-                    let operation =
-                        ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
-                            .with_mesh(mesh.clone());
-                    let mut outputs = operation
-                        .batch_in_parent(&context, &EmptyRegionDriver, &[input, split_extent, concat_extent])?
-                        .into_parts()
-                        .0;
-                    Ok(outputs.remove(0).into_value())
-                },
-                ArrayIrType::Array(input_type),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_custom::<BatchingError>(),
-                Some(&BatchingError::Type(TypeError::invalid(expected_message))),
-            );
-        }
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_batching_shadows_manual_axis_through_unrelated_batch() {
-        // The unrelated inner batch forwards to the outer batch named `x`. That outer batch shadows the mesh axis,
-        // so forwarding must leave mesh validation to the level that handles the exchange.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 4);
-        for (unreduced, sharding) in [(false, sharding.clone()), (true, sharding.with_unreduced_axes(["x"]).unwrap())] {
-            let input_type =
-                ArrayType::new_static(DataType::F32, [2, 2, 2, 3]).with_sharding(sharding.clone()).unwrap();
-            let expected_type = ArrayType::new_static(DataType::F32, [2, 2, 1, 6]).with_sharding(sharding).unwrap();
-            let (output_type, program) =
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    |input| {
-                        batch(
-                            |item| {
-                                batch(
-                                    |item| item.parallel_all_to_all_tiled("x", 0, 1),
-                                    item,
-                                    BatchAxis::new(0),
-                                    BatchAxis::new(0),
-                                    BatchAxisSpecification::named("y"),
-                                )
-                                .map_err(Into::into)
-                            },
-                            input,
-                            BatchAxis::new(0),
-                            BatchAxis::new(0),
-                            BatchAxisSpecification::named("x"),
-                        )
-                        .map_err(Into::into)
-                    },
-                    ArrayIrType::Array(input_type),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .unwrap();
-            assert_eq!(output_type, ArrayIrType::Array(expected_type));
-            let expected = if unreduced {
-                indoc! {"
-                lambda %0:f32[2, 2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] .
-                let %1:dimension<2> = constant [value=2]
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<2> = constant [value=2]
-                    %4:dimension<3> = constant [value=3]
-                    %5:dimension<2> = constant [value=2]
-                    %6:dimension<1> = dimension_div %3 %5
-                    %7:dimension<6> = dimension_mul %4 %5
-                    %8:dimension<2> = constant [value=2]
-                    %9:bool[] = const true
-                    %10:dimension<3> = dimension_div %7 %1
-                    %11:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
-                reshape %0 %1 %2 %1 %6 %10
-                    %12:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[2, 1, 0, 3, 4]] %11
-                    %13:f32[2, 2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}], unreduced={'x'}}] = \
-                transpose [permutation=[0, 1, 3, 2, 4]] %12
-                    %14:f32[2, 2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
-                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] %13 %1 %2 %6 %7
-                in (%14)"
-                }
-            } else {
-                indoc! {"
-                lambda %0:f32[2, 2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] .
-                let %1:dimension<2> = constant [value=2]
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<2> = constant [value=2]
-                    %4:dimension<3> = constant [value=3]
-                    %5:dimension<2> = constant [value=2]
-                    %6:dimension<1> = dimension_div %3 %5
-                    %7:dimension<6> = dimension_mul %4 %5
-                    %8:dimension<2> = constant [value=2]
-                    %9:bool[] = const true
-                    %10:dimension<3> = dimension_div %7 %1
-                    %11:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = reshape %0 %1 %2 \
-                %1 %6 %10
-                    %12:f32[2, 2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = transpose \
-                [permutation=[2, 1, 0, 3, 4]] %11
-                    %13:f32[2, 2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}, {}]}] = transpose \
-                [permutation=[0, 1, 3, 2, 4]] %12
-                    %14:f32[2, 2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape \
-                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] %13 %1 %2 %6 %7
-                in (%14)"
-                }
-            };
-            assert_eq!(program.to_string(), expected);
-        }
     }
 
     #[test]
     fn test_parallel_all_to_all_differentiation() {
         // The homogeneous JVP applies exactly the same exchange to the primal and live tangent.
-        let program = parallel_all_to_all_program(
+        let program = collective_program(
             ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
             ArrayType::new_static(DataType::F32, [4, 3]),
         );
@@ -2397,49 +2653,6 @@ mod tests {
             },
         );
         assert_eq!(jvp.output_types(), vec![ArrayType::new_static(DataType::F32, [2, 6]); 2]);
-    }
-
-    #[test]
-    fn test_parallel_all_to_all_differentiation_with_zero_tangent() {
-        // Structural zeros use the inferred result shape and stage no linear call or tangent exchange.
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into());
-        let first = trace.input(DimensionValue::constant(3).unwrap().r#type().into_owned().into());
-        let second = trace.input(DimensionValue::constant(2).unwrap().r#type().into_owned().into());
-        let inputs = [input, first, second]
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let output = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::default())
-            .jvp_in_parent(&DifferentiationContext::fused(trace.clone()), &EmptyRegionDriver, &inputs)
-            .unwrap()
-            .remove(0);
-        assert!(output.tangent().is_zero());
-        assert_eq!(
-            output.primal().r#type().as_ref(),
-            &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
-        );
-        let builder = trace.builder().borrow().clone();
-        let input_count = builder.input_ids().len();
-        let output_ids = vec![output.primal().atom_id().unwrap()];
-        let output_count = output_ids.len();
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                output_ids,
-                vec![Placeholder; input_count],
-                vec![Placeholder; output_count],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2, 3], %1:dimension<3>, %2:dimension<2> .
-                let %3:f32[3, 2] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=1, \
-                options=Untiled] %0 %1 %2
-                in (%3)"
-            },
-        );
     }
 
     #[test]
@@ -2489,34 +2702,121 @@ mod tests {
     #[test]
     fn test_parallel_all_to_all_differentiation_shadows_manual_axis() {
         // An inner batch named `x` performs a local exchange despite an enclosing mesh axis with that name.
-        // Differentiation must retain structural zeros and preserve invariant or unreduced mesh state.
+        // Differentiation must retain structural zeros and preserve the manual invariance of the input.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 3);
-        for (unreduced, sharding) in [(false, sharding.clone()), (true, sharding.with_unreduced_axes(["x"]).unwrap())] {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
-            let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
-            let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                let context = DifferentiationContext::fused(batch_context);
+                let item =
+                    DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context.clone());
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
+                let mut outputs = context.bind(operation, Vec::new(), &[item])?;
+                let output = outputs.remove(0);
+                assert!(output.tangent().is_zero());
+                Ok(output.primal().clone().into_batch().into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
+                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape [shape=[2, 2, 1, \
+                3]] %0
+                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[1, 0, 2, 3]] %1
+                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[0, 2, 1, 3]] %2
+                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape [shape=[2, 1, 6], \
+                output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %3
+                in (%4)"
+            },
+        );
+
+        // The composite capability stages result extents with structural-zero tangents and uses the same binder.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
-                        .with_axis_name("x".to_string());
-                    let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                    let axis_extent = input.dispatch_domain().dimension_constant(2)?;
+                    let batch_context =
+                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.dispatch_domain(), axis_extent)
+                            .with_axis_name("x".to_string());
+                    let item = BatchingTracer::new(batch_context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?);
                     let context = DifferentiationContext::fused(batch_context);
-                    let item =
-                        DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context.clone());
-                    let operation =
-                        ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-                    let mut outputs = context.bind(operation, Vec::new(), &[item])?;
-                    let output = outputs.remove(0);
+                    let item = DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context);
+                    let output = item.parallel_all_to_all_tiled("x", 0, 1)?;
                     assert!(output.tangent().is_zero());
                     Ok(output.primal().clone().into_batch().into_value())
                 },
-                input_type.clone(),
+                ArrayIrType::Array(input_type),
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
             )
             .unwrap();
-            assert_eq!(output_type, expected_type);
-            let expected = if unreduced {
-                indoc! {"
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<3> = constant [value=3]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<1> = dimension_div %2 %4
+                    %6:dimension<6> = dimension_mul %3 %4
+                    %7:dimension<2> = constant [value=2]
+                    %8:bool[] = const true
+                    %9:dimension<3> = dimension_div %6 %1
+                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape %0 %1 %1 %5 %9
+                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[1, 0, 2, 3]] %10
+                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
+                [permutation=[0, 2, 1, 3]] %11
+                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape \
+                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %12 %1 %5 %6
+                in (%13)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_differentiation_shadows_manual_axis_unreduced() {
+        // An inner batch named `x` performs a local exchange despite an enclosing mesh axis with that name.
+        // Differentiation must retain structural zeros and preserve the pending sum over the shadowed mesh axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 3).with_unreduced_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2, 3]).with_sharding(sharding.clone()).unwrap();
+        let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| {
+                let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    .with_axis_name("x".to_string());
+                let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
+                let context = DifferentiationContext::fused(batch_context);
+                let item =
+                    DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context.clone());
+                let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
+                let mut outputs = context.bind(operation, Vec::new(), &[item])?;
+                let output = outputs.remove(0);
+                assert!(output.tangent().is_zero());
+                Ok(output.primal().clone().into_batch().into_value())
+            },
+            input_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, expected_type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
                 lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
                 let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}], unreduced={'x'}}] = reshape \
                 [shape=[2, 2, 1, 3]] %0
@@ -2529,47 +2829,32 @@ mod tests {
                         output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}},
                     ] %3
                 in (%4)"
-                }
-            } else {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
-                let %1:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape [shape=[2, 2, 1, \
-                3]] %0
-                    %2:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[1, 0, 2, 3]] %1
-                    %3:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[0, 2, 1, 3]] %2
-                    %4:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape [shape=[2, 1, 6], \
-                output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %3
-                in (%4)"
-                }
-            };
-            assert_eq!(program.to_string(), expected);
+            },
+        );
 
-            // The composite capability stages result extents with structural-zero tangents and uses the same binder.
-            let (output_type, program) =
-                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                    |input| {
-                        let axis_extent = input.dispatch_domain().dimension_constant(2)?;
-                        let batch_context =
-                            BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.dispatch_domain(), axis_extent)
-                                .with_axis_name("x".to_string());
-                        let item =
-                            BatchingTracer::new(batch_context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?);
-                        let context = DifferentiationContext::fused(batch_context);
-                        let item =
-                            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context);
-                        let output = item.parallel_all_to_all_tiled("x", 0, 1)?;
-                        assert!(output.tangent().is_zero());
-                        Ok(output.primal().clone().into_batch().into_value())
-                    },
-                    ArrayIrType::Array(input_type),
-                    vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
-                )
-                .unwrap();
-            assert_eq!(output_type, ArrayIrType::Array(expected_type));
-            let expected = if unreduced {
-                indoc! {"
+        // The composite capability stages result extents with structural-zero tangents and uses the same binder.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    let axis_extent = input.dispatch_domain().dimension_constant(2)?;
+                    let batch_context =
+                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.dispatch_domain(), axis_extent)
+                            .with_axis_name("x".to_string());
+                    let item = BatchingTracer::new(batch_context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?);
+                    let context = DifferentiationContext::fused(batch_context);
+                    let item = DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context);
+                    let output = item.parallel_all_to_all_tiled("x", 0, 1)?;
+                    assert!(output.tangent().is_zero());
+                    Ok(output.primal().clone().into_batch().into_value())
+                },
+                ArrayIrType::Array(input_type),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(expected_type));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
                 lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] .
                 let %1:dimension<2> = constant [value=2]
                     %2:dimension<2> = constant [value=2]
@@ -2589,35 +2874,56 @@ mod tests {
                     %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] = reshape \
                 [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}], unreduced={'x'}}] %12 %1 %5 %6
                 in (%13)"
-                }
-            } else {
-                indoc! {"
-                lambda %0:f32[2, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] .
-                let %1:dimension<2> = constant [value=2]
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<3> = constant [value=3]
-                    %4:dimension<2> = constant [value=2]
-                    %5:dimension<1> = dimension_div %2 %4
-                    %6:dimension<6> = dimension_mul %3 %4
-                    %7:dimension<2> = constant [value=2]
-                    %8:bool[] = const true
-                    %9:dimension<3> = dimension_div %6 %1
-                    %10:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = reshape %0 %1 %1 %5 %9
-                    %11:f32[2, 2, 1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[1, 0, 2, 3]] %10
-                    %12:f32[2, 1, 2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}, {}, {}]}] = transpose \
-                [permutation=[0, 2, 1, 3]] %11
-                    %13:f32[2, 1, 6][sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] = reshape \
-                [output_sharding={mesh<['x'=2:manual]>, [{}, {}, {}]}] %12 %1 %5 %6
-                in (%13)"
-                }
-            };
-            assert_eq!(program.to_string(), expected);
-        }
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_differentiation_array_ir_zero_tangent() {
+        // Structural zeros use the inferred result shape and stage no linear call or tangent exchange.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let split_extent = trace.input(DimensionValue::constant(3).unwrap().r#type().into_owned().into());
+        let concatenation_extent = trace.input(DimensionValue::constant(2).unwrap().r#type().into_owned().into());
+        let inputs = [input, split_extent, concatenation_extent]
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let output = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::default())
+            .jvp_in_parent(&DifferentiationContext::fused(trace.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap()
+            .remove(0);
+        assert!(output.tangent().is_zero());
+        assert_eq!(
+            output.primal().r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
+        );
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.primal().atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:dimension<3>, %2:dimension<2> .
+                let %3:f32[3, 2] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=1, \
+                options=Untiled] %0 %1 %2
+                in (%3)"
+            },
+        );
     }
 
     #[test]
     fn test_parallel_all_to_all_differentiation_array_ir_linearization() {
+        // A composite exchange linearizes into a linear call that retains its explicit result extent as a residual,
+        // and whose transpose applies the adjoint exchange to the output cotangent.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
         let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
@@ -2821,44 +3127,55 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_transposition() {
-        // Both modes invert by swapping the split and concat axes, retaining the participant grouping.
-        for options in [
-            CollectiveOptions::tiled(),
-            CollectiveOptions::default(),
-            CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
-            CollectiveOptions::default().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
-        ] {
-            let axis_size = if options.axis_index_groups().is_some() { 4 } else { 2 };
-            let program = parallel_all_to_all_program(
-                ParallelAllToAllOperation::new("x".to_string(), axis_size, 0, 1, options.clone()),
-                ArrayType::new_static(DataType::F32, [2, 3]),
-            );
-            let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-            let expected = match (options.mode(), options.axis_index_groups().is_some()) {
-                (CollectiveMode::Untiled, false) => indoc! {"
-                lambda %0:f32[3, 2] .
-                let %1:f32[2, 3] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=1, concat_axis=0, \
-                options=Untiled] %0
-                in (%1)"
-                },
-                (CollectiveMode::Untiled, true) => indoc! {"
-                lambda %0:f32[3, 2] .
-                let %1:f32[2, 3] = parallel_all_to_all [
-                    axis_name=\"x\",
-                    axis_size=4,
-                    split_axis=1,
-                    concat_axis=0,
-                    options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
-                ] %0
-                in (%1)"
-                },
-                (CollectiveMode::Tiled, false) => indoc! {"
+        // Both modes transpose by swapping the split and concat axes, and transposing twice restores the original
+        // program.
+        let program = collective_program(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
                 lambda %0:f32[1, 6] .
                 let %1:f32[2, 3] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=1, concat_axis=0, \
                 options=Tiled] %0
                 in (%1)"
-                },
-                (CollectiveMode::Tiled, true) => indoc! {"
+            },
+        );
+        assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+
+        let program = collective_program(
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::default()),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[2, 3] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=1, concat_axis=0, \
+                options=Untiled] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+
+        // The transpose retains the ordered participant groups in both modes.
+        let program = collective_program(
+            ParallelAllToAllOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                1,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+            ),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
                 lambda %0:f32[1, 6] .
                 let %1:f32[2, 3] = parallel_all_to_all [
                     axis_name=\"x\",
@@ -2868,17 +3185,41 @@ mod tests {
                     options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
                 ] %0
                 in (%1)"
-                },
-            };
-            assert_eq!(transposed.to_string(), expected);
+            },
+        );
+        assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
 
-            assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
-        }
+        let program = collective_program(
+            ParallelAllToAllOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                1,
+                CollectiveOptions::default().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+            ),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[2, 3] = parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=4,
+                    split_axis=1,
+                    concat_axis=0,
+                    options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
 
         // An exchange over a manual mesh axis transposes over the same mesh.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-        let program = parallel_all_to_all_program(
+        let program = collective_program(
             operation.clone().with_mesh(mesh.clone()),
             ArrayType::new_static(DataType::F32, [2, 3])
                 .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["x"]).unwrap())
@@ -2906,181 +3247,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_to_all_parallel_all_to_all_with_options_extents() {
-        let groups = vec![vec![0, 2], vec![3, 1]];
-        for (mode, concat_axis) in
-            [(CollectiveMode::Untiled, 1), (CollectiveMode::Tiled, 1), (CollectiveMode::Tiled, 0)]
-        {
-            let options = CollectiveOptions::new(mode).with_axis_index_groups(groups.clone());
-            let error = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options.clone()),
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 3])),
-                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
-            )
-            .unwrap_err();
-            let expected = match mode {
-                CollectiveMode::Untiled => "`parallel_all_to_all` untiled split axis 0 size 3 must equal group size 2",
-                CollectiveMode::Tiled => "`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2",
-            };
-            assert_eq!(error, ProgramError::Type(TypeError::invalid(expected)));
-
-            // Group-local requirements remain runtime assertions, including when coincident axes preserve the shape.
-            let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(9)).unwrap());
-            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options.clone()),
-                ArrayIrType::Array(ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![dimension.into(), Dimension::Static(3)]),
-                )),
-                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
-            )
-            .unwrap();
-            let expected = match (mode, concat_axis) {
-                (CollectiveMode::Untiled, 1) => indoc! {"
-                lambda %0:f32[length, 3] .
-                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
-                    %2:dimension<2> = constant [value=2]
-                    %3:bool[] = compare [direction=Equal] %1 %2
-                    () = assert [
-                        message=\"collective axis extent must match the participant count\",
-                        labels=[\"extent\", \"participants\"],
-                    ] %3 %1 %2
-                    %4:dimension<3> = constant [value=3]
-                    %5:dimension<2> = constant [value=2]
-                    %6:f32[3, 2] = parallel_all_to_all [
-                        axis_name=\"x\",
-                        axis_size=4,
-                        split_axis=0,
-                        concat_axis=1,
-                        options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
-                    ] %0 %4 %5
-                in (%6)"
-                },
-                (CollectiveMode::Tiled, 1) => indoc! {"
-                lambda %0:f32[length, 3] .
-                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
-                    %2:dimension<3> = constant [value=3]
-                    %3:dimension<2> = constant [value=2]
-                    %4:dimension<0> = constant [value=0]
-                    %5:dimension<length % 2 ∈ [0, 2)> = dimension_rem %1 %3
-                    %6:bool[] = compare [direction=Equal] %5 %4
-                    () = assert [
-                        message=\"collective extent must be divisible by the participant count\",
-                        labels=[\"extent\", \"divisor\"],
-                    ] %6 %1 %3
-                    %7:dimension<length / 2 ∈ [0, 5)> = dimension_div %1 %3
-                    %8:dimension<6> = dimension_mul %2 %3
-                    %9:f32[length / 2, 6] = parallel_all_to_all [
-                        axis_name=\"x\",
-                        axis_size=4,
-                        split_axis=0,
-                        concat_axis=1,
-                        options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
-                    ] %0 %7 %8
-                in (%9)"
-                },
-                (CollectiveMode::Tiled, 0) => indoc! {"
-                lambda %0:f32[length, 3] .
-                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
-                    %2:dimension<3> = constant [value=3]
-                    %3:dimension<2> = constant [value=2]
-                    %4:dimension<0> = constant [value=0]
-                    %5:dimension<length % 2 ∈ [0, 2)> = dimension_rem %1 %3
-                    %6:bool[] = compare [direction=Equal] %5 %4
-                    () = assert [
-                        message=\"collective extent must be divisible by the participant count\",
-                        labels=[\"extent\", \"divisor\"],
-                    ] %6 %1 %3
-                    %7:f32[length, 3] = parallel_all_to_all [
-                        axis_name=\"x\",
-                        axis_size=4,
-                        split_axis=0,
-                        concat_axis=0,
-                        options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
-                    ] %0 %1 %2
-                in (%7)"
-                },
-                _ => unreachable!(),
-            };
-            assert_eq!(program.to_string(), expected);
-            let error =
-                program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
-            let (message, label) = match mode {
-                CollectiveMode::Untiled => ("collective axis extent must match the participant count", "participants"),
-                CollectiveMode::Tiled => ("collective extent must be divisible by the participant count", "divisor"),
-            };
-            assert_eq!(
-                error.downcast_custom::<AssertionError>(),
-                Some(&AssertionError::Failed {
-                    message: message.to_string(),
-                    observations: vec![("extent".to_string(), "3".to_string()), (label.to_string(), "2".to_string())],
-                },),
-            );
-        }
-
-        // Untiled exchange omits its consumed static input axis, while coincident tiled axes need no arithmetic.
-        for (options, input_shape, output_shape) in
-            [(CollectiveOptions::default(), [2, 3], [3, 2]), (CollectiveOptions::tiled(), [4, 3], [4, 3])]
-        {
-            let concat_axis = if options.mode == CollectiveMode::Untiled { 1 } else { 0 };
-            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                |input| input.parallel_all_to_all_with_options("x", 0, concat_axis, options.clone()),
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, input_shape)),
-                vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
-            )
-            .unwrap();
-            assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, output_shape).into()]);
-            let expected = match options.mode() {
-                CollectiveMode::Untiled => indoc! {"
-                lambda %0:f32[2, 3] .
-                let %1:dimension<3> = constant [value=3]
-                    %2:dimension<2> = constant [value=2]
-                    %3:f32[3, 2] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=1, \
-                options=Untiled] %0 %1 %2
-                in (%3)"
-                },
-                CollectiveMode::Tiled => indoc! {"
-                lambda %0:f32[4, 3] .
-                let %1:dimension<4> = constant [value=4]
-                    %2:dimension<3> = constant [value=3]
-                    %3:f32[4, 3] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=0, \
-                options=Tiled] %0 %1 %2
-                in (%3)"
-                },
-            };
-            assert_eq!(program.to_string(), expected);
-        }
-    }
-
-    #[test]
     fn test_parallel_all_to_all_parallel_all_to_all() {
-        // Homogeneous array values stage the static-shape operation without explicit result extents, and exchange
-        // chunks over a `batch` level so that batch item `j` receives chunk `j` of every item.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying_type = ArrayType::new_static(DataType::F32, [4])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-            |input| input.parallel_all_to_all_tiled("x", 0, 0),
-            varying_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
-                    axis_name=\"x\",
-                    axis_size=2,
-                    split_axis=0,
-                    concat_axis=0,
-                    options=Tiled,
-                    mesh=['x'=2:manual],
-                ] %0
-                in (%1)"
-            },
-        );
+        // An untiled exchange over a `batch` level swaps the per-item split axis with the batch axis, so batch item
+        // `j` receives element `j` of every item.
         assert_eq!(
             batch(
                 |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
@@ -3107,7 +3276,420 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_tiled() {
+        // Homogeneous array values stage the static-shape operation without explicit result extents. Over a manual
+        // mesh axis, a varying input is exchanged directly and the staged operation records the mesh.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_tiled("x", 0, 0),
+            varying_type,
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=2,
+                    split_axis=0,
+                    concat_axis=0,
+                    options=Tiled,
+                    mesh=['x'=2:manual],
+                ] %0
+                in (%1)"
+            },
+        );
+
+        // Over a `batch` level, batch item `j` receives chunk `j` of every item, concatenated in sender order.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_all_to_all_tiled("x", 0, 0)
+                },
+                Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 4, vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_with_options() {
+        // The staged exchange records the ordered participant groups of `options`, and its geometry uses their common
+        // group size.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let varying_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 0, options.clone()),
+            varying_type.clone(),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] .
+                let %1:f32[4][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] = parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=4,
+                    split_axis=0,
+                    concat_axis=0,
+                    options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                    mesh=['x'=4:manual],
+                ] %0
+                in (%1)"
+            },
+        );
+
+        // Over a manual mesh axis, an invariant input is first made varying, so the exchanged output is varying.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 0, options.clone()),
+                ArrayType::new_static(DataType::F32, [4])
+                    .with_sharding(Sharding::replicated(mesh.clone(), 1))
+                    .unwrap(),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh: mesh.clone() })],
+            )
+            .map(|(output_type, _)| output_type),
+            Ok(varying_type),
+        );
+
+        // A pending cross-device sum over the exchanged manual axis is rejected before anything is staged.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 0, options.clone()),
+                ArrayType::new_static(DataType::F32, [4])
+                    .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+                    .unwrap(),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 4, mesh })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))),
+        );
+
+        // A traced value outside any binder of the axis name is rejected.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 0, options.clone()),
+                ArrayType::new_static(DataType::F32, [4]),
+                Vec::new(),
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_with_options_preserves_unrelated_pending_sums() {
+        // The composite capability makes an invariant input varying over the exchanged axis `x` without dropping a
+        // pending sum over the independent `y` axis, but rejects a pending sum over `x` itself.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["y"]).unwrap();
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled()),
+                ArrayIrType::Array(
+                    ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding.clone()).unwrap(),
+                ),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            )
+            .map(|(output_type, _)| output_type),
+            Ok(ArrayIrType::Array(
+                ArrayType::new_static(DataType::F32, [1, 6])
+                    .with_sharding(sharding.with_varying_manual_axes(["x"]).unwrap())
+                    .unwrap(),
+            )),
+        );
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled()),
+                ArrayIrType::Array(
+                    ArrayType::new_static(DataType::F32, [2, 3])
+                        .with_sharding(Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap())
+                        .unwrap(),
+                ),
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs"))),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_with_options_array_ir_extents() {
+        // The composite capability validates both axes before it stages any result extent.
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 2, 0, CollectiveOptions::default()),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` split axis 2 or concat axis 0 is out of bounds for rank 2",
+            ))),
+        );
+
+        // Static group-local requirements are rejected while staging, while dynamic ones remain runtime assertions,
+        // including when coincident axes preserve the shape.
+        let untiled = CollectiveOptions::default().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let tiled = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let static_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 3]));
+        let dynamic_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                DimensionVariable::new("length", DimensionBounds::new(1, Some(9)).unwrap()).into(),
+                Dimension::Static(3),
+            ]),
+        ));
+
+        // An untiled split extent must equal the group size.
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 1, untiled.clone()),
+                static_type.clone(),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` untiled split axis 0 size 3 must equal group size 2",
+            ))),
+        );
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 1, untiled.clone()),
+            dynamic_type.clone(),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[length, 3] .
+                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %2:dimension<2> = constant [value=2]
+                    %3:bool[] = compare [direction=Equal] %1 %2
+                    () = assert [
+                        message=\"collective axis extent must match the participant count\",
+                        labels=[\"extent\", \"participants\"],
+                    ] %3 %1 %2
+                    %4:dimension<3> = constant [value=3]
+                    %5:dimension<2> = constant [value=2]
+                    %6:f32[3, 2] = parallel_all_to_all [
+                        axis_name=\"x\",
+                        axis_size=4,
+                        split_axis=0,
+                        concat_axis=1,
+                        options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
+                    ] %0 %4 %5
+                in (%6)"
+            },
+        );
+        let error = program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective axis extent must match the participant count".to_string(),
+                observations: vec![
+                    ("extent".to_string(), "3".to_string()),
+                    ("participants".to_string(), "2".to_string()),
+                ],
+            }),
+        );
+
+        // A tiled split extent must be divisible by the group size.
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 1, tiled.clone()),
+                static_type.clone(),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2",
+            ))),
+        );
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 1, tiled.clone()),
+            dynamic_type.clone(),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[length, 3] .
+                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %2:dimension<3> = constant [value=3]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<0> = constant [value=0]
+                    %5:dimension<length % 2 ∈ [0, 2)> = dimension_rem %1 %3
+                    %6:bool[] = compare [direction=Equal] %5 %4
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %6 %1 %3
+                    %7:dimension<length / 2 ∈ [0, 5)> = dimension_div %1 %3
+                    %8:dimension<6> = dimension_mul %2 %3
+                    %9:f32[length / 2, 6] = parallel_all_to_all [
+                        axis_name=\"x\",
+                        axis_size=4,
+                        split_axis=0,
+                        concat_axis=1,
+                        options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                    ] %0 %7 %8
+                in (%9)"
+            },
+        );
+        let error = program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective extent must be divisible by the participant count".to_string(),
+                observations: vec![("extent".to_string(), "3".to_string()), ("divisor".to_string(), "2".to_string()),],
+            }),
+        );
+
+        // Coincident tiled axes preserve the shape but still require a divisible split extent.
+        assert_eq!(
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_to_all_with_options("x", 0, 0, tiled.clone()),
+                static_type,
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` split axis 0 size 3 is not divisible by group size 2",
+            ))),
+        );
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 0, tiled.clone()),
+            dynamic_type,
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[length, 3] .
+                let %1:dimension<length ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %2:dimension<3> = constant [value=3]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<0> = constant [value=0]
+                    %5:dimension<length % 2 ∈ [0, 2)> = dimension_rem %1 %3
+                    %6:bool[] = compare [direction=Equal] %5 %4
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %6 %1 %3
+                    %7:f32[length, 3] = parallel_all_to_all [
+                        axis_name=\"x\",
+                        axis_size=4,
+                        split_axis=0,
+                        concat_axis=0,
+                        options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                    ] %0 %1 %2
+                in (%7)"
+            },
+        );
+        let error = program.interpret(ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap())).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective extent must be divisible by the participant count".to_string(),
+                observations: vec![("extent".to_string(), "3".to_string()), ("divisor".to_string(), "2".to_string()),],
+            }),
+        );
+
+        // An untiled exchange omits its consumed static input axis from the explicit result extents.
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::default()),
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3])),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
+        )
+        .unwrap();
+        assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, [3, 2]).into()]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:dimension<3> = constant [value=3]
+                    %2:dimension<2> = constant [value=2]
+                    %3:f32[3, 2] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=1, \
+                options=Untiled] %0 %1 %2
+                in (%3)"
+            },
+        );
+
+        // Coincident static tiled axes need no extent arithmetic.
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_to_all_with_options("x", 0, 0, CollectiveOptions::tiled()),
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 3])),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
+        )
+        .unwrap();
+        assert_eq!(program.output_types(), vec![ArrayType::new_static(DataType::F32, [4, 3]).into()]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 3] .
+                let %1:dimension<4> = constant [value=4]
+                    %2:dimension<3> = constant [value=3]
+                    %3:f32[4, 3] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=0, \
+                options=Tiled] %0 %1 %2
+                in (%3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_with_options_projected_value() {
+        // A projected array view of a composite value stages the exchange through its composite value, so that the
+        // result extents are staged as explicit extent values.
+        let (output_type, program) =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| {
+                    let array = ValueProjection::<ArrayType>::into_projected(input)?;
+                    Ok(array.parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled())?.into_value())
+                },
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 3])),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 6])));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 3] .
+                let %1:dimension<4> = constant [value=4]
+                    %2:dimension<3> = constant [value=3]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<2> = dimension_div %1 %3
+                    %5:dimension<6> = dimension_mul %2 %3
+                    %6:f32[2, 6] = parallel_all_to_all [axis_name=\"x\", axis_size=2, split_axis=0, concat_axis=1, \
+                options=Tiled] %0 %4 %5
+                in (%6)"
+            },
+        );
+    }
+
+    #[test]
     fn test_parallel_swap_axes_parallel_swap_axes() {
+        // Over a manual mesh axis, an unsharded invariant input is placed on the mesh and made varying before the
+        // exchange, which stages identical split and concatenation positions.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_swap_axes("x", 0),
@@ -3146,6 +3728,58 @@ mod tests {
                     ] %2 %4 %3
                 in (%5)"
             },
+        );
+
+        // Over a `batch` level, batch item `j` receives element `j` of every item along the swapped axis.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_swap_axes("x", 0)
+                },
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_parallel_swap_axes_parallel_swap_axes_with_axis_index_groups() {
+        // The swapped ranked axis must have the common group size, rather than the full named-axis size, as its
+        // extent, and the staged exchange records the ordered participant groups.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_swap_axes_with_axis_index_groups("x", 0, vec![vec![0, 2], vec![3, 1]]),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [2, 3]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:f32[2, 3] = parallel_all_to_all [
+                    axis_name=\"x\",
+                    axis_size=4,
+                    split_axis=0,
+                    concat_axis=0,
+                    options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_swap_axes_with_axis_index_groups("x", 0, vec![vec![0, 2], vec![3, 1]]),
+                ArrayType::new_static(DataType::F32, [4, 3]),
+                vec![("x".to_string(), NamedAxis::Batched { size: Some(4) })],
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` untiled split axis 0 size 4 must equal group size 2",
+            ))),
         );
     }
 }

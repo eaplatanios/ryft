@@ -134,7 +134,7 @@ impl ParallelRaggedAllToAllEvaluation for Array {
             .try_fold(1usize, |count, dimension| count.checked_mul(dimension.value().unwrap()))
             .ok_or_else(|| ProgramError::InvalidArgument {
                 message: format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`"
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`",
                 ),
             })?;
         let row_byte_count = row_element_count
@@ -813,10 +813,10 @@ where
             }
             if self.axis_index_groups().is_some() {
                 return Err(BatchingError::UnsupportedOperation {
-                    message:
-                        "`parallel_ragged_all_to_all` axis index groups are not supported when merging an unrelated \
-                              mapped axis"
-                            .to_string(),
+                    message: format!(
+                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` axis index groups are not supported when \
+                         merging an unrelated mapped axis",
+                    ),
                 });
             }
 
@@ -824,7 +824,7 @@ where
             return provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("batching"), || {
                     provenance_context.invoke_with_provenance_scope(
-                        ProvenanceScope::new("parallel_ragged_all_to_all"),
+                        ProvenanceScope::new(PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME),
                         || {
                             let participant_axis_count = usize::from(self.is_physical());
                             let input_leading_axis = participant_axis_count;
@@ -834,10 +834,10 @@ where
                             self.infer_output_types(logical_input_types.as_slice(), &[])?;
                             let batch_size = P::axis_dimension(context)?.value().ok_or_else(|| {
                                 BatchingError::UnsupportedOperation {
-                                    message:
-                                        "`parallel_ragged_all_to_all` merged batching requires a statically known \
-                                          mapped-axis extent"
-                                            .to_string(),
+                                    message: format!(
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching \
+                                         requires a statically known mapped-axis extent",
+                                    ),
                                 }
                             })?;
                             if batch_size == 0 {
@@ -849,7 +849,7 @@ where
                                     BatchingError::UnsupportedOperation {
                                         message: format!(
                                             "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching requires \
-                                         `{name}` axis {axis} to have a static extent",
+                                             `{name}` axis {axis} to have a static extent",
                                         ),
                                     }
                                 })
@@ -1003,9 +1003,10 @@ where
             .any(|input| !matches!(context.parent().resolve(input.value()), ValueResolution::Constant(_)))
         {
             return Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` cannot materialize a batch-bound collective with staged metadata"
-                        .to_string(),
+                message: format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` cannot materialize a batch-bound collective with \
+                     staged metadata",
+                ),
             });
         }
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -1099,7 +1100,7 @@ impl_differentiable_operation! {
             provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
                     provenance_context.invoke_with_provenance_scope(
-                        ProvenanceScope::new("parallel_ragged_all_to_all_transpose"),
+                        ProvenanceScope::new(format!("{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}_transpose")),
                         || {
                             check_count!("input", inputs, 6, ProgramError);
                             check_count!("output", outputs, 1, ProgramError);
@@ -1430,7 +1431,7 @@ where
     })?;
     let marker_extent = output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
         message: format!(
-            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`"
+            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`",
         ),
     })?;
     let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
@@ -1775,15 +1776,17 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape,
-        Sharding, ShardingDimension,
+        ArrayIrOperation, ArrayOperation, ArrayTracingContext, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
+        RaggedAxis,
     };
-    use crate::axes::NamedAxis;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
+    use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
-    use crate::macros::{check_gradient, check_operation_transposition, check_operation_type_inference};
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
+        check_operation_type_inference,
+    };
+    use crate::operations::collectives::tests::eager_collective_context;
     use crate::operations::manipulation::transposition::Transpose;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
@@ -1792,12 +1795,11 @@ mod tests {
 
     use super::*;
 
-    /// Homogeneous array trace shared by staged batching and differentiation cases.
-    type ArrayTestTracingContext = TracingContext<Array, ArrayOperation<Array>>;
-    /// Composite trace shared by dimension-aware batching and capability cases.
-    type ArrayIrTestTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    /// Composite trace shared by the dynamic mapped-extent batching, composite differentiation, and capability tests.
+    type ArrayIrTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-    /// Executes a degenerate single-participant ragged exchange with i64 metadata.
+    /// Executes a degenerate single-participant ragged exchange of the `operand` `[1, 2, 3]` into the `output` seed
+    /// `[9, 9, 9, 9]`, using the provided `i64` metadata.
     fn interpret_single_participant_parallel_ragged_all_to_all(
         input_offsets: Vec<i64>,
         send_sizes: Vec<i64>,
@@ -1820,7 +1822,9 @@ mod tests {
         Ok(outputs.remove(0))
     }
 
-    /// Applies an explicit list of logical row transfers without deriving routing from the operation metadata.
+    /// Applies an explicit list of logical row transfers without deriving routing from the operation metadata. The
+    /// packed `operand` and `output` buffers hold `input_extent` and `output_extent` rows of `row_width` elements per
+    /// participant, and each transfer is a `(sender, input_offset, receiver, output_offset, size)` tuple.
     fn reference_ragged_transfers(
         operand: &[i32],
         output: &[i32],
@@ -1849,6 +1853,49 @@ mod tests {
         .unwrap()
     }
 
+    /// Exchanges the two-participant `operand` rows into the `output` seeds at a matching named `batch` level over the
+    /// axis `x` and sums the exchanged result. The fixed metadata route row 0 of participant 0 into row 1 of
+    /// participant 1 and row 0 of participant 1 into row 2 of participant 0. The metadata are lifted into the context
+    /// of `operand`, so the same expansion serves both concrete evaluation and reverse-mode differentiation. This is a
+    /// macro rather than a generic function because each call site binds a different traced value type, and naming the
+    /// batching capability bounds of a generic value type overflows the trait solver.
+    macro_rules! batched_parallel_ragged_all_to_all_sum {
+        // Expands to a `Result` holding the summed exchange of the provided `operand` and `output` values.
+        ($operand:expr, $output:expr $(,)?) => {{
+            let operand = $operand;
+            let output = $output;
+            let context = operand.dispatch_domain();
+            let input_offsets = context.lift(Array::matrix(2, 2, vec![0i32, 0, 0, 2]).unwrap())?;
+            let send_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
+            let output_offsets = context.lift(Array::matrix(2, 2, vec![1i32, 1, 2, 3]).unwrap())?;
+            let receive_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
+            let exchanged = batch(
+                |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                    operand.parallel_ragged_all_to_all(
+                        "x",
+                        &output,
+                        &input_offsets,
+                        &send_sizes,
+                        &output_offsets,
+                        &receive_sizes,
+                    )
+                },
+                (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
+                (
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                ),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )?;
+            Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
+        }};
+    }
+
     #[test]
     fn test_parallel_ragged_all_to_all() {
         let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 4);
@@ -1859,6 +1906,7 @@ mod tests {
         assert_eq!(operation.mesh(), None);
         assert_eq!(operation.effective_axis_size(), Ok(4));
         assert!(!operation.is_physical());
+        assert_eq!(operation.update_kind(), ParallelRaggedAllToAllUpdateKind::Overwrite);
         assert!(!operation.accumulates_updates());
         assert_eq!(operation.to_string(), "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4]");
         assert_eq!(operation, operation.clone());
@@ -1915,14 +1963,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_with_physical_representation_and_additive_updates() {
+    fn test_parallel_ragged_all_to_all_with_physical_representation() {
+        // The batching-internal physical representation is rendered explicitly and keeps the overwrite semantics.
         let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 4);
-        // The batching-internal physical representation and the transpose-internal additive updates are rendered
-        // explicitly.
+        let physical = operation.with_physical_representation();
+        assert!(physical.is_physical());
+        assert_eq!(physical.update_kind(), ParallelRaggedAllToAllUpdateKind::Overwrite);
+        assert!(!physical.accumulates_updates());
+        assert_eq!(
+            physical.to_string(),
+            "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, representation=Physical]",
+        );
+        assert_ne!(physical, operation);
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_with_additive_updates() {
+        // The transpose-internal additive updates are rendered explicitly and keep the logical representation.
+        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 4);
+        let additive = operation.with_additive_updates();
+        assert!(!additive.is_physical());
+        assert_eq!(additive.update_kind(), ParallelRaggedAllToAllUpdateKind::Add);
+        assert!(additive.accumulates_updates());
+        assert_eq!(additive.to_string(), "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, update_kind=Add]");
+        assert_ne!(additive, operation);
+
+        // Additive updates compose with the physical representation, which renders first.
         let internal = operation.with_physical_representation().with_additive_updates();
         assert!(internal.is_physical());
-        assert!(internal.accumulates_updates());
         assert_eq!(internal.update_kind(), ParallelRaggedAllToAllUpdateKind::Add);
+        assert!(internal.accumulates_updates());
         assert_eq!(
             internal.to_string(),
             "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, representation=Physical, update_kind=Add]",
@@ -2077,6 +2147,110 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_ragged_all_to_all_type_inference_physical_representation() {
+        // The batching-internal representation prefixes every input with a static participant axis whose extent equals
+        // the axis size. Type inference validates the public contract without that axis and returns the physical type
+        // of `output`.
+        let participant_extent = DimensionVariable::new("participants", DimensionBounds::new(0, Some(4)).unwrap());
+        let metadata = || ArrayType::new_static(DataType::I32, [2, 2]);
+        check_operation_type_inference!(
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
+            cases = [
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [2, 3, 2]),
+                        ArrayType::new_static(DataType::F32, [2, 4, 2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    output_types = [ArrayType::new_static(DataType::F32, [2, 4, 2])],
+                },
+                {
+                    input_types = [
+                        ArrayType::new(
+                            DataType::F32,
+                            Shape::new(vec![
+                                Dimension::Dynamic(participant_extent),
+                                Dimension::Static(3),
+                                Dimension::Static(2),
+                            ]),
+                        ),
+                        ArrayType::new_static(DataType::F32, [2, 4, 2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`parallel_ragged_all_to_all` physical input 0 must have a static leading participant \
+                             dimension",
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [2, 3, 2]),
+                        ArrayType::new_static(DataType::F32, [3, 4, 2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`parallel_ragged_all_to_all` physical input 1 leading participant dimension 3 must equal \
+                             axis size 2",
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [2, 3, 2]),
+                        ArrayType::new_static(DataType::F32, [2, 4, 2]),
+                        ArrayType::new_static(DataType::I32, [2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`parallel_ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[]`",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_type_inference_array_ir() {
+        // The composite carrier projects its inputs onto the homogeneous array contract and wraps the inferred type.
+        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2);
+        let metadata = || ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]));
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 2])),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                ],
+                &[],
+            ),
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 2]))]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F64, [4, 2])),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
+            )),
+        );
+    }
+
+    #[test]
     fn test_parallel_ragged_all_to_all_type_inference_manual_variation() {
         let mesh = manual_mesh();
         let invariant = Sharding::replicated(mesh.clone(), 1);
@@ -2127,48 +2301,6 @@ mod tests {
                     ],
                     error = "`parallel_ragged_all_to_all` inputs must have matching varying manual axes; insert \
                              `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
-                },
-            ],
-        );
-
-        // For fixed metadata, the exchange is jointly linear in `operand` and `output`, so it preserves a pending sum
-        // that both carry, but rejects mismatched reduction state and metadata that are themselves unreduced.
-        let pending = varying.clone().with_unreduced_axes(["y"]).unwrap();
-        check_operation_type_inference!(
-            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_mesh(mesh.clone()),
-            cases = [
-                {
-                    input_types = [
-                        operand(&pending),
-                        output(&pending),
-                        metadata(&varying),
-                        metadata(&varying),
-                        metadata(&varying),
-                        metadata(&varying),
-                    ],
-                    output_types = [output(&pending)],
-                },
-                {
-                    input_types = [
-                        operand(&pending),
-                        output(&varying),
-                        metadata(&varying),
-                        metadata(&varying),
-                        metadata(&varying),
-                        metadata(&varying),
-                    ],
-                    error = "`parallel_ragged_all_to_all` `operand` and `output` must carry identical reduction state",
-                },
-                {
-                    input_types = [
-                        operand(&varying),
-                        output(&varying),
-                        metadata(&varying),
-                        metadata(&pending),
-                        metadata(&varying),
-                        metadata(&varying),
-                    ],
-                    error = "`parallel_ragged_all_to_all` `send_sizes` must not carry unreduced state",
                 },
             ],
         );
@@ -2273,72 +2405,152 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_ragged_all_to_all_type_inference_reduction_state() {
+        let mesh = manual_mesh();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let pending = varying.clone().with_unreduced_axes(["y"]).unwrap();
+        let operand =
+            |sharding: &Sharding| ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding.clone()).unwrap();
+        let output =
+            |sharding: &Sharding| ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let metadata =
+            |sharding: &Sharding| ArrayType::new_static(DataType::I32, [2]).with_sharding(sharding.clone()).unwrap();
+
+        // For fixed metadata, the exchange is jointly linear in `operand` and `output`, so it preserves a pending sum
+        // that both carry, but rejects mismatched reduction state and metadata that are themselves unreduced.
+        check_operation_type_inference!(
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_mesh(mesh),
+            cases = [
+                {
+                    input_types = [
+                        operand(&pending),
+                        output(&pending),
+                        metadata(&varying),
+                        metadata(&varying),
+                        metadata(&varying),
+                        metadata(&varying),
+                    ],
+                    output_types = [output(&pending)],
+                },
+                {
+                    input_types = [
+                        operand(&pending),
+                        output(&varying),
+                        metadata(&varying),
+                        metadata(&varying),
+                        metadata(&varying),
+                        metadata(&varying),
+                    ],
+                    error = "`parallel_ragged_all_to_all` `operand` and `output` must carry identical reduction state",
+                },
+                {
+                    input_types = [
+                        operand(&varying),
+                        output(&varying),
+                        metadata(&varying),
+                        metadata(&pending),
+                        metadata(&varying),
+                        metadata(&varying),
+                    ],
+                    error = "`parallel_ragged_all_to_all` `send_sizes` must not carry unreduced state",
+                },
+            ],
+        );
+
+        // Every shard must also route the same way, so metadata must not be sharded over a reduction axis of the data
+        // inputs.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = Sharding::replicated(explicit_mesh.clone(), 1).with_unreduced_axes(["y"]).unwrap();
+        let sharded = Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        check_operation_type_inference!(
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2),
+            cases = [{
+                input_types = [
+                    operand(&unreduced),
+                    output(&unreduced),
+                    metadata(&sharded),
+                    ArrayType::new_static(DataType::I32, [2]),
+                    ArrayType::new_static(DataType::I32, [2]),
+                    ArrayType::new_static(DataType::I32, [2]),
+                ],
+                error = "`parallel_ragged_all_to_all` `input_offsets` must be invariant over the reduction axes of \
+                         `operand` and `output`",
+            }],
+        );
+    }
+
+    #[test]
     fn test_parallel_ragged_all_to_all_interpretation() {
+        // A single participant copies its own segments into the output seed, leaving the remaining rows unchanged.
         assert_eq!(
             interpret_single_participant_parallel_ragged_all_to_all(vec![1], vec![2], vec![0], vec![2]),
             Ok(Array::vector(vec![2.0f32, 3.0, 9.0, 9.0]).unwrap()),
         );
-        assert_eq!(
-            interpret_single_participant_parallel_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
-            ProgramError::InvalidArgument { message: "`input_offsets[0]` must be non-negative but got -1".to_string() },
-        );
-        assert_eq!(
-            interpret_single_participant_parallel_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]).unwrap_err(),
-            ProgramError::InvalidArgument {
-                message: "`parallel_ragged_all_to_all` input region [2, 4) for participant 0 exceeds input extent 3"
-                    .to_string(),
-            },
-        );
-        assert_eq!(
-            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![0], vec![1]).unwrap_err(),
-            ProgramError::InvalidArgument {
-                message: "`parallel_ragged_all_to_all` send size 2 from participant 0 to participant 0 does not match \
-                          receive size 1"
-                    .to_string(),
-            },
-        );
-        assert_eq!(
-            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![3], vec![2]).unwrap_err(),
-            ProgramError::InvalidArgument {
-                message: "`parallel_ragged_all_to_all` output region [3, 5) for participant 0 exceeds output extent 4"
-                    .to_string(),
-            },
-        );
-        assert_eq!(
-            interpret_single_participant_parallel_ragged_all_to_all(vec![0, 1], vec![1, 1], vec![0, 0], vec![1, 1])
-                .unwrap_err(),
-            ProgramError::InvalidArgument {
-                message:
-                    "`parallel_ragged_all_to_all` received output regions [0, 1) and [0, 1) overlap for participant 0"
-                        .to_string(),
-            },
-        );
+
+        // Send regions may overlap, which resends the same source row into disjoint received regions.
         assert_eq!(
             interpret_single_participant_parallel_ragged_all_to_all(vec![0, 0], vec![1, 1], vec![0, 1], vec![1, 1]),
             Ok(Array::vector(vec![1.0f32, 1.0, 9.0, 9.0]).unwrap()),
         );
 
+        // The complete exchange is validated before anything is copied: metadata must be non-negative, every region
+        // must be in bounds without overflowing, send and receive sizes must agree, and received regions must be
+        // disjoint.
+        assert_eq!(
+            interpret_single_participant_parallel_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]),
+            Err(ProgramError::InvalidArgument {
+                message: "`input_offsets[0]` must be non-negative but got -1".to_string(),
+            }),
+        );
+        assert_eq!(
+            interpret_single_participant_parallel_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]),
+            Err(ProgramError::InvalidArgument {
+                message: "`parallel_ragged_all_to_all` input region [2, 4) for participant 0 exceeds input extent 3"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![0], vec![1]),
+            Err(ProgramError::InvalidArgument {
+                message: "`parallel_ragged_all_to_all` send size 2 from participant 0 to participant 0 does not match \
+                          receive size 1"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0], vec![2], vec![3], vec![2]),
+            Err(ProgramError::InvalidArgument {
+                message: "`parallel_ragged_all_to_all` output region [3, 5) for participant 0 exceeds output extent 4"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            interpret_single_participant_parallel_ragged_all_to_all(vec![0, 1], vec![1, 1], vec![0, 0], vec![1, 1]),
+            Err(ProgramError::InvalidArgument {
+                message:
+                    "`parallel_ragged_all_to_all` received output regions [0, 1) and [0, 1) overlap for participant 0"
+                        .to_string(),
+            }),
+        );
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         assert_eq!(
-            context
-                .bind(
-                    ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
-                    Vec::new(),
-                    &[
-                        Array::vector(vec![1.0f32]).unwrap(),
-                        Array::vector(vec![0.0f32]).unwrap(),
-                        Array::vector(vec![u64::MAX]).unwrap(),
-                        Array::vector(vec![1u64]).unwrap(),
-                        Array::vector(vec![0u64]).unwrap(),
-                        Array::vector(vec![1u64]).unwrap(),
-                    ],
-                )
-                .unwrap_err(),
-            ProgramError::InvalidArgument {
+            context.bind(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+                Vec::new(),
+                &[
+                    Array::vector(vec![1.0f32]).unwrap(),
+                    Array::vector(vec![0.0f32]).unwrap(),
+                    Array::vector(vec![u64::MAX]).unwrap(),
+                    Array::vector(vec![1u64]).unwrap(),
+                    Array::vector(vec![0u64]).unwrap(),
+                    Array::vector(vec![1u64]).unwrap(),
+                ],
+            ),
+            Err(ProgramError::InvalidArgument {
                 message:
                     "`parallel_ragged_all_to_all` input region for participant 0 at metadata index 0 overflows `usize`"
                         .to_string(),
-            },
+            }),
         );
 
         // Outside any binder, an exchange is degenerate only when its participant groups are singletons, whatever the
@@ -2380,66 +2592,111 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_interpretation_skips_zero_byte_transfers() {
+        // Zero-length segments at maximal offsets stay within `usize::MAX`-row extents of zero-byte rows, so the
+        // physical exchange copies nothing and never computes an overflowing byte offset.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let data_type = ArrayType::new_static(DataType::F32, [3, usize::MAX, 0]);
         let data = || Array::from_elements::<f32>(data_type.clone(), &[]).unwrap();
         let metadata_type = ArrayType::new_static(DataType::U64, [3, 3]);
         let offsets = Array::from_elements(metadata_type.clone(), &[u64::MAX; 9]).unwrap();
         let sizes = Array::from_elements(metadata_type, &[0u64; 9]).unwrap();
-        let mut outputs = context
-            .bind(
+        assert_eq!(
+            context.bind(
                 ParallelRaggedAllToAllOperation::new("x".to_string(), 3).with_physical_representation(),
                 Vec::new(),
                 &[data(), data(), offsets.clone(), sizes.clone(), offsets, sizes],
-            )
-            .unwrap();
-        assert_eq!(outputs.remove(0).r#type().as_ref(), &data_type);
+            ),
+            Ok(vec![data()]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_interpretation_additive_updates() {
+        // Received segments add into the output seed, so overlapping received regions accumulate instead of being
+        // rejected.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert_eq!(
+            context.bind(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1).with_additive_updates(),
+                Vec::new(),
+                &[
+                    Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap(),
+                    Array::vector(vec![9.0f32, 9.0, 9.0, 9.0]).unwrap(),
+                    Array::vector(vec![0i64, 1]).unwrap(),
+                    Array::vector(vec![2i64, 2]).unwrap(),
+                    Array::vector(vec![0i64, 1]).unwrap(),
+                    Array::vector(vec![2i64, 2]).unwrap(),
+                ],
+            ),
+            Ok(vec![Array::vector(vec![10.0f32, 13.0, 12.0, 9.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_interpretation_array_ir() {
+        // A composite value interprets the exchange through its array member.
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context.bind(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+                Vec::new(),
+                &[
+                    ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![9.0f32, 9.0, 9.0, 9.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![1i64]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![2i64]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![0i64]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![2i64]).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0, 9.0, 9.0]).unwrap())]),
+        );
     }
 
     #[test]
     fn test_parallel_ragged_all_to_all_partial_evaluation() {
-        let input_types = [
-            ArrayType::new_static(DataType::F32, [3]),
-            ArrayType::new_static(DataType::F32, [4]),
-            ArrayType::new_static(DataType::I64, [2]),
-            ArrayType::new_static(DataType::I64, [2]),
-            ArrayType::new_static(DataType::I64, [2]),
-            ArrayType::new_static(DataType::I64, [2]),
-        ];
-        let program = |operation: ParallelRaggedAllToAllOperation| {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-            let outputs = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().to_vec();
-            builder
-                .build::<Vec<Array>, Vec<Array>>(
-                    outputs,
-                    vec![Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let inputs = [
-            Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap(),
-            Array::vector(vec![9.0f32, 9.0, 9.0, 9.0]).unwrap(),
-            Array::vector(vec![1i64, 0]).unwrap(),
-            Array::vector(vec![2i64, 0]).unwrap(),
-            Array::vector(vec![0i64, 2]).unwrap(),
-            Array::vector(vec![2i64, 0]).unwrap(),
-        ]
-        .map(PartialValue::Known);
-
-        // A degenerate exchange folds known inputs.
-        let degenerate = program(ParallelRaggedAllToAllOperation::new("x".to_string(), 1));
-        assert_eq!(
-            degenerate.partially_evaluate(&inputs).unwrap().outputs(),
-            &[PartialEvaluationOutput::Known(Array::vector(vec![2.0f32, 3.0, 9.0, 9.0]).unwrap())],
+        // A degenerate exchange folds known inputs and residualizes whenever any input is unknown.
+        check_operation_partial_evaluation!(
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+            inputs = [
+                Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap(),
+                Array::vector(vec![9.0f32, 9.0, 9.0, 9.0]).unwrap(),
+                Array::vector(vec![1i64, 0]).unwrap(),
+                Array::vector(vec![2i64, 0]).unwrap(),
+                Array::vector(vec![0i64, 2]).unwrap(),
+                Array::vector(vec![2i64, 0]).unwrap(),
+            ],
+            expected = Array::vector(vec![2.0f32, 3.0, 9.0, 9.0]).unwrap(),
         );
 
-        // An exchange with other participants has no eager per-participant value and therefore residualizes, keeping
-        // its known metadata as ordinary runtime values.
-        let exchange = program(ParallelRaggedAllToAllOperation::new("x".to_string(), 2));
-        let evaluation = exchange.partially_evaluate(&inputs).unwrap();
-        assert!(evaluation.outputs()[0].is_unknown());
+        // An exchange with other participants has no eager per-participant value and therefore residualizes even when
+        // every input is known, keeping its known metadata as ordinary runtime values.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = vec![
+            builder.add_input(ArrayType::new_static(DataType::F32, [3])),
+            builder.add_input(ArrayType::new_static(DataType::F32, [4])),
+            builder.add_input(ArrayType::new_static(DataType::I64, [2])),
+            builder.add_input(ArrayType::new_static(DataType::I64, [2])),
+            builder.add_input(ArrayType::new_static(DataType::I64, [2])),
+            builder.add_input(ArrayType::new_static(DataType::I64, [2])),
+        ];
+        let outputs = builder
+            .add_instruction(ParallelRaggedAllToAllOperation::new("x".to_string(), 2), Vec::new(), inputs, None)
+            .unwrap()
+            .to_vec();
+        let exchange =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 6], vec![Placeholder]).unwrap();
+        let evaluation = exchange
+            .partially_evaluate(&[
+                PartialValue::Known(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
+                PartialValue::Known(Array::vector(vec![9.0f32, 9.0, 9.0, 9.0]).unwrap()),
+                PartialValue::Known(Array::vector(vec![1i64, 0]).unwrap()),
+                PartialValue::Known(Array::vector(vec![2i64, 0]).unwrap()),
+                PartialValue::Known(Array::vector(vec![0i64, 2]).unwrap()),
+                PartialValue::Known(Array::vector(vec![2i64, 0]).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::<Array>::Unknown(0)]);
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
@@ -2452,31 +2709,21 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_batching() {
+        // A matching named `batch` level is the participant axis of the eager reference implementation, which executes
+        // the complete exchange between its batch items.
         let operand = vec![1i32, 2, 2, 3, 4, 0];
         let output_seed = vec![0i32; 8];
-        let input_offsets = vec![0usize, 1, 0, 1];
-        let send_sizes = vec![1usize, 2, 1, 1];
-        let output_offsets = vec![0usize, 0, 1, 2];
-        let receive_sizes = vec![1i32, 1, 2, 1];
-        let output: ArrayIrValue<Array> = batch(
-            |inputs: Vec<
-                BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatchingPolicy>,
-            >| {
+        let output: Array = batch(
+            |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
-                ArrayIrValue::Array(Array::matrix(2, 3, operand.clone()).unwrap()),
-                ArrayIrValue::Array(Array::matrix(2, 4, output_seed.clone()).unwrap()),
-                ArrayIrValue::Array(
-                    Array::matrix(2, 2, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::matrix(2, 2, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::matrix(2, 2, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(Array::matrix(2, 2, receive_sizes).unwrap()),
+                Array::matrix(2, 3, operand.clone()).unwrap(),
+                Array::matrix(2, 4, output_seed.clone()).unwrap(),
+                Array::matrix(2, 2, vec![0i32, 1, 0, 1]).unwrap(),
+                Array::matrix(2, 2, vec![1i32, 2, 1, 1]).unwrap(),
+                Array::matrix(2, 2, vec![0i32, 0, 1, 2]).unwrap(),
+                Array::matrix(2, 2, vec![1i32, 1, 2, 1]).unwrap(),
             ],
             vec![BatchAxis::new(0); 6],
             BatchAxis::new(0),
@@ -2491,7 +2738,7 @@ mod tests {
             1,
             &[(0, 0, 0, 0, 1), (0, 1, 1, 0, 2), (1, 0, 0, 1, 1), (1, 1, 1, 2, 1)],
         );
-        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 4, expected).unwrap()));
+        assert_eq!(output, Array::matrix(2, 4, expected).unwrap());
 
         // Reversed noncontiguous groups, two slices per peer, and width-two rows exercise every routing index and
         // prove that the byte kernel preserves trailing dimensions.
@@ -2502,14 +2749,8 @@ mod tests {
             })
             .collect::<Vec<i32>>();
         let output_seed = vec![-1i32; 4 * 5 * 2];
-        let input_offsets = [0usize, 1, 2, 3].repeat(4);
-        let send_sizes = vec![1usize; 16];
-        let output_offsets = vec![2, 3, 2, 3, 2, 3, 2, 3, 0, 1, 0, 1, 0, 1, 0, 1];
-        let receive_sizes = vec![1i32; 16];
-        let output: ArrayIrValue<Array> = batch(
-            |inputs: Vec<
-                BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatchingPolicy>,
-            >| {
+        let output: Array = batch(
+            |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
                     "x",
                     &inputs[1],
@@ -2521,23 +2762,12 @@ mod tests {
                 )
             },
             vec![
-                ArrayIrValue::Array(
-                    Array::from_elements(ArrayType::new_static(DataType::I32, [4, 4, 2]), operand.as_slice()).unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), output_seed.as_slice())
-                        .unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::matrix(4, 4, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::matrix(4, 4, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(
-                    Array::matrix(4, 4, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
-                ),
-                ArrayIrValue::Array(Array::matrix(4, 4, receive_sizes).unwrap()),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [4, 4, 2]), operand.as_slice()).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), output_seed.as_slice()).unwrap(),
+                Array::matrix(4, 4, [0i32, 1, 2, 3].repeat(4)).unwrap(),
+                Array::matrix(4, 4, vec![1i32; 16]).unwrap(),
+                Array::matrix(4, 4, vec![2i32, 3, 2, 3, 2, 3, 2, 3, 0, 1, 0, 1, 0, 1, 0, 1]).unwrap(),
+                Array::matrix(4, 4, vec![1i32; 16]).unwrap(),
             ],
             vec![BatchAxis::new(0); 6],
             BatchAxis::new(0),
@@ -2571,140 +2801,55 @@ mod tests {
         );
         assert_eq!(
             output,
-            ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), expected.as_slice()).unwrap(),
-            ),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), expected.as_slice()).unwrap(),
         );
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_batching_unrelated_axis() {
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("y".to_string());
-        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation();
-        let operand = Array::from_elements::<f64>(
-            ArrayType::new_static(DataType::F64, [2, 2, 3]),
-            &[10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
-        )
-        .unwrap();
-        let output = Array::from_elements::<f64>(
-            ArrayType::new_static(DataType::F64, [2, 2, 4]),
-            &[
-                100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
-                212.0, 213.0,
-            ],
-        )
-        .unwrap();
-        let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
-        let metadata = |elements: &[i8]| Array::from_elements(metadata_type.clone(), elements).unwrap();
-        let inputs = vec![
-            ArrayBatch::new(operand, BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(output, BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(metadata(&[0, 2, 1, 0, 0, 1, 2, 2]), BatchAxis::new(2)).unwrap(),
-            ArrayBatch::new(metadata(&[1; 8]), BatchAxis::new(2)).unwrap(),
-            ArrayBatch::new(metadata(&[0, 1, 1, 0, 2, 3, 3, 2]), BatchAxis::new(2)).unwrap(),
-            ArrayBatch::new(metadata(&[1; 8]), BatchAxis::new(2)).unwrap(),
-        ];
-        let outputs = operation.batch(&context, &EmptyRegionDriver, inputs.as_slice()).unwrap().into_parts().0;
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
-        assert_eq!(
-            outputs[0].value().elements::<f64>().unwrap(),
+    fn test_parallel_ragged_all_to_all_batching_array_ir() {
+        // Composite values reach the eager exchange of a matching named `batch` level through their array members.
+        let operand = vec![1i32, 2, 2, 3, 4, 0];
+        let output_seed = vec![0i32; 8];
+        let output: ArrayIrValue<Array> = batch(
+            |inputs: Vec<
+                BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatchingPolicy>,
+            >| {
+                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+            },
             vec![
-                10.0, 101.0, 30.0, 103.0, 110.0, 22.0, 112.0, 41.0, 200.0, 11.0, 202.0, 32.0, 20.0, 211.0, 42.0, 213.0,
+                ArrayIrValue::Array(Array::matrix(2, 3, operand.clone()).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 4, output_seed.clone()).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![0i32, 1, 0, 1]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 2, 1, 1]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![0i32, 0, 1, 2]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 1, 2, 1]).unwrap()),
             ],
-        );
-    }
-
-    #[test]
-    fn test_parallel_ragged_all_to_all_batching_shadows_manual_axis() {
-        // A `batch` level that binds `x` inside a manual region whose mesh also has an axis `x` shadows that mesh axis.
-        // The capability then stages an ordinary exchange, which the `batch` level executes over its own batch items
-        // without requiring any variation over the mesh axis.
-        let mesh = manual_mesh();
-        let typed = |data_type, dimensions: [usize; 2]| {
-            ArrayType::new_static(data_type, dimensions)
-                .with_sharding(Sharding::replicated(mesh.clone(), 2))
-                .unwrap()
-        };
-        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-            |inputs: Vec<_>| {
-                let domain = inputs[0].dispatch_domain();
-                let context =
-                    BatchingContext::<_, ArrayBatchingPolicy>::new(domain.clone(), 2).with_axis_name("x".to_string());
-                let item = |value| -> Result<_, ProgramError> {
-                    Ok(BatchingTracer::new(context.clone(), ArrayBatch::new(value, BatchAxis::new(0))?))
-                };
-                let metadata = || item(domain.lift(Array::matrix(2, 2, vec![0i32; 4]).unwrap())?);
-                let operand = item(inputs[0].clone())?;
-                let output = item(inputs[1].clone())?;
-                let exchanged = operand.parallel_ragged_all_to_all(
-                    "x",
-                    &output,
-                    &metadata()?,
-                    &metadata()?,
-                    &metadata()?,
-                    &metadata()?,
-                )?;
-                Ok(exchanged.into_batch().into_value())
-            },
-            vec![typed(DataType::F32, [2, 3]), typed(DataType::F32, [2, 4])],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![BatchAxis::new(0); 6],
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
         )
         .unwrap();
-        assert_eq!(output_type, typed(DataType::F32, [2, 4]));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}], %1:f32[2, \
-                    4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] .
-                let %2:i32[2, 2] = const [[0, 0], [0, 0]]
-                    %3:i32[2, 2] = const [[0, 0], [0, 0]]
-                    %4:i32[2, 2] = const [[0, 0], [0, 0]]
-                    %5:i32[2, 2] = const [[0, 0], [0, 0]]
-                    %6:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] = \
-                        parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, representation=Physical] %0 %1 %2 \
-                        %3 %4 %5
-                in (%6)"
-            },
+        let expected = reference_ragged_transfers(
+            operand.as_slice(),
+            output_seed.as_slice(),
+            3,
+            4,
+            1,
+            &[(0, 0, 0, 0, 1), (0, 1, 1, 0, 2), (1, 0, 0, 1, 1), (1, 1, 1, 2, 1)],
         );
-
-        // An exchange over the manual mesh axis itself belongs to its manual region and requires devices, so a
-        // matching `batch` level, which can only shadow that axis, rejects it.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let item = |value: Array| ArrayBatch::new(value, BatchAxis::new(0)).unwrap();
-        let metadata = || item(Array::matrix(2, 2, vec![0i32; 4]).unwrap());
-        assert_eq!(
-            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_mesh(mesh).batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    item(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap()),
-                    item(Array::matrix(2, 4, vec![0.0f32; 8]).unwrap()),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                ],
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_ragged_all_to_all` over a manual mesh axis cannot bind a named batch axis"
-                    .to_string(),
-            }),
-        );
+        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 4, expected).unwrap()));
     }
 
     #[test]
     fn test_parallel_ragged_all_to_all_batching_rejects_ragged_inputs() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        // One per-item logical extent does not determine the per-peer sizes and offsets of an explicitly packed
+        // exchange, so batching rejects inputs that carry a `RaggedAxis` before choosing any batching path.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), length, vec![0])])
             .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
+        let context = eager_collective_context("x", 2);
         let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0i32; 4]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
             ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
@@ -2727,81 +2872,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_staging() {
-        let input_types = vec![
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            ArrayType::new_static(DataType::F32, [2, 4]),
-            ArrayType::new_static(DataType::I8, [2, 2]),
-            ArrayType::new_static(DataType::I8, [2, 2]),
-            ArrayType::new_static(DataType::I8, [2, 2]),
-            ArrayType::new_static(DataType::I8, [2, 2]),
-        ];
-        let (output, program) = ArrayTestTracingContext::trace(
-            |inputs: Vec<_>| {
-                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
-                let inputs = inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs.remove(0).into_value())
-            },
-            input_types,
-        )
-        .unwrap();
-
-        assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2, 4]));
-        assert_eq!(
-            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
-                .to_string(),
-            indoc! {"
-                lambda %0:f32[2, 3], %1:f32[2, 4], %2:i8[2, 2], %3:i8[2, 2], %4:i8[2, 2], %5:i8[2, 2] .
-                let %6:f32[6] = reshape [shape=[6]] %0 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %7:f32[8] = reshape [shape=[8]] %1 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %8:u64[2, 2] = convert_element_type [data_type=u64] %2 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %9:u64[2, 2] = convert_element_type [data_type=u64] %3 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %10:u64[2, 2] = convert_element_type [data_type=u64] %4 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %11:u64[2, 2] = convert_element_type [data_type=u64] %5 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %12:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %13:u64[] = constant [value=3] ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %14:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %13 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %15:u64[2, 2] = mul %12 %14 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %16:u64[2, 2] = add %8 %15 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %17:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %18:u64[] = constant [value=4] ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %19:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %18 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %20:u64[2, 2] = mul %17 %19 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %21:u64[2, 2] = add %10 %20 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %22:u64[4] = reshape [shape=[4]] %16 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %23:u64[4] = reshape [shape=[4]] %9 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %24:u64[4] = reshape [shape=[4]] %21 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %25:u64[4] = reshape [shape=[4]] %11 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                    %26:f32[8] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2] %6 %7 %22 %23 %24 %25 ; \
-                        provenance=ryft::batching::parallel_ragged_all_to_all
-                    %27:f32[2, 4] = reshape [shape=[2, 4]] %26 ; provenance=ryft::batching::parallel_ragged_all_to_all
-                in (%27)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_parallel_ragged_all_to_all_batching_rejects_staged_metadata() {
+    fn test_parallel_ragged_all_to_all_batching_requires_constant_metadata() {
         // A matching `batch` level executes the exchange eagerly, so it rejects metadata that do not resolve to
         // constants, whether they are staged in a trace or unknown during partial evaluation, while unknown data
         // inputs with known constant metadata are accepted.
-        let physical_input_types = vec![
+        let input_types = vec![
             ArrayType::new_static(DataType::F32, [2, 3]),
             ArrayType::new_static(DataType::F32, [2, 4]),
             ArrayType::new_static(DataType::I32, [2, 2]),
@@ -2809,7 +2884,7 @@ mod tests {
             ArrayType::new_static(DataType::I32, [2, 2]),
             ArrayType::new_static(DataType::I32, [2, 2]),
         ];
-        let error = ArrayTestTracingContext::trace(
+        let error = ArrayTracingContext::trace(
             |inputs: Vec<_>| {
                 let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("x".to_string());
                 let inputs = inputs
@@ -2822,7 +2897,7 @@ mod tests {
                     .0;
                 Ok(outputs[0].value().clone())
             },
-            physical_input_types,
+            input_types,
         )
         .unwrap_err();
         let error = error.downcast_custom::<BatchingError>().unwrap();
@@ -2892,6 +2967,211 @@ mod tests {
             .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().r#type().into_owned(), ArrayType::new_static(DataType::F32, [2, 4]));
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_shadows_manual_axis() {
+        // A `batch` level that binds `x` inside a manual region whose mesh also has an axis `x` shadows that mesh axis.
+        // The capability then stages an ordinary exchange, which the `batch` level executes over its own batch items
+        // without requiring any variation over the mesh axis.
+        let mesh = manual_mesh();
+        let typed = |data_type, dimensions: [usize; 2]| {
+            ArrayType::new_static(data_type, dimensions)
+                .with_sharding(Sharding::replicated(mesh.clone(), 2))
+                .unwrap()
+        };
+        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+            |inputs: Vec<_>| {
+                let domain = inputs[0].dispatch_domain();
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(domain.clone(), 2).with_axis_name("x".to_string());
+                let item = |value| -> Result<_, ProgramError> {
+                    Ok(BatchingTracer::new(context.clone(), ArrayBatch::new(value, BatchAxis::new(0))?))
+                };
+                let metadata = || item(domain.lift(Array::matrix(2, 2, vec![0i32; 4]).unwrap())?);
+                let operand = item(inputs[0].clone())?;
+                let output = item(inputs[1].clone())?;
+                let exchanged = operand.parallel_ragged_all_to_all(
+                    "x",
+                    &output,
+                    &metadata()?,
+                    &metadata()?,
+                    &metadata()?,
+                    &metadata()?,
+                )?;
+                Ok(exchanged.into_batch().into_value())
+            },
+            vec![typed(DataType::F32, [2, 3]), typed(DataType::F32, [2, 4])],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output_type, typed(DataType::F32, [2, 4]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}], %1:f32[2, \
+                    4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] .
+                let %2:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %3:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %4:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %5:i32[2, 2] = const [[0, 0], [0, 0]]
+                    %6:f32[2, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] = \
+                        parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2, representation=Physical] %0 %1 %2 \
+                        %3 %4 %5
+                in (%6)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_rejects_manual_mesh_exchange() {
+        // An exchange over the manual mesh axis itself belongs to its manual region and requires devices, so a
+        // matching `batch` level, which can only shadow that axis, rejects it.
+        let context = eager_collective_context("x", 2);
+        let item = |value: Array| ArrayBatch::new(value, BatchAxis::new(0)).unwrap();
+        let metadata = || item(Array::matrix(2, 2, vec![0i32; 4]).unwrap());
+        assert_eq!(
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_mesh(manual_mesh()).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    item(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap()),
+                    item(Array::matrix(2, 4, vec![0.0f32; 8]).unwrap()),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                ],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_ragged_all_to_all` over a manual mesh axis cannot bind a named batch axis"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_physical_representation() {
+        // An unrelated mapped axis merges into the packed data and metadata axes that follow the leading participant
+        // axis of the physical representation, so the eager exchange keeps each batch item's segments separate.
+        let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
+        let metadata = |elements: &[i8]| Array::from_elements(metadata_type.clone(), elements).unwrap();
+        check_operation_batching!(
+            @exact,
+            operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 1),
+                        Array::from_elements::<f64>(
+                            ArrayType::new_static(DataType::F64, [2, 2, 3]),
+                            &[10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 1),
+                        Array::from_elements::<f64>(
+                            ArrayType::new_static(DataType::F64, [2, 2, 4]),
+                            &[
+                                100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0,
+                                210.0, 211.0, 212.0, 213.0,
+                            ],
+                        )
+                        .unwrap(),
+                    ),
+                    (@mapped(axis = 2), metadata(&[0, 2, 1, 0, 0, 1, 2, 2])),
+                    (@mapped(axis = 2), metadata(&[1; 8])),
+                    (@mapped(axis = 2), metadata(&[0, 1, 1, 0, 2, 3, 3, 2])),
+                    (@mapped(axis = 2), metadata(&[1; 8])),
+                ],
+                outputs = [(
+                    @mapped(axis = 1),
+                    Array::from_elements::<f64>(
+                        ArrayType::new_static(DataType::F64, [2, 2, 4]),
+                        &[
+                            10.0, 101.0, 30.0, 103.0, 110.0, 22.0, 112.0, 41.0, 200.0, 11.0, 202.0, 32.0, 20.0, 211.0,
+                            42.0, 213.0,
+                        ],
+                    )
+                    .unwrap(),
+                )],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_staging() {
+        // A staged merge widens the metadata to `u64`, rebases the input and output offsets of each batch item by its
+        // index times the static `operand` and `output` extents, and stages one exchange over the packed values.
+        let input_types = vec![
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            ArrayType::new_static(DataType::I8, [2, 2]),
+            ArrayType::new_static(DataType::I8, [2, 2]),
+            ArrayType::new_static(DataType::I8, [2, 2]),
+            ArrayType::new_static(DataType::I8, [2, 2]),
+        ];
+        let (output_type, program) = ArrayTracingContext::trace(
+            |inputs: Vec<_>| {
+                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
+                let inputs = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
+                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            input_types,
+        )
+        .unwrap();
+
+        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [2, 4]));
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:f32[2, 4], %2:i8[2, 2], %3:i8[2, 2], %4:i8[2, 2], %5:i8[2, 2] .
+                let %6:f32[6] = reshape [shape=[6]] %0 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %7:f32[8] = reshape [shape=[8]] %1 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %8:u64[2, 2] = convert_element_type [data_type=u64] %2 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %9:u64[2, 2] = convert_element_type [data_type=u64] %3 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %10:u64[2, 2] = convert_element_type [data_type=u64] %4 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %11:u64[2, 2] = convert_element_type [data_type=u64] %5 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %12:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %13:u64[] = constant [value=3] ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %14:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %13 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %15:u64[2, 2] = mul %12 %14 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %16:u64[2, 2] = add %8 %15 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %17:u64[2, 2] = iota [type=u64[2, 2], dimension=1] ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %18:u64[] = constant [value=4] ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %19:u64[2, 2] = broadcast [output_type=u64[2, 2], output_axes=[]] %18 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %20:u64[2, 2] = mul %17 %19 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %21:u64[2, 2] = add %10 %20 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %22:u64[4] = reshape [shape=[4]] %16 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %23:u64[4] = reshape [shape=[4]] %9 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %24:u64[4] = reshape [shape=[4]] %21 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %25:u64[4] = reshape [shape=[4]] %11 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                    %26:f32[8] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=2] %6 %7 %22 %23 %24 %25 ; \
+                        provenance=ryft::batching::parallel_ragged_all_to_all
+                    %27:f32[2, 4] = reshape [shape=[2, 4]] %26 ; provenance=ryft::batching::parallel_ragged_all_to_all
+                in (%27)"
+            },
+        );
     }
 
     #[test]
@@ -2905,7 +3185,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["x"]).unwrap())
                 .unwrap()
         };
-        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
             |inputs: Vec<_>| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2)
                     .with_axis_name("y".to_string());
@@ -3015,7 +3295,220 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_empty_batch() {
+        // An empty mapped axis exchanges nothing and returns the aligned output seed, but the logical input types are
+        // still validated.
+        let context = eager_collective_context("y", 0);
+        let empty = |r#type: ArrayType| Array::from_elements::<f32>(r#type, &[]).unwrap();
+        let empty_metadata = || Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
+        let inputs = vec![
+            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 3])), BatchAxis::new(0)).unwrap(),
+            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+        ];
+        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
+            .batch(&context, &EmptyRegionDriver, inputs.as_slice())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            outputs,
+            vec![ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap()],
+        );
+
+        let mut invalid_inputs = inputs;
+        invalid_inputs[1] = ArrayBatch::new(
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 4]), &[]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        assert_eq!(
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
+                &context,
+                &EmptyRegionDriver,
+                invalid_inputs.as_slice(),
+            ),
+            Err(BatchingError::Type(TypeError::invalid(
+                "`parallel_ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_rejects_axis_index_groups() {
+        // Merging an unrelated mapped axis into the packed participant data would change the meaning of each fixed
+        // participant group, so a grouped exchange is rejected.
+        let context = eager_collective_context("y", 2);
+        let item = |value: Array| ArrayBatch::new(value, BatchAxis::new(0)).unwrap();
+        let metadata = || item(Array::matrix(2, 2, vec![0i32; 4]).unwrap());
+        assert_eq!(
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap().batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    item(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap()),
+                    item(Array::matrix(2, 4, vec![0.0f32; 8]).unwrap()),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                ],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message:
+                    "`parallel_ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped \
+                     axis"
+                        .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_rejects_dynamic_data_extents() {
+        // Offset rebasing stages the leading `operand` and `output` extents as scalar constants, so a merged unrelated
+        // axis requires a static leading extent.
+        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(0, Some(8)).unwrap());
+        let error = ArrayTracingContext::trace(
+            |inputs: Vec<_>| {
+                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
+                let inputs = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
+                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(input_extent)])),
+                ArrayType::new_static(DataType::F32, [2, 4]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+            ],
+        )
+        .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message:
+                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
+                        .to_string(),
+            },
+        );
+
+        // Reshaping the packed data cannot yet recover dynamic trailing extents, so those must be static as well.
+        let trailing_extent = DimensionVariable::new("trailing_extent", DimensionBounds::new(0, Some(8)).unwrap());
+        let error = ArrayTracingContext::trace(
+            |inputs: Vec<_>| {
+                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
+                let inputs = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
+                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            vec![
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![
+                        Dimension::Static(2),
+                        Dimension::Static(3),
+                        Dimension::Dynamic(trailing_extent.clone()),
+                    ]),
+                ),
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Dynamic(trailing_extent)]),
+                ),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+            ],
+        )
+        .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message:
+                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
+                        .to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_rejects_dynamic_mapped_extent() {
+        // Offset rebasing stages the mapped-axis extent as a scalar constant, so a merged unrelated axis requires a
+        // static extent.
+        let context = ArrayIrTracingContext::new();
+        let batch_size = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let batch_extent = context.input(DimensionType::from(batch_size.clone()).into());
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context.clone(), batch_extent)
+            .with_axis_name("y".to_string());
+        let packed_type = |data_type, dimensions: &[usize]| {
+            ArrayType::new(
+                data_type,
+                Shape::new(
+                    std::iter::once(Dimension::Dynamic(batch_size.clone()))
+                        .chain(dimensions.iter().copied().map(Dimension::Static))
+                        .collect(),
+                ),
+            )
+        };
+        let metadata_type = packed_type(DataType::I32, &[2, 2]);
+        let input_types = [
+            packed_type(DataType::F32, &[2, 3]),
+            packed_type(DataType::F32, &[2, 4]),
+            metadata_type.clone(),
+            metadata_type.clone(),
+            metadata_type.clone(),
+            metadata_type,
+        ];
+        let inputs = input_types.map(|r#type| {
+            BatchingTracer::new(
+                batching_context.clone(),
+                ArrayIrBatch::new(context.input(r#type.into()), BatchAxis::new(0)).unwrap(),
+            )
+        });
+        let error = batching_context
+            .bind(
+                ArrayIrOperation::ParallelRaggedAllToAll(
+                    ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
+                ),
+                Vec::new(),
+                &inputs,
+            )
+            .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message: "`parallel_ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
     fn test_parallel_ragged_all_to_all_batching_composes_named_axes_in_both_orders() {
+        // A matching `x` level and an unrelated `y` level compose in either nesting order and exchange the same
+        // segments, so the two results differ only in the physical order of their batch axes.
         let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
         let inputs = (
             Array::from_elements::<f64>(
@@ -3113,192 +3606,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_empty_batches_and_groups() {
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 0)
-            .with_axis_name("y".to_string());
-        let empty = |r#type: ArrayType| Array::from_elements::<f32>(r#type, &[]).unwrap();
-        let empty_metadata = || Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
-        let inputs = vec![
-            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 3])), BatchAxis::new(0)).unwrap(),
-            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-        ];
-        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-            .batch(&context, &EmptyRegionDriver, inputs.as_slice())
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [0, 4]));
-
-        let grouped = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap();
-        assert_eq!(
-            grouped.batch(&context, &EmptyRegionDriver, inputs.as_slice()),
-            Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped \
-                     axis"
-                        .to_string(),
-            }),
-        );
-
-        let mut invalid_inputs = inputs;
-        invalid_inputs[1] = ArrayBatch::new(
-            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 4]), &[]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        assert_eq!(
-            ParallelRaggedAllToAllOperation::new("x".to_string(), 2).batch(
-                &context,
-                &EmptyRegionDriver,
-                invalid_inputs.as_slice(),
-            ),
-            Err(BatchingError::Type(TypeError::invalid(
-                "`parallel_ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_rejects_dynamic_packed_extent() {
-        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(0, Some(8)).unwrap());
-        let error = ArrayTestTracingContext::trace(
-            |inputs: Vec<_>| {
-                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
-                let inputs = inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs.remove(0).into_value())
-            },
-            vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(input_extent)])),
-                ArrayType::new_static(DataType::F32, [2, 4]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-            ],
-        )
-        .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
-                        .to_string(),
-            },
-        );
-
-        let trailing_extent = DimensionVariable::new("trailing_extent", DimensionBounds::new(0, Some(8)).unwrap());
-        let error = ArrayTestTracingContext::trace(
-            |inputs: Vec<_>| {
-                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
-                let inputs = inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs.remove(0).into_value())
-            },
-            vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![
-                        Dimension::Static(2),
-                        Dimension::Static(3),
-                        Dimension::Dynamic(trailing_extent.clone()),
-                    ]),
-                ),
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Dynamic(trailing_extent)]),
-                ),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-            ],
-        )
-        .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message:
-                    "`parallel_ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
-                        .to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_parallel_ragged_all_to_all_batching_unrelated_axis_rejects_dynamic_mapped_extent() {
-        let context = ArrayIrTestTracingContext::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let batch_extent = context.input(DimensionType::from(batch.clone()).into());
-        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context.clone(), batch_extent)
-            .with_axis_name("y".to_string());
-        let packed_type = |data_type, dimensions: &[usize]| {
-            ArrayType::new(
-                data_type,
-                Shape::new(
-                    std::iter::once(Dimension::Dynamic(batch.clone()))
-                        .chain(dimensions.iter().copied().map(Dimension::Static))
-                        .collect(),
-                ),
-            )
-        };
-        let metadata_type = packed_type(DataType::I32, &[2, 2]);
-        let input_types = [
-            packed_type(DataType::F32, &[2, 3]),
-            packed_type(DataType::F32, &[2, 4]),
-            metadata_type.clone(),
-            metadata_type.clone(),
-            metadata_type.clone(),
-            metadata_type,
-        ];
-        let inputs = input_types.map(|r#type| {
-            BatchingTracer::new(
-                batching_context.clone(),
-                ArrayIrBatch::new(context.input(r#type.into()), BatchAxis::new(0)).unwrap(),
-            )
-        });
-        let error = batching_context
-            .bind(
-                ArrayIrOperation::ParallelRaggedAllToAll(
-                    ParallelRaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
-                ),
-                Vec::new(),
-                &inputs,
-            )
-            .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message: "`parallel_ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
-                    .to_string(),
-            },
-        );
-    }
-
-    #[test]
     fn test_parallel_ragged_all_to_all_differentiation() {
+        // The exchange is jointly linear in `operand` and `output`, so a live tangent of either data input is exchanged
+        // with the primal metadata, a structural zero contributes zeros, and two structural zeros yield a structural
+        // zero.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 1);
         let operand = Array::vector(vec![10.0f64, 11.0, 12.0]).unwrap();
@@ -3308,167 +3619,162 @@ mod tests {
             Array::vector(vec![2i32]).unwrap(),
             Array::vector(vec![0i32]).unwrap(),
             Array::vector(vec![2i32]).unwrap(),
-        ];
+        ]
+        .map(|primal| DifferentiationDual::new_with_zero_tangent(primal).unwrap());
         let operand_tangent = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
         let output_tangent = Array::vector(vec![10.0f64, 20.0, 30.0, 40.0]).unwrap();
-        let structural_zero = |primal: &Array| MaybeZero::Zero(primal.r#type().tangent().unwrap());
-        let duals = |operand_tangent: MaybeZero<Array>, output_tangent: MaybeZero<Array>| {
-            let mut inputs = vec![
-                DifferentiationDual::new(operand.clone(), operand_tangent).unwrap(),
-                DifferentiationDual::new(output.clone(), output_tangent).unwrap(),
-            ];
-            inputs.extend(metadata.iter().cloned().map(|primal| {
-                let tangent = structural_zero(&primal);
-                DifferentiationDual::new(primal, tangent).unwrap()
-            }));
-            inputs
-        };
 
-        let evaluate = |inputs: Vec<DifferentiationDual<Array>>| {
-            operation
-                .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, inputs.as_slice())
-                .unwrap()
-                .remove(0)
-        };
-        let zero = evaluate(duals(structural_zero(&operand), structural_zero(&output)));
-        assert_eq!(zero.primal().elements::<f64>().unwrap(), vec![11.0, 12.0, 102.0, 103.0]);
-        assert!(zero.tangent().is_zero());
+        let zero = operation
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(operand.clone()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(output.clone()).unwrap(),
+                    metadata[0].clone(),
+                    metadata[1].clone(),
+                    metadata[2].clone(),
+                    metadata[3].clone(),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(zero.primal(), &Array::vector(vec![11.0f64, 12.0, 102.0, 103.0]).unwrap());
+        assert!(matches!(
+            zero.tangent(),
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::new_static(DataType::F64, [4]),
+        ));
 
-        let operand_only = evaluate(duals(MaybeZero::Value(operand_tangent.clone()), structural_zero(&output)));
-        assert_eq!(operand_only.tangent().as_value().unwrap().elements::<f64>().unwrap(), vec![2.0, 3.0, 0.0, 0.0]);
+        let operand_only = operation
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(operand.clone(), MaybeZero::Value(operand_tangent.clone())).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(output.clone()).unwrap(),
+                    metadata[0].clone(),
+                    metadata[1].clone(),
+                    metadata[2].clone(),
+                    metadata[3].clone(),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(operand_only.tangent().as_value(), Some(&Array::vector(vec![2.0f64, 3.0, 0.0, 0.0]).unwrap()));
 
-        let output_only = evaluate(duals(structural_zero(&operand), MaybeZero::Value(output_tangent.clone())));
-        assert_eq!(output_only.tangent().as_value().unwrap().elements::<f64>().unwrap(), vec![0.0, 0.0, 30.0, 40.0]);
+        let output_only = operation
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(operand.clone()).unwrap(),
+                    DifferentiationDual::new(output.clone(), MaybeZero::Value(output_tangent.clone())).unwrap(),
+                    metadata[0].clone(),
+                    metadata[1].clone(),
+                    metadata[2].clone(),
+                    metadata[3].clone(),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(output_only.tangent().as_value(), Some(&Array::vector(vec![0.0f64, 0.0, 30.0, 40.0]).unwrap()));
 
-        let joint = evaluate(duals(MaybeZero::Value(operand_tangent), MaybeZero::Value(output_tangent)));
-        assert_eq!(joint.tangent().as_value().unwrap().elements::<f64>().unwrap(), vec![2.0, 3.0, 30.0, 40.0]);
+        let joint = operation
+            .jvp(
+                &DifferentiationContext::fused(context),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(operand, MaybeZero::Value(operand_tangent)).unwrap(),
+                    DifferentiationDual::new(output, MaybeZero::Value(output_tangent)).unwrap(),
+                    metadata[0].clone(),
+                    metadata[1].clone(),
+                    metadata[2].clone(),
+                    metadata[3].clone(),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(joint.tangent().as_value(), Some(&Array::vector(vec![2.0f64, 3.0, 30.0, 40.0]).unwrap()));
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_differentiation_through_named_batch_axis() {
+    fn test_parallel_ragged_all_to_all_differentiation_array_ir() {
+        // A composite exchange differentiates through the rule of its array member, which applies the same exchange,
+        // with the same primal metadata, to the live tangents of both data inputs.
+        let context = ArrayIrTracingContext::new();
+        let operand = context.input(ArrayType::new_static(DataType::F32, [3]).into());
+        let output = context.input(ArrayType::new_static(DataType::F32, [4]).into());
+        let metadata =
+            (0..4).map(|_| context.input(ArrayType::new_static(DataType::I32, [1]).into())).collect::<Vec<_>>();
+        let operand_tangent = context.input(ArrayType::new_static(DataType::F32, [3]).into());
+        let output_tangent = context.input(ArrayType::new_static(DataType::F32, [4]).into());
+        let mut inputs = vec![
+            DifferentiationDual::new(operand, MaybeZero::Value(operand_tangent)).unwrap(),
+            DifferentiationDual::new(output, MaybeZero::Value(output_tangent)).unwrap(),
+        ];
+        inputs
+            .extend(metadata.into_iter().map(|metadata| DifferentiationDual::new_with_zero_tangent(metadata).unwrap()));
+        let outputs = ParallelRaggedAllToAllOperation::new("x".to_string(), 1)
+            .jvp_in_parent(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
+        let output_ids =
+            vec![outputs[0].primal().atom_id().unwrap(), outputs[0].tangent().as_value().unwrap().atom_id().unwrap()];
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                output_ids,
+                vec![Placeholder; 8],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f32[4], %2:i32[1], %3:i32[1], %4:i32[1], %5:i32[1], %6:f32[3], %7:f32[4] .
+                let %8:f32[4] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=1] %0 %1 %2 %3 %4 %5
+                    %9:f32[4] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=1] %6 %7 %2 %3 %4 %5
+                in (%8, %9)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_differentiation_around_named_batch_axis() {
+        // Differentiating a function that contains a matching `batch` level transposes the physical exchange: each
+        // `operand` row receives the cotangent of every row that it was sent to, and each `output` row receives its
+        // cotangent only when no segment overwrote it.
         let operand = Array::matrix(2, 3, vec![10.0f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap();
         let output = Array::matrix(2, 4, vec![100.0f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap();
-        let input_offsets = Array::matrix(2, 2, vec![0i32, 0, 0, 2]).unwrap();
-        let send_sizes = Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap();
-        let output_offsets = Array::matrix(2, 2, vec![1i32, 1, 2, 3]).unwrap();
-        let receive_sizes = Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap();
-
-        let (value, gradient) = differentiate_at((operand, output))
-            .value_and_gradient(move |(operand, output)| {
-                let context = operand.context().clone();
-                let input_offsets = context.lift(input_offsets.clone())?;
-                let send_sizes = context.lift(send_sizes.clone())?;
-                let output_offsets = context.lift(output_offsets.clone())?;
-                let receive_sizes = context.lift(receive_sizes.clone())?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.parallel_ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
-            })
+        let (value, gradient) = differentiate_at((operand.clone(), output.clone()))
+            .value_and_gradient(|(operand, output)| batched_parallel_ragged_all_to_all_sum!(operand, output))
             .unwrap();
+        assert_eq!(value, Array::scalar(939.0f64).unwrap());
+        assert_eq!(gradient.0, Array::matrix(2, 3, vec![1.0f64, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap());
+        assert_eq!(gradient.1, Array::matrix(2, 4, vec![1.0f64, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]).unwrap());
 
-        assert_eq!(value.elements::<f64>().unwrap(), vec![939.0]);
-        assert_eq!(gradient.0.elements::<f64>().unwrap(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(gradient.1.elements::<f64>().unwrap(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
-
+        // Both data inputs also agree with central finite differences.
         check_gradient!(
-            |operand, output| {
-                let context = operand.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0i32, 0, 0, 2]).unwrap())?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1i32, 1, 2, 3]).unwrap())?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.parallel_ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
-            },
-            at = Array::matrix(2, 3, vec![10.0f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
-            with = Array::matrix(2, 4, vec![100.0f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap(),
+            |operand, output| batched_parallel_ragged_all_to_all_sum!(operand, output),
+            at = operand.clone(),
+            with = output.clone(),
             step = 1e-6,
             tolerance = 1e-6,
         );
         check_gradient!(
-            |output, operand| {
-                let context = output.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0i32, 0, 0, 2]).unwrap())?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1i32, 1, 2, 3]).unwrap())?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.parallel_ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
-            },
-            at = Array::matrix(2, 4, vec![100.0f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap(),
-            with = Array::matrix(2, 3, vec![10.0f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
+            |output, operand| batched_parallel_ragged_all_to_all_sum!(operand, output),
+            at = output,
+            with = operand,
             step = 1e-6,
             tolerance = 1e-6,
         );
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_differentiation_outside_named_batch_axis() {
+    fn test_parallel_ragged_all_to_all_differentiation_inside_named_batch_axis() {
+        // Differentiating inside a matching `batch` level transposes the logical exchange, whose offset metadata are
+        // transposed by dense exchanges over the same named axis.
         let (values, gradients) = batch(
             |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                 differentiate_at((operand, output))
@@ -3510,13 +3816,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(values.elements::<f64>().unwrap(), vec![324.0, 615.0]);
-        assert_eq!(gradients.0.elements::<f64>().unwrap(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(gradients.1.elements::<f64>().unwrap(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+        assert_eq!(values, Array::vector(vec![324.0f64, 615.0]).unwrap());
+        assert_eq!(gradients.0, Array::matrix(2, 3, vec![1.0f64, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap());
+        assert_eq!(gradients.1, Array::matrix(2, 4, vec![1.0f64, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]).unwrap());
     }
 
     #[test]
     fn test_parallel_ragged_all_to_all_transposition() {
+        // Overlapping send regions accumulate into the shared `operand` cotangent, zero-length segments contribute
+        // nothing, and the `output` cotangent survives only outside received regions.
         check_operation_transposition!(
             @exact,
             operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
@@ -3556,37 +3864,149 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_transposition_sharding() {
+    fn test_parallel_ragged_all_to_all_transposition_preserves_explicit_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        for dimensions in [
-            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])],
-        ] {
-            let sharding = Sharding::new(mesh.clone(), dimensions).unwrap();
-            let operand_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(sharding.clone()).unwrap();
-            let output_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let operand = builder.add_input(operand_type.clone());
-            let output = builder.add_input(output_type.clone());
-            let input_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
-            let send_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
-            let output_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
-            let receive_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
-            let result = builder
-                .add_instruction(
-                    ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
-                    Vec::new(),
-                    vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
+
+        // A cotangent keeps the explicit sharding of its data input when the exchanged leading axis is sharded.
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()])
                 .unwrap();
-            let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-            assert_eq!(pullback.input_types(), &[output_type]);
-            assert_eq!(pullback.output_types(), &[operand_type, program.input_types()[1].clone()]);
-        }
+        let operand_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(sharding.clone()).unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(operand_type);
+        let output = builder.add_input(output_type);
+        let input_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
+        let result = builder
+            .add_instruction(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+                Vec::new(),
+                vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] .
+                let %1:i32[1] = const [0]
+                    %2:i32[1] = const [1]
+                    %3:i32[1] = const [0]
+                    %4:i32[1] = const [1]
+                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                        options=Tiled] %3
+                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                        options=Tiled] %1
+                    %7:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = zero \
+                        [type=f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}]]
+                    %8:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = parallel_ragged_all_to_all \
+                        [axis_name=\"x\", axis_size=1, update_kind=Add] %0 %7 %5 %4 %6 %2
+                    %9:u64[1] = convert_element_type [data_type=u64] %5
+                    %10:u64[1] = convert_element_type [data_type=u64] %4
+                    %11:i64[5] = zero [type=i64[5]]
+                    %12:i64[1] = one [type=i64[1]]
+                    %13:i64[1] = neg %12
+                    %14:u64[1] = add %9 %10
+                    %15:u64[1, 1] = reshape [shape=[1, 1]] %9
+                    %16:u64[1, 1] = reshape [shape=[1, 1]] %14
+                    %17:i64[5] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %11 %15 %12
+                    %18:i64[5] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %16 %13
+                    %19:i64[5] = cumulative [kind=sum, axis=0] %18
+                    %20:i64[4] = slice [start_indices=[0], limits=[4]] %19
+                    %21:i64[4] = zero [type=i64[4]]
+                    %22:bool[4] = compare [direction=NotEqual] %20 %21
+                    %23:bool[4, 2] = broadcast [output_type=bool[4, 2], output_axes=[0]] %22
+                    %24:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = zero \
+                        [type=f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}]]
+                    %25:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = select %23 %24 %0
+                in (%8, %25)"
+            },
+        );
+
+        // A cotangent also keeps the explicit sharding of its data input when a trailing axis is sharded.
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])]).unwrap();
+        let operand_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(sharding.clone()).unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(operand_type);
+        let output = builder.add_input(output_type);
+        let input_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0i32]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![1i32]).unwrap());
+        let result = builder
+            .add_instruction(
+                ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+                Vec::new(),
+                vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] .
+                let %1:i32[1] = const [0]
+                    %2:i32[1] = const [1]
+                    %3:i32[1] = const [0]
+                    %4:i32[1] = const [1]
+                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                        options=Tiled] %3
+                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                        options=Tiled] %1
+                    %7:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] = zero \
+                        [type=f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}]]
+                    %8:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] = parallel_ragged_all_to_all \
+                        [axis_name=\"x\", axis_size=1, update_kind=Add] %0 %7 %5 %4 %6 %2
+                    %9:u64[1] = convert_element_type [data_type=u64] %5
+                    %10:u64[1] = convert_element_type [data_type=u64] %4
+                    %11:i64[5] = zero [type=i64[5]]
+                    %12:i64[1] = one [type=i64[1]]
+                    %13:i64[1] = neg %12
+                    %14:u64[1] = add %9 %10
+                    %15:u64[1, 1] = reshape [shape=[1, 1]] %9
+                    %16:u64[1, 1] = reshape [shape=[1, 1]] %14
+                    %17:i64[5] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %11 %15 %12
+                    %18:i64[5] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %16 %13
+                    %19:i64[5] = cumulative [kind=sum, axis=0] %18
+                    %20:i64[4] = slice [start_indices=[0], limits=[4]] %19
+                    %21:i64[4] = zero [type=i64[4]]
+                    %22:bool[4] = compare [direction=NotEqual] %20 %21
+                    %23:bool[4, 2] = broadcast [output_type=bool[4, 2], output_axes=[0]] %22
+                    %24:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] = zero \
+                        [type=f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}]]
+                    %25:f32[4, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] = select %23 %24 %0
+                in (%8, %25)"
+            },
+        );
     }
 
     #[test]
@@ -3615,13 +4035,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Array>(
-                vec![result],
-                vec![Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder],
-                Placeholder,
-            )
-            .unwrap();
+        let program = builder.build::<Vec<Array>, Array>(vec![result], vec![Placeholder; 6], Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(pullback.output_types(), &[typed(DataType::F32, 3), typed(DataType::F32, 4)]);
         assert_eq!(
@@ -3702,7 +4116,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_transposition_grouped_staging() {
+    fn test_parallel_ragged_all_to_all_transposition_grouped() {
+        // The dense offset exchanges and the adjoint ragged exchange stay within the participant groups of the forward
+        // exchange, and the output seed's cotangent is masked outside the received regions.
         let groups = vec![vec![0, 2], vec![3, 1]];
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
@@ -3792,13 +4208,45 @@ mod tests {
             },
         );
 
+        // The adjoint exchange is itself transposable, so transposing the pullback recovers the forward signature.
         let transposed_twice = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_transposition_additive_output() {
+    fn test_parallel_ragged_all_to_all_transposition_grouped_physical() {
+        // The physical representation has no named-axis binder left in which to exchange offsets, so its transpose
+        // permutes the offset blocks of every participant group with static slices and concatenations.
+        let operand_type = ArrayType::new_static(DataType::F64, [4, 2]);
+        let output_type = ArrayType::new_static(DataType::F64, [4, 2]);
+        check_operation_transposition!(
+            @exact,
+            operation = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
+                .unwrap()
+                .with_physical_representation(),
+            cases = [{
+                inputs = [
+                    (@linear(type = operand_type)),
+                    (@linear(type = output_type)),
+                    (@known, Array::matrix(4, 2, vec![0i32, 1, 0, 1, 0, 1, 0, 1]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![1i32; 8]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![0i32, 0, 1, 1, 1, 1, 0, 0]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![1i32; 8]).unwrap()),
+                ],
+                output_cotangents = [Array::matrix(4, 2, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
+                input_cotangents = [
+                    Array::matrix(4, 2, vec![1.0f64, 5.0, 8.0, 4.0, 2.0, 6.0, 7.0, 3.0]).unwrap(),
+                    Array::matrix(4, 2, vec![0.0f64; 8]).unwrap(),
+                ],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_transposition_additive_updates() {
+        // An accumulating exchange keeps every element of its output seed, so the `output` cotangent passes through
+        // unmasked and no metadata exchange is staged.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let output = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
@@ -3835,35 +4283,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_transposition_grouped_physical() {
-        let operation = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
-            .unwrap()
-            .with_physical_representation();
-        let data_type = ArrayType::new_static(DataType::F64, [4, 2]);
-        let output_type = ArrayType::new_static(DataType::F64, [4, 2]);
-        check_operation_transposition!(
-            @exact,
-            operation = operation,
-            cases = [{
-                inputs = [
-                    (@linear(type = data_type)),
-                    (@linear(type = output_type)),
-                    (@known, Array::matrix(4, 2, vec![0i32, 1, 0, 1, 0, 1, 0, 1]).unwrap()),
-                    (@known, Array::matrix(4, 2, vec![1i32; 8]).unwrap()),
-                    (@known, Array::matrix(4, 2, vec![0i32, 0, 1, 1, 1, 1, 0, 0]).unwrap()),
-                    (@known, Array::matrix(4, 2, vec![1i32; 8]).unwrap()),
-                ],
-                output_cotangents = [Array::matrix(4, 2, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
-                input_cotangents = [
-                    Array::matrix(4, 2, vec![1.0f64, 5.0, 8.0, 4.0, 2.0, 6.0, 7.0, 3.0]).unwrap(),
-                    Array::matrix(4, 2, vec![0.0f64; 8]).unwrap(),
-                ],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_parallel_ragged_all_to_all_transposition_rejects_unavailable_or_unrepresentable_metadata() {
+    fn test_parallel_ragged_all_to_all_transposition_rejects_unknown_metadata() {
+        // Transposition treats the metadata as primal residuals that route the adjoint exchange, so it rejects metadata
+        // that are themselves linear inputs and therefore unknown.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = [
             builder.add_input(ArrayType::new_static(DataType::F32, [3])),
@@ -3881,20 +4303,19 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Array>(
-                vec![result],
-                vec![Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder],
-                Placeholder,
-            )
-            .unwrap();
+        let program = builder.build::<Vec<Array>, Array>(vec![result], vec![Placeholder; 6], Placeholder).unwrap();
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1, 2], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`parallel_ragged_all_to_all` transpose requires `input_offsets` to be a known primal \
                                residual",
         ));
+    }
 
+    #[test]
+    fn test_parallel_ragged_all_to_all_transposition_rejects_dynamic_output_extent() {
+        // The output mask stages an `M + 1` marker with static scatter and slice operations, so the leading `output`
+        // extent `M` must be static.
         let output_extent = DimensionVariable::new("output_extent", DimensionBounds::new(0, Some(8)).unwrap());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
@@ -3920,7 +4341,11 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`parallel_ragged_all_to_all` transpose requires a static output leading dimension",
         ));
+    }
 
+    #[test]
+    fn test_parallel_ragged_all_to_all_transposition_rejects_marker_extent_overflow() {
+        // The `M + 1` marker extent of the output mask must itself fit in `usize`.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [1]));
         let output = builder.add_input(ArrayType::new_static(DataType::F32, [usize::MAX]));
@@ -3957,14 +4382,17 @@ mod tests {
             ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
             ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
         ];
-        let unbound = ArrayIrTestTracingContext::trace(
-            |inputs: Vec<_>| {
-                inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
-            },
-            input_types.clone(),
-        )
-        .unwrap_err();
-        assert_eq!(unbound.to_string(), "axis name `x` is not bound by any enclosing transform");
+        assert_eq!(
+            ArrayIrTracingContext::trace(
+                |inputs: Vec<_>| {
+                    inputs[0]
+                        .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                },
+                input_types.clone(),
+            )
+            .map(|(output_type, _)| output_type),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
 
         // Over a manual mesh axis, the exchange records the mesh. An input that is invariant over the axis is first
         // made varying, and alignment then makes every input vary over each manual axis that any input varies over,
@@ -3980,7 +4408,7 @@ mod tests {
                 .with_sharding(sharding.clone().with_varying_manual_axes(varying_manual_axes.iter().copied()).unwrap())
                 .unwrap()
         };
-        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
@@ -4029,7 +4457,7 @@ mod tests {
 
         // A composite value exchanges through its array view, which converts the exchange back into its direct
         // composite carrier. Inputs without a sharding are placed on the axis's mesh before they are made varying.
-        let (output_type, program) = ArrayIrTestTracingContext::trace_with_named_axes(
+        let (output_type, program) = ArrayIrTracingContext::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
@@ -4087,7 +4515,7 @@ mod tests {
 
         // A pending sum over the participating manual mesh axis is rejected before any input is made varying.
         assert_eq!(
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            ArrayTracingContext::trace_with_named_axes(
                 |inputs: Vec<_>| {
                     inputs[0]
                         .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
@@ -4104,7 +4532,7 @@ mod tests {
                 ],
                 axes,
             )
-            .map(|(output, _)| output),
+            .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
                 "`parallel_ragged_all_to_all` does not support unreduced inputs",
             ))),
@@ -4143,24 +4571,22 @@ mod tests {
             typed(DataType::I32, 2),
         ];
         let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
-        let trace = |axis_index_groups: Vec<Vec<usize>>| {
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                |inputs: Vec<_>| {
-                    inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
-                        "x",
-                        &inputs[1],
-                        &inputs[2],
-                        &inputs[3],
-                        &inputs[4],
-                        &inputs[5],
-                        axis_index_groups.clone(),
-                    )
-                },
-                input_types.clone(),
-                axes.clone(),
-            )
-        };
-        let (output_type, program) = trace(vec![vec![1], vec![0]]).unwrap();
+        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+            |inputs: Vec<_>| {
+                inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
+                    "x",
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    &inputs[5],
+                    vec![vec![1], vec![0]],
+                )
+            },
+            input_types.clone(),
+            axes.clone(),
+        )
+        .unwrap();
         assert_eq!(output_type, typed(DataType::F32, 4));
         assert_eq!(
             program.to_string(),
@@ -4184,7 +4610,22 @@ mod tests {
 
         // Groups that do not partition the full axis are rejected before anything is staged.
         assert_eq!(
-            trace(vec![vec![0, 1], vec![1]]).map(|(output, _)| output),
+            ArrayTracingContext::trace_with_named_axes(
+                |inputs: Vec<_>| {
+                    inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
+                        "x",
+                        &inputs[1],
+                        &inputs[2],
+                        &inputs[3],
+                        &inputs[4],
+                        &inputs[5],
+                        vec![vec![0, 1], vec![1]],
+                    )
+                },
+                input_types,
+                axes,
+            )
+            .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
                 "`parallel_ragged_all_to_all` axis index group 1 has size 1 but every group must have size 2",
             ))),
@@ -4194,6 +4635,20 @@ mod tests {
         // binder, so every axis name is unbound for them.
         let data = Array::vector(vec![1.0, 2.0]).unwrap();
         let metadata = Array::vector(vec![0i32]).unwrap();
+        assert_eq!(
+            data.parallel_ragged_all_to_all_with_axis_index_groups(
+                "x",
+                &data,
+                &metadata,
+                &metadata,
+                &metadata,
+                &metadata,
+                vec![vec![0]],
+            ),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+        let data = ArrayIrValue::Array(data);
+        let metadata = ArrayIrValue::Array(metadata);
         assert_eq!(
             data.parallel_ragged_all_to_all_with_axis_index_groups(
                 "x",
