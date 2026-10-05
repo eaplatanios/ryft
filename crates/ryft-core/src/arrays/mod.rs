@@ -45,7 +45,7 @@ pub use sharding::{
     ShardingError, ShardingVisualization,
 };
 pub use types::{
-    ArrayIrType, ArrayIrTypeRefinements, ArrayType, ArrayTypeRefinements, DataType, DataTypeError, Dimension,
-    DimensionBounds, DimensionError, DimensionType, DimensionVariable, Layout, LayoutError, MAX_DIMENSION_EXTENT,
-    Memory, Shape, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+    ArrayIrType, ArrayIrTypeRefinements, ArrayType, ArrayTypeRefinements, AsArrayType, DataType, DataTypeError,
+    Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Layout, LayoutError,
+    MAX_DIMENSION_EXTENT, Memory, Shape, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
 };

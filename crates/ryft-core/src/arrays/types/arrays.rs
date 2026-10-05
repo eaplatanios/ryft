@@ -946,6 +946,22 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     }
 }
 
+/// [`Type`] universe whose types may describe arrays. Universe-parameterized array capabilities use this view in their
+/// provided functions to read the [`ArrayType`] of a value in either universe, so that those functions are available
+/// for homogeneous array values and for composite array IR values alike.
+pub trait AsArrayType: Type {
+    /// Returns the [`ArrayType`] that this type describes, or a [`TypeError`] if it does not describe an array
+    /// (e.g., a first-class dimension or a reference in the array IR universe).
+    fn as_array_type(&self) -> Result<&ArrayType, TypeError>;
+}
+
+impl AsArrayType for ArrayType {
+    #[inline]
+    fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

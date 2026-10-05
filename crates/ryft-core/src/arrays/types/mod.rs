@@ -5,7 +5,7 @@ pub mod ir;
 pub mod layouts;
 pub mod memories;
 
-pub use arrays::{ArrayType, ArrayTypeRefinements};
+pub use arrays::{ArrayType, ArrayTypeRefinements, AsArrayType};
 pub use data::{DataType, DataTypeError};
 pub use dimensions::{
     Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape,
