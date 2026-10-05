@@ -1,9 +1,13 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
-use crate::arrays::{ArrayType, Broadcastable};
+use crate::arrays::{
+    ArrayType, Broadcastable, bf16, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz,
+    f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, u1, u2, u4,
+};
 use crate::macros::check_count;
-use crate::programs::{Operation, ProgramError, TypeError};
+use crate::parameters::{Parameter, Parameterized, Parameterwise};
+use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 pub mod arithmetic;
 pub mod assertions;
@@ -51,6 +55,11 @@ pub use collectives::{
     ParallelPermuteOperation, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
+pub use complex::{
+    COMPLEX_OPERATION_NAME, CONJUGATE_OPERATION_NAME, Complex, ComplexOperation, ComplexOperations, Conjugate,
+    ConjugateOperation, IMAGINARY_OPERATION_NAME, Imaginary, ImaginaryOperation, REAL_OPERATION_NAME, Real,
+    RealOperation,
+};
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
     DynamicIota, DynamicOne, DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME,
@@ -154,6 +163,89 @@ pub use trigonometric::{
     SinOperation, TAN_OPERATION_NAME, TANH_OPERATION_NAME, Tan, TanOperation, Tanh, TanhOperation,
     TrigonometricOperations,
 };
+
+/// Universe membership of a capability implementor. Every capability (e.g., [`Add`]) is parameterized by the universe
+/// that it operates in, and that parameter defaults to its implementor's [`Universe`](Self::Universe), so that ordinary
+/// bounds and calls such as `A: Add` and `a.add(&b)` refer to the implementor's own universe. Values belong to the
+/// universe of their [`Typed::Type`] through a blanket implementation, host types that are not [`Typed`] (e.g.,
+/// primitive integers and floating-point numbers) are their own universe, and [`Parameterwise`] structures belong
+/// to the universe of their parameters.
+///
+/// A universe is a type-level marker only, and it does not need to be a [`Type`](crate::Type). Capabilities only use
+/// it to tell implementations apart, and so host types need no artificial [`Type`](crate::Type) to belong to one. The
+/// universe parameter lets one capability have separate implementations for different universes (e.g., a homogeneous
+/// array implementation and a composite array IR implementation that projects onto it), which coherence could not
+/// otherwise tell apart, because it cannot use associated types to prove two implementations disjoint. Capabilities
+/// require [`Capability`] without pinning its universe to their parameter, because pinning it overflows the trait
+/// solver. An implementor must therefore only implement capabilities for its own universe.
+///
+/// In generic code, prefer stating capability bounds with their default universe (e.g., `V: Add + Broadcast`) or a
+/// bundle such as [`ArrayOperations`](crate::ArrayOperations), and avoid mixing them with explicitly named universes
+/// for the same value (e.g., `V: Broadcast` in one bound and `V: Broadcast<ArrayType>` in another). The trait solver
+/// cannot always prove that `<V as Capability>::Universe` and `<V as Typed>::Type` are the same type when `V` is a
+/// generic or projected type, and so such mixed bounds may fail to unify. Likewise, traits must not state
+/// `Typed<Type = T>` alongside a universe-parameterized capability bound at `T`, because the resulting
+/// equality makes bounds on `V::Type` unusable.
+pub trait Capability {
+    /// Universe that this implementor belongs to (e.g., the [`Typed::Type`] of a value, or a host type itself).
+    type Universe;
+}
+
+impl<V: Typed> Capability for V {
+    type Universe = V::Type;
+}
+
+// A parameterwise structure belongs to the universe of its parameters, so that default universe parameters resolve
+// for it exactly as they do for its parameters.
+impl<P: Parameter + Capability, S: Parameterized<P>> Capability for Parameterwise<P, S> {
+    type Universe = P::Universe;
+}
+
+/// Implements [`Capability`] for a host type that is not [`Typed`], making the host type its own universe.
+macro_rules! impl_host_capability {
+    ($type:ty) => {
+        impl Capability for $type {
+            type Universe = $type;
+        }
+    };
+}
+
+impl_host_capability!(bool);
+impl_host_capability!(i8);
+impl_host_capability!(i16);
+impl_host_capability!(i32);
+impl_host_capability!(i64);
+impl_host_capability!(i128);
+impl_host_capability!(isize);
+impl_host_capability!(u8);
+impl_host_capability!(u16);
+impl_host_capability!(u32);
+impl_host_capability!(u64);
+impl_host_capability!(u128);
+impl_host_capability!(usize);
+impl_host_capability!(f32);
+impl_host_capability!(f64);
+impl_host_capability!(i1);
+impl_host_capability!(i2);
+impl_host_capability!(i4);
+impl_host_capability!(u1);
+impl_host_capability!(u2);
+impl_host_capability!(u4);
+impl_host_capability!(f4e2m1fn);
+impl_host_capability!(f6e2m3fn);
+impl_host_capability!(f6e3m2fn);
+impl_host_capability!(f8e3m4);
+impl_host_capability!(f8e4m3);
+impl_host_capability!(f8e4m3fn);
+impl_host_capability!(f8e4m3fnuz);
+impl_host_capability!(f8e4m3b11fnuz);
+impl_host_capability!(f8e5m2);
+impl_host_capability!(f8e5m2fnuz);
+impl_host_capability!(f8e8m0fnu);
+impl_host_capability!(bf16);
+impl_host_capability!(f16);
+impl_host_capability!(num_complex::Complex<f32>);
+impl_host_capability!(num_complex::Complex<f64>);
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
 /// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations.
@@ -319,13 +411,61 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension, StridedLayout,
     };
     use crate::programs::RegionInterface;
     use crate::tests::hash_of;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
+
+    #[test]
+    fn test_capability() {
+        // Values belong to the universe of their type, so universe-defaulted capabilities refer to their own universe.
+        fn assert_value_universe<V: Typed + Capability<Universe = <V as Typed>::Type>>() {}
+
+        assert_value_universe::<Array>();
+        assert_value_universe::<ArrayType>();
+        assert_value_universe::<DimensionValue>();
+        assert_value_universe::<ArrayIrValue<Array>>();
+        assert_value_universe::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
+        assert_value_universe::<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>();
+
+        // Host types that are not typed belong to the universe of their own host type, including integers that are
+        // wider than every array data type.
+        fn assert_host_universe<T: Capability<Universe = T>>() {}
+
+        assert_host_universe::<bool>();
+        assert_host_universe::<i8>();
+        assert_host_universe::<i128>();
+        assert_host_universe::<isize>();
+        assert_host_universe::<u128>();
+        assert_host_universe::<usize>();
+        assert_host_universe::<f32>();
+        assert_host_universe::<f64>();
+
+        // Host types satisfy the capability bundles whose members they implement, in their own universes.
+        fn assert_floating_point_bundles<
+            V: ArithmeticOperations
+                + ExponentialOperations
+                + TrigonometricOperations
+                + RoundingOperations
+                + ExtremaOperations,
+        >() {
+        }
+
+        assert_floating_point_bundles::<f32>();
+        assert_floating_point_bundles::<f64>();
+
+        fn assert_integer_bundles<V: ExtremaOperations + LogicalOperations>() {}
+
+        assert_integer_bundles::<bool>();
+        assert_integer_bundles::<i8>();
+        assert_integer_bundles::<i128>();
+        assert_integer_bundles::<usize>();
+    }
 
     #[test]
     fn test_elementwise_operation_type_inference() {
