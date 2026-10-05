@@ -1,8 +1,10 @@
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayType, LogicalMesh, RaggedArrayExtentBatchingPolicy, RaggedAxis,
-    RaggedMaskIdentity,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, LogicalMesh, RaggedArrayExtentBatchingPolicy,
+    RaggedAxis, RaggedMaskIdentity,
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -10,6 +12,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{
@@ -533,6 +536,9 @@ impl_differentiable_operation! {
 /// Participant subgroups retain the ordinary collective contract: the staged operation carries no mesh and preserves
 /// the input variation, because distinct groups can produce distinct results.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// Each device squares its own weight, and the sum of the squares is shared by all of them. Transposing the program
@@ -578,7 +584,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelReduce: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ParallelReduce<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the reduction of this value across the participants of the named axis `axis_name`, staging a
     /// [`ParallelReduceOperation`] of the provided `kind`. Over a manual mesh axis, an input that is invariant over the
     /// axis is first passed through [`parallel_vary`](ParallelVary::parallel_vary), the staged operation records the
@@ -663,7 +670,7 @@ impl<
         + Select
         + ParallelVary
         + StopGradient,
-> ParallelReduce for V
+> ParallelReduce<ArrayType> for V
 {
     fn parallel_reduce(&self, kind: ReductionKind, axis_name: &str) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();

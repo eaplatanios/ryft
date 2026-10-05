@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
     ArrayType, DataType, DimensionType, LogicalMesh, MeshAxisType, Sharding,
@@ -11,6 +13,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
@@ -299,6 +302,9 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// two providers with an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error, which restores the
 /// capabilities and turns a variation transition into a runtime error instead of a compile error.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// A shared scalar scaled by a per-device weight varies once it is combined with that weight. The capability inserts
@@ -334,7 +340,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelVary: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ParallelVary<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value marked as varying across the manual mesh axis `axis_name`, staging a
     /// [`ParallelVaryOperation`] and, for a value without a sharding, a broadcast that first places it on the axis's
     /// mesh. The local shard is unchanged; only its type records that shards may now differ across the axis.
@@ -399,7 +406,7 @@ impl<
             Operation: OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>
                            + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>,
         > + NamedAxes,
-> ParallelVary for V
+> ParallelVary<ArrayType> for V
 {
     fn parallel_vary(&self, axis_name: &str) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();

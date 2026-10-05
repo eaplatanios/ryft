@@ -6,6 +6,8 @@
 
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
     Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
@@ -23,6 +25,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_ragged_all_to_all::PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME;
@@ -822,6 +825,9 @@ where
 /// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
 /// values share the same call syntax.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// Each row sends its first half to batch item zero and its second half to batch item one:
@@ -847,7 +853,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelAllToAll<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
+#[capability]
+pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Exchanges single slices, removing `split_axis` from the input and inserting the sender axis at `concat_axis`
     /// in the output. The split extent must equal the participant count, and rank is preserved.
     ///
@@ -1093,7 +1100,11 @@ where
 }
 
 /// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.
-pub trait ParallelSwapAxes<T: Type = <Self as Typed>::Type>: ParallelAllToAll<T> {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait ParallelSwapAxes<T = <Self as Capability>::Universe>: Capability + ParallelAllToAll<T> {
     /// Swaps `axis` with `axis_name` over the full named axis. The ranked axis must have the participant count as its
     /// extent. This is [`ParallelAllToAll::parallel_all_to_all`] with identical split and concatenation positions.
     ///

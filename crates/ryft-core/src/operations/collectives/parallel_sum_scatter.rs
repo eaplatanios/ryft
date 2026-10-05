@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
     DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape,
@@ -18,6 +20,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_all_gather::{
@@ -42,7 +45,7 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -743,6 +746,9 @@ impl<
 /// [`ParallelReduce::parallel_reduce`](super::ParallelReduce::parallel_reduce). The output extents are staged
 /// as explicit extent values, and a runtime assertion checks every extent that is not statically known.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// Sum two rows elementwise and give each batch item half of the summed row:
@@ -768,7 +774,8 @@ impl<
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelSumScatter<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
+#[capability]
+pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the sum of this value across the participants of the named axis `axis_name`, scattered along
     /// `scatter_axis`. The extent of `scatter_axis` must equal the number of participants, and the axis is removed,
     /// so that participant `i` receives row `i` of the sum.

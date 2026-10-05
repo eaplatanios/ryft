@@ -1159,9 +1159,9 @@ macro_rules! define_elementwise_operation {
 /// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
 /// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
 /// covers every value whose dispatch domain can bind the operation for that value's own universe, and composite array
-/// IR values implement it through their array members (refer to [`impl_array_ir_projected_capability!`]).
-/// [`Parameterwise`](crate::Parameterwise) structures implement it parameter-by-parameter (i.e., by
-/// zipping the parameters of both inputs for binary capabilities).
+/// IR values implement it through their array members (refer to the `#[capability]` attribute documented on
+/// [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise) structures implement it
+/// parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary capabilities).
 ///
 /// # Examples
 ///
@@ -1233,6 +1233,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {
@@ -1278,12 +1279,6 @@ macro_rules! define_elementwise_capability {
                 self.map(|parameter| <__P as $capability<__T>>::$accuracy_method(parameter, accuracy))
             }
         }
-
-        $crate::arrays::macros::impl_array_ir_projected_capability! {
-            $capability {
-                fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Self;
-            }
-        }
     };
 
     // This branch defines a receiver capability whose unary operation is provided by the value type family.
@@ -1301,6 +1296,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {
@@ -1352,12 +1348,6 @@ macro_rules! define_elementwise_capability {
                 self.map(|parameter| <__P as $capability<__T>>::$method(parameter))
             }
         }
-
-        $crate::arrays::macros::impl_array_ir_projected_capability! {
-            $capability {
-                fn $method(&self) -> Self;
-            }
-        }
     };
 
     // This branch defines a two-input capability whose binary operation is provided by the value type family,
@@ -1376,6 +1366,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {
@@ -1428,12 +1419,6 @@ macro_rules! define_elementwise_capability {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
                 self.zip_map($argument, |left, right| <__P as $capability<__T>>::$method(left, right))
-            }
-        }
-
-        $crate::arrays::macros::impl_array_ir_projected_capability! {
-            $capability {
-                fn $method(&self, $argument: &Self) -> Self;
             }
         }
     };
@@ -5407,10 +5392,10 @@ pub use crate::{
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_arithmetic_dimension_capability, define_dimension_arithmetic_operation,
     define_elementwise_capability, define_elementwise_operation, dispatch_on_array_element_type,
-    impl_array_elementwise_operation, impl_array_ir_projected_capability, impl_differentiable_elementwise_operation,
-    impl_differentiable_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_nullary_batchable_operation, impl_nullary_transposable_operation, impl_parameterwise_operator,
-    impl_reference_dischargeable_operation, impl_tracer_operator,
+    impl_array_elementwise_operation, impl_differentiable_elementwise_operation, impl_differentiable_operation,
+    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation, impl_parameterwise_operator, impl_reference_dischargeable_operation,
+    impl_tracer_operator,
 };
 
 #[cfg(test)]

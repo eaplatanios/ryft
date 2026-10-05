@@ -18,40 +18,36 @@ use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use crate::operations::collectives::{
-    ParallelAllGather, ParallelAllGatherOperation, ParallelAllToAll, ParallelAllToAllOperation,
-    ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelSumScatter,
+    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
     ParallelSumScatterOperation,
-};
-use crate::operations::complex::{
-    ComplexOperation, ComplexOperations, ConjugateOperation, ImaginaryOperation, RealOperation,
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
-    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, CeilOperation, ClampOperation,
-    CollectiveOperations, Compare, CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation,
-    ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, Cumulative,
-    CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
-    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
-    DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    DotOperation, DotOperations, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
-    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation,
-    ExponentialOperations, ExtremaOperations, FloorOperation, GatherOperation, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
-    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation,
-    PowOperation, Print, PrintOperation, RaggedDotOperation, ReduceOperation, ReducePrecisionOperation,
-    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
-    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
-    ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations,
-    SignOperation, SinOperation, SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient,
-    StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation,
-    TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation, WhileOperation,
-    XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CeilOperation, ClampOperation,
+    CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations, ConcatenateOperation,
+    ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation,
+    ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomFunctionOperation,
+    CustomFunctionTransposeOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
+    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
+    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DynamicBroadcastOperation,
+    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpOperation, ExponentialOperations, ExtremaOperations,
+    FloorOperation, GatherOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
+    MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
+    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
+    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
+    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -164,66 +160,79 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 /// capabilities through which values stage or execute [`ArrayOperation`] variants, listed in variant order. It is
 /// implemented automatically for every value that implements all of its members, and so it must never be implemented
 /// manually.
-pub trait ArrayOperations:
-    Value<Type = ArrayType>
-    + ConstantOperations
-    + ExtremaOperations
-    + ArithmeticOperations
-    + TrigonometricOperations
-    + ExponentialOperations
-    + Erf
-    + RoundingOperations
-    + LogicalOperations
-    + ComplexOperations
-    + ReductionOperations
-    + Cumulative
-    + Sort
-    + DotOperations
-    + ScaledDot
-    + DotProductAttention
-    + CollectiveOperations<ArrayType>
-    + Compare
-    + Select
-    + ManipulationOperations
-    + ShardingOperations
-    + StopGradient
-    + Tag
-    + RngBitGenerator
-    + Print
-    + Assert
-    + CustomCall
+///
+/// The bundle is parameterized by the [`Capability`] universe `T` of its values, which defaults to that of the
+/// implementing value. Homogeneous array values (e.g., [`Array`] and the tracers over [`ArrayType`]) implement
+/// `ArrayOperations<ArrayType>`, and composite array IR values (e.g., [`ArrayIrValue`] and the tracers over
+/// [`ArrayIrType`]) implement `ArrayOperations<ArrayIrType>` by applying the array capabilities to their array members
+/// (a first-class dimension or reference member fails with the projection's [`TypeError`]). Generic code bounded by
+/// `V: ArrayOperations` therefore works for values of either universe without projecting them.
+///
+/// The bundle deliberately does not pin `Value<Type = T>`. A value's capability universe is its own [`Typed::Type`] by
+/// convention (refer to [`Capability`]), and an equality between the two in the bound would make the trait solver
+/// normalize `V::Type` to the universe projection, so that bounds on `V::Type` in generic code (e.g.,
+/// `V::Type: DifferentiableType`) would no longer apply.
+pub trait ArrayOperations<T = <Self as Capability>::Universe>:
+    Value
+    + ConstantOperations<T>
+    + ExtremaOperations<T>
+    + ArithmeticOperations<T>
+    + TrigonometricOperations<T>
+    + ExponentialOperations<T>
+    + Erf<T>
+    + RoundingOperations<T>
+    + LogicalOperations<T>
+    + ComplexOperations<T>
+    + ReductionOperations<T>
+    + Cumulative<T>
+    + Sort<T>
+    + DotOperations<T>
+    + ScaledDot<T>
+    + DotProductAttention<T>
+    + CollectiveOperations<T>
+    + Compare<Self, T>
+    + Select<T>
+    + ManipulationOperations<T>
+    + ShardingOperations<T>
+    + StopGradient<T>
+    + Tag<T>
+    + RngBitGenerator<T>
+    + Print<T>
+    + Assert<T>
+    + CustomCall<T>
 {
 }
 
 impl<
-    V: Value<Type = ArrayType>
-        + ConstantOperations
-        + ExtremaOperations
-        + ArithmeticOperations
-        + TrigonometricOperations
-        + ExponentialOperations
-        + Erf
-        + RoundingOperations
-        + LogicalOperations
-        + ComplexOperations
-        + ReductionOperations
-        + Cumulative
-        + Sort
-        + DotOperations
-        + ScaledDot
-        + DotProductAttention
-        + CollectiveOperations<ArrayType>
-        + Compare
-        + Select
-        + ManipulationOperations
-        + ShardingOperations
-        + StopGradient
-        + Tag
-        + RngBitGenerator
-        + Print
-        + Assert
-        + CustomCall,
-> ArrayOperations for V
+    T,
+    V: Value
+        + ConstantOperations<T>
+        + ExtremaOperations<T>
+        + ArithmeticOperations<T>
+        + TrigonometricOperations<T>
+        + ExponentialOperations<T>
+        + Erf<T>
+        + RoundingOperations<T>
+        + LogicalOperations<T>
+        + ComplexOperations<T>
+        + ReductionOperations<T>
+        + Cumulative<T>
+        + Sort<T>
+        + DotOperations<T>
+        + ScaledDot<T>
+        + DotProductAttention<T>
+        + CollectiveOperations<T>
+        + Compare<V, T>
+        + Select<T>
+        + ManipulationOperations<T>
+        + ShardingOperations<T>
+        + StopGradient<T>
+        + Tag<T>
+        + RngBitGenerator<T>
+        + Print<T>
+        + Assert<T>
+        + CustomCall<T>,
+> ArrayOperations<T> for V
 {
 }
 
@@ -477,36 +486,38 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on composite array IR values, so that
-/// generic composite code can state one bound instead of listing each capability it uses. Its members are the
-/// capability groups, member projections, and individual capabilities through which values stage or execute
-/// [`ArrayIrOperation`] variants, listed in variant order. It is implemented automatically for every value that
-/// implements all of its members, and so it must never be implemented manually.
+/// generic composite code can state one bound instead of listing each capability it uses. It is implemented
+/// automatically for every value that implements all of its members, and so it must never be implemented manually.
 ///
-/// The homogeneous [`ArrayIrOperation::Array`] and [`ArrayIrOperation::Dimension`] variants are reached through member
-/// projections, so the bundle requires that the [`ValueProjection<ArrayType>`](ValueProjection) of a value satisfies
-/// [`ArrayOperations`] and that its [`ValueProjection<DimensionType>`](ValueProjection) satisfies
-/// [`DimensionOperations`]. Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
-/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site. Bounding homogeneous
-/// capabilities such as [`Add`] directly would instead demand `From<AddOperation<ArrayIrType>>`-style conversions of
-/// every array operation, which the composite family intentionally does not provide. The remaining members are mixed
-/// capabilities, whose signatures cross the array and first-class-dimension member kinds (e.g., [`DimensionSize`] and
-/// [`DynamicManipulationOperations`]), the [`ReferenceOperations`] over [`ArrayReferenceTransform`] paths, the
-/// shape-changing collectives, which stage explicit result extents, and [`Compare`] of first-class dimensions.
+/// The bundle extends [`ArrayOperations<ArrayIrType>`](ArrayOperations), through which composite values apply every
+/// array capability to their array members, with the mixed capabilities whose signatures cross the array and
+/// first-class-dimension member kinds (e.g., [`DimensionSize`] and [`DynamicManipulationOperations`]), the
+/// [`ReferenceOperations`] over [`ArrayReferenceTransform`] paths, and the dynamic random bit generator. It also
+/// requires that the [`ValueProjection<ArrayType>`](ValueProjection) of a value satisfies [`ArrayOperations`] and that
+/// its [`ValueProjection<DimensionType>`](ValueProjection) satisfies [`DimensionOperations`], so that generic composite
+/// code that projects explicitly (e.g., to compute in the array universe over several operations) does not have to
+/// restate `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds. That projected guarantee is not
+/// implied by the member bound: a blanket implementation that derives `V: X` from `V::Projected: X` cannot be
+/// inverted.
 ///
 /// Variants without a value-level capability are necessarily absent. These are the context-side constructors
 /// [`DynamicZero`](crate::operations::constants::DynamicZero),
 /// [`DynamicOne`](crate::operations::constants::DynamicOne), and
-/// [`DynamicIota`](crate::operations::constants::DynamicIota), the foreign-kernel calls that composite values reach
-/// through their array projection, and the variants that function-level APIs and transforms stage on behalf of values,
-/// namely control flow, rematerialization, linear calls, and custom functions.
+/// [`DynamicIota`](crate::operations::constants::DynamicIota), and the variants that function-level APIs and
+/// transforms stage on behalf of values, namely control flow, rematerialization, linear calls, and custom functions.
 ///
-/// Checked arithmetic over first-class dimensions uses their member projection:
+/// Array capabilities apply directly to composite values, and checked arithmetic over first-class dimensions uses
+/// their member projection:
 ///
 /// ```rust
 /// use ryft_core::arrays::DimensionValue;
 /// use ryft_core::{Array, ArrayIrValue, DimensionType, Mul, ProgramError, ValueProjection};
 ///
 /// # fn main() -> Result<(), ProgramError> {
+/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
+/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]).unwrap());
+/// assert_eq!(left.mul(&right)?, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0]).unwrap()));
+///
 /// let rows: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
 /// let columns: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
 /// let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
@@ -517,69 +528,39 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// # }
 /// ```
 ///
-/// The same mechanism applies to arrays: project the composite value, use the member capability, and inject the
-/// member result back when a composite consumer needs it. For the array member that reads
-/// `value.into_projected()?.mul(&other.into_projected()?)`, followed by `from_projected`:
-///
-/// ```rust
-/// use ryft_core::arrays::ArrayType;
-/// use ryft_core::{Array, ArrayIrValue, Mul, ProgramError, ValueProjection};
-///
-/// # fn main() -> Result<(), ProgramError> {
-/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
-/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]).unwrap());
-/// let product = ValueProjection::<ArrayType>::into_projected(left)?
-///     .mul(&ValueProjection::<ArrayType>::into_projected(right)?)?;
-/// let product = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::from_projected(product);
-/// assert_eq!(product, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0]).unwrap()));
-/// # Ok(())
-/// # }
-/// ```
-///
-/// The [`ParameterProjection`](crate::ParameterProjection) extension trait applies the same projection to a whole
+/// The [`ParameterProjection`](crate::ParameterProjection) extension trait applies the member projection to a whole
 /// [`Parameterized`](crate::parameters::Parameterized) tree at a boundary (i.e.,
-/// `model.project_parameters::<ArrayType>()?` and `projected.lift_parameters::<ArrayIrValue<A>>()?`), which is how
-/// hand-written composite code computes with ordinary array capabilities without projecting leaf by leaf. Dense
-/// derivative terminals ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that same route, because
-/// their coordinate machinery is defined on [`ArrayType`].
+/// `model.project_parameters::<ArrayType>()?` and `projected.lift_parameters::<ArrayIrValue<A>>()?`), which code whose
+/// machinery is defined only on [`ArrayType`] uses instead of projecting leaf by leaf. Dense derivative terminals
+/// ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that route for their coordinate machinery.
 ///
 /// As with [`ArrayOperations`], this bundle implies nothing about the tracers derived from an implementing value, and
 /// a tracer requirement stays a separate bound.
 pub trait ArrayIrOperations:
     Value<Type = ArrayIrType>
-    + ValueProjection<ArrayType, Projected: ArrayOperations>
+    + ArrayOperations<ArrayIrType>
+    + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
     + ValueProjection<DimensionType, Projected: DimensionOperations>
     + DimensionSize
     + DimensionFromScalar
     + DimensionToScalar
     + ReferenceOperations<ArrayReferenceTransform>
-    + ParallelAllGather<ArrayIrType>
-    + ParallelSumScatter<ArrayIrType>
-    + ParallelAllToAll<ArrayIrType>
-    + ParallelRaggedAllToAll<ArrayIrType>
-    + Compare
     + DynamicManipulationOperations
     + DynamicRngBitGenerator
-    + Assert
 {
 }
 
 impl<
     V: Value<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: ArrayOperations>
+        + ArrayOperations<ArrayIrType>
+        + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
         + ValueProjection<DimensionType, Projected: DimensionOperations>
         + DimensionSize
         + DimensionFromScalar
         + DimensionToScalar
         + ReferenceOperations<ArrayReferenceTransform>
-        + ParallelAllGather<ArrayIrType>
-        + ParallelSumScatter<ArrayIrType>
-        + ParallelAllToAll<ArrayIrType>
-        + ParallelRaggedAllToAll<ArrayIrType>
-        + Compare
         + DynamicManipulationOperations
-        + DynamicRngBitGenerator
-        + Assert,
+        + DynamicRngBitGenerator,
 > ArrayIrOperations for V
 {
 }
@@ -1008,8 +989,9 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DotsSavable, ForwardModeDifferentiate, LinearizationTracer,
-        NothingSavable, ReverseModeDifferentiate,
+        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DifferentiationContext, DotsSavable, ForwardModeDifferentiate,
+        LinearizationTracer, NothingSavable, PartitionedDifferentiationPolicy, ReverseModeDifferentiate,
+        differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -1018,12 +1000,12 @@ mod tests {
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
         CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, RandomAlgorithm,
-        ReduceOperation, ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation,
-        WhileOperation, ZeroOperation,
+        DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
+        MulOperation, RandomAlgorithm, ReduceOperation, ReductionKind, RematerializationOptimizationBarrier,
+        ScanOperation, SinOperation, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialValue, ResidualPolicyReference};
+    use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder,
         ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
@@ -1044,13 +1026,38 @@ mod tests {
     #[test]
     fn test_array_operations_holds_for_every_canonical_array_value() {
         // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
-        // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface.
+        // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface in
+        // their own universe, including nested tracers over both homogeneous and composite contexts.
         fn requires_array_operations<V: ArrayOperations>() {}
 
+        type CompositeTracingContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type NestedContext<C> = DifferentiationContext<PartialEvaluationContext<C>, PartitionedDifferentiationPolicy>;
+
         requires_array_operations::<Array>();
+        requires_array_operations::<ArrayIrValue<Array>>();
         requires_array_operations::<Tracer<ArrayTracingContext>>();
-        requires_array_operations::<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>();
-        requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>();
+        requires_array_operations::<Tracer<CompositeTracingContext>>();
+        requires_array_operations::<LinearizationTracer<EagerArrayContext>>();
+        requires_array_operations::<LinearizationTracer<EagerCompositeContext>>();
+        requires_array_operations::<BatchingTracer<EagerArrayContext, ArrayBatchingPolicy>>();
+        requires_array_operations::<BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>>();
+        requires_array_operations::<BatchingTracer<NestedContext<ArrayTracingContext>, ArrayBatchingPolicy>>();
+        requires_array_operations::<BatchingTracer<NestedContext<CompositeTracingContext>, ArrayIrBatchingPolicy>>();
+    }
+
+    #[test]
+    fn test_composite_value_and_gradient_with_captures() {
+        // A captured scalar gradient over composite values reaches the projected member rules of the capabilities it
+        // uses: `f(x; c) = (x + c) · c` has the gradient `c` with respect to `x`, while `c` is a runtime capture.
+        let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
+        let (value, gradient) = differentiate_at(vector(vec![1.0, 2.0]))
+            .with_captures(vector(vec![3.0, 4.0]))
+            .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::inner_product()))
+            .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0f32 * 3.0 + 6.0 * 4.0).unwrap()));
+        assert_eq!(gradient, vector(vec![3.0, 4.0]));
     }
 
     #[test]

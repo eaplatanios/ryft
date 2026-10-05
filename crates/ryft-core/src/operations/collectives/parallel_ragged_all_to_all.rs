@@ -6,6 +6,8 @@
 
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
@@ -25,6 +27,7 @@ use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
 };
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation, Neg, NegOperation};
 use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
@@ -49,8 +52,8 @@ use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
-    OperationProvider, ProgramError, ProjectedValue, ProvenanceScope, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection, infer_projected_operation_output_types,
+    OperationProvider, ProgramError, ProjectedValue, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming,
+    Typed, Value, ValueProjection, infer_projected_operation_output_types,
     infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -1536,7 +1539,11 @@ fn metadata_extent_scalar(metadata_type: &ArrayType, extent: usize) -> Result<Ar
 /// makes its inputs vary over the axis, because the receivers generally obtain different segments. Every input is
 /// then aligned to the manual axes that any input varies over (refer to [`ManualVariationAlignment`]), because each
 /// device computes its result from all six inputs.
-pub trait ParallelRaggedAllToAll<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait ParallelRaggedAllToAll<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Exchanges segments over the full named axis.
     ///
     /// # Parameters

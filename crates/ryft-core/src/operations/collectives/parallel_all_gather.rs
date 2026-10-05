@@ -6,6 +6,8 @@
 
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType,
@@ -25,6 +27,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::Compare;
@@ -41,7 +44,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -968,7 +971,11 @@ where
 ///
 /// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
 /// values share the same call syntax.
-pub trait ParallelAllGather<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Stacks participants along a new axis at `concat_axis`, producing an output that varies across `axis_name`.
     #[inline]
     fn parallel_all_gather(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {

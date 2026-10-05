@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -14,6 +16,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{LinearCollectiveOperation, resolve_named_axis_size, validate_manual_mesh_input};
@@ -24,8 +27,8 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Typed,
-    Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -421,6 +424,9 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 /// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
 /// values, which permute through their array views, share the same call syntax.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// Every batch item sends its row to the next item. No item sends to the first item, which receives zeros:
@@ -445,7 +451,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOpera
 /// # Ok(())
 /// # }
 /// ```
-pub trait ParallelPermute<T: Type = <Self as Typed>::Type>: Typed<Type = T> + Sized {
+#[capability]
+pub trait ParallelPermute<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value permuted across the participants of the named axis `axis_name`. For every `(source, target)`
     /// pair, participant `target` receives the value of participant `source`, and every participant that no pair
     /// targets receives zeros. Over a manual mesh axis, an input that does not vary over the axis is first made
@@ -518,6 +525,18 @@ impl ParallelPermute<ArrayType> for Array {
         _source_target_pairs: Vec<(usize, usize)>,
     ) -> Result<Self, ProgramError> {
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
+}
+
+impl<A: Value<Type = ArrayType> + ParallelPermute<ArrayType>> ParallelPermute<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
+    fn parallel_permute(
+        &self,
+        axis_name: &str,
+        source_target_pairs: Vec<(usize, usize)>,
+    ) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Array(input.parallel_permute(axis_name, source_target_pairs)?))
     }
 }
 
@@ -1623,6 +1642,17 @@ mod tests {
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).unwrap().parallel_permute("i", vec![(0, 1)]),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "i".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_parallel_permute_parallel_permute_composite() {
+        // Concrete composite values permute through their array members, which for concrete arrays outside a
+        // named-axis environment reports the unbound axis.
+        let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(vector.clone()).parallel_permute("x", vec![(0, 1)]),
+            vector.parallel_permute("x", vec![(0, 1)]).map(ArrayIrValue::Array),
         );
     }
 

@@ -65,8 +65,7 @@ use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshap
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1379,13 +1378,13 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 }
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
-/// automatically for every type that implements all of its members. The group is parameterized by the [`Type`] universe
-/// `T` of its values because several of its members are. The context-side [`AxisIndex`] is implemented by contexts
-/// rather than values and is therefore not a member.
-pub trait CollectiveOperations<T: Type>:
-    ParallelReduce
-    + ParallelVary
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`].
+/// It is implemented automatically for every type that implements all of its members. The group is parameterized by the
+/// [`Capability`](crate::Capability) universe `T` of its values because several of its members are. The context-side
+/// [`AxisIndex`] is implemented by contexts rather than values and is therefore not a member.
+pub trait CollectiveOperations<T>:
+    ParallelReduce<T>
+    + ParallelVary<T>
     + ParallelAllGather<T>
     + ParallelSumScatter<T>
     + ParallelPermute<T>
@@ -1395,9 +1394,9 @@ pub trait CollectiveOperations<T: Type>:
 }
 
 impl<
-    T: Type,
-    V: ParallelReduce
-        + ParallelVary
+    T,
+    V: ParallelReduce<T>
+        + ParallelVary<T>
         + ParallelAllGather<T>
         + ParallelSumScatter<T>
         + ParallelPermute<T>
