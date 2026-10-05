@@ -15,6 +15,7 @@ use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -32,11 +33,11 @@ use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
-use crate::parameters::Parameter;
+use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value,
-    ValueProjection,
+    Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue, RegionInterface, TypeError,
+    Typed, Value, ValueProjection,
 };
 
 mod batching;

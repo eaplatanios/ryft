@@ -1,8 +1,15 @@
+use ryft_macros::capability;
+
 use super::*;
 
 /// Value-level scaled dot-product attention capability. Refer to the documentation of
 /// [`DotProductAttentionOperation`] for the `BTNH` input convention, the exact semantics, and the transform rules.
-pub trait DotProductAttention: Parameter + Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
+/// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
+/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+#[capability]
+pub trait DotProductAttention<T = <Self as Capability>::Universe>: Capability + Parameter + Sized {
     /// Computes attention from its canonical input structure and semantic configuration.
     ///
     /// # Parameters
@@ -98,7 +105,7 @@ impl DotProductAttentionBackward for Array {
 /// context. The `From<DotProductAttentionOperation>` bound makes this disjoint from the eager reference value types
 /// (whose context operation is [`ConstantOperation`]), so it covers
 /// the transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttention for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttention<ArrayType> for V
 where
     V::DispatchDomain: Context<Operation: From<DotProductAttentionOperation>>,
 {
@@ -119,6 +126,39 @@ where
         check_count!("output", outputs, expected_output_count, ProgramError);
         let residual = configuration.return_residual().then(|| outputs.remove(1));
         Ok((outputs.remove(0), residual))
+    }
+}
+
+// A composite tracer computes attention through the array views of its inputs. Attention takes its inputs as one
+// `AttentionInputs` structure without a receiver, which the shared projection macro cannot express, and so this
+// projection and the concrete one below are written out.
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    DotProductAttention<ArrayIrType> for V
+where
+    ProjectedValue<ArrayType, V>: DotProductAttention<ArrayType>,
+{
+    fn dot_product_attention(
+        inputs: AttentionInputs<Self>,
+        configuration: AttentionConfiguration,
+    ) -> Result<(Self, Option<Self>), ProgramError> {
+        let inputs = inputs.try_map_parameters(|input| {
+            ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)
+        })?;
+        let (output, residual) = ProjectedValue::<ArrayType, V>::dot_product_attention(inputs, configuration)?;
+        Ok((V::from_projected(output), residual.map(V::from_projected)))
+    }
+}
+
+impl<A: Value<Type = ArrayType> + DotProductAttention<ArrayType>> DotProductAttention<ArrayIrType> for ArrayIrValue<A> {
+    fn dot_product_attention(
+        inputs: AttentionInputs<Self>,
+        configuration: AttentionConfiguration,
+    ) -> Result<(Self, Option<Self>), ProgramError> {
+        let inputs = inputs.try_map_parameters(|input| {
+            ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)
+        })?;
+        let (output, residual) = A::dot_product_attention(inputs, configuration)?;
+        Ok((Self::Array(output), residual.map(Self::Array)))
     }
 }
 

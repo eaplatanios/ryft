@@ -357,6 +357,30 @@ fn test_dot_product_attention_interpretation() {
 }
 
 #[test]
+fn test_dot_product_attention_composite() {
+    // Concrete composite values compute attention over their array members.
+    let query =
+        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 1, 2]), &[1.0, 0.0, 0.0, 1.0]).unwrap();
+    let key =
+        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 1, 2]), &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            .unwrap();
+    let value =
+        Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 1, 2]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+    let configuration = AttentionConfiguration::new().with_residual(true);
+    let (output, residual) =
+        Array::dot_product_attention(AttentionInputs::new(query.clone(), key.clone(), value.clone()), configuration)
+            .unwrap();
+    assert_eq!(
+        ArrayIrValue::dot_product_attention(
+            AttentionInputs::new(ArrayIrValue::Array(query), ArrayIrValue::Array(key), ArrayIrValue::Array(value)),
+            configuration,
+        ),
+        Ok((ArrayIrValue::Array(output), residual.map(ArrayIrValue::Array))),
+    );
+}
+
+#[test]
 fn test_dot_product_attention_batching() {
     // Each mapped example carries one complete rank-four attention problem. The boundary folds that mapped axis
     // into its logical batch axis and restores it on the output.

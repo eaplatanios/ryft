@@ -8515,7 +8515,9 @@ mod tests {
         // primal is [8, 10, 9] and the per-item tangent scale is 2^iterations = [8, 2, 1].
         fn batched_bounded_while<V>(x: V) -> Result<V, ProgramError>
         where
-            V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
+            V: Value<Type = ArrayType>
+                + crate::operations::manipulation::Broadcast
+                + crate::operations::manipulation::Transpose,
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
             TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatchingPolicy>
                 + crate::batching::BatchableOperation<

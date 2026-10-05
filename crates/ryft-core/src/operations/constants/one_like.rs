@@ -1,6 +1,8 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
     dispatch_on_array_element_type,
@@ -8,7 +10,7 @@ use crate::arrays::{
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::ElementwiseOperation;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
 
@@ -102,6 +104,9 @@ impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIr
 /// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
 /// result, so differentiation returns zero for its tangent or cotangent.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -109,7 +114,8 @@ impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIr
 /// let input = Array::vector(vec![2.0f32, -3.0]).unwrap();
 /// assert_eq!(input.one_like(), Ok(Array::vector(vec![1.0f32, 1.0]).unwrap()));
 /// ```
-pub trait OneLike: Sized {
+#[capability]
+pub trait OneLike<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns a _one_ value with the same type and runtime shape as `self`. Returns an error if its element
     /// data type cannot represent one, including when the exemplar is empty.
     fn one_like(&self) -> Result<Self, ProgramError>;
@@ -138,7 +144,7 @@ impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation<V::Type>>>>> OneLike for V {
+impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<OneLikeOperation<T>>>>> OneLike<T> for V {
     #[inline]
     fn one_like(&self) -> Result<Self, ProgramError> {
         let operation = OneLikeOperation::new();

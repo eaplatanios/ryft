@@ -1233,7 +1233,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
-        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
+        #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {
@@ -1296,7 +1296,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
-        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
+        #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {
@@ -1366,7 +1366,7 @@ macro_rules! define_elementwise_capability {
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
         #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
-        #[$crate::operations::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
+        #[::ryft_macros::capability(projection($crate::arrays::ArrayIrType => $crate::arrays::ArrayType))]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized
         {

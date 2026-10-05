@@ -2539,8 +2539,7 @@ mod tests {
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
-    use crate::operations::complex::{Complex, Real};
-    use crate::operations::{One, Reduce, ReductionKind};
+    use crate::operations::{Complex, One, Real, Reduce, ReductionKind};
     use crate::parameters::Parameter;
     use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope, ReferenceType};
     use crate::tracing::DomainTracingContext;

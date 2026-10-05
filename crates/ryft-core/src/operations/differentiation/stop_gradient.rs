@@ -1,14 +1,20 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType,
+};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::operations::Capability;
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value, ValueProjection};
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
@@ -111,9 +117,23 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
 impl_non_differentiable_operation!(<T> StopGradientOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> StopGradientOperation<T> where T: Type);
 
+// Composite tracers stop gradients by lifting the type-generic barrier into the homogeneous array member, whose
+// batching and differentiation rules then apply through the member projection. A first-class dimension input is
+// rejected by member type inference.
+impl<A: Value<Type = ArrayType>> From<StopGradientOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(_: StopGradientOperation<ArrayIrType>) -> Self {
+        Self::Array(ArrayOperation::StopGradient(StopGradientOperation::new()))
+    }
+}
+
 /// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
 /// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait StopGradient: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait StopGradient<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value unchanged while marking it as a constant for differentiation purposes, and a [`ProgramError`]
     /// if the value's context fails to bind the operation. Tracing contexts never fail here, because the value is
     /// always native to its own context, but contexts that execute operations eagerly (e.g., a backend running
@@ -121,7 +141,9 @@ pub trait StopGradient: Sized {
     fn stop_gradient(&self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<StopGradientOperation<V::Type>>>>> StopGradient for V {
+impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<StopGradientOperation<T>>>>> StopGradient<T>
+    for V
+{
     #[inline]
     fn stop_gradient(&self) -> Result<Self, ProgramError> {
         // Any context-carrying value stops gradients by binding a `StopGradientOperation` through its own context.
@@ -140,6 +162,16 @@ impl StopGradient for Array {
     #[inline]
     fn stop_gradient(&self) -> Result<Self, ProgramError> {
         Ok(self.clone())
+    }
+}
+
+// A concrete composite value stops the gradients of its array member. Its eager dispatch domain binds only constants,
+// so the generic implementation above never applies to it.
+impl<A: Value<Type = ArrayType> + StopGradient<ArrayType>> StopGradient<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
+    fn stop_gradient(&self) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Array(input.stop_gradient()?))
     }
 }
 
@@ -168,8 +200,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension,
+        Array, ArrayOperation, DataType, Dimension, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
@@ -178,9 +210,11 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::operations::arithmetic::Add;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -377,6 +411,62 @@ mod tests {
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
         assert_eq!(gradient.to_f64s(), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_stop_gradient_composite() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
+
+        // Composite tracers stage the barrier as an array-member instruction.
+        let (_, program) = CompositeContext::trace(
+            |input: Tracer<CompositeContext>| input.stop_gradient(),
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = stop_gradient %0
+                in (%1)"
+            },
+        );
+
+        // Concrete composite values pass their array member through, while first-class dimension members are rejected.
+        assert_eq!(vector(vec![2.0, 3.0]).stop_gradient(), Ok(vector(vec![2.0, 3.0])));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.stop_gradient(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // Batching nested inside forward mode rebinds the barrier through the surrounding differentiation context, so
+        // the tangent is severed.
+        let (primal, tangent) = differentiate_at(vector(vec![2.0, 3.0]))
+            .jvp(vector(vec![5.0, 7.0]), |x| {
+                Ok(batch(|item| Ok(item.stop_gradient()?), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            })
+            .unwrap();
+        assert_eq!(primal, vector(vec![2.0, 3.0]));
+        assert_eq!(tangent, vector(vec![0.0, 0.0]));
+
+        // Forward mode nested inside batching severs only the stopped term, so `x + stop_gradient(x)` pushes each
+        // item's tangent forward unchanged.
+        let tangent = batch(
+            |item| {
+                let (_, tangent) = differentiate_at(item.clone())
+                    .jvp(item, |x| Ok(x.add(&x.stop_gradient()?)?))
+                    .map_err(ProgramError::from)?;
+                Ok(tangent)
+            },
+            vector(vec![2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tangent, vector(vec![2.0, 3.0]));
     }
 
     #[test]

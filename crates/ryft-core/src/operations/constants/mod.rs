@@ -51,6 +51,7 @@
 //! ```
 
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
+use crate::operations::Capability;
 use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
@@ -330,9 +331,9 @@ pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 /// Group of the value-driven constant capabilities [`ZeroLike`] and [`OneLike`]. It is implemented automatically for
 /// every type that implements all of its members. The context-side constructors (e.g., [`Zero`] and [`One`]) are
 /// implemented by contexts rather than values and are therefore not members.
-pub trait ConstantOperations: ZeroLike + OneLike {}
+pub trait ConstantOperations<T = <Self as Capability>::Universe>: Capability + ZeroLike<T> + OneLike<T> {}
 
-impl<V: ZeroLike + OneLike> ConstantOperations for V {}
+impl<T, V: ZeroLike<T> + OneLike<T>> ConstantOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

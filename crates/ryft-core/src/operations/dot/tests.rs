@@ -5,9 +5,9 @@ use num_complex::Complex as ComplexNumber;
 use pretty_assertions::assert_eq;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-    DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
-    StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
+    Array, ArrayBatch, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+    DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
+    ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::{Context, EagerContext};
@@ -21,7 +21,7 @@ use crate::operations::manipulation::broadcasting::DynamicBroadcast;
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, Value, ValueProjection};
-use crate::tracing::TracingContext;
+use crate::tracing::{Tracer, TracingContext};
 
 use super::*;
 
@@ -1190,6 +1190,52 @@ fn test_array_dot() {
 }
 
 #[test]
+fn test_array_dot_with_output_sharding() {
+    // The requested sharding is validated by the operation's type inference and recorded on the computed result.
+    let mesh = test_mesh();
+    let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
+    let lhs = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let rhs = Array::matrix(3, 2, vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
+    let sharding =
+        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
+    let product = lhs.dot_with_output_sharding(&rhs, &dimensions, &sharding).unwrap();
+    assert_eq!(product.r#type().into_owned(), plain_array(&[2, 2]).with_sharding(sharding).unwrap());
+    assert_eq!(product.elements::<f32>(), Ok(vec![58.0, 64.0, 139.0, 154.0]));
+
+    // Invalid requests are rejected exactly as they are for staged programs.
+    let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap();
+    assert_eq!(
+        lhs.dot_with_output_sharding(&rhs, &dimensions, &rank_one),
+        Err(ProgramError::Type(TypeError::invalid("TODO")))
+    );
+
+    // Concrete arrays always hold fully reduced results, and so they reject unreduced outputs even when the request is
+    // valid for staged programs.
+    let lhs = Array::from_elements(
+        sharded_array(&mesh, &[2, 2], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]),
+        &[1.0f32, 2.0, 3.0, 4.0],
+    )
+    .unwrap();
+    let rhs = Array::from_elements(
+        sharded_array(&mesh, &[2, 2], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]),
+        &[5.0f32, 6.0, 7.0, 8.0],
+    )
+    .unwrap();
+    let unreduced = Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+        .unwrap()
+        .with_unreduced_axes(["k"])
+        .unwrap();
+    assert_eq!(
+        lhs.dot_with_output_sharding(&rhs, &dimensions, &unreduced),
+        Err(ProgramError::UnsupportedOperation {
+            message: "`dot` cannot produce unreduced outputs for concrete arrays, which always hold fully reduced \
+                      results; stage the computation to request unreduced output axes"
+                .to_string(),
+        }),
+    );
+}
+
+#[test]
 fn test_array_dot_with_accumulation_type() {
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
     // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
@@ -1851,4 +1897,41 @@ fn test_dot_batching_ragged_dynamic_prefix() -> Result<(), ProgramError> {
     )?;
     assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0]).unwrap()));
     Ok(())
+}
+
+#[test]
+fn test_dot_composite() {
+    type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    // Composite tracers stage the homogeneous dot product as an array-member instruction.
+    let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+    let (_, program) = CompositeContext::trace(
+        |inputs: Vec<Tracer<CompositeContext>>| inputs[0].dot(&inputs[1], &DotDimensionNumbers::inner_product()),
+        vec![vector_type.clone(), vector_type],
+    )
+    .unwrap();
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+            lambda %0:f32[2], %1:f32[2] .
+            let %2:f32[] = dot [
+                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+            ] %0 %1
+            in (%2)"
+        },
+    );
+
+    // Concrete composite values contract their array members, and differentiation reaches the homogeneous rule
+    // through the composite member projection.
+    let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+    let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+    assert_eq!(
+        left.dot(&right, &DotDimensionNumbers::inner_product()),
+        Ok(ArrayIrValue::Array(Array::scalar(11.0f32).unwrap())),
+    );
+    assert_eq!(
+        differentiate_at(left.clone())
+            .jvp(right.clone(), |input| input.dot(&input, &DotDimensionNumbers::inner_product())),
+        Ok((ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()), ArrayIrValue::Array(Array::scalar(22.0f32).unwrap()))),
+    );
 }

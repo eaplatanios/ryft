@@ -1,6 +1,8 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
     dispatch_on_array_element_type,
@@ -8,7 +10,7 @@ use crate::arrays::{
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::ElementwiseOperation;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
 
@@ -110,6 +112,9 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
 /// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
 /// result, so differentiation returns zero for its tangent or cotangent.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -117,7 +122,8 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
 /// let input = Array::vector(vec![2.0f32, -3.0]).unwrap();
 /// assert_eq!(input.zero_like(), Ok(Array::vector(vec![0.0f32, 0.0]).unwrap()));
 /// ```
-pub trait ZeroLike: Sized {
+#[capability]
+pub trait ZeroLike<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns a _zero_ value with the same type and runtime shape as `self`. Returns an error if its element
     /// data type cannot represent zero, including when the exemplar is empty.
     fn zero_like(&self) -> Result<Self, ProgramError>;
@@ -144,7 +150,7 @@ impl<A: Value<Type = ArrayType> + ZeroLike> ZeroLike for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation<V::Type>>>>> ZeroLike for V {
+impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<ZeroLikeOperation<T>>>>> ZeroLike<T> for V {
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
         let operation = ZeroLikeOperation::new();
@@ -166,11 +172,12 @@ mod tests {
         DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
         StridedLayout, f8e8m0fnu,
     };
-    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
+    use crate::operations::arithmetic::Add;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
     use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
@@ -384,6 +391,24 @@ mod tests {
             .trim_end(),
         );
     }
+
+    #[test]
+    fn test_zero_like_composite() {
+        let vector = |values: Vec<f32>| ArrayIrValue::Array(Array::vector(values).unwrap());
+
+        // Concrete composite values, composite batching, and composite differentiation all reach the homogeneous
+        // exemplar-based zero through the array member.
+        assert_eq!(vector(vec![2.0, 3.0]).zero_like(), Ok(vector(vec![0.0, 0.0])));
+        assert_eq!(
+            batch(|item| Ok(item.zero_like()?), vector(vec![2.0, 3.0]), BatchAxis::new(0), BatchAxis::new(0), None,),
+            Ok(vector(vec![0.0, 0.0])),
+        );
+        assert_eq!(
+            differentiate_at(vector(vec![2.0, 3.0])).jvp(vector(vec![5.0, 7.0]), |x| Ok(x.add(&x.zero_like()?)?)),
+            Ok((vector(vec![2.0, 3.0]), vector(vec![5.0, 7.0]))),
+        );
+    }
+
     #[test]
     fn test_zero_like_staging_mixed() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

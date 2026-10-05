@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use crate::arrays::{Array, ArrayAddressing, ArrayElement, NumericArrayElement, StaticShape};
+use ryft_macros::capability;
+
+use crate::arrays::{Array, ArrayAddressing, ArrayElement, ArrayIrType, NumericArrayElement, StaticShape};
 use crate::macros::dispatch_on_array_element_type;
+use crate::operations::Capability;
 use crate::operations::arithmetic::Add;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
@@ -185,26 +188,27 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It performs the contraction
 /// described by `dimensions`, supporting standard matrix multiplication, batched matrix multiplication, vector inner
 /// products, and arbitrary tensor contractions.
-pub trait Dot<Rhs = Self>: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
+/// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
+/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Dot<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, and returns a [`ProgramError`] if
     /// the inputs are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
     fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError>;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
-    /// for the result. The requested sharding overrides the inferred output sharding and is validated by the staged
-    /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). The
-    /// default implementation ignores the requested sharding and delegates to [`Self::dot`], which is correct for
-    /// concrete (single-device) values, for which a sharding only describes distribution metadata; staging
-    /// implementations override this method to attach the requested sharding to the staged operation.
+    /// for the result. The requested sharding overrides the inferred output sharding and is validated by the
+    /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). Staging
+    /// values attach it to the staged operation, composite values project it onto their array members, and concrete
+    /// [`Array`]s record it on their result, rejecting unreduced axes because they always hold fully reduced results.
     fn dot_with_output_sharding(
         &self,
         rhs: &Rhs,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError> {
-        let _ = output_sharding;
-        self.dot(rhs, dimensions)
-    }
+    ) -> Result<Self, ProgramError>;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the inputs to
     /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
@@ -218,6 +222,39 @@ pub trait Dot<Rhs = Self>: Sized {
 }
 
 impl Dot for Array {
+    fn dot_with_output_sharding(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        output_sharding: &Sharding,
+    ) -> Result<Self, ProgramError> {
+        // An `Array` is a concrete single-device value, so the requested sharding only describes the placement of its
+        // result. The `DotOperation` type inference rule validates the request exactly as it does for staged programs,
+        // and the result records the validated sharding. Unreduced axes are rejected because a concrete array always
+        // holds the fully reduced result, whereas an unreduced sharding would claim pending per-device partial sums.
+        let input_types = [self.r#type().into_owned(), rhs.r#type().into_owned()];
+        let mut output_types = DotOperation::new(dimensions.clone())
+            .with_output_sharding(output_sharding.clone())
+            .infer_output_types(&input_types, &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        let inferred_type = output_types.remove(0);
+        if !inferred_type.unreduced_axes().is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{DOT_OPERATION_NAME}` cannot produce unreduced outputs for concrete arrays, which always hold \
+                     fully reduced results; stage the computation to request unreduced output axes",
+                ),
+            });
+        }
+        let output = self.dot(rhs, dimensions)?;
+        let output_type = output
+            .r#type()
+            .into_owned()
+            .with_sharding(inferred_type.sharding().cloned())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(Self::new_unchecked(output_type, output.shared_storage_bytes().clone()))
+    }
+
     fn dot_with_accumulation_type(
         &self,
         rhs: &Self,
@@ -240,7 +277,7 @@ impl Dot for Array {
 
 // Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
 // disjoint from eager values, whose context operation is `ConstantOperation`.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Dot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Dot<V, ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<DotOperation>,
@@ -396,7 +433,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedDo
 }
 
 /// Value-level grouped generalized dot capability.
-pub trait RaggedDot: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
+/// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
+/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait RaggedDot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes a grouped generalized dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three
     /// modes, metadata shapes, cumulative-interval clipping, and zero-group and uncovered-position semantics.
     fn ragged_dot_general(
@@ -428,7 +470,7 @@ impl RaggedDot for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> RaggedDot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> RaggedDot<ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<RaggedDotOperation>,
@@ -458,9 +500,9 @@ impl<T: Dot + Transpose> DotOps for T {}
 
 /// Group of the dot product capabilities [`Dot`] and [`RaggedDot`]. It is implemented automatically for every type that
 /// implements all of its members.
-pub trait DotOperations: Dot + RaggedDot {}
+pub trait DotOperations<T = <Self as Capability>::Universe>: Capability + Dot<Self, T> + RaggedDot<T> {}
 
-impl<V: Dot + RaggedDot> DotOperations for V {}
+impl<T, V: Dot<V, T> + RaggedDot<T>> DotOperations<T> for V {}
 
 impl Array {
     /// Allocates an array whose logical elements are initialized to the additive identity.

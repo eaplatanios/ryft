@@ -72,6 +72,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Broadcastable,
     DataType, Sharding, ShardingDimension,
@@ -80,10 +82,10 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::ElementwiseOperation;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
@@ -424,6 +426,9 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// branches for a fixed condition. Refer to the [module documentation](self) for its sharding, differentiation, and
 /// batching semantics.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -434,7 +439,8 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// assert_eq!(Array::select(&condition, &on_true, &on_false)?.to_f64s(), vec![1.0, 0.0, 3.0]);
 /// # Ok::<(), ProgramError>(())
 /// ```
-pub trait Select: Sized {
+#[capability]
+pub trait Select<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the value whose elements are taken from `on_true` wherever `condition` is `true` and from `on_false`
     /// elsewhere. The inputs broadcast and the branch element types promote as described on [`Select`].
     ///
@@ -526,7 +532,7 @@ impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
 impl<
     T: Type,
     V: Value<Type = T, DispatchDomain: Context<Operation: From<SelectOperation<T>>>> + ManualVariationAlignment<T>,
-> Select for V
+> Select<T> for V
 {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let inputs = V::align_manual_variation(&[condition.clone(), on_true.clone(), on_false.clone()])?;
