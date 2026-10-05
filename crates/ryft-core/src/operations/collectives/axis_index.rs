@@ -248,7 +248,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, Shape};
-    use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
     use crate::programs::Typed;
     use crate::tracing::DomainTracingContext;
@@ -256,10 +256,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_axis_index_operation() {
+    fn test_axis_index() {
         let operation = AxisIndexOperation::new("devices".to_string());
+        assert_eq!(operation.name(), AXIS_INDEX_OPERATION_NAME);
         assert_eq!(operation.axis_name(), "devices");
         assert_eq!(operation.mesh(), None);
+        assert_eq!(operation.to_string(), "axis_index [axis_name=\"devices\"]");
+    }
+
+    #[test]
+    fn test_axis_index_type_inference() {
+        let operation = AxisIndexOperation::new("devices".to_string());
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::U64)]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let operation = operation.with_mesh(mesh.clone());
@@ -280,7 +287,65 @@ mod tests {
     }
 
     #[test]
-    fn test_axis_index_stages_a_nullary_operation_for_a_bound_axis() {
+    fn test_axis_index_batching() {
+        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the input values.
+        let output: Array = batch(
+            |item| item.context().axis_index("i"),
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        )
+        .unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)])));
+        assert_eq!(output, Array::vector(vec![0u64, 1, 2]).unwrap());
+    }
+
+    #[test]
+    fn test_axis_index_batching_nested_axes() {
+        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
+        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
+        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
+        // vary over inner items). The inner output is therefore declared replicated, and the outer level stacks the
+        // per-row outer index, giving the `u64` vector `[0, 1]`.
+        let input = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap();
+        let output: Array = batch(
+            |row| {
+                batch(
+                    |scalar| scalar.context().axis_index("o"),
+                    row,
+                    BatchAxis::new(0),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("i"),
+                )
+                .map_err(Into::into)
+            },
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("o"),
+        )
+        .unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])));
+        assert_eq!(output, Array::vector(vec![0u64, 1]).unwrap());
+    }
+
+    #[test]
+    fn test_axis_index_batching_unbound_axis() {
+        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
+        let result: Result<Array, BatchingError> = batch(
+            |item| item.context().axis_index("j"),
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        );
+        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
+    }
+
+    #[test]
+    fn test_axis_index_axis_index() {
         // Validate `name` against the seeded `NamedAxes` environment and stage a nullary `AxisIndexOperation`
         // producing a scalar `u64`, regardless of whether the axis is batch- or mesh-bound.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -295,7 +360,7 @@ mod tests {
             output_type,
             ArrayType::scalar(DataType::U64)
                 .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["device"]).unwrap())
-                .unwrap()
+                .unwrap(),
         );
         assert_eq!(
             program.to_string(),
@@ -308,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_axis_index_rejects_an_unbound_axis() {
+    fn test_axis_index_axis_index_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
         // `AxisError::UnboundAxisName` as a `ProgramError::Axis` error.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -319,65 +384,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, ProgramError::Axis(AxisError::UnboundAxisName { name: "missing".to_string() }));
-    }
-
-    #[test]
-    fn test_batch_axis_index_produces_per_item_indices() {
-        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
-        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the input values.
-        let output: Array = batch(
-            |item| item.context().axis_index("i"),
-            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("i"),
-        )
-        .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)])));
-        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
-        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
-        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
-        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
-        // vary over inner items). The inner output is therefore declared replicated, and the outer level stacks the
-        // per-row outer index, giving the `u64` vector `[0, 1]`.
-        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap();
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |row| {
-                    let context = row.context().clone();
-                    Ok(Batch::batch(
-                        &context,
-                        |scalar| scalar.context().axis_index("o"),
-                        row,
-                        BatchAxis::new(0),
-                        BatchAxis::replicated(),
-                        BatchAxisSpecification::named("i"),
-                    )?)
-                },
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("o"),
-            )
-            .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])));
-        assert_eq!(output.to_f64s(), vec![0.0, 1.0]);
-    }
-
-    #[test]
-    fn test_batch_axis_index_rejects_unbound_axis() {
-        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
-        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
-            |item| item.context().axis_index("j"),
-            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("i"),
-        );
-        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 }

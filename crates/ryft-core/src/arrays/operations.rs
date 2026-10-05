@@ -322,7 +322,6 @@ impl<
 /// a first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug, Operation)]
 #[ryft(
-    crate = "crate",
     identity,
     type = ArrayIrType,
     constant = ArrayIrValue<A>,

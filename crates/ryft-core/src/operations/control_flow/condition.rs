@@ -1116,7 +1116,9 @@ where
 /// condition is accepted only when its outputs are typed accordingly: every branch output must vary over each manual
 /// axis that the predicate varies over (refer to [`validate_condition_output`](Self::validate_condition_output)). An
 /// invariant predicate keeps every device on the same branch. As for a `while` loop with a varying predicate, keeping
-/// collectives out of branches that devices may take differently is the program's responsibility.
+/// collectives out of branches that devices may take differently is the program's responsibility. This includes
+/// collectives that transposition introduces: a branch that applies `parallel_vary` to an invariant differentiable
+/// input transposes into a mesh sum inside that branch, so such inputs should be varied before the condition instead.
 pub trait ConditionType: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;
@@ -2653,9 +2655,10 @@ mod tests {
         assert_eq!(
             invariant_output.validate_condition_output(&varying),
             Err(TypeError::invalid(
-                "`condition` output `f32[]{mesh=[devices=2:manual], sharding=[]}` must vary over every manual axis \
-                 that the predicate `bool[]{mesh=[devices=2:manual], sharding=[], varying=[devices]}` varies over, \
-                 because devices may take different branches; insert `parallel_vary` on the branch outputs",
+                "`condition` output `f32[][sharding={mesh<['devices'=2:manual]>, []}]` must vary over every manual \
+                 axis that the predicate \
+                 `bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]` varies over, because \
+                 devices may take different branches; insert `parallel_vary` on the branch outputs",
             )),
         );
         assert_eq!(
@@ -2667,7 +2670,8 @@ mod tests {
                 .validate_condition_output(&ArrayIrType::Array(varying)),
             Err(TypeError::invalid(
                 "`condition` output `dimension<extent ∈ [1, 8)>` cannot record manual variation, so it cannot be \
-                 produced under the varying predicate `bool[]{mesh=[devices=2:manual], sharding=[], varying=[devices]}`",
+                 produced under the varying predicate \
+                 `bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]`",
             )),
         );
     }
@@ -2687,6 +2691,39 @@ mod tests {
             ),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
         );
+    }
+
+    #[test]
+    fn test_zz_probe_condition_zero_tangents() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let branch = |first: usize| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let inputs = (0..3).map(|_| builder.add_input(scalar.clone())).collect::<Vec<_>>();
+            let outputs = [inputs[first], inputs[2]]
+                .map(|input| builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0]);
+            builder
+                .build::<Vec<Array>, Vec<Array>>(outputs.to_vec(), vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let inputs = (0..3).map(|_| builder.add_input(scalar.clone())).collect::<Vec<_>>();
+        let true_branch = builder.import_program(branch(0));
+        let false_branch = builder.import_program(branch(1));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![true_branch, false_branch],
+                vec![p, inputs[0], inputs[1], inputs[2]],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+        println!("PROBE condition jvp: {:?}", program.jvp_with_respect_to(&[1]).map(|program| program.to_string()));
+        println!("PROBE condition linearize: {:?}", program.linearize_with_respect_to(&[1]).map(|_| ()));
     }
 
     #[test]

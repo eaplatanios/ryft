@@ -5692,6 +5692,178 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_varying_while_predicate_gradient_executes_on_cpu() {
+        use ryft_core::{
+            ArrayOperation, CompareOperation, ComparisonDirection, ConstantOperation, MulOperation, ReduceOperation,
+            WhileOperation,
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // Each device squares its shard while the shard is below `10`, so the loop predicate varies over `x` and the
+        // devices run different numbers of iterations: inputs `1.5`, `2`, `3`, and `20` take three, two, two, and zero
+        // iterations. Reverse mode stores per-device residual stacks and validity masks of the same variation.
+        let traced: TracedXlaProgram<ArrayType, Vec<ArrayType>> = trace(
+            {
+                let sharded = sharded.clone();
+                move |x: ShardMapTracer| {
+                    let (value, gradient) = x
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at(x.into_value())
+                        .value_and_gradient(|x| {
+                            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                            Ok(shard_map::<_, _, ArrayType, _>(
+                                |local_x: ShardMapTracer| {
+                                    let local_type = local_x.r#type().into_owned();
+                                    // The limit is a non-differentiable constant, so it is created with the
+                                    // variation of the state that it is compared against.
+                                    let limit_sharding =
+                                        Sharding::replicated(local_type.sharding().unwrap().mesh().clone(), 0)
+                                            .with_varying_manual_axes(["x"])
+                                            .unwrap();
+                                    let limit_type =
+                                        ArrayType::scalar(DataType::F32).with_sharding(limit_sharding).unwrap();
+                                    let condition = {
+                                        let mut builder = XlaProgramBuilder::new();
+                                        let state = builder.add_input(ArrayIrType::Array(local_type.clone()));
+                                        let state = builder
+                                            .add_instruction(
+                                                ReduceOperation::new(vec![0], ReductionKind::Sum),
+                                                Vec::new(),
+                                                vec![state],
+                                                None,
+                                            )
+                                            .unwrap()[0];
+                                        let limit = CpuArray::from_elements(limit_type, &[10f32]).unwrap();
+                                        let limit = builder
+                                            .add_instruction(
+                                                ConstantOperation::new(limit),
+                                                Vec::new(),
+                                                Vec::new(),
+                                                None,
+                                            )
+                                            .unwrap()[0];
+                                        let predicate = builder
+                                            .add_instruction(
+                                                XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
+                                                    ComparisonDirection::LessThan,
+                                                ))),
+                                                Vec::new(),
+                                                vec![state, limit],
+                                                None,
+                                            )
+                                            .unwrap()[0];
+                                        builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
+                                    };
+                                    let body = {
+                                        let mut builder = XlaProgramBuilder::new();
+                                        let state = builder.add_input(ArrayIrType::Array(local_type));
+                                        let next_state = builder
+                                            .add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None)
+                                            .unwrap()[0];
+                                        builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
+                                    };
+                                    let context = local_x.value().context().clone();
+                                    let mut outputs = context
+                                        .stage_operation(
+                                            XlaOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                                            vec![condition, body],
+                                            &[local_x.into_value()],
+                                        )
+                                        .unwrap();
+                                    ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()
+                                },
+                                x,
+                                mesh.clone(),
+                                sharded.clone(),
+                                sharded.clone(),
+                            )
+                            .unwrap()
+                            .reduce(&[0], ReductionKind::Sum)
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                    ]
+                }
+            },
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(std::slice::from_ref(&sharded)),
+                Some(&[replicated, sharded.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let inputs = [1.5f32, 2.0, 3.0, 20.0];
+        let buffers = devices
+            .iter()
+            .zip(inputs)
+            .map(|(device, input)| {
+                client
+                    .buffer(values_to_bytes(&[input]).as_slice(), BufferType::F32, [1], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[4], sharded),
+            device_mesh,
+            buffers,
+        )
+        .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Each shard computes `x^(2^k)` after `k` iterations, whose derivative is `2^k x^(2^k - 1)`.
+        let expected_gradients = devices
+            .iter()
+            .map(|device| device.id().unwrap())
+            .zip([8.0 * 1.5f32.powi(7), 4.0 * 2f32.powi(3), 4.0 * 3f32.powi(3), 1.0])
+            .collect::<HashMap<_, _>>();
+        assert_eq!(outputs.len(), 4);
+        for (output, device_id) in outputs.into_iter().zip(device_ids) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec![vec![1.5f32.powi(8) + 16.0 + 81.0 + 20.0], vec![expected_gradients[&device_id]]]);
+        }
+    }
+
+    #[test]
     fn test_shard_map_custom_call_lowers_inside_manual_region_and_executes_on_cpu() {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
 
@@ -7129,10 +7301,9 @@ mod tests {
         }
 
         // Partial and empty permutations give every untargeted participant a zero-filled shard.
-        for (pairs, expected_values_by_device) in [
-            (vec![(0, 1)], [[0.0f32, 0.0], [1.0, 2.0]]),
-            (Vec::new(), [[0.0f32, 0.0], [0.0, 0.0]]),
-        ] {
+        for (pairs, expected_values_by_device) in
+            [(vec![(0, 1)], [[0.0f32, 0.0], [1.0, 2.0]]), (Vec::new(), [[0.0f32, 0.0], [0.0, 0.0]])]
+        {
             let mesh = device_mesh.logical_mesh().clone();
             let sharding = sharding.clone();
             let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(

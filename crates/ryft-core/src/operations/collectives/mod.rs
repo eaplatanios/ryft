@@ -1409,25 +1409,36 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable,
-        Layout, Memory, Shape, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout,
+        Memory, StridedLayout,
     };
     use crate::batching::{BatchableOperation, BatchingPolicy, BatchingTracer};
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::MemberDifferentiableOperation;
-    use crate::macros::check_operation_partial_evaluation;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::parallel_all_gather::{
         ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
     };
     use crate::operations::collectives::parallel_all_to_all::ParallelAllToAllOperation;
+    use crate::operations::constants::constant::DimensionConstant;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
+
+    /// Creates an eager composite batching level whose mapped extent is a first-class dimension value.
+    fn dynamic_collective_context(
+        extent: DimensionValue,
+    ) -> BatchingContext<
+        ProjectedContext<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayType>,
+        ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+    > {
+        BatchingContext::with_policy(ProjectedContext::new(EagerContext::new()), ArrayIrValue::Dimension(extent))
+            .with_axis_name("x".to_string())
+    }
 
     #[test]
     fn test_collective_mode_forwarded_split_axes() {
@@ -1493,7 +1504,8 @@ mod tests {
                         assert_eq!(
                             mode.forwarded_concatenation_axes(concatenation_axis, batch_axis),
                             (physical_concatenation_axis, output_batch_axis),
-                            "mode={mode:?}, rank={rank}, concatenation_axis={concatenation_axis}, batch_axis={batch_axis}",
+                            "mode={mode:?}, rank={rank}, concatenation_axis={concatenation_axis}, \
+                                batch_axis={batch_axis}",
                         );
                     }
                 }
@@ -1567,11 +1579,59 @@ mod tests {
     }
 
     #[test]
-    fn test_collective_options_validate_axis_index_groups() {
+    fn test_collective_options_new() {
+        let options = CollectiveOptions::new(CollectiveMode::Untiled);
+        assert_eq!(options.mode(), CollectiveMode::Untiled);
+        assert_eq!(options.axis_index_groups(), None);
+        assert_eq!(options, CollectiveOptions::default());
+        assert_eq!(format!("{options:?}"), "Untiled");
+    }
+
+    #[test]
+    fn test_collective_options_tiled() {
+        let options = CollectiveOptions::tiled();
+        assert_eq!(options, CollectiveOptions::new(CollectiveMode::Tiled));
+        assert_eq!(format!("{options:?}"), "Tiled");
+    }
+
+    #[test]
+    fn test_collective_options_with_axis_index_groups() {
         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         assert_eq!(options.mode(), CollectiveMode::Tiled);
         assert_eq!(options.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
+        assert_eq!(format!("{options:?}"), "CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] }");
+    }
+
+    #[test]
+    fn test_collective_options_mode() {
+        assert_eq!(CollectiveOptions::default().mode(), CollectiveMode::Untiled);
+        assert_eq!(CollectiveOptions::tiled().mode(), CollectiveMode::Tiled);
+    }
+
+    #[test]
+    fn test_collective_options_axis_index_groups() {
+        assert_eq!(CollectiveOptions::default().axis_index_groups(), None);
+        assert_eq!(
+            CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]).axis_index_groups(),
+            Some([vec![0], vec![1]].as_slice()),
+        );
+    }
+
+    #[test]
+    fn test_collective_options_effective_axis_size() {
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         assert_eq!(options.effective_axis_size("parallel_all_gather", 4), Ok(2));
+        assert_eq!(CollectiveOptions::default().effective_axis_size("parallel_all_gather", 4), Ok(4));
+        assert_eq!(
+            CollectiveOptions::default().effective_axis_size("parallel_all_gather", 0),
+            Err(TypeError::invalid("`parallel_all_gather` axis size must be greater than zero")),
+        );
+        assert_eq!(
+            CollectiveOptions::default()
+                .with_axis_index_groups(vec![vec![]])
+                .effective_axis_size("parallel_all_gather", 4),
+            Err(TypeError::invalid("`parallel_all_gather` axis index groups must contain at least one participant")),
+        );
 
         assert_eq!(
             CollectiveOptions::default()
@@ -1585,13 +1645,13 @@ mod tests {
                 .effective_axis_size("parallel_all_gather", 3),
             Err(TypeError::invalid(
                 "`parallel_all_gather` axis index group 1 has size 1 but every group must have size 2",
-            )),
+            ),),
         );
         assert_eq!(
             CollectiveOptions::default()
                 .with_axis_index_groups(vec![vec![0, 1], vec![1, 2]])
                 .effective_axis_size("parallel_all_gather", 4),
-            Err(TypeError::invalid("`parallel_all_gather` axis index groups contain participant 1 more than once",)),
+            Err(TypeError::invalid("`parallel_all_gather` axis index groups contain participant 1 more than once")),
         );
         assert_eq!(
             CollectiveOptions::default()
@@ -1608,13 +1668,384 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_collective_shape_arithmetic_uses_group_size() {
-        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
+    fn test_linear_collective_operation_check_degenerate_interpretation() {
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled());
+        assert_eq!(operation.check_degenerate_interpretation(), Ok(()));
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         assert_eq!(
-            ParallelAllGatherOperation::new("x".to_string(), 4, 0, grouped, ParallelAllGatherOutputVariance::Varying)
-                .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into()]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
+            operation.check_degenerate_interpretation(),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
+                    .to_string(),
+            },),
+        );
+        assert_eq!(
+            ParallelAllToAllOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                0,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]),
+            )
+            .check_degenerate_interpretation(),
+            Ok(()),
+        );
+        assert_eq!(
+            ParallelAllToAllOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                0,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 0]]),
+            )
+            .check_degenerate_interpretation(),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_all_to_all` axis index groups contain participant 0 more than once",
+            ),),),
+        );
+    }
+
+    #[test]
+    fn test_shape_changing_collective_batching_capabilities() {
+        // The batching rules of each shape-changing collective require only the capabilities of its own kernel, so a
+        // context whose values can transpose but not reduce still batches all-gathers and all-to-alls. This compiles
+        // only if those rules hold under exactly these bounds.
+
+        /// Requires an operation rule under precisely the supplied context and policy bounds.
+        fn requires_batching<C: Context, P: BatchingPolicy<C>, O: BatchableOperation<C, P>>() {}
+
+        /// Checks that rearrangement collectives need no reduction capability.
+        fn rearranging_collectives_batch<
+            C: Context<
+                    Type = ArrayType,
+                    Value: Transpose,
+                    Operation: From<ParallelAllGatherOperation> + From<ParallelAllToAllOperation>,
+                >,
+            P: CollectiveArrayExtentBatchingPolicy<C>,
+        >() {
+            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllGatherOperation>();
+            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllToAllOperation>();
+        }
+
+        rearranging_collectives_batch::<EagerContext<Array, ArrayOperation<Array>>, StaticArrayExtentBatchingPolicy>();
+    }
+
+    #[test]
+    fn test_static_array_extent_batching_policy_collective_axis_extent() {
+        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
+            EagerContext::new(),
+            2,
+        )
+        .with_axis_name("x".to_string());
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 2),
+            Ok(2),
+        );
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 3),
+            Err(BatchingError::UnsupportedOperation {
+                message:
+                    "`parallel_all_gather` over axis `x` resolved axis size 3 but the mapped batch axis has size 2"
+                        .to_string(),
+            },),
+        );
+    }
+
+    #[test]
+    fn test_static_array_extent_batching_policy_collective_extent_constant() {
+        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
+            EagerContext::new(),
+            2,
+        )
+        .with_axis_name("x".to_string());
+        assert_eq!(StaticArrayExtentBatchingPolicy::collective_extent_constant(&context, 0), Ok(0));
+    }
+
+    #[test]
+    fn test_static_array_extent_batching_policy_divide_extents_exactly() {
+        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
+            EagerContext::new(),
+            2,
+        )
+        .with_axis_name("x".to_string());
+        assert_eq!(StaticArrayExtentBatchingPolicy::divide_extents_exactly(&context, &8, &2), Ok(4));
+        assert_eq!(StaticArrayExtentBatchingPolicy::divide_extents_exactly(&context, &0, &2), Ok(0));
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::divide_extents_exactly(&context, &8, &0),
+            Err(BatchingError::UnsupportedOperation { message: "extent 8 must be divisible by extent 0".to_string() }),
+        );
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::divide_extents_exactly(&context, &7, &2),
+            Err(BatchingError::UnsupportedOperation { message: "extent 7 must be divisible by extent 2".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_static_array_extent_batching_policy_match_collective_axis() {
+        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
+            EagerContext::new(),
+            2,
+        )
+        .with_axis_name("x".to_string());
+        let replicated = ArrayBatch::replicated(Array::vector(vec![1f32, 2.0]).unwrap());
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::match_collective_axis(&context, &replicated, &[2]),
+            Ok(ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 2.0, 1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap()),
+        );
+        let mapped =
+            ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(1)).unwrap();
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::match_collective_axis(&context, &mapped, &[2]),
+            Ok(ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 3.0, 2.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_static_array_extent_batching_policy_reshape_collective() {
+        let context = BatchingContext::<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>::new(
+            EagerContext::new(),
+            2,
+        )
+        .with_axis_name("x".to_string());
+        let input = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            StaticArrayExtentBatchingPolicy::reshape_collective(&context, input, &[3, 2], None),
+            Ok(Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_collective_axis_extent() {
+        let axis_extent = DimensionValue::constant(2).unwrap();
+        let context = dynamic_collective_context(axis_extent.clone());
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 2),
+            Ok(axis_extent),
+        );
+        let error = ProgramError::from(
+            DynamicArrayExtentBatchingPolicy::collective_axis_extent(&context, "parallel_all_gather", "x", 3)
+                .unwrap_err(),
+        );
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective axis extent must match the participant count".to_string(),
+                observations: vec![
+                    ("extent".to_string(), "2".to_string()),
+                    ("participants".to_string(), "3".to_string())
+                ],
+            },),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_collective_extent_constant() {
+        let context = dynamic_collective_context(DimensionValue::constant(2).unwrap());
+        let extent = DynamicArrayExtentBatchingPolicy::collective_extent_constant(&context, 0).unwrap();
+        assert_eq!(extent.extent(), 0);
+        assert_eq!(extent.r#type().extent(), Some(0));
+        assert_eq!(extent.r#type().to_string(), "dimension<0>");
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_divide_extents_exactly() {
+        let context = dynamic_collective_context(DimensionValue::constant(2).unwrap());
+        // Exact type metadata proves validity on the host, while dynamic metadata retains value checks.
+        let quotient = DynamicArrayExtentBatchingPolicy::divide_extents_exactly(
+            &context,
+            &DimensionValue::constant(8).unwrap(),
+            &DimensionValue::constant(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(quotient.extent(), 4);
+        assert_eq!(quotient.r#type().extent(), Some(4));
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(
+                &context,
+                &DimensionValue::constant(7).unwrap(),
+                &DimensionValue::constant(2).unwrap(),
+            ),
+            Err(BatchingError::UnsupportedOperation { message: "extent 7 must be divisible by extent 2".to_string() }),
+        );
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(
+                &context,
+                &DimensionValue::constant(8).unwrap(),
+                &DimensionValue::constant(0).unwrap(),
+            ),
+            Err(BatchingError::UnsupportedOperation { message: "extent 8 must be divisible by extent 0".to_string() }),
+        );
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(17)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(9)).unwrap());
+        let left = DimensionValue::new(left_type.clone(), 8).unwrap();
+        let right = DimensionValue::new(right_type.clone(), 2).unwrap();
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &right).unwrap().extent(),
+            4,
+        );
+        let zero = DimensionValue::new(right_type, 0).unwrap();
+        let error = ProgramError::from(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &zero).unwrap_err(),
+        );
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective divisor must be positive".to_string(),
+                observations: vec![("divisor".to_string(), "0".to_string())],
+            },),
+        );
+        let left = DimensionValue::new(left_type, 7).unwrap();
+        let error = ProgramError::from(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &right).unwrap_err(),
+        );
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "collective extent must be divisible by the participant count".to_string(),
+                observations: vec![("extent".to_string(), "7".to_string()), ("divisor".to_string(), "2".to_string())],
+            },),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_divide_extents_exactly_staging() {
+        let left_type =
+            DimensionType::from(DimensionVariable::new("extent", DimensionBounds::new(0, Some(17)).unwrap()));
+        for positive_divisor in [false, true] {
+            let lower = usize::from(positive_divisor);
+            let right_type =
+                DimensionType::from(DimensionVariable::new("divisor", DimensionBounds::new(lower, Some(9)).unwrap()));
+            let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let left = ValueProjection::<DimensionType>::into_projected(trace.input(left_type.clone().into())).unwrap();
+            let right =
+                ValueProjection::<DimensionType>::into_projected(trace.input(right_type.clone().into())).unwrap();
+            let axis_extent = trace.dimension_constant(2).unwrap();
+            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                ProjectedContext::new(trace.clone()),
+                axis_extent,
+            );
+            let quotient = DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &right).unwrap();
+            let quotient: Tracer<_> = ValueProjection::<DimensionType>::from_projected(quotient);
+            let program = trace
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![quotient.atom_id().unwrap()],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let expected = if positive_divisor {
+                indoc! {"
+                lambda %0:dimension<extent ∈ [0, 17)>, %1:dimension<divisor ∈ [1, 9)> .
+                let %2:dimension<2> = constant [value=2]
+                    %3:dimension<0> = constant [value=0]
+                    %4:dimension<extent % divisor ∈ [0, 8)> = dimension_rem %0 %1
+                    %5:bool[] = compare [direction=Equal] %4 %3
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %5 %0 %1
+                    %6:dimension<extent / divisor ∈ [0, 17)> = dimension_div %0 %1
+                in (%6)"
+                }
+            } else {
+                indoc! {"
+                lambda %0:dimension<extent ∈ [0, 17)>, %1:dimension<divisor ∈ [0, 9)> .
+                let %2:dimension<2> = constant [value=2]
+                    %3:dimension<0> = constant [value=0]
+                    %4:dimension<1> = constant [value=1]
+                    %5:bool[] = compare [direction=GreaterThan] %1 %3
+                    () = assert [message=\"collective divisor must be positive\", labels=[\"divisor\"]] %5 %1
+                    %6:dimension<max(divisor, 1) ∈ [1, 9)> = dimension_max %1 %4
+                    %7:dimension<extent % max(divisor, 1) ∈ [0, 8)> = dimension_rem %0 %6
+                    %8:bool[] = compare [direction=Equal] %7 %3
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %8 %0 %1
+                    %9:dimension<extent / max(divisor, 1) ∈ [0, 17)> = dimension_div %0 %6
+                in (%9)"
+                }
+            };
+            assert_eq!(program.to_string(), expected);
+            let inputs = vec![
+                ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 8).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 2).unwrap()),
+            ];
+            let outputs = program.interpret(inputs).unwrap();
+            let quotient = ValueProjection::<DimensionType>::into_projected(outputs[0].clone()).unwrap();
+            assert_eq!(quotient.extent(), 4);
+            assert_eq!(quotient.r#type().bounds(), DimensionBounds::new(0, Some(17)).unwrap());
+            let inputs = vec![
+                ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 7).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 2).unwrap()),
+            ];
+            let error = program.interpret(inputs).unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<AssertionError>(),
+                Some(&AssertionError::Failed {
+                    message: "collective extent must be divisible by the participant count".to_string(),
+                    observations: vec![
+                        ("extent".to_string(), "7".to_string()),
+                        ("divisor".to_string(), "2".to_string())
+                    ],
+                },),
+            );
+            if !positive_divisor {
+                let inputs = vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 8).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 0).unwrap()),
+                ];
+                let error = program.interpret(inputs).unwrap_err();
+                assert_eq!(
+                    error.downcast_custom::<AssertionError>(),
+                    Some(&AssertionError::Failed {
+                        message: "collective divisor must be positive".to_string(),
+                        observations: vec![("divisor".to_string(), "0".to_string())],
+                    },),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_match_collective_axis() {
+        let context = dynamic_collective_context(DimensionValue::constant(2).unwrap());
+        let replicated = ArrayBatch::replicated(Array::vector(vec![1f32, 2.0]).unwrap());
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::match_collective_axis(
+                &context,
+                &replicated,
+                &[DimensionValue::constant(2).unwrap()],
+            ),
+            Ok(ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 2.0, 1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap()),
+        );
+        let mapped =
+            ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(1)).unwrap();
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::match_collective_axis(
+                &context,
+                &mapped,
+                &[DimensionValue::constant(2).unwrap()],
+            ),
+            Ok(ArrayBatch::new(Array::matrix(2, 2, vec![1f32, 3.0, 2.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_array_extent_batching_policy_reshape_collective() {
+        let context = dynamic_collective_context(DimensionValue::constant(2).unwrap());
+        let input = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::reshape_collective(
+                &context,
+                input,
+                &[DimensionValue::constant(3).unwrap(), DimensionValue::constant(2).unwrap()],
+                None,
+            ),
+            Ok(Array::matrix(3, 2, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
         );
     }
 
@@ -1634,381 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shape_changing_collective_kernel_capabilities() {
-        // The batching rules of each shape-changing collective require only the capabilities of its own kernel, so a
-        // context whose values can transpose but not reduce still batches all-gathers and all-to-alls. This compiles
-        // only if those rules hold under exactly these bounds.
-        fn requires_batching<C: Context, P: BatchingPolicy<C>, O: BatchableOperation<C, P>>() {}
-        fn rearranging_collectives_batch<
-            C: Context<
-                    Type = ArrayType,
-                    Value: Transpose,
-                    Operation: From<ParallelAllGatherOperation> + From<ParallelAllToAllOperation>,
-                >,
-            P: CollectiveArrayExtentBatchingPolicy<C>,
-        >() {
-            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllGatherOperation>();
-            requires_batching::<C, ArrayBatchingPolicy<P>, ParallelAllToAllOperation>();
-        }
-        rearranging_collectives_batch::<EagerContext<Array, ArrayOperation<Array>>, StaticArrayExtentBatchingPolicy>();
-    }
-
-    #[test]
-    fn test_linear_collective_operation_degenerate_interpretation() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
-
-        // Eager binding validates the shared participant count before it can return an identity value.
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 0, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                std::slice::from_ref(&input),
-            ),
-            Err(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` axis size must be greater than zero"))),
-        );
-
-        // The tiled identity rule must also honor the operation-specific axis validation.
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 1, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                std::slice::from_ref(&input),
-            ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_all_to_all` split axis 1 or concat axis 0 is out of bounds for rank 1",
-            ))),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                std::slice::from_ref(&input),
-            ),
-            Ok(vec![input.clone()]),
-        );
-
-        // Outside any binder, only collectives whose instances each combine a single participant are defined. Groups
-        // with one participant each qualify even over a larger axis, in both array families, while ungrouped
-        // collectives over that axis do not.
-        let singleton_groups = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]);
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, singleton_groups.clone()),
-                Vec::new(),
-                std::slice::from_ref(&input),
-            ),
-            Ok(vec![input.clone()]),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                std::slice::from_ref(&input),
-            ),
-            Err(ProgramError::UnsupportedOperation {
-                message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
-                    .to_string(),
-            }),
-        );
-        let composite_inputs =
-            [ArrayIrValue::Array(input.clone()), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
-        assert_eq!(
-            ParallelSumScatterOperation::new("x".to_string(), 2, 0, singleton_groups)
-                .shape_changing_collective_interpret_in_parent::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>(
-                    &composite_inputs,
-                ),
-            Ok(vec![ArrayIrValue::Array(input)]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
-        type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
-        // through the payload's member JVP rule.
-        let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
-        let dimension_type = DimensionType::from(variable.clone());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let context = Context::new();
-        let primal = context.input(array_type.clone().into());
-        let tangent = context.input(array_type.into());
-        let extent = context.input(dimension_type.into());
-        let extent_tangent_type = extent.r#type().tangent()?;
-        let outputs = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            1,
-            0,
-            CollectiveOptions::tiled(),
-            ParallelAllGatherOutputVariance::Varying,
-        )
-        .jvp_in_parent(
-            &DifferentiationContext::fused(context.clone()),
-            &EmptyRegionDriver,
-            &[
-                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
-                DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
-            ],
-        )?;
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(_)));
-        assert!(
-            context
-                .builder()
-                .borrow()
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_untiled_collective_type_inference() {
-        let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
-
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                "x".to_string(),
-                4,
-                1,
-                CollectiveOptions::default(),
-                ParallelAllGatherOutputVariance::Varying,
-            )
-            .infer_array_ir_output_types(&[
-                shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
-                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-            ]),
-            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
-        );
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default())
-                .infer_array_ir_output_types(&[
-                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ]),
-            Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
-        );
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default())
-                .infer_array_ir_output_types(&[
-                    shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ]),
-            Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_shape_changing_collective_type_inference() {
-        let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
-        let split_result = DimensionVariable::new("split", DimensionBounds::new(1, Some(9)).unwrap());
-        let concat_result = DimensionVariable::new("concat", DimensionBounds::new(2, Some(33)).unwrap());
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(input_axis.clone()), Dimension::Static(3)]),
-        );
-
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                "x".to_string(),
-                2,
-                0,
-                CollectiveOptions::tiled(),
-                ParallelAllGatherOutputVariance::Varying
-            )
-            .infer_array_ir_output_types(&[
-                input_type.clone().into(),
-                ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-            ]),
-            Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(concat_result.clone()), Dimension::Static(3)]),
-                )
-                .into()
-            ]),
-        );
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled())
-                .infer_array_ir_output_types(&[
-                    input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
-                    ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
-                ]),
-            Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(split_result), Dimension::Dynamic(concat_result),]),
-                )
-                .into()
-            ]),
-        );
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled())
-                .infer_array_ir_output_types(&[
-                    ArrayIrType::Array(input_type.clone()),
-                    ArrayIrType::Dimension(DimensionType::from(input_axis)),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ]),
-            Ok(vec![input_type.into()]),
-        );
-
-        let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                "x".to_string(),
-                2,
-                0,
-                CollectiveOptions::tiled(),
-                ParallelAllGatherOutputVariance::Varying
-            )
-            .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
-        );
-        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying
-                ).infer_array_ir_output_types(
-                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()]
-            ),
-            Err(TypeError::invalid(
-                "`parallel_all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
-                 expected 6 \
-                 but got 5"
-                    .to_string(),
-            )),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_shape_changing_collective_type_inference_untiled() {
-        let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
-        let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
-        let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
-        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
-
-        // Inserting an axis preserves the extents already projected into the base output type on either side.
-        let gather = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            1,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-        assert_eq!(
-            gather.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                exact_three.clone().into(),
-                exact_two.clone().into(),
-                exact_four.clone().into(),
-            ]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
-        );
-        assert_eq!(
-            gather.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                exact_three.clone().into(),
-                exact_two.clone().into(),
-                exact_five.into(),
-            ]),
-            Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
-        );
-
-        // Removing an axis or removing then inserting one needs no separate output-to-input axis mapping.
-        assert_eq!(
-            ParallelSumScatterOperation::new("x".to_string(), 2, 1, CollectiveOptions::default())
-                .infer_parent_output_types(
-                    &[
-                        ArrayType::new_static(DataType::F32, [3, 2, 4]).into(),
-                        exact_three.clone().into(),
-                        exact_four.clone().into(),
-                    ],
-                    &[],
-                ),
-            Ok(vec![ArrayType::new_static(DataType::F32, [3, 4]).into()]),
-        );
-        assert_eq!(
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 2, CollectiveOptions::default())
-                .infer_array_ir_output_types(&[
-                    ArrayType::new_static(DataType::F32, [2, 3, 4]).into(),
-                    exact_three.into(),
-                    exact_four.into(),
-                    exact_two.into(),
-                ]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [3, 4, 2]).into()]),
-        );
-    }
-
-    #[test]
-    fn test_untiled_collectives_over_batched_axis_materialize_rank_changes() {
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let mapped_matrix =
-            || ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Some(0)).unwrap();
-
-        let gathered = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            1,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        )
-        .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
-        .unwrap()
-        .into_parts()
-        .0;
-        assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
-
-        let exchanged = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
-            .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(exchanged[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
-    }
-
-    #[test]
-    fn test_shape_changing_collective_transposes_are_involutive() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])));
-        let output = builder
-            .add_instruction(
-                ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let transposed_twice =
-            program.transpose_with_respect_to(&[0], &[]).unwrap().transpose_with_respect_to(&[0], &[]).unwrap();
-        assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::ParallelAllToAll(_)));
-        assert_eq!(transposed_twice.input_types(), program.input_types());
-        assert_eq!(transposed_twice.output_types(), program.output_types());
-    }
-
-    #[test]
-    fn test_array_ir_collective_forwarding() -> Result<(), ProgramError> {
+    fn test_batching_context_forward_collective_array_ir() -> Result<(), ProgramError> {
         // A forwarded untiled collective can move the mapped axis, while its replicated form must not acquire one.
         for (operation, output_shape, output_batch_axis) in [
             (
@@ -2072,209 +2129,64 @@ mod tests {
                     output.value().r#type().as_ref(),
                     &ArrayIrType::Array(ArrayType::new_static(DataType::F32, physical_output_shape)),
                 );
+                let program =
+                    trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        vec![output.value().atom_id()?],
+                        vec![Placeholder; 2 + output_shape.len()],
+                        vec![Placeholder],
+                    )?;
+                let expected = match (operation.name(), mapped) {
+                    ("parallel_all_gather", false) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<2>, %3:dimension<2>, %4:dimension<3> .
+                        let %5:f32[2, 2, 3] = parallel_all_gather [
+                            axis_name=\"inner\",
+                            axis_size=2,
+                            concat_axis=0,
+                            options=Untiled,
+                            output_variance=Varying,
+                        ] %1 %2 %3 %4
+                        in (%5)"
+                    },
+                    ("parallel_all_gather", true) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<2>, %3:dimension<2>, %4:dimension<3> .
+                        let %5:f32[2, 2, 5, 3] = parallel_all_gather [
+                            axis_name=\"inner\",
+                            axis_size=2,
+                            concat_axis=0,
+                            options=Untiled,
+                            output_variance=Varying,
+                        ] %1 %2 %3 %0 %4
+                        in (%5)"
+                    },
+                    ("parallel_sum_scatter", false) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<3> .
+                        let %3:f32[3] = parallel_sum_scatter [axis_name=\"inner\", axis_size=2, scatter_axis=0, \
+                        options=Untiled] %1 %2
+                        in (%3)"
+                    },
+                    ("parallel_sum_scatter", true) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<3> .
+                        let %3:f32[5, 3] = parallel_sum_scatter [axis_name=\"inner\", axis_size=2, scatter_axis=0, \
+                        options=Untiled] %1 %0 %2
+                        in (%3)"
+                    },
+                    ("parallel_all_to_all", false) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<3>, %3:dimension<2> .
+                        let %4:f32[3, 2] = parallel_all_to_all [axis_name=\"inner\", axis_size=2, split_axis=0, \
+                        concat_axis=1, options=Untiled] %1 %2 %3
+                        in (%4)"
+                    },
+                    ("parallel_all_to_all", true) => indoc! {"
+                        lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<3>, %3:dimension<2> .
+                        let %4:f32[5, 3, 2] = parallel_all_to_all [axis_name=\"inner\", axis_size=2, split_axis=0, \
+                        concat_axis=2, options=Untiled] %1 %0 %2 %3
+                        in (%4)"
+                    },
+                    _ => unreachable!(),
+                };
+                assert_eq!(program.to_string(), expected);
             }
         }
         Ok(())
-    }
-
-    #[test]
-    fn test_array_ir_collective_eager_contracts() {
-        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-
-        assert_eq!(
-            context.bind(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    1,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying
-                ),
-                Vec::new(),
-                &[input.clone(), extent.clone()],
-            ),
-            Ok(vec![input.clone()]),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                &[input.clone(), extent.clone()],
-            ),
-            Ok(vec![input.clone()]),
-        );
-        assert_eq!(
-            context.bind(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
-                Vec::new(),
-                &[
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
-                ],
-            ),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap())]),
-        );
-
-        assert_eq!(
-            context
-                .bind(
-                    ParallelAllGatherOperation::new(
-                        "x".to_string(),
-                        1,
-                        0,
-                        CollectiveOptions::tiled(),
-                        ParallelAllGatherOutputVariance::Varying
-                    ),
-                    Vec::new(),
-                    &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),],
-                )
-                .unwrap_err()
-                .to_string(),
-            "`parallel_all_gather` output axis 0 extent must equal observed result extent 3 but got 4",
-        );
-        assert_eq!(
-            context
-                .bind(
-                    ParallelAllGatherOperation::new(
-                        "x".to_string(),
-                        2,
-                        0,
-                        CollectiveOptions::tiled(),
-                        ParallelAllGatherOutputVariance::Varying
-                    ),
-                    Vec::new(),
-                    &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(6).unwrap()),],
-                )
-                .unwrap_err(),
-            ProgramError::UnsupportedOperation {
-                message: "cannot interpret `parallel_all_gather` over axis `x` of size 2 without an enclosing binder"
-                    .to_string(),
-            },
-        );
-
-        check_operation_partial_evaluation!(
-            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = ParallelAllGatherOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled(), ParallelAllGatherOutputVariance::Varying),
-            cases = [
-                {
-                    inputs = [(@known, input.clone()), (@known, extent.clone())],
-                    outputs = [(@known, input.clone())],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
-                        (@known, extent.clone()),
-                    ],
-                    outputs = [(@residual, input.clone())],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-
-        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
-        let dimension_type = DimensionType::from(variable.clone());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let array = builder.add_input(array_type.into());
-        let result_extent = builder.add_input(dimension_type.clone().into());
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    1,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying,
-                ),
-                Vec::new(),
-                vec![array, result_extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let primal = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
-        let result_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
-        let jvp = program.jvp().unwrap();
-        assert_eq!(
-            jvp.interpret(vec![primal.clone(), result_extent.clone(), tangent.clone(),]),
-            Ok(vec![primal, tangent]),
-        );
-        assert!(
-            jvp.instructions()
-                .iter()
-                .any(|instruction| { matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)) })
-        );
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        let mut primal_outputs = linearization
-            .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()), result_extent])
-            .unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
-        let mut pullback_inputs = vec![cotangent.clone()];
-        pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
-        let zero_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
-        let zero_array = || {
-            ArrayIrValue::Array(
-                Array::from_elements::<f32>(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])), &[])
-                    .unwrap(),
-            )
-        };
-        let mut primal_outputs = linearization.primal().interpret(vec![zero_array(), zero_extent]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let zero_cotangent = zero_array();
-        let mut pullback_inputs = vec![zero_cotangent.clone()];
-        pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0], &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct `parallel_all_gather` transposition with runtime-dependent type metadata requires \
-                    linearization so that the relevant primal information can be retained as residuals",
-        ));
-    }
-
-    #[test]
-    fn test_array_ir_shape_changing_collective_linearization() {
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
-        let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let output = builder
-            .add_instruction(
-                ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
-                Vec::new(),
-                vec![array, extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        assert!(linearization.tangent().to_string().contains("linear_call"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
-        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
-        let mut pullback_inputs = vec![cotangent.clone()];
-        pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
     }
 }

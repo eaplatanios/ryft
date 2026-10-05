@@ -3245,6 +3245,47 @@ mod tests {
             .unwrap()
     }
 
+    /// Builds a program whose `while` loop runs over the states `[x: f64[], limit: f64[]]`, squaring `x` while it is
+    /// below `limit` and passing `limit` through unchanged, under the optional `iteration_bound`.
+    fn pass_through_while_program(
+        iteration_bound: Option<usize>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let condition_inputs = (0..2).map(|_| condition_builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let predicate = condition_builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                condition_inputs.clone(),
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body_inputs = (0..2).map(|_| body_builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let square = body_builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![body_inputs[0], body_inputs[0]], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![square, body_inputs[1]], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = (0..2).map(|_| builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let operation = WhileOperation::new().with_iteration_bound(iteration_bound).unwrap();
+        let outputs = builder
+            .add_instruction(operation, vec![condition_region, body_region], inputs, None)
+            .unwrap()
+            .to_vec();
+        builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap()
+    }
+
     /// Captured array payload in the reference discharge fixtures.
     type DischargeArrayCapture = CaptureReference<ArrayType>;
     /// Captured composite value in the reference discharge fixtures.
@@ -3697,11 +3738,19 @@ mod tests {
         assert_eq!(infer(invariant_predicate, state_types.clone()), Ok(state_types));
         assert_eq!(
             infer(varying_predicate.clone(), vec![varying_state.clone(), invariant_state]),
-            Err(TypeError::invalid("")),
+            Err(TypeError::invalid(
+                "`while` state `f32[][sharding={mesh<['m'=2:manual]>, []}]` must vary over every manual axis that the \
+                 predicate `bool[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]` varies over, because \
+                 devices may run different numbers of iterations; insert `parallel_vary` on the initial state",
+            )),
         );
         assert_eq!(
             infer(varying_predicate.clone(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]),
-            Err(TypeError::invalid("")),
+            Err(TypeError::invalid(
+                "`while` state `f32[]` must vary over every manual axis that the predicate \
+                 `bool[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]` varies over, because devices may \
+                 run different numbers of iterations; insert `parallel_vary` on the initial state",
+            )),
         );
         assert_eq!(
             infer(
@@ -3716,7 +3765,11 @@ mod tests {
                 varying_predicate,
                 vec![ArrayIrType::Reference(ReferenceType::new(invariant(DataType::F32).unwrap()))],
             ),
-            Err(TypeError::invalid("")),
+            Err(TypeError::invalid(
+                "`while` state `f32[][sharding={mesh<['m'=2:manual]>, []}]` must vary over every manual axis that the \
+                 predicate `bool[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}]` varies over, because \
+                 devices may run different numbers of iterations; insert `parallel_vary` on the initial state",
+            )),
         );
     }
 
@@ -7334,6 +7387,18 @@ mod tests {
     }
 
     #[test]
+    fn test_zz_probe_zero_tangent_carries() {
+        for bound in [Some(3), None] {
+            let program = pass_through_while_program(bound);
+            println!("PROBE jvp {bound:?}: {:?}", program.jvp_with_respect_to(&[0]).map(|program| program.to_string()));
+            println!("PROBE linearize {bound:?}: {:?}", program.linearize_with_respect_to(&[0]).map(|_| ()));
+        }
+        let program = chained_carry_while_program();
+        println!("PROBE chained linearize: {:?}", program.linearize_with_respect_to(&[3]).map(|_| ()));
+        println!("PROBE chained jvp: {:?}", program.jvp_with_respect_to(&[3]).map(|program| program.to_string()));
+    }
+
+    #[test]
     fn test_unbounded_while_staged_linearization_recovers_the_primal_loop_through_the_closed_knownness_split() {
         // Linearization of a staged unbounded loop composes the fused doubled-state forward-mode rule with the
         // `while` closed-knownness split: the fused loop's primal half is closed under the body and the condition
@@ -8587,24 +8652,18 @@ mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(state_type.clone());
-        let limit = builder.add_input(state_type.clone());
+        let limit = builder.add_constant(Array::from_elements(state_type.clone(), &[10f32]).unwrap());
         let predicate = builder
-            .add_instruction(
-                CompareOperation::new(ComparisonDirection::LessThan),
-                Vec::new(),
-                vec![state, limit],
-                None,
-            )
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, limit], None)
             .unwrap()[0];
         let condition = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(state_type.clone());
-        let limit = builder.add_input(state_type.clone());
         let next_state = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
         let body = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![next_state, limit], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(vec![next_state], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
@@ -8614,24 +8673,137 @@ mod tests {
                     &inputs,
                 )
             },
-            vec![state_type.clone(), state_type.clone()],
+            vec![state_type.clone()],
             vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
         )
         .unwrap();
         let program = program.to_flat_program();
         let jvp = program.jvp_with_respect_to(&[0]).unwrap();
-        assert_eq!(jvp.to_string(), "");
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                    %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                let %2:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero \
+                    [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                    %3:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero \
+                        [type=f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
+                    %4:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero \
+                        [type=bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
+                    %5:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                        %6:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                        %7:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                        %8:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = while \
+                        [iteration_bound=3] %0 %2 %3 %4 [
+                        condition={
+                            lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %1:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %2:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                %3:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                            let %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = const 10.0
+                                %5:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = compare \
+                                    [direction=LessThan] %0 %4
+                            in (%5)
+                        },
+                        body={
+                            lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %1:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %2:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                                %3:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                            let %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %0 %0
+                                %5:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                                    output_type=f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                                    output_axes=[],
+                                ] %0
+                                %6:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                    dynamic_update_slice %2 %5 %1
+                                %7:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = one \
+                                    [type=bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                                %8:bool[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
+                                    output_type=bool[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
+                                    output_axes=[],
+                                ] %7
+                                %9:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                    dynamic_update_slice %3 %8 %1
+                                %10:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = one \
+                                    [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                                %11:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = add %1 %10
+                            in (%4, %11, %6, %9)
+                        },
+                    ]
+                    %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = scan [carry_count=1, \
+                        length=3, reverse=false] %1 %7 %8 [
+                        body={
+                            lambda %0:i64[], %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                %3:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                            let %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = condition %3 %1 \
+                                %2 [
+                                true={
+                                    lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                        %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                                    let %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %0
+                                        %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %0
+                                        %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = add %2 %3
+                                    in (%4)
+                                },
+                                false={
+                                    lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                        %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                                    in (%0)
+                                },
+                            ]
+                            in (%4)
+                        },
+                    ]
+                in (%5, %9)
+            "}
+            .trim_end(),
+        );
 
         // Reverse mode transposes the tangent scan, including its varying `condition` guard. At `x = 2` with limit
         // `10`, the loop squares twice, so `f(x) = x⁴` with value `16` and gradient `4 x³ = 32`.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         let pullback = linearization.pullback().unwrap();
-        assert_eq!(pullback.to_string(), "");
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                    %1:bool[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %2:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = scan [carry_count=1, \
+                    length=3, reverse=true] %0 %1 %2 [
+                    body={
+                        lambda %0:i64[], %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                            %2:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                            %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                        let %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = condition %2 %1 %3 [
+                            true={
+                                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                    %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                                let %2:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %0
+                                    %3:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %1 %0
+                                    %4:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = add %2 %3
+                                in (%4)
+                            },
+                            false={
+                                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+                                    %1:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] .
+                                in (%0)
+                            },
+                        ]
+                        in (%4)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
         let state_value = |value: f32| Array::from_elements(state_type.clone(), &[value]).unwrap();
-        let mut primal_outputs = linearization.primal().interpret(vec![state_value(2.0), state_value(10.0)]).unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![state_value(2.0)]).unwrap();
         assert_eq!(primal_outputs[0], state_value(16.0));
         let mut pullback_inputs = vec![state_value(1.0)];
-        pullback_inputs.extend(primal_outputs.split_off(2));
+        pullback_inputs.extend(primal_outputs.split_off(1));
         assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![state_value(32.0)]));
     }
 
