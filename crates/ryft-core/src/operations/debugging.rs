@@ -56,15 +56,17 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayType};
+use ryft_macros::capability;
+
+use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::ElementwiseOperation;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
-    Value,
+    Value, ValueProjection,
 };
 
 /// Canonical operation name for [`PrintOperation`].
@@ -206,11 +208,27 @@ impl_differentiable_elementwise_operation! {
     rule = [@positive],
 }
 
+impl<A: Value<Type = ArrayType>> From<PrintOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: PrintOperation<ArrayIrType>) -> Self {
+        // Composite tracers print by lifting the type-generic print into the homogeneous array member, preserving
+        // its label and effect class, so that the member's effect declaration and transform rules apply through the
+        // projection.
+        Self::Array(ArrayOperation::Print(
+            PrintOperation::new(operation.label()).with_effect_class(operation.effect_class()),
+        ))
+    }
+}
+
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged operation
 /// defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
 /// relative to other ordered print instructions.
-pub trait Print: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait Print<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value unchanged while printing it to standard error with `label`, and a [`ProgramError`] if the
     /// value's context fails to bind the operation. Tracing contexts never fail here, because the value is always
     /// native to its own context, but contexts that execute operations eagerly (e.g., a backend running operation
@@ -239,7 +257,17 @@ impl Print for Array {
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>>> Print for V {
+impl<A: Value<Type = ArrayType> + Print<ArrayType>> Print<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
+        // A concrete composite value prints its array member, because its eager dispatch domain binds only constants
+        // and so the generic implementation below never applies to it.
+        let input = <Self as ValueProjection<ArrayType>>::into_projected(self)?;
+        Ok(Self::Array(input.print_with_effect_class(label, effect_class)?))
+    }
+}
+
+impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<PrintOperation<T>>>>> Print<T> for V {
     #[inline]
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
         // Any context-carrying value prints by binding a `PrintOperation` through its own context. The
@@ -270,7 +298,7 @@ mod tests {
     };
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Program};
-    use crate::tracing::{DomainTracer, Trace, TracingContext};
+    use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -454,6 +482,32 @@ mod tests {
         let array = Array::vector(vec![1.0, 2.0]).unwrap();
         assert_eq!(array.clone().print("x"), Ok(array.clone()));
         assert_eq!(array.clone().print_with_effect_class("x", EffectClass::UnorderedIo), Ok(array));
+    }
+
+    #[test]
+    fn test_print_composite() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Composite tracers stage the print as an array-member instruction that keeps its label and effect class,
+        // so the staged program declares the selected effect.
+        let (_, program) = CompositeContext::trace(
+            |input: Tracer<CompositeContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
+            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+
+        // A concrete composite value prints its array member immediately and returns itself unchanged.
+        let value = ArrayIrValue::Array(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value));
     }
 
     #[test]

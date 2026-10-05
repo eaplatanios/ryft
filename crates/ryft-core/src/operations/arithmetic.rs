@@ -51,11 +51,10 @@ use crate::arrays::{
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::macros::{
-    check_count, check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    check_count, check_types, define_elementwise_capability, define_elementwise_operation,
     dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
-    impl_differentiable_operation,
+    impl_differentiable_operation, impl_parameterwise_operator, impl_tracer_operator,
 };
-use crate::operations::Accuracy;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
@@ -63,6 +62,7 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
+use crate::operations::{Accuracy, Capability};
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 
@@ -132,7 +132,8 @@ impl std::ops::Neg for Array {
     }
 }
 
-define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
+impl_tracer_operator!(@unary std::ops::Neg, neg, Neg, neg);
+impl_parameterwise_operator!(@unary Neg, neg);
 
 /// Implements [`Neg`] for one host primitive type.
 macro_rules! impl_neg_for_primitive {
@@ -221,7 +222,8 @@ impl std::ops::Add for Array {
     }
 }
 
-define_tracer_operator!(@binary std::ops::Add, add, capability = Add, method = add);
+impl_tracer_operator!(@binary std::ops::Add, add, Add, add);
+impl_parameterwise_operator!(@binary Add, add);
 
 /// Implements [`Add`] for one host primitive type.
 macro_rules! impl_add_for_primitive {
@@ -317,7 +319,8 @@ impl std::ops::Sub for Array {
     }
 }
 
-define_tracer_operator!(@binary std::ops::Sub, sub, capability = Sub, method = sub);
+impl_tracer_operator!(@binary std::ops::Sub, sub, Sub, sub);
+impl_parameterwise_operator!(@binary Sub, sub);
 
 /// Implements [`Sub`] for one host primitive type.
 macro_rules! impl_sub_for_primitive {
@@ -568,7 +571,8 @@ impl std::ops::Mul<f64> for Array {
     }
 }
 
-define_tracer_operator!(@binary std::ops::Mul, mul, capability = Mul, method = mul);
+impl_tracer_operator!(@binary std::ops::Mul, mul, Mul, mul);
+impl_parameterwise_operator!(@binary Mul, mul);
 
 /// Implements [`Mul`] for one host primitive type.
 macro_rules! impl_mul_for_primitive {
@@ -723,7 +727,8 @@ impl std::ops::Div for Array {
     }
 }
 
-define_tracer_operator!(@binary std::ops::Div, div, capability = Div, method = div);
+impl_tracer_operator!(@binary std::ops::Div, div, Div, div);
+impl_parameterwise_operator!(@binary Div, div);
 
 /// Implements [`Div`] for one host primitive type.
 macro_rules! impl_div_for_primitive {
@@ -844,12 +849,7 @@ impl std::ops::Rem for Array {
     }
 }
 
-define_tracer_operator!(
-    @binary std::ops::Rem,
-    rem,
-    capability = Rem,
-    method = rem,
-);
+impl_tracer_operator!(@binary std::ops::Rem, rem, Rem, rem);
 
 /// Implements [`Rem`] for one host primitive type.
 macro_rules! impl_rem_for_primitive {
@@ -1417,44 +1417,46 @@ impl_rsqrt_for_primitive!(f64);
 /// Group of the elementwise arithmetic capabilities, including both the fallible capabilities (e.g., [`Add`]) and the
 /// panicking [`std::ops`] operator sugar for negation, addition, subtraction, multiplication, and division. It is
 /// implemented automatically for every type that implements all of its members.
-pub trait ArithmeticOperations:
-    Sign
-    + Neg
+pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + Sign<T>
+    + Neg<T>
     + std::ops::Neg<Output = Self>
-    + Add
+    + Add<T>
     + std::ops::Add<Output = Self>
-    + Sub
+    + Sub<T>
     + std::ops::Sub<Output = Self>
-    + Mul
+    + Mul<T>
     + std::ops::Mul<Output = Self>
-    + Div
+    + Div<T>
     + std::ops::Div<Output = Self>
-    + Rem
-    + Pow
-    + Sqrt
-    + Rsqrt
-    + Abs
+    + Rem<T>
+    + Pow<T>
+    + Sqrt<T>
+    + Rsqrt<T>
+    + Abs<T>
 {
 }
 
 impl<
-    V: Sign
-        + Neg
+    T,
+    V: Sign<T>
+        + Neg<T>
         + std::ops::Neg<Output = V>
-        + Add
+        + Add<T>
         + std::ops::Add<Output = V>
-        + Sub
+        + Sub<T>
         + std::ops::Sub<Output = V>
-        + Mul
+        + Mul<T>
         + std::ops::Mul<Output = V>
-        + Div
+        + Div<T>
         + std::ops::Div<Output = V>
-        + Rem
-        + Pow
-        + Sqrt
-        + Rsqrt
-        + Abs,
-> ArithmeticOperations for V
+        + Rem<T>
+        + Pow<T>
+        + Sqrt<T>
+        + Rsqrt<T>
+        + Abs<T>,
+> ArithmeticOperations<T> for V
 {
 }
 
@@ -1469,10 +1471,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
+        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+        Dimension, DimensionValue, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::axes::NamedAxis;
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError, differentiate_at,
@@ -1485,7 +1489,7 @@ mod tests {
     use crate::operations::constants::one_like::OneLike;
     use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::operations::reductions::{Reduce, ReductionKind};
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Parameterwise, Placeholder};
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, TypeError, Typed};
 
     use super::*;
@@ -1701,6 +1705,15 @@ mod tests {
             }),
         );
         assert_eq!(Neg::neg(&2.5f64), Ok(-2.5));
+    }
+
+    #[test]
+    fn test_neg_parameterwise() {
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!(Neg::neg(&model).map(Parameterwise::into_inner), Ok((vec![-10, -20], -30)));
+
+        // The `-` operator negates every parameter.
+        assert_eq!((-model).into_inner(), (vec![-10, -20], -30));
     }
 
     #[test]
@@ -2028,6 +2041,171 @@ mod tests {
     }
 
     #[test]
+    fn test_add_composite() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Composite tracers stage the homogeneous addition as an array-member instruction.
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = CompositeContext::trace(
+            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].add(&inputs[1]),
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = add %0 %1
+                in (%2)"
+            },
+        );
+
+        // Concrete composite values add their array members, while first-class dimension members are rejected.
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+        assert_eq!(left.add(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.add(&dimension),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // Batching and differentiation reach the homogeneous rules through the composite member projection.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>| item.add(&item),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0f32, 4.0, 6.0, 8.0]).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(left.clone()).jvp(right.clone(), |input| input.add(&input)),
+            Ok((
+                ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0f32, 8.0]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_add_universes() {
+        // An unchanged generic bound resolves to each implementor's own universe, including host integers
+        // that no array data type can represent, reference arrays, and first-class dimensions.
+        fn checked_sum<A: Add + Clone>(values: &[A]) -> Result<A, ProgramError> {
+            values[1..].iter().try_fold(values[0].clone(), |sum, value| sum.add(value))
+        }
+        assert_eq!(checked_sum(&[1i64, 2, 3]), Ok(6));
+        assert_eq!(checked_sum(&[u128::MAX - 1, 1]), Ok(u128::MAX));
+        assert_eq!(
+            checked_sum(&[i128::MAX, 1]),
+            Err(ProgramError::InvalidArgument { message: "`add` output does not fit in `i128`".to_string() }),
+        );
+        assert_eq!(checked_sum(&[1.5f64, 2.5]), Ok(4.0));
+        assert_eq!(
+            checked_sum(&[Array::vector(vec![1.0f32, 2.0]).unwrap(), Array::vector(vec![3.0f32, 4.0]).unwrap()]),
+            Ok(Array::vector(vec![4.0f32, 6.0]).unwrap()),
+        );
+        let dimensions = [DimensionValue::constant(2).unwrap(), DimensionValue::constant(3).unwrap()];
+        assert_eq!(checked_sum(&dimensions).map(|dimension| dimension.extent()), Ok(5));
+
+        // Calls infer the universe from their receiver. Host primitives use the fully qualified form because the method
+        // call `2i64.add(&3)` resolves to the by-value `std::ops::Add::add` first.
+        assert_eq!(Add::add(&2i64, &3), Ok(5));
+        assert_eq!(
+            Array::scalar(1.0f32).unwrap().add(&Array::scalar(2.0f32).unwrap()),
+            Ok(Array::scalar(3.0f32).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_add_parameterwise() {
+        // Structures add their corresponding parameters with default or explicit universes, and they reject
+        // structures with different parameter paths without masking the errors of the parameters themselves.
+        let vector = |values: Vec<f32>| Array::vector(values).unwrap();
+        let left = Parameterwise::<Array, _>::from((vector(vec![1.0, 2.0]), vector(vec![3.0])));
+        let right = Parameterwise::from((vector(vec![10.0, 20.0]), vector(vec![30.0])));
+        assert_eq!(
+            Add::add(&left, &right).map(Parameterwise::into_inner),
+            Ok((vector(vec![11.0, 22.0]), vector(vec![33.0]))),
+        );
+        assert_eq!(Add::<ArrayType>::add(&left, &right), Add::add(&left, &right));
+        assert_eq!(
+            Add::add(
+                &Parameterwise::<Array, _>::from(vec![vector(vec![1.0])]),
+                &Parameterwise::from(vec![vector(vec![1.0]), vector(vec![2.0])]),
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+        assert_eq!(
+            Add::add(&left, &Parameterwise::from((vector(vec![10.0, 20.0, 30.0]), vector(vec![30.0])))),
+            Err(ProgramError::Type(TypeError::invalid("failed to broadcast shape `[3]` to shape `[2]`"))),
+        );
+
+        // Composite parameters add their array members, and first-class dimension members are rejected.
+        let composite = |values: Vec<f32>| ArrayIrValue::Array(vector(values));
+        let left = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![composite(vec![1.0]), composite(vec![2.0])]);
+        assert_eq!(
+            Add::add(&left, &left).map(Parameterwise::into_inner),
+            Ok(vec![composite(vec![2.0]), composite(vec![4.0])]),
+        );
+        let dimension = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![ArrayIrValue::Dimension(
+            DimensionValue::constant(2).unwrap(),
+        )]);
+        assert_eq!(
+            Add::add(&dimension, &dimension),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+
+        // The `+` operator adds corresponding parameters or a single parameter to every parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() + Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![11, 22], 33));
+        assert_eq!((model + 1).into_inner(), (vec![11, 21], 31));
+
+        // The `+` operator moves corresponding parameters, and so they need not implement `Clone`.
+        #[derive(Debug, PartialEq)]
+        struct Leaf(i32);
+
+        impl Parameter for Leaf {}
+
+        impl std::ops::Add for Leaf {
+            type Output = Self;
+
+            fn add(self, right: Self) -> Self {
+                Self(self.0 + right.0)
+            }
+        }
+
+        let sum =
+            Parameterwise::<Leaf, _>::from(vec![Leaf(1), Leaf(2)]) + Parameterwise::from(vec![Leaf(10), Leaf(20)]);
+        assert_eq!(sum.into_inner(), vec![Leaf(11), Leaf(22)]);
+
+        // A failed `+` operator poisons a staged trace, which reports the error at its boundary.
+        type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
+        let traced = ArrayTracingContext::trace(
+            |inputs: Vec<Tracer<ArrayTracingContext>>| {
+                let left = Parameterwise::<Tracer<ArrayTracingContext>, _>::from(vec![inputs[0].clone()]);
+                Ok((left + Parameterwise::from(vec![inputs[1].clone()])).into_inner().remove(0))
+            },
+            vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [3])],
+        );
+        assert!(matches!(traced, Err(ProgramError::Type(_))));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to broadcast shape `[3]` to shape `[2]`")]
+    fn test_add_parameterwise_eager_failure() {
+        // Eager parameters have no deferral point, and so a failed `+` operator panics immediately.
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        let _ = left + Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()]);
+    }
+
+    #[test]
     fn test_sub_type_inference() {
         check_operation_type_inference!(
             @elementwise @binary,
@@ -2255,6 +2433,33 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`sub` output does not fit in `usize`".to_string() }),
         );
         assert_eq!(Sub::sub(&2.5f32, &0.5), Ok(2.0));
+    }
+
+    #[test]
+    fn test_sub_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![10.0f32, 20.0]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        assert_eq!(
+            Sub::sub(&left, &right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![9.0f32, 18.0]).unwrap()]),
+        );
+        assert_eq!(
+            Sub::sub(&left, &Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        // The `-` operator subtracts corresponding parameters or a single parameter from every parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() - Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![9, 18], 27));
+        assert_eq!((model - 1).into_inner(), (vec![9, 19], 29));
+    }
+
+    #[test]
+    #[should_panic(expected = "binary parameterwise operation inputs must have the same parameter structure")]
+    fn test_sub_parameterwise_mismatched_structures() {
+        let _ = Parameterwise::<i32, _>::from((vec![1i32], 2i32)) - Parameterwise::from((vec![1i32, 2], 3i32));
     }
 
     #[test]
@@ -2594,6 +2799,40 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`mul` output does not fit in `i8`".to_string() }),
         );
         assert_eq!(Mul::mul(&2.5f64, &4.0), Ok(10.0));
+    }
+
+    #[test]
+    fn test_mul_parameterwise() {
+        let left = Parameterwise::<Array, _>::from(vec![Array::vector(vec![10.0f32, 20.0]).unwrap()]);
+        let right = Parameterwise::from(vec![Array::vector(vec![1.0f32, 2.0]).unwrap()]);
+        assert_eq!(
+            Mul::mul(&left, &right).map(Parameterwise::into_inner),
+            Ok(vec![Array::vector(vec![10.0f32, 40.0]).unwrap()]),
+        );
+        assert_eq!(
+            Mul::mul(&left, &Parameterwise::from(Vec::new())),
+            Err(ProgramError::InvalidArgument {
+                message: "binary parameterwise operation inputs must have the same parameter structure".to_string(),
+            }),
+        );
+
+        // The `*` operator multiplies corresponding parameters or scales every parameter by a single parameter.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        assert_eq!((model.clone() * Parameterwise::from((vec![1i32, 2], 3i32))).into_inner(), (vec![10, 40], 90));
+        assert_eq!((model * 2).into_inner(), (vec![20, 40], 60));
+
+        // Differentiation reaches the parameters through parameterwise arithmetic that is wrapped inside the
+        // differentiated function and unwrapped at its boundary.
+        let scalar = |value: f32| Array::scalar(value).unwrap();
+        let model = (scalar(1.0), vec![scalar(2.0), scalar(3.0)]);
+        let (value, gradient) = differentiate_at(model.clone())
+            .value_and_gradient(|model| {
+                let (first, rest) = (Parameterwise::from(model.clone()) * Parameterwise::from(model)).into_inner();
+                rest.into_iter().fold(first, |sum, parameter| sum + parameter)
+            })
+            .unwrap();
+        assert_eq!(value, scalar(14.0));
+        assert_eq!(gradient, (scalar(2.0), vec![scalar(4.0), scalar(6.0)]));
     }
 
     #[test]
@@ -2937,6 +3176,17 @@ mod tests {
             }),
         );
         assert_eq!(Div::div(&1.0f64, &0.0), Ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_div_parameterwise() {
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        let update = Parameterwise::from((vec![1i32, 2], 3i32));
+        assert_eq!(Div::div(&model, &update).map(Parameterwise::into_inner), Ok((vec![10, 10], 10)));
+
+        // The `/` operator divides corresponding parameters or every parameter by a single parameter on the right.
+        assert_eq!((model.clone() / update).into_inner(), (vec![10, 10], 10));
+        assert_eq!((model / 10).into_inner(), (vec![1, 2], 3));
     }
 
     #[test]

@@ -55,9 +55,12 @@ use std::fmt::Display;
 
 use num_complex::Complex;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayType, DataType, Dimension, FloatingPointArrayElement,
-    NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, DataType, Dimension,
+    FloatingPointArrayElement, NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -68,6 +71,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -509,7 +513,11 @@ impl_differentiable_operation! {
 ///
 /// Besides the general [`Self::cumulative`] function, this trait provides one forward and one reverse shortcut function
 /// per kind, which all share the axis, direction, and error contract of [`Self::cumulative`].
-pub trait Cumulative: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Cumulative<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Accumulates `self` along `axis` using the combining operator selected by `kind`.
     ///
     /// # Parameters
@@ -689,7 +697,7 @@ impl Cumulative for Array {
 // `From<CumulativeOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>>>
-    Cumulative for V
+    Cumulative<ArrayType> for V
 {
     fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
         let axis = axis.into();

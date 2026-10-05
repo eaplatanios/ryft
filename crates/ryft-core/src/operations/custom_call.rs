@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
-    Sharding, ShardingDimension, TiledLayout,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable,
+    Layout, RaggedAxis, Sharding, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -20,6 +22,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
@@ -2008,7 +2011,11 @@ impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for Custom
 /// executes a [`CustomCallOperation`]; refer to its documentation for the calling convention and the transform
 /// rules. The capability method dispatches through the first input's context, so it needs at least one input
 /// (zero-input custom calls can still be staged directly through a program builder).
-pub trait CustomCall: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait CustomCall<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
     /// declared output type, and a [`ProgramError`] if something goes wrong.
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
@@ -2039,7 +2046,9 @@ impl CustomCall for Array {
 // context. The conversion bound makes this disjoint from the eager reference value types (whose context operation is
 // [`ConstantOperation`]), so it covers the transform tracers and
 // backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType>> CustomCall for V
+// Context-carrying values bind the custom call through their own context in either universe, because
+// `CustomCallOperation` is also a native member operation of the composite array IR universe.
+impl<T: Type, V: Value<Type = T>> CustomCall<T> for V
 where
     V::DispatchDomain: Context<Operation: From<CustomCallOperation>>,
 {
@@ -2061,6 +2070,23 @@ where
             });
         };
         first.dispatch_domain().bind(operation.clone(), Vec::new(), inputs.as_slice())
+    }
+}
+
+// A concrete composite value calls the kernel on its array members.
+impl<A: Value<Type = ArrayType> + CustomCall<ArrayType>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
+    fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
+        operation: &CustomCallOperation,
+        inputs: I,
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        Self: 'a,
+    {
+        let inputs = inputs
+            .into_iter()
+            .map(<Self as ValueProjection<ArrayType>>::projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(A::custom_call(operation, inputs)?.into_iter().map(Self::Array).collect())
     }
 }
 
@@ -4093,5 +4119,18 @@ mod tests {
             program.transpose_with_respect_to(&[0], &[]),
             Err(error) if error.to_string() == "operation `custom_call` is not transposable",
         ));
+    }
+
+    #[test]
+    fn test_custom_call_composite() {
+        // Concrete composite values call the kernel on their array members, which the reference array backend cannot
+        // execute.
+        let operation = CustomCallOperation::new("kernel", vec![ArrayType::new_static(DataType::F32, [2])]);
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::custom_call(&operation, [&ArrayIrValue::Array(input.clone())]),
+            Array::custom_call(&operation, [&input])
+                .map(|outputs| outputs.into_iter().map(ArrayIrValue::Array).collect()),
+        );
     }
 }

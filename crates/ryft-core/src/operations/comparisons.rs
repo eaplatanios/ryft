@@ -38,6 +38,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Broadcastable,
     DataType, DimensionType, DimensionValue,
@@ -49,15 +51,15 @@ use crate::macros::{
     check_count, check_types, dispatch_on_array_element_type, impl_non_differentiable_operation,
     impl_non_transposable_operation, impl_reference_dischargeable_operation,
 };
-use crate::operations::ElementwiseOperation;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::manipulation::conversions::ElementType;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection,
+    Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
 /// Direction of the pairwise comparison performed by a [`CompareOperation`].
@@ -403,6 +405,59 @@ impl ComparisonType for ArrayIrType {
     }
 }
 
+// Homogeneous operation families provide the requested comparison itself.
+impl<O: Operation<Type = DataType> + From<CompareOperation<DataType>>>
+    OperationProvider<DataType, CompareOperation<DataType>> for O
+{
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: CompareOperation<DataType>, input_types: &[&DataType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(request.into())
+    }
+}
+
+impl<O: Operation<Type = ArrayType> + From<CompareOperation<ArrayType>>>
+    OperationProvider<ArrayType, CompareOperation<ArrayType>> for O
+{
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: CompareOperation<ArrayType>, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(request.into())
+    }
+}
+
+// Composite operation families select the comparison by member kind. Array pairs compare through the homogeneous array
+// member, which owns promotion, broadcasting, and manual-axis variation, while first-class dimension pairs keep the
+// native composite comparison, whose transform rules prove dimension predicates. Mixed pairs have no comparison.
+impl<
+    O: Operation<Type = ArrayIrType>
+        + From<CompareOperation<ArrayIrType>>
+        + OperationProjection<ArrayType, Projected: From<CompareOperation<ArrayType>>>,
+> OperationProvider<ArrayIrType, CompareOperation<ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(request: CompareOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        match (input_types[0], input_types[1]) {
+            (ArrayIrType::Array(_), ArrayIrType::Array(_)) => Ok(
+                <Self as OperationProjection<ArrayType>>::Projected::from(CompareOperation::new(request.direction()))
+                    .into(),
+            ),
+            (ArrayIrType::Dimension(_), ArrayIrType::Dimension(_)) => Ok(request.into()),
+            (left, right) => Err(TypeError::invalid(format!(
+                "`{COMPARE_OPERATION_NAME}` inputs must both be arrays or both be first-class dimensions, but got \
+                 `{left}` and `{right}`",
+            ))
+            .into()),
+        }
+    }
+}
+
 /// Represents the ability to compare two values and produce Boolean data. Array inputs are broadcast to a common
 /// shape and their element types are promoted before comparison. The output has that shape and [`DataType::Boolean`]
 /// elements. Equality and inequality support complex elements while ordered comparisons reject them. A comparison
@@ -416,6 +471,9 @@ impl ComparisonType for ArrayIrType {
 /// by their identities and extent bounds can be returned as constants without staging an operation. `Output` permits
 /// an array output when the input type, such as [`DimensionValue`], cannot represent Boolean data.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -427,7 +485,8 @@ impl ComparisonType for ArrayIrType {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Compare<Output = Self>: Sized {
+#[capability]
+pub trait Compare<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Compares this value with `other` according to `direction`, returning Boolean data. Returns an error if the
     /// input types cannot be promoted or broadcast together, or if the direction is unsupported for their elements.
     /// Refer to [`Compare`] for dimension and contextual behavior.
@@ -552,14 +611,26 @@ impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<A
     }
 }
 
-impl<A: Value<Type = ArrayType>> Compare for ArrayIrValue<A>
+impl<A: Value<Type = ArrayType> + Compare> Compare for ArrayIrValue<A>
 where
     DimensionValue: Compare<A>,
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
-        let left = <Self as ValueProjection<DimensionType>>::projected(self)?;
-        let right = <Self as ValueProjection<DimensionType>>::projected(other)?;
-        Ok(Self::Array(left.compare(right, direction)?))
+        // A concrete composite value compares array pairs through its array members and first-class dimension pairs
+        // through their extents, matching the member-kind selection of the composite operation provider above.
+        match (self, other) {
+            (Self::Array(left), Self::Array(right)) => Ok(Self::Array(left.compare(right, direction)?)),
+            (Self::Dimension(left), Self::Dimension(right)) => {
+                Ok(Self::Array(Compare::<A>::compare(left, right, direction)?))
+            }
+            (left, right) => Err(TypeError::invalid(format!(
+                "`{COMPARE_OPERATION_NAME}` inputs must both be arrays or both be first-class dimensions, but got \
+                 `{}` and `{}`",
+                left.r#type(),
+                right.r#type(),
+            ))
+            .into()),
+        }
     }
 }
 
@@ -598,16 +669,25 @@ impl<
     }
 }
 
+// Any context-carrying value compares by binding the comparison that its operation family provides for the aligned
+// input types, so that composite families can select a member operation (see the composite provider above).
 impl<
     T: Type,
-    V: Value<Type = T, DispatchDomain: Context<Operation: From<CompareOperation<T>>>> + ManualVariationAlignment<T>,
-> Compare<V> for V
+    V: Value<Type = T, DispatchDomain = C> + ManualVariationAlignment<T>,
+    C: Context<Value = V, Operation: OperationProvider<T, CompareOperation<T>, Operation = C::Operation>>,
+> Compare<V, T> for V
 {
     #[inline]
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         let inputs = [self.clone(), other.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        Ok(self.dispatch_domain().bind(CompareOperation::new(direction), Vec::new(), &inputs)?.remove(0))
+        let left_type = inputs[0].r#type();
+        let right_type = inputs[1].r#type();
+        let operation = <C::Operation as OperationProvider<T, CompareOperation<T>>>::provide(
+            CompareOperation::new(direction),
+            &[left_type.as_ref(), right_type.as_ref()],
+        )?;
+        Ok(self.dispatch_domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 }
 
@@ -623,7 +703,7 @@ mod tests {
         Memory, MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, f8e5m2, i2,
     };
     use crate::axes::NamedAxis;
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -1353,15 +1433,21 @@ mod tests {
 
     #[test]
     fn test_compare_for_array_ir_value() {
-        // Dimension members compare their extents, whereas array members are rejected because array comparisons
-        // use the projected `ArrayType` operation.
+        // Dimension members compare their extents, array members compare through their array members,
+        // and mixed members have no comparison.
         let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
         let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(5).unwrap());
         assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())));
-        let array = ArrayIrValue::Array(Array::scalar(1.0).unwrap());
+        let array = ArrayIrValue::Array(Array::vector(vec![1.0, 6.0]).unwrap());
+        let other = ArrayIrValue::Array(Array::scalar(5.0).unwrap());
+        assert_eq!(array.less_than(&other), Ok(ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap())));
         assert_eq!(
-            array.less_than(&array),
-            Err(TypeError::invalid("expected dimension type but got array type").into())
+            array.less_than(&left),
+            Err(TypeError::invalid(
+                "`compare` inputs must both be arrays or both be first-class dimensions, but got `f64[2]` and \
+                 `dimension<3>`",
+            )
+            .into()),
         );
     }
 
@@ -1457,6 +1543,81 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_compare_for_composite_tracer() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Array pairs stage the homogeneous comparison as an array-member instruction, whose interpretation and
+        // batching reuse the array rules.
+        let (_, program) = CompositeContext::trace(
+            |(left, right): (_, _)| left.less_than(&right),
+            (
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f64[] .
+                let %2:bool[2] = compare [direction=LessThan] %0 %1
+                in (%2)"
+            },
+        );
+        assert!(matches!(program.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Compare(_))));
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5.0).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap())),
+        );
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<
+                    EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                    ArrayIrBatchingPolicy,
+                >| { item.less_than(&item.zero_like()?) },
+                ArrayIrValue::Array(Array::vector(vec![-1.0f32, 2.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap())),
+        );
+
+        // Dimension pairs keep the native composite comparison, and mixed pairs are rejected while staging.
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
+        let (_, program) = CompositeContext::trace(
+            |(left, right): (_, _)| left.less_than(&right),
+            (ArrayIrType::from(left_type.clone()), ArrayIrType::from(right_type)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+                let %2:bool[] = compare [direction=LessThan] %0 %1
+                in (%2)"
+            },
+        );
+        assert!(matches!(program.instructions()[0].operation(), ArrayIrOperation::Compare(_)));
+        assert_eq!(
+            CompositeContext::trace(
+                |(left, right): (_, _)| left.less_than(&right),
+                (ArrayIrType::Array(ArrayType::scalar(DataType::F32)), ArrayIrType::from(left_type)),
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`compare` inputs must both be arrays or both be first-class dimensions, but got `f32[]` and \
+                 `dimension<left ∈ [0, 9)>`",
+            ))),
         );
     }
 

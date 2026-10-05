@@ -42,7 +42,9 @@
 
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayElement, ArrayType, Broadcastable, DataType};
+use ryft_macros::capability;
+
+use crate::arrays::{Array, ArrayElement, ArrayIrType, ArrayType, Broadcastable, DataType};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -50,7 +52,6 @@ use crate::macros::{
     check_count, check_types, define_elementwise_capability, define_elementwise_operation,
     impl_array_elementwise_operation, impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::ElementwiseOperation;
 use crate::operations::arithmetic::{Add, Div, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -60,6 +61,7 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::logical::And;
 use crate::operations::manipulation::conversions::ConvertElementType;
+use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
@@ -534,7 +536,11 @@ impl_differentiable_operation! {
 
 /// Represents the ability to clamp values elementwise into the interval delimited by `lower` and `upper`. Concrete
 /// arrays compute immediately while context-carrying values apply [`ClampOperation`] through their context.
-pub trait Clamp: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Clamp<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Clamps this value elementwise to the inclusive `[lower, upper]` interval (i.e., computes
     /// `min(max(self, lower), upper)`), promoting and broadcasting its inputs as needed. Returns
     /// an error if the input types or metadata are unsupported.
@@ -556,7 +562,7 @@ impl<
                 Operation: From<<ClampOperation<T> as OperationProvider<T>>::Operation>,
             >,
         > + ManualVariationAlignment<T>,
-> Clamp for V
+> Clamp<T> for V
 where
     ClampOperation<T>: OperationProvider<T>,
 {
@@ -621,9 +627,9 @@ impl_clamp_for_primitive!(f64);
 
 /// Group of the elementwise extrema capabilities [`Min`], [`Max`], and [`Clamp`]. It is implemented automatically
 /// for every type that implements all of its members.
-pub trait ExtremaOperations: Min + Max + Clamp {}
+pub trait ExtremaOperations<T = <Self as Capability>::Universe>: Capability + Min<T> + Max<T> + Clamp<T> {}
 
-impl<V: Min + Max + Clamp> ExtremaOperations for V {}
+impl<T, V: Min<T> + Max<T> + Clamp<T>> ExtremaOperations<T> for V {}
 
 /// Returns the weight with which `candidate` receives the tangent of an extremum of `candidate` and `other`, following
 /// JAX's balanced comparison: `1` where `candidate` wins under `direction` (i.e., [`ComparisonDirection::LessThan`]

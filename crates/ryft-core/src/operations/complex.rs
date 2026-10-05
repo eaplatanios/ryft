@@ -42,6 +42,7 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::arithmetic::NegOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -581,11 +582,14 @@ impl Imaginary for Array {
     }
 }
 
-/// Group of the complex-number capabilities [`Complex`], [`Real`], [`Imaginary`], and [`Conjugate`]. It is implemented
-/// automatically for every type that implements all of its members.
-pub trait ComplexOperations: Complex + Real + Imaginary + Conjugate {}
+/// Group of the complex-number capabilities [`Complex`], [`Real`], [`Imaginary`], and [`Conjugate`].
+/// It is implemented automatically for every type that implements all of its members.
+pub trait ComplexOperations<T = <Self as Capability>::Universe>:
+    Capability + Complex<T> + Real<T> + Imaginary<T> + Conjugate<T>
+{
+}
 
-impl<V: Complex + Real + Imaginary + Conjugate> ComplexOperations for V {}
+impl<T, V: Complex<T> + Real<T> + Imaginary<T> + Conjugate<T>> ComplexOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

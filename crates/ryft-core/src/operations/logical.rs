@@ -33,9 +33,10 @@ use std::sync::Arc;
 
 use crate::arrays::{Array, ArrayAddressing, ArrayType, Broadcastable, DataType};
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    impl_tracer_operator,
 };
+use crate::operations::Capability;
 use crate::programs::{ProgramError, TypeError, Typed};
 
 /// Implements one logical capability for one host primitive type through the corresponding Rust operator, which is
@@ -89,7 +90,7 @@ define_elementwise_capability!(
     NotOperation,
 );
 
-define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");
+impl_tracer_operator!(@unary std::ops::Not, not, Not, not);
 
 impl_capability_for_primitive!(@unary Not, not, !, bool);
 impl_capability_for_primitive!(@unary Not, not, !, i8);
@@ -178,7 +179,7 @@ define_elementwise_capability!(
     AndOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitAnd, bitand, capability = And, method = and);
+impl_tracer_operator!(@binary std::ops::BitAnd, bitand, And, and);
 
 impl_capability_for_primitive!(@binary And, and, &, bool);
 impl_capability_for_primitive!(@binary And, and, &, i8);
@@ -239,7 +240,7 @@ define_elementwise_capability!(
     OrOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitOr, bitor, capability = Or, method = or);
+impl_tracer_operator!(@binary std::ops::BitOr, bitor, Or, or);
 
 impl_capability_for_primitive!(@binary Or, or, |, bool);
 impl_capability_for_primitive!(@binary Or, or, |, i8);
@@ -301,7 +302,7 @@ define_elementwise_capability!(
     XorOperation,
 );
 
-define_tracer_operator!(@binary std::ops::BitXor, bitxor, capability = Xor, method = xor);
+impl_tracer_operator!(@binary std::ops::BitXor, bitxor, Xor, xor);
 
 impl_capability_for_primitive!(@binary Xor, xor, ^, bool);
 impl_capability_for_primitive!(@binary Xor, xor, ^, i8);
@@ -399,9 +400,9 @@ impl Array {
 
 /// Group of the elementwise logical and bitwise capabilities [`Not`], [`And`], [`Or`], and [`Xor`]. It is implemented
 /// automatically for every type that implements all of its members.
-pub trait LogicalOperations: Not + And + Or + Xor {}
+pub trait LogicalOperations<T = <Self as Capability>::Universe>: Capability + Not<T> + And<T> + Or<T> + Xor<T> {}
 
-impl<V: Not + And + Or + Xor> LogicalOperations for V {}
+impl<T, V: Not<T> + And<T> + Or<T> + Xor<T>> LogicalOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

@@ -76,6 +76,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 use half::{bf16, f16};
+use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrType,
@@ -92,6 +93,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::iota::IotaOperation;
@@ -981,7 +983,11 @@ impl<
 /// every element of an array condition and bounds the number of reported failures. Observations may be dimensions
 /// or Boolean, integer, `bf16`, `f16`, `f32`, and `f64` values. All input types are validated even when the condition
 /// is known to pass.
-pub trait Assert: Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait Assert<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Requires this scalar Boolean value to be true. A failure reports the message and named scalar observations.
     /// Under batching, reports the first failing item at each batching level and includes its batch index.
     ///
@@ -1057,11 +1063,9 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
 }
 
 impl<
-    V: Value<
-            Type: Into<ArrayIrType>,
-            DispatchDomain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<V::Type>>>,
-        >,
-> Assert for V
+    T: Type + Into<ArrayIrType>,
+    V: Value<Type = T, DispatchDomain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<T>>>>,
+> Assert<T> for V
 {
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
         let operation = AssertOperation::new(message)

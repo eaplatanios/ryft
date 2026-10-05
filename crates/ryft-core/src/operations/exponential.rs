@@ -34,7 +34,6 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::Accuracy;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Real};
@@ -42,6 +41,7 @@ use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::logical::And;
+use crate::operations::{Accuracy, Capability};
 use crate::programs::{MaybeZero, ProgramError, Type, Typed};
 
 /// Canonical operation name for [`ExpOperation`].
@@ -525,11 +525,14 @@ macro_rules! impl_logistic_for_primitive {
 impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
 
-/// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`Log`], [`Ln1p`], [`LogAddExp`], and
-/// [`Logistic`]. It is implemented automatically for every type that implements all of its members.
-pub trait ExponentialOperations: Exp + Log + Ln1p + LogAddExp + Logistic {}
+/// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`Log`], [`Ln1p`], [`LogAddExp`],
+/// and [`Logistic`]. It is implemented automatically for every type that implements all of its members.
+pub trait ExponentialOperations<T = <Self as Capability>::Universe>:
+    Capability + Exp<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>
+{
+}
 
-impl<V: Exp + Log + Ln1p + LogAddExp + Logistic> ExponentialOperations for V {}
+impl<T, V: Exp<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>> ExponentialOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {
