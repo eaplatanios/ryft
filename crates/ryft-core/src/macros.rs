@@ -1156,6 +1156,12 @@ macro_rules! define_elementwise_operation {
 }
 
 /// Defines a value-level capability trait paired with an elementwise operation and its dispatch-domain implementation.
+/// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
+/// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
+/// covers every value whose dispatch domain can bind the operation for that value's own universe, and composite array
+/// IR values implement it through their array members (refer to [`impl_array_ir_projected_capability!`]).
+/// [`Parameterwise`](crate::Parameterwise) structures implement it parameter-by-parameter (i.e., by
+/// zipping the parameters of both inputs for binary capabilities).
 ///
 /// # Examples
 ///
@@ -1222,7 +1228,14 @@ macro_rules! define_elementwise_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: Sized {
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
             $(#[$method_documentation])+
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
@@ -1233,24 +1246,42 @@ macro_rules! define_elementwise_capability {
             fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__V: $crate::Value> $capability for __V
+        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>> $capability<__T> for __V
         where
-            $operation<__V::Type>: $crate::Operation<Type = __V::Type>,
+            $operation<__T>: $crate::Operation<Type = __T>,
             __V::DispatchDomain: $crate::Context<
-                    Type = __V::Type,
+                    Type = __T,
                     Value = __V,
-                    Operation: ::std::convert::From<$operation<__V::Type>>,
+                    Operation: ::std::convert::From<$operation<__T>>,
                 >,
         {
             #[inline]
             fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError> {
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
-                    $operation::<__V::Type>::new().with_accuracy(accuracy),
+                    $operation::<__T>::new().with_accuracy(accuracy),
                     Vec::new(),
                     ::std::slice::from_ref(self),
                 )?
                 .remove(0))
+            }
+        }
+
+        $crate::impl_array_ir_projected_capability! {
+            $capability {
+                fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Self;
+            }
+        }
+
+        impl<
+            __T,
+            __P: $crate::Parameter + $capability<__T>,
+            __S: $crate::Parameterized<__P>,
+        > $capability<__T> for $crate::Parameterwise<__P, __S>
+        {
+            #[inline]
+            fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError> {
+                self.map(|parameter| <__P as $capability<__T>>::$accuracy_method(parameter, accuracy))
             }
         }
     };
@@ -1265,26 +1296,38 @@ macro_rules! define_elementwise_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: Sized {
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
             $(#[$method_documentation])+
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__V: $crate::Value> $capability for __V
-        where
-            $operation<__V::Type>: $crate::OperationProvider<__V::Type>,
-            __V::DispatchDomain: $crate::Context<
-                    Type = __V::Type,
+        impl<
+            __T: $crate::Type,
+            __V: $crate::Value<
+                Type = __T,
+                DispatchDomain: $crate::Context<
+                    Type = __T,
                     Value = __V,
                     Operation: ::std::convert::From<
-                        <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::Operation,
+                        <$operation<__T> as $crate::OperationProvider<__T>>::Operation,
                     >,
                 >,
+            >,
+        > $capability<__T> for __V
+        where
+            $operation<__T>: $crate::OperationProvider<__T>,
         {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
                 let input_type = $crate::Typed::r#type(self);
-                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(
+                let operation = <$operation<__T> as $crate::OperationProvider<__T>>::provide(
                     (),
                     &[input_type.as_ref()],
                 )?;
@@ -1297,10 +1340,28 @@ macro_rules! define_elementwise_capability {
                 .remove(0))
             }
         }
+
+        $crate::impl_array_ir_projected_capability! {
+            $capability {
+                fn $method(&self) -> Self;
+            }
+        }
+
+        impl<
+            __T,
+            __P: $crate::Parameter + $capability<__T>,
+            __S: $crate::Parameterized<__P>,
+        > $capability<__T> for $crate::Parameterwise<__P, __S>
+        {
+            #[inline]
+            fn $method(&self) -> Result<Self, $crate::ProgramError> {
+                self.map(|parameter| <__P as $capability<__T>>::$method(parameter))
+            }
+        }
     };
 
-    // This branch defines a two-input capability whose binary operation is provided by the value type family, using the
-    // caller-provided name for the right input.
+    // This branch defines a two-input capability whose binary operation is provided by the value type family,
+    // using the caller-provided name for the right input.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -1310,7 +1371,14 @@ macro_rules! define_elementwise_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: Sized {
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and composite array IR values implement it for"]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their array members."]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
             $(#[$method_documentation])+
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
@@ -1327,7 +1395,7 @@ macro_rules! define_elementwise_capability {
                     >,
                 >,
             > + $crate::ManualVariationAlignment<__T>,
-        > $capability for __V
+        > $capability<__T> for __V
         where
             $operation<__T>: $crate::OperationProvider<__T>,
         {
@@ -1350,7 +1418,325 @@ macro_rules! define_elementwise_capability {
                 .remove(0))
             }
         }
+
+        $crate::impl_array_ir_projected_capability! {
+            $capability {
+                fn $method(&self, $argument: &Self) -> Self;
+            }
+        }
+
+        impl<
+            __T,
+            __P: $crate::Parameter + $capability<__T>,
+            __S: $crate::Parameterized<__P>,
+        > $capability<__T> for $crate::Parameterwise<__P, __S>
+        {
+            #[inline]
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
+                self.zip_map($argument, |left, right| <__P as $capability<__T>>::$method(left, right))
+            }
+        }
     };
+}
+
+// TODO(eaplatanios): Review this.
+/// Implements an array capability for composite array IR values by delegating to their array members.
+///
+/// Every capability `X<T>` that is parameterized by its universe `T` (see
+/// [`Capability`](crate::operations::Capability)) and implemented for homogeneous array values (`X<ArrayType>`) gains
+/// two composite implementations (`X<ArrayIrType>`):
+///
+///   - a blanket implementation for every [`Value`](crate::Value) over [`ArrayIrType`](crate::arrays::ArrayIrType)
+///     whose [`ValueProjection`](crate::ValueProjection) into [`ArrayType`](crate::arrays::ArrayType) is a
+///     [`ProjectedValue`](crate::ProjectedValue) (i.e., every composite tracer), which projects the receiver and the
+///     `&Self` inputs, applies `X<ArrayType>` to the projections, and lifts the output back, and
+///   - a concrete implementation for [`ArrayIrValue<A>`](crate::arrays::ArrayIrValue) that applies `X<ArrayType>` to
+///     its array members.
+///
+/// Projecting a first-class dimension or reference member fails with the projection's
+/// [`TypeError`](crate::TypeError), exactly as an explicit projection does. Staged composite programs therefore contain
+/// the same array instructions that homogeneous programs contain, and batching and differentiation reach the
+/// homogeneous rules through the composite member projection.
+///
+/// The blanket implementation requires that no generic implementation of `X` applies to composite values, which holds
+/// for provider-backed and closed elementwise capabilities (whose operations implement
+/// [`Operation`](crate::Operation) and [`OperationProvider`](crate::OperationProvider) only for
+/// [`DataType`](crate::arrays::DataType) and [`ArrayType`](crate::arrays::ArrayType)) and for capabilities whose
+/// generic implementation is bounded by `Value<Type = ArrayType>`. Adding an `ArrayIrType` provider for such an
+/// operation would make the implementations overlap.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// impl_array_ir_projected_capability! {
+///     Dot<Self> {
+///         fn dot(&self, right: &Self, dimension_numbers: &DotDimensionNumbers) -> Self;
+///     }
+/// }
+/// ```
+///
+/// # Parameters
+///
+///   - `$capability`: Universe-parameterized capability trait, optionally followed by `<Self>` when the trait takes a
+///     right-input type parameter before its universe (e.g., `Dot<Rhs = Self, T>`).
+///   - `fn ...;`: Required functions of the capability, with any function generics written in brackets after the name
+///     (e.g., `fn reverse[A: Into<Axes>](&self, axes: A) -> Self;`, because declarative macros cannot match `<...>`
+///     lists). Each function takes `&self`, any number of `&Self`, `&[Self]`, and `Option<&Self>` inputs (which are
+///     projected), and any number of other inputs (which are passed through unchanged), and returns `Self`,
+///     `(Self, Self)`, `Vec<Self>`, or `(Self, Vec<Self>)`.
+#[macro_export]
+macro_rules! impl_array_ir_projected_capability {
+    // This branch accepts a capability whose only type parameter is its universe.
+    ($capability:ident { $($functions:tt)* }) => {
+        $crate::impl_array_ir_projected_capability!(
+            @implementation
+            [__V: $crate::Value<Type = $crate::arrays::ArrayIrType>
+                + $crate::ValueProjection<
+                    $crate::arrays::ArrayType,
+                    Projected = $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
+                >]
+            [$capability<$crate::arrays::ArrayIrType>]
+            [__V]
+            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>:
+                $capability<$crate::arrays::ArrayType>]
+            [$capability<$crate::arrays::ArrayType>]
+            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>]
+            { $($functions)* }
+        );
+        $crate::impl_array_ir_projected_capability!(
+            @implementation
+            [__A: $crate::Value<Type = $crate::arrays::ArrayType> + $capability<$crate::arrays::ArrayType>]
+            [$capability<$crate::arrays::ArrayIrType>]
+            [$crate::arrays::ArrayIrValue<__A>]
+            []
+            [$capability<$crate::arrays::ArrayType>]
+            [__A]
+            { $($functions)* }
+        );
+    };
+
+    // This branch accepts a capability whose right-input type parameter precedes its universe and defaults to `Self`.
+    ($capability:ident<Self> { $($functions:tt)* }) => {
+        $crate::impl_array_ir_projected_capability!(
+            @implementation
+            [__V: $crate::Value<Type = $crate::arrays::ArrayIrType>
+                + $crate::ValueProjection<
+                    $crate::arrays::ArrayType,
+                    Projected = $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
+                >]
+            [$capability<__V, $crate::arrays::ArrayIrType>]
+            [__V]
+            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>: $capability<
+                $crate::ProjectedValue<$crate::arrays::ArrayType, __V>,
+                $crate::arrays::ArrayType,
+            >]
+            [$capability<$crate::ProjectedValue<$crate::arrays::ArrayType, __V>, $crate::arrays::ArrayType>]
+            [$crate::ProjectedValue<$crate::arrays::ArrayType, __V>]
+            { $($functions)* }
+        );
+        $crate::impl_array_ir_projected_capability!(
+            @implementation
+            [__A: $crate::Value<Type = $crate::arrays::ArrayType> + $capability<__A, $crate::arrays::ArrayType>]
+            [$capability<$crate::arrays::ArrayIrValue<__A>, $crate::arrays::ArrayIrType>]
+            [$crate::arrays::ArrayIrValue<__A>]
+            []
+            [$capability<__A, $crate::arrays::ArrayType>]
+            [__A]
+            { $($functions)* }
+        );
+    };
+
+    // This branch generates one implementation from its generics, trait references, implementing type, bounds on the
+    // projected value, and functions.
+    (
+        @implementation
+        [$($generics:tt)*]
+        [$($composite_trait:tt)*]
+        [$self_type:ty]
+        [$($where_clause:tt)*]
+        $projected_trait:tt
+        $projected_type:tt
+        { $($functions:tt)* }
+    ) => {
+        impl<$($generics)*> $($composite_trait)* for $self_type
+        where
+            $($where_clause)*
+        {
+            $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($functions)*);
+        }
+    };
+
+    // This branch munches one function that returns `Self`.
+    (
+        @functions $projected_trait:tt $projected_type:tt
+        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> Self; $($rest:tt)*
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type [single] $function [$($($generics)*)?] [] []
+            $($($inputs)*)?
+        );
+        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
+    };
+
+    // This branch munches one function that returns a pair of values.
+    (
+        @functions $projected_trait:tt $projected_type:tt
+        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> (Self, Self); $($rest:tt)*
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type [pair] $function [$($($generics)*)?] [] []
+            $($($inputs)*)?
+        );
+        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
+    };
+
+    // This branch munches one function that returns a vector of values.
+    (
+        @functions $projected_trait:tt $projected_type:tt
+        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> Vec<Self>; $($rest:tt)*
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type [vector] $function [$($($generics)*)?] [] []
+            $($($inputs)*)?
+        );
+        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
+    };
+
+    // This branch munches one function that returns a value and a vector of values.
+    (
+        @functions $projected_trait:tt $projected_type:tt
+        fn $function:ident $([$($generics:tt)*])? (&self $(, $($inputs:tt)*)?) -> (Self, Vec<Self>); $($rest:tt)*
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type [value_and_vector] $function [$($($generics)*)?] [] []
+            $($($inputs)*)?
+        );
+        $crate::impl_array_ir_projected_capability!(@functions $projected_trait $projected_type $($rest)*);
+    };
+
+    // This branch ends the function munching.
+    (@functions $projected_trait:tt $projected_type:tt) => {};
+
+    // This branch munches a projected `&Self` input.
+    (
+        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
+        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: &Self $(, $($rest:tt)*)?
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type $output $function $generics
+            [$($parameters)* $input: &Self,] [$($arguments)* [projected $input]] $($($rest)*)?
+        );
+    };
+
+    // This branch munches a projected `&[Self]` input.
+    (
+        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
+        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: &[Self] $(, $($rest:tt)*)?
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type $output $function $generics
+            [$($parameters)* $input: &[Self],] [$($arguments)* [projected_slice $input]] $($($rest)*)?
+        );
+    };
+
+    // This branch munches a projected `Option<&Self>` input.
+    (
+        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
+        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: Option<&Self> $(, $($rest:tt)*)?
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type $output $function $generics
+            [$($parameters)* $input: Option<&Self>,] [$($arguments)* [projected_option $input]] $($($rest)*)?
+        );
+    };
+
+    // This branch munches a passed-through input.
+    (
+        @function $projected_trait:tt $projected_type:tt $output:tt $function:ident $generics:tt
+        [$($parameters:tt)*] [$($arguments:tt)*] $input:ident: $input_type:ty $(, $($rest:tt)*)?
+    ) => {
+        $crate::impl_array_ir_projected_capability!(
+            @function $projected_trait $projected_type $output $function $generics
+            [$($parameters)* $input: $input_type,] [$($arguments)* [passed $input]] $($($rest)*)?
+        );
+    };
+
+    // This branch emits a function once every input has been munched. Projected inputs are projected into their array
+    // members before the array capability is applied, and its outputs are lifted back into composite values.
+    (
+        @function [$($projected_trait:tt)*] [$projected_type:ty] $output:tt $function:ident [$($generics:tt)*]
+        [$($parameters:tt)*] [$([$kind:ident $argument:ident])*]
+    ) => {
+        #[inline]
+        fn $function<$($generics)*>(
+            &self,
+            $($parameters)*
+        ) -> Result<$crate::impl_array_ir_projected_capability!(@output $output), $crate::ProgramError> {
+            let receiver = $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(self.clone())?;
+            $($crate::impl_array_ir_projected_capability!(@argument $kind $argument);)*
+            let output = <$projected_type as $($projected_trait)*>::$function(
+                &receiver,
+                $($crate::impl_array_ir_projected_capability!(@pass $kind $argument)),*
+            )?;
+            Ok($crate::impl_array_ir_projected_capability!(@lift $output output))
+        }
+    };
+
+    // These branches name the output type of a function.
+    (@output [single]) => { Self };
+    (@output [pair]) => { (Self, Self) };
+    (@output [vector]) => { Vec<Self> };
+    (@output [value_and_vector]) => { (Self, Vec<Self>) };
+
+    // These branches lift the projected output of a function back into composite values.
+    (@lift [single] $output:ident) => {
+        <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected($output)
+    };
+    (@lift [pair] $output:ident) => {{
+        let (first, second) = $output;
+        (
+            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(first),
+            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(second),
+        )
+    }};
+    (@lift [vector] $output:ident) => {
+        $output
+            .into_iter()
+            .map(<Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected)
+            .collect()
+    };
+    (@lift [value_and_vector] $output:ident) => {{
+        let (first, rest) = $output;
+        (
+            <Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(first),
+            rest.into_iter()
+                .map(<Self as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected)
+                .collect(),
+        )
+    }};
+
+    // These branches project one input, rebinding it under its own name.
+    (@argument projected $argument:ident) => {
+        let $argument = $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected($argument.clone())?;
+    };
+    (@argument projected_slice $argument:ident) => {
+        let $argument = $argument
+            .iter()
+            .map(|value| $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(value.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+    };
+    (@argument projected_option $argument:ident) => {
+        let $argument = $argument
+            .map(|value| $crate::ValueProjection::<$crate::arrays::ArrayType>::into_projected(value.clone()))
+            .transpose()?;
+    };
+    (@argument passed $argument:ident) => {};
+
+    // These branches pass one (possibly projected) input to the array capability.
+    (@pass projected $argument:ident) => { &$argument };
+    (@pass projected_slice $argument:ident) => { $argument.as_slice() };
+    (@pass projected_option $argument:ident) => { $argument.as_ref() };
+    (@pass passed $argument:ident) => { $argument };
 }
 
 /// Implements [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) by delegating to one of
@@ -3539,21 +3925,18 @@ macro_rules! impl_nullary_batchable_operation {
 ///
 /// The operator traits (i.e., `std::ops::Add`, `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single
 /// `impl<V: Value>` blanket implementation (i.e., the shape used for the fallible in-crate capability traits) is not
-/// allowed due to the orphan rule. This macro stamps out the implementations that a blanket would otherwise cover. Note
-/// also that because an operator must return `Self`, the two error modes differ by tracer and cannot be collapsed: a
-/// staged [`Tracer`](crate::Tracer) records through its [`unary`](crate::Tracer::unary) and
-/// [`binary`](crate::Tracer::binary) helpers, which *poison* on a failed bind so that the error surfaces later at
-/// tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer) and
-/// [`DifferentiationTracer`](crate::DifferentiationTracer) have no deferral point and bind directly, panicking with
-/// `$message` if the bind fails, and [`PartialTracer`](crate::PartialTracer) follows the same direct-bind shape (i.e.,
-/// a mixed known/unknown bind residualizes rather than fails, so a bind error is a genuine type error). Binding
-/// directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal (e.g.,
-/// no `Type = ArrayType` pin is needed on the batching arm).
-///
-/// Binary invocations use a fallible capability whose provider selects the operation for the value's
-/// [`Type`](crate::Type) family. Provider-construction failures poison ordinary staged tracers and fail immediately
-/// for direct-binding transform tracers and projected member views, preserving each value family's established error
-/// behavior.
+/// allowed due to the orphan rule. This macro stamps out the implementations that a blanket would otherwise cover,
+/// each delegating to one fallible capability whose provider selects the operation for the value's
+/// [`Type`](crate::Type) family, so that operation selection and error behavior are defined in one place.
+/// Note also that because an operator must return `Self`, the two error modes differ by value family and cannot be
+/// collapsed: a staged [`Tracer`](crate::Tracer) _poisons_ itself on a failed capability, so that the error surfaces
+/// later at tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer),
+/// [`DifferentiationTracer`](crate::DifferentiationTracer), [`PartialTracer`](crate::PartialTracer) (for which a
+/// mixed known/unknown bind residualizes rather than fails, so a failure is a genuine type error), projected member
+/// views, and concrete composite [`ArrayIrValue`](crate::ArrayIrValue)s (which also get the operators here) have no
+/// deferral point and panic with the capability's error immediately. Every operator applies for whichever universe
+/// the capability covers, so tracers over composite contexts and over any [`BatchingPolicy`](crate::BatchingPolicy)
+/// gain the operator together with the capability.
 ///
 /// # Parameters
 ///
@@ -3561,110 +3944,100 @@ macro_rules! impl_nullary_batchable_operation {
 ///     `@unary` produces `fn(self) -> Self` operators and `@binary` produces `fn(self, Self) -> Self` operators.
 ///   - `$trait`: Path to the foreign `std::ops` operator trait to implement (e.g., `std::ops::Add`).
 ///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
-///   - `capability = $capability, method = $capability_method`: Fallible value capability and method that implement
-///     the binary operator. Operator sugar delegates to this pair so operation selection and error behavior remain
-///     defined in one place.
-///   - `$message`: Panic message used when a unary tracer bind fails.
+///   - `$capability`: Path to the fallible value capability that implements the operator (e.g., `Add`).
+///   - `$capability_method`: Identifier of the capability function that implements the operator (e.g., `add`). It
+///     differs from `$method` for operators such as `std::ops::BitAnd`, whose `bitand` is implemented by `And::and`.
 #[macro_export]
 macro_rules! define_tracer_operator {
-    // This branch implements receiver-only operator syntax for every transform tracer family.
-    (@unary $trait:path, $method:ident, $operation:ident, $message:literal $(,)?) => {
+    // This branch layers panicking unary operator sugar over one fallible value capability for every tracer family.
+    (@unary $trait:path, $method:ident, $capability:path, $capability_method:ident $(,)?) => {
         impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
-            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T>,
-            <$crate::ProjectedValue<__T, __V> as $crate::Value>::DispatchDomain: $crate::Context<
-                    Type = __T,
-                    Value = $crate::ProjectedValue<__T, __V>,
-                    Operation: ::std::convert::From<$operation<__T>>,
-                >,
+            $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T> + $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(
-                    &$crate::Value::dispatch_domain(&self),
-                    $operation::<__T>::new(),
-                    Vec::new(),
-                    ::std::slice::from_ref(&self),
-                )
-                .expect($message)
-                .remove(0)
+                <Self as $capability>::$capability_method(&self).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
-        impl<__C: $crate::StagingContext<Operation: ::std::convert::From<$operation<__C::Type>>>> $trait
-            for $crate::Tracer<__C>
+        impl<__C: $crate::StagingContext> $trait for $crate::Tracer<__C>
+        where
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                self.unary($operation::new())
+                let input_type = $crate::Typed::r#type(&self);
+                match <Self as $capability>::$capability_method(&self) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        $crate::StagingContext::error(self.context(), error);
+                        $crate::Tracer::new(
+                            self.context().clone(),
+                            $crate::TracerState::Poison,
+                            input_type.into_owned(),
+                        )
+                    }
+                }
             }
         }
 
         impl<__C: $crate::Context> $trait for $crate::PartialTracer<__C>
         where
-            $crate::PartialEvaluationContext<__C>: $crate::Context<
-                    Value = $crate::PartialTracer<__C>,
-                    Operation: ::std::convert::From<$operation<__C::Type>>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
+        impl<__C: $crate::Context, __P: $crate::BatchingPolicy<__C>> $trait for $crate::BatchingTracer<__C, __P>
         where
-            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
-                    Operation: ::std::convert::From<$operation<$crate::arrays::ArrayType>>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
         impl<__C: $crate::Context, __P: $crate::DifferentiationPolicy<__C>> $trait
             for $crate::DifferentiationTracer<__C, __P>
         where
-            $crate::DifferentiationContext<__C, __P>: $crate::Context<
-                    Value = $crate::DifferentiationTracer<__C, __P>,
-                    Operation: ::std::convert::From<$operation<__C::Type>>,
-                >,
+            Self: $capability,
         {
             type Output = Self;
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation::new(), Vec::new(), ::std::slice::from_ref(&self))
-                    .expect($message)
-                    .remove(0)
+                <Self as $capability>::$capability_method(&self).unwrap_or_else(|error| panic!("{error}"))
+            }
+        }
+
+        impl<__A: $crate::Value<Type = $crate::arrays::ArrayType>> $trait for $crate::arrays::ArrayIrValue<__A>
+        where
+            Self: $capability,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                <Self as $capability>::$capability_method(&self).unwrap_or_else(|error| panic!("{error}"))
             }
         }
     };
 
     // This branch layers panicking binary operator sugar over one fallible value capability for every tracer family.
-    (
-        @binary $trait:path,
-        $method:ident,
-        capability = $capability:path,
-        method = $capability_method:ident $(,)?
-    ) => {
+    (@binary $trait:path, $method:ident, $capability:path, $capability_method:ident $(,)?) => {
         impl<__T: $crate::Type, __V> $trait for $crate::ProjectedValue<__T, __V>
         where
             $crate::ProjectedValue<__T, __V>: $crate::Value<Type = __T> + $capability,
@@ -3708,8 +4081,7 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
+        impl<__C: $crate::Context, __P: $crate::BatchingPolicy<__C>> $trait for $crate::BatchingTracer<__C, __P>
         where
             Self: $capability,
         {
@@ -3731,6 +4103,92 @@ macro_rules! define_tracer_operator {
             #[inline]
             fn $method(self, right: Self) -> Self {
                 <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+            }
+        }
+
+        impl<__A: $crate::Value<Type = $crate::arrays::ArrayType>> $trait for $crate::arrays::ArrayIrValue<__A>
+        where
+            Self: $capability,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                <Self as $capability>::$capability_method(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+            }
+        }
+    };
+}
+
+// TODO(eaplatanios): Review this.
+/// Implements a foreign `std::ops` operator trait as panicking sugar for [`Parameterwise`](crate::Parameterwise)
+/// structures by applying the operator of their parameter type to every parameter. Binary operators are implemented
+/// both between two structures, whose parameter paths must match, and between a structure and a single parameter on
+/// the right, which is broadcast to every parameter of the structure. The operators panic on structure mismatches,
+/// while failures of the parameter operators follow the error modes of the parameter type (e.g., staged
+/// [`Tracer`](crate::Tracer)s poison themselves instead of panicking). The operators consume their structures and
+/// move each parameter into the by-value operator of `P`, so that unary and structure-to-structure operators neither
+/// clone parameters nor require `P: Clone`. Only the broadcast operators clone their right parameter, once per
+/// parameter of the structure.
+///
+/// # Parameters
+///
+///   - `@unary` / `@binary`: Selects the operator shape to stamp out.
+///   - `$trait`: Name of the foreign `std::ops` operator trait to implement (e.g., `Add`).
+///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
+#[macro_export]
+macro_rules! define_parameterwise_operator {
+    // This branch applies a unary operator to every parameter of a structure.
+    (@unary $trait:ident, $method:ident $(,)?) => {
+        impl<__P: $crate::Parameter + std::ops::$trait<Output = __P>, __S: $crate::Parameterized<__P>> std::ops::$trait
+            for $crate::Parameterwise<__P, __S>
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                let value = self.into_inner();
+                let structure = value.parameter_structure();
+                let parameters = value.into_parameters().map(<__P as std::ops::$trait>::$method);
+                Self::new(__S::from_parameters(structure, parameters).unwrap())
+            }
+        }
+    };
+
+    // This branch applies a binary operator to corresponding parameters, or to every parameter and a broadcast one.
+    (@binary $trait:ident, $method:ident $(,)?) => {
+        impl<__P: $crate::Parameter + std::ops::$trait<Output = __P>, __S: $crate::Parameterized<__P>> std::ops::$trait
+            for $crate::Parameterwise<__P, __S>
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let (left, right) = (self.into_inner(), right.into_inner());
+                if !left.parameter_paths().eq(right.parameter_paths()) {
+                    panic!("parameterwise inputs must have the same parameter structure");
+                }
+                let structure = left.parameter_structure();
+                let parameters = left
+                    .into_parameters()
+                    .zip(right.into_parameters())
+                    .map(|(left, right)| <__P as std::ops::$trait>::$method(left, right));
+                Self::new(__S::from_parameters(structure, parameters).unwrap())
+            }
+        }
+
+        impl<__P: Clone + $crate::Parameter + std::ops::$trait<Output = __P>, __S: $crate::Parameterized<__P>>
+            std::ops::$trait<__P> for $crate::Parameterwise<__P, __S>
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: __P) -> Self {
+                let left = self.into_inner();
+                let structure = left.parameter_structure();
+                let parameters =
+                    left.into_parameters().map(|left| <__P as std::ops::$trait>::$method(left, right.clone()));
+                Self::new(__S::from_parameters(structure, parameters).unwrap())
             }
         }
     };
@@ -5208,14 +5666,14 @@ macro_rules! check_gradient {
                 // Per input element, the two central differences estimate the real partials that assemble the
                 // conjugate steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
                 let part_type = input_type.clone().with_data_type($crate::arrays::DataType::F64);
-                let real_values = $crate::operations::complex::Real::real(&input).unwrap().to_f64s();
-                let imaginary_values = $crate::operations::complex::Imaginary::imaginary(&input).unwrap().to_f64s();
+                let real_values = $crate::operations::Real::real(&input).unwrap().to_f64s();
+                let imaginary_values = $crate::operations::Imaginary::imaginary(&input).unwrap().to_f64s();
                 let perturbed = |index: usize, real_delta: f64, imaginary_delta: f64| {
                     let mut real_values = real_values.clone();
                     let mut imaginary_values = imaginary_values.clone();
                     real_values[index] += real_delta;
                     imaginary_values[index] += imaginary_delta;
-                    $crate::operations::complex::Complex::complex(
+                    $crate::operations::Complex::complex(
                         &$crate::Array::from_elements::<f64>(part_type.clone(), &real_values).unwrap(),
                         &$crate::Array::from_elements::<f64>(part_type.clone(), &imaginary_values).unwrap(),
                     )
@@ -5233,7 +5691,7 @@ macro_rules! check_gradient {
                         perturbed(index, 0.0, -step),
                     ));
                 }
-                let estimate = $crate::operations::complex::Complex::complex(
+                let estimate = $crate::operations::Complex::complex(
                     &$crate::Array::from_elements::<f64>(part_type.clone(), &real_estimates).unwrap(),
                     &$crate::Array::from_elements::<f64>(part_type, &imaginary_estimates).unwrap(),
                 )
@@ -5249,10 +5707,11 @@ pub use crate::{
     check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_arithmetic_dimension_capability, define_dimension_arithmetic_operation,
-    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
-    impl_differentiable_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_nullary_batchable_operation, impl_nullary_transposable_operation, impl_reference_dischargeable_operation,
+    define_elementwise_capability, define_elementwise_operation, define_parameterwise_operator, define_tracer_operator,
+    dispatch_on_array_element_type, impl_array_elementwise_operation, impl_array_ir_projected_capability,
+    impl_differentiable_elementwise_operation, impl_differentiable_operation, impl_non_differentiable_operation,
+    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
+    impl_reference_dischargeable_operation,
 };
 
 #[cfg(test)]
@@ -5265,11 +5724,14 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType,
-        Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+        ArrayOperation, ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionError,
+        DimensionType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        ShardingError,
     };
-    use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
+    use crate::batching::{
+        BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
+    };
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -5277,9 +5739,9 @@ mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
-        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation, Reduce,
-        ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
+        Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, Capability,
+        DivOperation, ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation,
+        Reduce, ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -5288,7 +5750,7 @@ mod tests {
     use crate::programs::{
         EmptyRegionDriver, MaybeZero, NoReferenceTransform, Operation, OperationProvider, ProgramError,
         ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
+        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -5621,6 +6083,15 @@ mod tests {
     }
 
     define_elementwise_capability!(
+        @unary
+        /// Fallible capability used by the unary operator macro fixture.
+        TestUnaryCapability,
+        /// Applies the fixture's unary operation.
+        apply_unary_fallible,
+        TestUnaryOperation,
+    );
+
+    define_elementwise_capability!(
         @binary
         /// Fallible capability used by the ordinary binary operator macro fixture.
         TestBinaryCapability,
@@ -5641,22 +6112,22 @@ mod tests {
     define_tracer_operator!(
         @unary TestUnaryOperator,
         apply_unary,
-        TestUnaryOperation,
-        "test unary operation failed",
+        TestUnaryCapability,
+        apply_unary_fallible,
     );
 
     define_tracer_operator!(
         @binary TestBinaryOperator,
         apply_binary,
-        capability = TestBinaryCapability,
-        method = apply_binary_fallible,
+        TestBinaryCapability,
+        apply_binary_fallible,
     );
 
     define_tracer_operator!(
         @binary TestProvidedBinaryOperator,
         apply_provided_binary,
-        capability = TestProvidedBinaryCapability,
-        method = apply_provided_binary_fallible,
+        TestProvidedBinaryCapability,
+        apply_provided_binary_fallible,
     );
 
     /// Type-directed nullary operation used to execute generated transposition and batching rules.
@@ -6347,6 +6818,88 @@ mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_impl_array_ir_projected_capability() {
+        // Two test capabilities cover the supported signature shapes: projected `&Self` inputs, passed-through inputs,
+        // functions without inputs, several functions per capability, and a right-input type parameter that precedes
+        // the universe.
+        trait Scale<T = <Self as Capability>::Universe>: Capability + Sized {
+            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError>;
+            fn double(&self) -> Result<Self, ProgramError>;
+        }
+
+        trait Combine<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Sized {
+            fn combine(&self, right: &Rhs) -> Result<Self, ProgramError>;
+        }
+
+        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Scale<ArrayType> for V {
+            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError> {
+                (0..count).try_fold(self.clone(), |sum, _| sum.add(right))
+            }
+
+            fn double(&self) -> Result<Self, ProgramError> {
+                self.add(self)
+            }
+        }
+
+        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Combine<V, ArrayType> for V {
+            fn combine(&self, right: &V) -> Result<Self, ProgramError> {
+                self.add(right)
+            }
+        }
+
+        impl_array_ir_projected_capability! {
+            Scale {
+                fn scale(&self, right: &Self, count: usize) -> Self;
+                fn double(&self) -> Self;
+            }
+        }
+
+        impl_array_ir_projected_capability! {
+            Combine<Self> {
+                fn combine(&self, right: &Self) -> Self;
+            }
+        }
+
+        // Composite tracers stage the homogeneous array instructions of every generated function.
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = CompositeContext::trace(
+            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].scale(&inputs[1], 2)?.double()?.combine(&inputs[1]),
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = add %0 %1
+                    %3:f32[2] = add %2 %1
+                    %4:f32[2] = add %3 %3
+                    %5:f32[2] = add %4 %1
+                in (%5)"
+            },
+        );
+
+        // Concrete composite values apply the capabilities to their array members, while first-class dimension
+        // members are rejected by the projection.
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+        assert_eq!(left.scale(&right, 2), Ok(ArrayIrValue::Array(Array::vector(vec![7.0f32, 10.0]).unwrap())));
+        assert_eq!(left.double(), Ok(ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap())));
+        assert_eq!(left.combine(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            left.scale(&dimension, 1),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+        assert_eq!(
+            dimension.combine(&left),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]
@@ -7119,6 +7672,67 @@ mod tests {
             output.tangent(),
             MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
         ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_define_tracer_operator_binary_composite_values() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type EagerCompositeContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Composite tracers stage operators through the composite capabilities, and a failed capability poisons the
+        // trace, which reports the error at its boundary.
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = CompositeContext::trace(
+            |inputs: Vec<Tracer<CompositeContext>>| Ok(inputs[0].clone() * inputs[1].clone() - inputs[1].clone()),
+            vec![array_type.clone(), array_type.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = mul %0 %1
+                    %3:f32[2] = sub %2 %1
+                in (%3)"
+            },
+        );
+        assert!(matches!(
+            CompositeContext::trace(
+                |inputs: Vec<Tracer<CompositeContext>>| Ok(inputs[0].clone() + inputs[1].clone()),
+                vec![
+                    array_type,
+                    ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::new(0, Some(4)).unwrap())),
+                ],
+            ),
+            Err(ProgramError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
+        ));
+
+        // Concrete composite values and composite batching tracers apply the operators to their array members.
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+        assert_eq!(left.clone() + right.clone(), ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap()));
+        assert_eq!(left.clone() - right.clone(), ArrayIrValue::Array(Array::vector(vec![-2.0f32, -2.0]).unwrap()));
+        assert_eq!(left * right, ArrayIrValue::Array(Array::vector(vec![3.0f32, 8.0]).unwrap()));
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>| Ok(item.clone() * item),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap()),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 4.0, 9.0, 16.0]).unwrap())),
+        );
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    #[should_panic(expected = "expected array type but got dimension type")]
+    fn test_define_tracer_operator_binary_composite_value_failure() {
+        // Concrete composite values have no deferral point, and so a failed capability panics immediately.
+        let _ = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())
+            + ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
     }
 
     #[test]
