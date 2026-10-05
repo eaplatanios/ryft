@@ -1348,6 +1348,13 @@ mod tests {
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDual, DifferentiationError, MemberDifferentiableOperation,
+    };
+
+    use crate::interpretation::InterpretableOperation;
+
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MemberOperation, ProgramBuilder, ProgramError};
     use crate::tracing::TracingContext;
@@ -1355,594 +1362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parallel_all_gather_output_variance_updates_canonical_sharding_state() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
-        let input = ArrayType::new_static(DataType::F32, [3]).with_sharding(varying_sharding).unwrap();
-
-        let infer = |output_variance| {
-            ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance)
-                .with_mesh(mesh.clone())
-                .infer_array_ir_output_types(&[
-                    ArrayIrType::Array(input.clone()),
-                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                ])
-        };
-        let varying = infer(ParallelAllGatherOutputVariance::Varying).unwrap();
-        let varying = <&ArrayType>::try_from(&varying[0]).unwrap();
-        assert_eq!(varying.sharding().unwrap().varying_manual_axes(), &["x".to_string()].into_iter().collect());
-        assert!(varying.sharding().unwrap().reduced_axes().is_empty());
-
-        let invariant = infer(ParallelAllGatherOutputVariance::Invariant).unwrap();
-        let invariant = <&ArrayType>::try_from(&invariant[0]).unwrap();
-        assert!(invariant.sharding().unwrap().varying_manual_axes().is_empty());
-        assert!(invariant.sharding().unwrap().reduced_axes().is_empty());
-
-        let reduced = infer(ParallelAllGatherOutputVariance::Reduced).unwrap();
-        let reduced = <&ArrayType>::try_from(&reduced[0]).unwrap();
-        assert!(reduced.sharding().unwrap().varying_manual_axes().is_empty());
-        assert_eq!(reduced.sharding().unwrap().reduced_axes(), &["x".to_string()].into_iter().collect());
-
-        // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and restores
-        // the varying input-cotangent state without a second reduce-scatter operation type.
-        let reduced_cotangent = reduced.cotangent().unwrap();
-        assert_eq!(
-            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
-                .with_mesh(mesh)
-                .infer_parent_output_types(
-                    &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
-                    &[],
-                ),
-            Ok(vec![input.cotangent().unwrap().into()]),
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_over_unbound_axis_is_rejected() {
-        use crate::batching::BatchingTracer;
-
-        // The batch binds only the axis `"i"`, but the `parallel_all_gather` names `"x"`, which no enclosing transform
-        // binds. Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
-        // acting as identity.
-        let result: Result<ArrayIrValue<Array>, BatchingError> = batch(
-            |item: BatchingTracer<
-                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-                ArrayIrBatchingPolicy,
-            >| { item.parallel_all_gather_tiled("x", 0) },
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
-            BatchAxis::new(0),
-            BatchAxis::replicated(),
-            BatchAxisSpecification::named("i"),
-        );
-        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }));
-    }
-
-    #[test]
-    fn test_array_ir_collective_tracing_import_and_rendering() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
-        let input_variable = DimensionVariable::new("items", bounds);
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["devices"]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let (_, program) = TestContext::trace_with_named_axes(
-            |input| input.parallel_all_gather_tiled("devices", 0),
-            ArrayIrType::Array(input_type),
-            vec![("devices".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
-        )
-        .unwrap();
-
-        let [dimension_size, axis_size, multiplied_extent, parallel_all_gather] = program.instructions() else {
-            panic!("expected dimension observation, axis-size constant, multiplication, and all-gather");
-        };
-        assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
-        assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
-        assert!(matches!(multiplied_extent.operation(), ArrayIrOperation::Dimension(DimensionOperation::Mul(_)),));
-        assert!(matches!(parallel_all_gather.operation(), ArrayIrOperation::ParallelAllGather(_)));
-        assert_eq!(multiplied_extent.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
-        assert_eq!(parallel_all_gather.inputs(), &[program.input_ids()[0], multiplied_extent.outputs()[0]]);
-        let rendered = program.to_string();
-        assert!(rendered.contains("dimension_size"));
-        assert!(rendered.contains("dimension_mul"));
-        assert!(rendered.contains("parallel_all_gather ["));
-        assert!(rendered.contains("axis_name=\"devices\""));
-        assert!(rendered.contains("options=Tiled"));
-
-        let target_variable = DimensionVariable::new("target", bounds);
-        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_variable)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let instantiated = program
-            .with_instantiated_type_identities(&[ArrayIrType::Array(target_type.clone())])
-            .unwrap()
-            .into_owned();
-        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let imported_input = destination.add_input(target_type.into());
-        let imported_outputs = destination.splice_program(&instantiated, &[imported_input]).unwrap();
-        let [imported_dimension_size, _, imported_multiplied_extent, imported_parallel_all_gather] =
-            destination.instructions()
-        else {
-            panic!("expected the imported array IR collective graph");
-        };
-        assert_eq!(imported_dimension_size.inputs(), &[imported_input]);
-        assert_eq!(imported_parallel_all_gather.inputs(), &[imported_input, imported_multiplied_extent.outputs()[0]]);
-        assert_eq!(imported_parallel_all_gather.outputs(), imported_outputs.as_slice());
-    }
-
-    #[test]
-    fn test_untiled_parallel_all_gather_co_moves_ragged_extents_onto_the_participant_axis() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1_i32, 3]).unwrap(),
-                    variable.clone(),
-                    vec![0],
-                )])
-                .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let operation = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-
-        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
-
-        assert_eq!(output.batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.value().to_f64s(), vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]);
-        assert_eq!(
-            output.ragged_axes(),
-            &[RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])],
-        );
-    }
-
-    #[test]
-    fn test_untiled_parallel_all_gather_materializes_replicated_ragged_extents() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::replicated(Array::vector(vec![1.0_f32, 2.0, 0.0]).unwrap())
-            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2_i32).unwrap(), variable.clone(), Vec::new())])
-            .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let operation = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-
-        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
-
-        assert_eq!(output.batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.value().to_f64s(), vec![1.0, 2.0, 0.0, 1.0, 2.0, 0.0]);
-        assert_eq!(
-            output.ragged_axes(),
-            &[RaggedAxis::new(1, Array::vector(vec![2_i32, 2]).unwrap(), variable, vec![0])],
-        );
-    }
-
-    #[test]
-    fn test_tiled_parallel_all_gather_rejects_unrepresentable_ragged_chunks() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
-            .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                "x".to_string(),
-                2,
-                0,
-                CollectiveOptions::tiled(),
-                ParallelAllGatherOutputVariance::Varying,
-            )
-            .batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation {
-                message: "tiled `parallel_all_gather` cannot represent participant-specific bounded ragged extents \
-                          after the participant and concatenation axes are fused"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_parallel_all_gather_preserves_untiled_ragged_metadata_and_rejects_tiled() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(8)).unwrap());
-        let extents = ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap());
-        let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-        .unwrap();
-        let extent =
-            |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
-        let ragged_extent =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(variable.clone()))
-                .unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        let untiled = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-        let output = untiled
-            .batch_in_parent(&context, &EmptyRegionDriver, &[input.clone(), extent(2), ragged_extent])
-            .unwrap()
-            .into_parts()
-            .0
-            .remove(0);
-        assert_eq!(
-            output.value(),
-            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
-        );
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, extents, variable.clone(), vec![0])]);
-
-        let tiled = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::tiled(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-        assert_eq!(
-            tiled.batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(6)]),
-            Err(BatchingError::UnsupportedOperation {
-                message: "tiled `parallel_all_gather` cannot represent participant-specific bounded ragged extents \
-                          after the participant and concatenation axes are fused"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_untiled_parallel_all_gather_materializes_replicated_ragged_extents() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 0.0]).unwrap()))
-            .with_ragged_axes(vec![RaggedAxis::new(
-                0,
-                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
-                variable.clone(),
-                Vec::new(),
-            )])
-            .unwrap();
-        let extent =
-            |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
-        let ragged_extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(
-            DimensionValue::new(DimensionType::from(variable.clone()), 2).unwrap(),
-        ));
-        let context = BatchingContext::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        )
-        .with_axis_name("x".to_string());
-        let output = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
-        )
-        .batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(2), ragged_extent])
-        .unwrap()
-        .into_parts()
-        .0
-        .remove(0);
-
-        assert_eq!(
-            output.value(),
-            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 0.0, 1.0, 2.0, 0.0]).unwrap()),
-        );
-        assert_eq!(
-            output.ragged_axes(),
-            &[RaggedAxis::new(1, ArrayIrValue::Array(Array::vector(vec![2_i32, 2]).unwrap()), variable, vec![0],)],
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_of_replicated_input_concatenates_copies() {
-        // A replicated input at a matching level is first materialized as `axis_size` identical batch items, so the
-        // gather degenerates to the item-major concatenation of that many copies of the shared value.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let outputs = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::tiled(),
-            ParallelAllGatherOutputVariance::Varying,
-        )
-        .batch(&context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap())])
-        .unwrap()
-        .into_parts()
-        .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_parallel_all_gather_transposes_to_parallel_sum_scatter() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
-        // A tiled all-gather is the adjoint of a sum-scatter over the same axis and dimension, so the pullback stages
-        // a `parallel_sum_scatter` on the output cotangent with the gather's concat axis as its scatter axis.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Varying,
-                ),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            pullback.to_string(),
-            indoc::indoc! {r#"
-                lambda %0:f32[4] .
-                let %1:f32[2] = parallel_sum_scatter [axis_name="x", axis_size=2, scatter_axis=0, options=Tiled] %0
-                in (%1)
-            "#}
-            .trim_end(),
-        );
-
-        let groups = vec![vec![0, 2], vec![3, 1]];
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    4,
-                    0,
-                    CollectiveOptions::tiled().with_axis_index_groups(groups.clone()),
-                    ParallelAllGatherOutputVariance::Varying,
-                ),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        let ArrayOperation::ParallelSumScatter(adjoint) = pullback.instructions()[0].operation() else {
-            panic!("expected grouped all-gather transpose to stage parallel-sum-scatter");
-        };
-        assert_eq!(adjoint.options().axis_index_groups(), Some(groups.as_slice()));
-
-        // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation, over the same
-        // mesh, consumes that state and returns the original varying input cotangent.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(input_type.clone());
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Reduced,
-                )
-                .with_mesh(mesh.clone()),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        let ArrayOperation::ParallelSumScatter(adjoint) = pullback.instructions()[0].operation() else {
-            panic!("expected reduced all-gather transpose to stage parallel-sum-scatter");
-        };
-        assert_eq!(adjoint.mesh(), Some(&mesh));
-        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
-
-        // Reduced output variance requires a manual mesh axis.
-        assert_eq!(
-            ParallelAllGatherOperation::new(
-                "x".to_string(),
-                2,
-                0,
-                CollectiveOptions::tiled(),
-                ParallelAllGatherOutputVariance::Reduced,
-            )
-            .infer_output_types(&[input_type], &[]),
-            Err(TypeError::invalid("`parallel_all_gather` with reduced output variance requires a manual mesh axis")),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_invariant_parallel_all_gather_linearization() {
-        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dimension_type = DimensionType::from(variable.clone());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let array = builder.add_input(array_type.into());
-        let result_extent = builder.add_input(dimension_type.clone().into());
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    1,
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Invariant,
-                ),
-                Vec::new(),
-                vec![array, result_extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        let rendered_tangent = linearization.tangent().to_string();
-        assert!(rendered_tangent.contains("dynamic_slice"));
-        assert!(rendered_tangent.contains("reshape"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
-        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
-        let mut pullback_inputs = vec![cotangent];
-        pullback_inputs.extend(residuals);
-        assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())]),
-        );
-
-        // A nondegenerate untiled invariant gather selects the current participant's size-one slice and reshapes
-        // away the ranked participant axis.
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
-        let participant_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let input_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        let output = builder
-            .add_instruction(
-                ParallelAllGatherOperation::new(
-                    "x".to_string(),
-                    2,
-                    0,
-                    CollectiveOptions::default(),
-                    ParallelAllGatherOutputVariance::Invariant,
-                ),
-                Vec::new(),
-                vec![array, participant_extent, input_extent],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
-        // guard that rule owns is what rejects direct transposition here.
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0], &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of invariant `parallel_all_gather` cannot represent the participant-indexed \
-                    slice; linearize so that the current participant can select its gathered chunk",
-        ));
-        let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
-        assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
-        assert!(pullback.contains("dimension_from_scalar"));
-        assert!(!pullback.contains("dimension_mul"));
-        assert!(pullback.contains("dynamic_slice"));
-    }
-
-    #[test]
-    fn test_array_ir_invariant_parallel_all_gather_linearization_inside_manual_region() {
-        // Inside a manual region, the output cotangent of an invariant gather is invariant across the gathered axis,
-        // while every participant selects a different chunk of it. The pullback therefore varies the cotangent over
-        // that axis with a real `parallel_vary` transition before slicing it at the checked participant index, so that
-        // the selected chunk has the input cotangent's variation.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-            |input| {
-                input.parallel_all_gather_with_options(
-                    "x",
-                    0,
-                    CollectiveOptions::tiled(),
-                    ParallelAllGatherOutputVariance::Invariant,
-                )
-            },
-            ArrayIrType::Array(input_type),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
-        )
-        .unwrap();
-        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap();
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}], %1:dimension<4> .
-                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = linear_call \
-                    [residual_count=1] %1 %0 [
-                    forward={
-                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                        let %2:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
-                            [axis_name=\"x\", mesh=['x'=2:manual]]
-                            %3:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %2
-                            %4:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
-                                [axis_name=\"x\"] %1
-                            %5:dimension<2> = constant [value=2]
-                            %6:dimension<x_index * 2 ∈ [0, 3)> = dimension_mul %3 %5
-                            %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
-                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %4 %6 %5
-                            %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
-                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %7 %5
-                        in (%8)
-                    },
-                    transpose={
-                        lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
-                            axis_name=\"x\",
-                            axis_size=2,
-                            concat_axis=0,
-                            options=Tiled,
-                            output_variance=Invariant,
-                            mesh=['x'=2:manual],
-                        ] %1 %0
-                        in (%2)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_type_inference() {
-        use crate::macros::check_operation_type_inference;
-
+    fn test_parallel_all_gather() {
         let operation = ParallelAllGatherOperation::new(
             "x".to_string(),
             4,
@@ -1956,7 +1376,7 @@ mod tests {
         assert_eq!(operation.name(), PARALLEL_ALL_GATHER_OPERATION_NAME);
         assert_eq!(
             operation.to_string(),
-            indoc::indoc! {r#"
+            indoc! {r#"
                 parallel_all_gather [
                     axis_name="x",
                     axis_size=4,
@@ -1966,6 +1386,17 @@ mod tests {
                 ]
             "#}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference() {
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            4,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
         );
         check_operation_type_inference!(
             operation = operation,
@@ -1983,7 +1414,7 @@ mod tests {
                         DataType::F32,
                         Shape::new(vec![Dimension::Dynamic(
                             DimensionVariable::new("dynamic", DimensionBounds::unbounded()),
-                        )]),
+                        )],),
                     )],
                     error = "`parallel_all_gather` does not support dynamically shaped inputs",
                 },
@@ -2006,7 +1437,7 @@ mod tests {
         assert_eq!(operation.mesh(), Some(&mesh));
         assert_eq!(
             operation.to_string(),
-            indoc::indoc! {r#"
+            indoc! {r#"
                 parallel_all_gather [
                     axis_name="x",
                     axis_size=2,
@@ -2096,7 +1527,252 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_gather_preserves_unrelated_pending_sums() {
+    fn test_parallel_all_gather_type_inference_output_variance() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [3]).with_sharding(varying_sharding).unwrap();
+
+        let infer = |output_variance| {
+            ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance)
+                .with_mesh(mesh.clone())
+                .infer_array_ir_output_types(&[
+                    ArrayIrType::Array(input.clone()),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                ])
+        };
+        let varying = infer(ParallelAllGatherOutputVariance::Varying).unwrap();
+        let varying = <&ArrayType>::try_from(&varying[0]).unwrap();
+        assert_eq!(varying.sharding().unwrap().varying_manual_axes(), &["x".to_string()].into_iter().collect());
+        assert!(varying.sharding().unwrap().reduced_axes().is_empty());
+
+        let invariant = infer(ParallelAllGatherOutputVariance::Invariant).unwrap();
+        let invariant = <&ArrayType>::try_from(&invariant[0]).unwrap();
+        assert!(invariant.sharding().unwrap().varying_manual_axes().is_empty());
+        assert!(invariant.sharding().unwrap().reduced_axes().is_empty());
+
+        let reduced = infer(ParallelAllGatherOutputVariance::Reduced).unwrap();
+        let reduced = <&ArrayType>::try_from(&reduced[0]).unwrap();
+        assert!(reduced.sharding().unwrap().varying_manual_axes().is_empty());
+        assert_eq!(reduced.sharding().unwrap().reduced_axes(), &["x".to_string()].into_iter().collect());
+
+        // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and restores
+        // the varying input-cotangent state without a second reduce-scatter operation type.
+        let reduced_cotangent = reduced.cotangent().unwrap();
+        assert_eq!(
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
+                .with_mesh(mesh)
+                .infer_parent_output_types(
+                    &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
+                    &[],
+                ),
+            Ok(vec![input.cotangent().unwrap().into()]),
+        );
+        // Reduced output variance requires a manual mesh axis.
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Reduced,
+            )
+            .infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[]),
+            Err(TypeError::invalid("`parallel_all_gather` with reduced output variance requires a manual mesh axis")),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_array_ir_untiled() {
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                4,
+                1,
+                CollectiveOptions::default(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .infer_array_ir_output_types(&[
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])).into(),
+                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ],),
+            Ok(vec![
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]),
+                )
+                .into()
+            ],),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_array_ir_dynamic() {
+        let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
+        let concat_result = DimensionVariable::new("concat", DimensionBounds::new(2, Some(33)).unwrap());
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(input_axis.clone()), Dimension::Static(3)]),
+        );
+
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .infer_array_ir_output_types(&[
+                input_type.clone().into(),
+                ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ],),
+            Ok(vec![
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(concat_result.clone()), Dimension::Static(3)]),
+                )
+                .into()
+            ],),
+        );
+        let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), exact_six.into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
+        );
+        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ).infer_array_ir_output_types(
+                &[ArrayType::new_static(DataType::F32, [3]).into(), exact_five.into()],
+            ),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` result extent must equal input axis 0 extent 3 multiplied by axis group size 2; \
+                 expected 6 \
+                 but got 5"
+                    .to_string(),
+            ),),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_array_ir_metadata() {
+        let operation = ParallelAllGatherOperation::new(
+            "participants".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let dimension = DimensionVariable::new("input", DimensionBounds::new(0, Some(9)).unwrap());
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension.clone())]))
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap())
+            .unwrap()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
+
+        // Check the final extent, even when the input dimension is symbolic and cannot establish exact geometry.
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                input.clone().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            ],),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` on a dimension sharded over explicit mesh axes requires the output size (3) \
+                 at axis 0 to be divisible by the mesh-axis product (2)",
+            ),),
+        );
+        let outputs = operation
+            .infer_array_ir_output_types(&[
+                input.clone().into(),
+                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+            ])
+            .unwrap();
+        let output = <&ArrayType>::try_from(&outputs[0]).unwrap();
+        assert_eq!(output.sharding(), input.sharding());
+        assert_eq!(output.memory(), input.memory());
+        assert!(output.layout().is_none());
+
+        // An unchanged symbolic shape retains layout just like the homogeneous identity case.
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[input.clone().into(), DimensionType::from(dimension).into()]),
+            Ok(vec![input.into()]),
+        );
+        let input = ArrayType::new_static(DataType::F32, [4])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            operation.infer_array_ir_output_types(&[
+                input.clone().into(),
+                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+            ],),
+            Ok(vec![input.into()]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_array_ir_group_size() {
+        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
+        assert_eq!(
+            ParallelAllGatherOperation::new("x".to_string(), 4, 0, grouped, ParallelAllGatherOutputVariance::Varying)
+                .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into()]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_array_ir_unchanged_extents() {
+        let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
+        let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
+        let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
+        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
+        // Inserting an axis preserves the extents already projected into the base output type on either side.
+        let gather = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            1,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        assert_eq!(
+            gather.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                exact_three.clone().into(),
+                exact_two.clone().into(),
+                exact_four.clone().into(),
+            ],),
+            Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
+        );
+        assert_eq!(
+            gather.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [3, 4]).into(),
+                exact_three.clone().into(),
+                exact_two.clone().into(),
+                exact_five.into(),
+            ],),
+            Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_type_inference_preserves_unrelated_pending_sums() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -2125,7 +1801,7 @@ mod tests {
             operation.infer_array_ir_output_types(&[
                 input.clone().into(),
                 DimensionValue::constant(8).unwrap().r#type().into_owned().into(),
-            ]),
+            ],),
             Ok(vec![expected.clone().into()]),
         );
 
@@ -2134,13 +1810,34 @@ mod tests {
             .clone()
             .with_sharding(input.sharding().unwrap().clone().with_varying_manual_axes(Vec::<String>::new()).unwrap())
             .unwrap();
-        let (output, _) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+        let (output, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |input| input.parallel_all_gather_tiled("x", 0),
             ArrayIrType::Array(invariant),
             vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
         )
         .unwrap();
         assert_eq!(output, ArrayIrType::Array(expected));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], unreduced={'y'}}] .
+                let %1:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], unreduced={'y'}, \
+                varying_manual={'x'}}] = parallel_vary [axis_name=\"x\"] %0
+                    %2:dimension<4> = constant [value=4]
+                    %3:dimension<2> = constant [value=2]
+                    %4:dimension<8> = dimension_mul %2 %3
+                    %5:f32[8][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], unreduced={'y'}, \
+                varying_manual={'x'}}] = parallel_all_gather [
+                        axis_name=\"x\",
+                        axis_size=2,
+                        concat_axis=0,
+                        options=Tiled,
+                        output_variance=Varying,
+                        mesh=['x'=2:manual, 'y'=2:manual],
+                    ] %1 %4
+                in (%5)"
+            },
+        );
 
         // Gathering over a pending sum on the participating axis remains invalid.
         let pending = ArrayType::new_static(DataType::F32, [4])
@@ -2153,65 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_gather_array_ir_type_inference_metadata() {
-        let operation = ParallelAllGatherOperation::new(
-            "participants".to_string(),
-            1,
-            0,
-            CollectiveOptions::tiled(),
-            ParallelAllGatherOutputVariance::Varying,
-        );
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let dimension = DimensionVariable::new("input", DimensionBounds::new(0, Some(9)).unwrap());
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension.clone())]))
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap())
-            .unwrap()
-            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
-            .with_memory(Memory::Host { pinned: true });
-
-        // Check the final extent, even when the input dimension is symbolic and cannot establish exact geometry.
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                input.clone().into(),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-            ]),
-            Err(TypeError::invalid(
-                "`parallel_all_gather` on a dimension sharded over explicit mesh axes requires the output size (3) \
-                 at axis 0 to be divisible by the mesh-axis product (2)",
-            )),
-        );
-        let outputs = operation
-            .infer_array_ir_output_types(&[
-                input.clone().into(),
-                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-            ])
-            .unwrap();
-        let output = <&ArrayType>::try_from(&outputs[0]).unwrap();
-        assert_eq!(output.sharding(), input.sharding());
-        assert_eq!(output.memory(), input.memory());
-        assert!(output.layout().is_none());
-
-        // An unchanged symbolic shape retains layout just like the homogeneous identity case.
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[input.clone().into(), DimensionType::from(dimension).into()]),
-            Ok(vec![input.into()]),
-        );
-        let input = ArrayType::new_static(DataType::F32, [4])
-            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
-            .with_memory(Memory::Host { pinned: true });
-        assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                input.clone().into(),
-                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-            ]),
-            Ok(vec![input.into()]),
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_interpretation_requires_an_enclosing_binder() {
-        use crate::interpretation::InterpretableOperation;
-
+    fn test_parallel_all_gather_interpretation() {
         // A single-participant axis is degenerate: the gather concatenates exactly one input, so interpretation is the
         // identity.
         let outputs = ParallelAllGatherOperation::new(
@@ -2228,7 +1867,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
+        assert_eq!(outputs[0].elements::<f64>().unwrap(), vec![1.0, 2.0]);
 
         // An untiled gather over a single participant inserts its size-one gathered axis.
         let outputs = ParallelAllGatherOperation::new(
@@ -2263,14 +1902,121 @@ mod tests {
         assert!(matches!(
             error,
             ProgramError::UnsupportedOperation { message }
-                if message == "cannot interpret `parallel_all_gather` over axis `x` of size 2 without an enclosing binder",
-        ));
+                if message == "cannot interpret `parallel_all_gather` over axis `x` of size 2 without an enclosing \
+                    binder",
+        ),);
     }
 
     #[test]
-    fn test_parallel_all_gather_over_batched_axis_materializes_the_gather() {
-        use crate::batching::BatchingTracer;
+    fn test_parallel_all_gather_interpretation_array_ir() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
 
+        assert_eq!(
+            context.bind(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                &[input.clone(), extent.clone()],
+            ),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            context
+                .bind(
+                    ParallelAllGatherOperation::new(
+                        "x".to_string(),
+                        1,
+                        0,
+                        CollectiveOptions::tiled(),
+                        ParallelAllGatherOutputVariance::Varying,
+                    ),
+                    Vec::new(),
+                    &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),],
+                )
+                .unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`parallel_all_gather` output axis 0 extent must equal observed result extent 3 but got 4"
+                    .to_string()
+            },
+        );
+        assert_eq!(
+            context
+                .bind(
+                    ParallelAllGatherOperation::new(
+                        "x".to_string(),
+                        2,
+                        0,
+                        CollectiveOptions::tiled(),
+                        ParallelAllGatherOutputVariance::Varying,
+                    ),
+                    Vec::new(),
+                    &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(6).unwrap()),],
+                )
+                .unwrap_err(),
+            ProgramError::UnsupportedOperation {
+                message: "cannot interpret `parallel_all_gather` over axis `x` of size 2 without an enclosing binder"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_partial_evaluation() {
+        let input = Array::vector(vec![1f32, 2.0]).unwrap();
+        check_operation_partial_evaluation!(
+            operation = ParallelAllGatherOperation::new(
+                "x".to_string(),
+                1,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            ),
+            inputs = [input.clone()],
+            expected = input,
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_partial_evaluation_array_ir() {
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = ParallelAllGatherOperation::new(
+                "x".to_string(),
+                1,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            ),
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, extent.clone())],
+                    outputs = [(@known, input.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, extent.clone()),
+                    ],
+                    outputs = [(@residual, input.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching() {
         // The batch binds the axis `"x"` that the `parallel_all_gather` names, so the matching batching rule consumes
         // the mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`, matching
@@ -2293,12 +2039,197 @@ mod tests {
         let ArrayIrValue::Array(output) = output else {
             panic!("`parallel_all_gather` must preserve the array member kind");
         };
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(output.elements::<f64>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
-    fn test_parallel_all_gather_batching_materializes_replicated_inputs_under_a_dynamic_extent()
-    -> Result<(), ProgramError> {
+    fn test_parallel_all_gather_batching_untiled() {
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let input =
+            ArrayBatch::new(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap();
+        let gathered = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            1,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        )
+        .batch(&context, &EmptyRegionDriver, &[input])
+        .unwrap()
+        .into_parts()
+        .0;
+        assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0f32, 3.0, 2.0, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_replicated() {
+        // A replicated input at a matching level is first materialized as `axis_size` identical batch items, so the
+        // gather degenerates to the item-major concatenation of that many copies of the shared value.
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let outputs = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        )
+        .batch(&context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap())])
+        .unwrap()
+        .into_parts()
+        .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().elements::<f64>().unwrap(), vec![1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_tiled_ragged() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+
+        assert_eq!(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation {
+                message: "tiled `parallel_all_gather` cannot represent participant-specific bounded ragged extents \
+                          after the participant and concatenation axes are fused"
+                    .to_string(),
+            },),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_untiled_ragged() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(vec![1i32, 3]).unwrap(),
+                    variable.clone(),
+                    vec![0],
+                )])
+                .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+
+        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
+
+        assert_eq!(output.batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.value().elements::<f64>().unwrap(), vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])],
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_array_ir_ragged() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(8)).unwrap());
+        let extents = ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap());
+        let input = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+        .unwrap();
+        let extent =
+            |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
+        let ragged_extent =
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(variable.clone()))
+                .unwrap();
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+        let untiled = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        let output = untiled
+            .batch_in_parent(&context, &EmptyRegionDriver, &[input.clone(), extent(2), ragged_extent])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(
+            output.value(),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
+        );
+        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, extents, variable.clone(), vec![0])]);
+
+        let tiled = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        assert_eq!(
+            tiled.batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(6)]),
+            Err(BatchingError::UnsupportedOperation {
+                message: "tiled `parallel_all_gather` cannot represent participant-specific bounded ragged extents \
+                          after the participant and concatenation axes are fused"
+                    .to_string(),
+            },),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_untiled_replicated_ragged() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::replicated(Array::vector(vec![1.0f32, 2.0, 0.0]).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i32).unwrap(), variable.clone(), Vec::new())])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+
+        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
+
+        assert_eq!(output.batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.value().elements::<f32>().unwrap(), vec![1.0, 2.0, 0.0, 1.0, 2.0, 0.0]);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![2i32, 2]).unwrap(), variable, vec![0])],
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_dynamic_extent_replicated() -> Result<(), ProgramError> {
         // Matching-axis collective batching consumes a complete logical result shape. A replicated input is
         // materialized along the mapped axis from those extents, dynamic unchanged axes keep their boundary-provided
         // identity, and the rule introduces no metadata read from the source array.
@@ -2373,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_gather_over_another_axis_is_forwarded_under_a_dynamic_extent() -> Result<(), ProgramError> {
+    fn test_parallel_all_gather_batching_dynamic_extent_forwarding() -> Result<(), ProgramError> {
         // A collective over a different named axis is forwarded as the same mixed operation. Only its physical axis
         // index and complete result shape are lifted around the current mapped axis, without reading the source shape.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2436,6 +2367,744 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_gather_batching_array_ir_replicated_ragged() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 0.0]).unwrap()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                0,
+                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
+                variable.clone(),
+                Vec::new(),
+            )])
+            .unwrap();
+        let extent =
+            |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
+        let ragged_extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(
+            DimensionValue::new(DimensionType::from(variable.clone()), 2).unwrap(),
+        ));
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+        let output = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        )
+        .batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(2), ragged_extent])
+        .unwrap()
+        .into_parts()
+        .0
+        .remove(0);
+
+        assert_eq!(
+            output.value(),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 0.0, 1.0, 2.0, 0.0]).unwrap()),
+        );
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, ArrayIrValue::Array(Array::vector(vec![2i32, 2]).unwrap()), variable, vec![0])],
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_member_rule() -> Result<(), ProgramError> {
+        // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
+        // through the payload's member JVP rule.
+        let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let primal = context.input(array_type.clone().into());
+        let tangent = context.input(array_type.into());
+        let extent = context.input(dimension_type.into());
+        let extent_tangent_type = extent.r#type().tangent()?;
+        let outputs = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        )
+        .jvp_in_parent(
+            &DifferentiationContext::fused(context.clone()),
+            &EmptyRegionDriver,
+            &[
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
+                DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
+            ],
+        )?;
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(_)));
+        let output_ids = vec![outputs[0].primal().atom_id()?, outputs[0].tangent().as_value().unwrap().atom_id()?];
+        let program = context.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            output_ids,
+            vec![Placeholder; 3],
+            vec![Placeholder; 2],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[items], %1:f32[items], %2:dimension<items ∈ [1, 9)> .
+                let %3:f32[items] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0 %2
+                    %4:f32[items] = linear_call [residual_count=1] %2 %1 [
+                        forward={
+                            lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items] .
+                            let %2:f32[items] = parallel_all_gather [
+                                axis_name=\"x\",
+                                axis_size=1,
+                                concat_axis=0,
+                                options=Tiled,
+                                output_variance=Varying,
+                            ] %1 %0
+                            in (%2)
+                        },
+                        transpose={
+                            lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items] .
+                            let %2:f32[items] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
+                options=Tiled] %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%3, %4)"
+            },
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_jvp() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let primal = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
+        let result_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![primal.clone(), result_extent.clone(), tangent.clone(),]),
+            Ok(vec![primal, tangent]),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
+                let %2:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0 %1
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)>, %2:f32[extent] .
+                let %3:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0 %1
+                    %4:f32[extent] = linear_call [residual_count=1] %1 %2 [
+                        forward={
+                            lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                            let %2:f32[extent] = parallel_all_gather [
+                                axis_name=\"x\",
+                                axis_size=1,
+                                concat_axis=0,
+                                options=Tiled,
+                                output_variance=Varying,
+                            ] %1 %0
+                            in (%2)
+                        },
+                        transpose={
+                            lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                            let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
+                options=Tiled] %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%3, %4)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_invariant() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
+                let %2:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Invariant,
+                ] %0 %1
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
+                let %2:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Invariant,
+                ] %0 %1
+                in (%2, %1)"
+            },
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
+                let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=1,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                        ] %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
+                        let %2:dimension<0> = constant [value=0]
+                            %3:f32[extent] = dynamic_slice [strides=[1], bounds=checked, \
+                requires_runtime_assertion=true] %1 %2 %0
+                            %4:f32[extent] = reshape %3 %0
+                        in (%4)
+                    },
+                ]
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [1, 9)> .
+                let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
+                        let %2:dimension<0> = constant [value=0]
+                            %3:f32[extent] = dynamic_slice [strides=[1], bounds=checked, \
+                requires_runtime_assertion=true] %1 %2 %0
+                            %4:f32[extent] = reshape %3 %0
+                        in (%4)
+                    },
+                    transpose={
+                        lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=1,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"
+            },
+        );
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
+        let mut pullback_inputs = vec![cotangent];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap())]),
+        );
+
+        // A nondegenerate untiled invariant gather selects the current participant's size-one slice and reshapes
+        // away the ranked participant axis.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let participant_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let input_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::default(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, participant_extent, input_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
+        // guard that rule owns is what rejects direct transposition here.
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct transposition of invariant `parallel_all_gather` cannot represent the \
+                    participant-indexed \
+                    slice; linearize so that the current participant can select its gathered chunk",
+        ),);
+        let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
+        assert_eq!(
+            pullback,
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:dimension<2> = const 2
+                    %2:dimension<3> = const 3
+                    %3:f32[3] = linear_call [residual_count=2] %1 %2 %0 [
+                        forward={
+                            lambda %0:dimension<2>, %1:dimension<3>, %2:f32[2, 3] .
+                            let %3:u64[] = axis_index [axis_name=\"x\"]
+                                %4:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %3
+                                %5:dimension<0> = constant [value=0]
+                                %6:dimension<1> = constant [value=1]
+                                %7:dimension<3> = constant [value=3]
+                                %8:f32[1, 3] = dynamic_slice [strides=[1, 1], bounds=checked, \
+                requires_runtime_assertion=true] %2 %4 %5 %6 %7
+                                %9:f32[3] = reshape %8 %7
+                            in (%9)
+                        },
+                        transpose={
+                            lambda %0:dimension<2>, %1:dimension<3>, %2:f32[3] .
+                            let %3:f32[2, 3] = parallel_all_gather [
+                                axis_name=\"x\",
+                                axis_size=2,
+                                concat_axis=0,
+                                options=Untiled,
+                                output_variance=Invariant,
+                            ] %2 %0 %1
+                            in (%3)
+                        },
+                    ]
+                in (%3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_dynamic_extent() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let result_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
+                let %2:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0 %1
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
+                let %2:f32[extent] = parallel_all_gather [
+                    axis_name=\"x\",
+                    axis_size=1,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0 %1
+                in (%2, %1)"
+            },
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
+                let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=1,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Varying,
+                        ] %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
+                options=Tiled] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[extent], %1:dimension<extent ∈ [0, 9)> .
+                let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
+                options=Tiled] %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<extent ∈ [0, 9)>, %1:f32[extent] .
+                        let %2:f32[extent] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=1,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Varying,
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"
+            },
+        );
+
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()), result_extent])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
+        let zero_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
+        let zero_array = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![zero_array.clone(), zero_extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let zero_cotangent = zero_array.clone();
+        let mut pullback_inputs = vec![zero_cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_invariant_manual_mesh() {
+        // Inside a manual region, the output cotangent of an invariant gather is invariant across the gathered axis,
+        // while every participant selects a different chunk of it. The pullback therefore varies the cotangent over
+        // that axis with a real `parallel_vary` transition before slicing it at the checked participant index, so that
+        // the selected chunk has the input cotangent's variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                input.parallel_all_gather_with_options(
+                    "x",
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                )
+            },
+            ArrayIrType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}], %1:dimension<4> .
+                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = linear_call \
+                    [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %2:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                            [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %3:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %2
+                            %4:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %1
+                            %5:dimension<2> = constant [value=2]
+                            %6:dimension<x_index * 2 ∈ [0, 3)> = dimension_mul %3 %5
+                            %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %4 %6 %5
+                            %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %7 %5
+                        in (%8)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
+                            axis_name=\"x\",
+                            axis_size=2,
+                            concat_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition() {
+        // A tiled all-gather is the adjoint of a sum-scatter over the same axis and dimension, so the pullback stages
+        // a `parallel_sum_scatter` on the output cotangent with the gather's concat axis as its scatter axis.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {r#"
+                lambda %0:f32[4] .
+                let %1:f32[2] = parallel_sum_scatter [axis_name="x", axis_size=2, scatter_axis=0, options=Tiled] %0
+                in (%1)
+            "#}
+            .trim_end(),
+        );
+
+        let groups = vec![vec![0, 2], vec![3, 1]];
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    4,
+                    0,
+                    CollectiveOptions::tiled().with_axis_index_groups(groups.clone()),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[2] = parallel_sum_scatter [
+                    axis_name=\"x\",
+                    axis_size=4,
+                    scatter_axis=0,
+                    options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                ] %0
+                in (%1)"
+            },
+        );
+
+        // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation, over the same
+        // mesh, consumes that state and returns the original varying input cotangent.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Reduced,
+                )
+                .with_mesh(mesh.clone()),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], unreduced={'x'}}] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter \
+                [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled, mesh=['x'=2:manual]] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition_array_ir_dynamic_extent() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ParallelAllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Varying,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct `parallel_all_gather` transposition with runtime-dependent type metadata \
+                    requires \
+                    linearization so that the relevant primal information can be retained as residuals",
+        ),);
+    }
+
+    #[test]
     fn test_parallel_all_gather_parallel_all_gather() {
         // Homogeneous array values stage the static-shape operation without explicit result extents, making an
         // invariant input varying first, and gather over a `batch` level so that every batch item receives all items.
@@ -2480,18 +3149,111 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [2, 2, 2]),
                 &[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
             )
-            .unwrap()),
+            .unwrap(),),
         );
 
         // Concrete arrays, and concrete composite values through their array members, are never inside an axis
         // binder, so every axis name is unbound for them.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).unwrap().parallel_all_gather("x", 0),
-            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }))
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_all_gather("x", 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_parallel_all_gather_unbound_axis() {
+        // The batch binds only the axis `"i"`, but the `parallel_all_gather` names `"x"`, which no enclosing transform
+        // binds. Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
+        // acting as identity.
+        let result: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |item: BatchingTracer<
+                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                ArrayIrBatchingPolicy,
+            >| { item.parallel_all_gather_tiled("x", 0) },
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+            BatchAxis::new(0),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::named("i"),
+        );
+        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }));
+    }
+
+    #[test]
+    fn test_parallel_all_gather_parallel_all_gather_tracing_import() {
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let input_variable = DimensionVariable::new("items", bounds);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["devices"]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_all_gather_tiled("devices", 0),
+            ArrayIrType::Array(input_type),
+            vec![("devices".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[items][sharding={mesh<['devices'=2:manual]>, [{}], varying_manual={'devices'}}] .
+                let %1:dimension<items ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<items * 2 ∈ [2, 9)> = dimension_mul %1 %2
+                    %4:f32[items * 2][sharding={mesh<['devices'=2:manual]>, [{}], varying_manual={'devices'}}] = \
+                parallel_all_gather [
+                        axis_name=\"devices\",
+                        axis_size=2,
+                        concat_axis=0,
+                        options=Tiled,
+                        output_variance=Varying,
+                        mesh=['devices'=2:manual],
+                    ] %0 %3
+                in (%4)"
+            },
+        );
+
+        let target_variable = DimensionVariable::new("target", bounds);
+        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_variable)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let instantiated = program
+            .with_instantiated_type_identities(&[ArrayIrType::Array(target_type.clone())])
+            .unwrap()
+            .into_owned();
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let imported_input = destination.add_input(target_type.into());
+        let imported_outputs = destination.splice_program(&instantiated, &[imported_input]).unwrap();
+        let imported = destination
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                imported_outputs,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            imported.to_string(),
+            indoc! {"
+                lambda %0:f32[target][sharding={mesh<['devices'=2:manual]>, [{}], varying_manual={'devices'}}] .
+                let %1:dimension<target ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<items * 2 ∈ [2, 9)> = dimension_mul %1 %2
+                    %4:f32[items * 2][sharding={mesh<['devices'=2:manual]>, [{}], varying_manual={'devices'}}] = \
+                parallel_all_gather [
+                        axis_name=\"devices\",
+                        axis_size=2,
+                        concat_axis=0,
+                        options=Tiled,
+                        output_variance=Varying,
+                        mesh=['devices'=2:manual],
+                    ] %0 %3
+                in (%4)"
+            },
         );
     }
 }

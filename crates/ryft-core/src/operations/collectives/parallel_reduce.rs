@@ -850,7 +850,10 @@ mod tests {
         assert_eq!(operation.axis_index_groups(), None);
         assert_eq!(operation.mesh(), None);
         assert_eq!(operation.to_string(), "parallel_reduce [kind=sum, axis_name=\"i\"]");
+    }
 
+    #[test]
+    fn test_parallel_reduce_grouped() {
         // Grouped reductions record the full axis size and their participant groups in order.
         let grouped =
             ParallelReduceOperation::grouped(ReductionKind::Mean, "x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
@@ -887,7 +890,10 @@ mod tests {
                 Err(TypeError::invalid(message)),
             );
         }
+    }
 
+    #[test]
+    fn test_parallel_reduce_with_mesh() {
         // Mesh reductions record and render their mesh.
         let (mesh, _, _) = mesh_scalar_types();
         let mesh_max = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh.clone());
@@ -897,7 +903,16 @@ mod tests {
             mesh_max.to_string(),
             "parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]]",
         );
+    }
 
+    #[test]
+    fn test_parallel_reduce_equality_and_hashing() {
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
+        let grouped =
+            ParallelReduceOperation::grouped(ReductionKind::Mean, "x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
+                .unwrap();
+        let (mesh, _, _) = mesh_scalar_types();
+        let mesh_max = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh);
         // Operations are equal, and hash alike, exactly when their kinds, axes, participant groups, and meshes agree.
         let max = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string());
         assert_eq!(mesh_max, mesh_max.clone());
@@ -1240,7 +1255,21 @@ mod tests {
             let input = Array::from_elements(input_type.clone(), &[2.0f32]).unwrap();
             let program = parallel_reduce_program(operation.clone(), input_type.clone());
             let evaluation = program.partially_evaluate(&[PartialValue::Known(input.clone())]).unwrap();
-            assert_eq!(evaluation.program().to_string(), program.to_string());
+            let expected = if operation.mesh().is_some() {
+                indoc! {"
+                    lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    in (%1)"
+                }
+            } else {
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=sum, axis_name=\"i\"] %0
+                    in (%1)"
+                }
+            };
+            assert_eq!(evaluation.program().to_string(), expected);
             assert!(evaluation.outputs()[0].is_unknown());
 
             // The composite family residualizes the operation in the same way.
@@ -1260,10 +1289,21 @@ mod tests {
             let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
             let input = PartialEvaluationValue::known(trace.input(input_type));
             let outputs = operation
-                .partially_evaluate(&PartialEvaluationContext::new(trace), &EmptyRegionDriver, &[input])
+                .partially_evaluate(&PartialEvaluationContext::new(trace.clone()), &EmptyRegionDriver, &[input])
                 .unwrap();
             assert!(outputs[0].is_known());
             assert_eq!(outputs[0].r#type().as_ref(), &output_type);
+            let parent_program = trace
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![outputs[0].as_known().unwrap().atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(parent_program.to_string(), expected);
         }
     }
 
@@ -1717,7 +1757,25 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].tangent().is_zero());
         assert_eq!(outputs[0].tangent().r#type().as_ref(), &invariant);
-        assert_eq!(context.builder().borrow().instructions().len(), 1);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![outputs[0].primal().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
+                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                    parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                in (%1)"
+            },
+        );
 
         // Every other kind is nonlinear and has no differentiation rule, although a structural zero tangent still
         // stays a structural zero, because every JVP is linear in its tangent.
@@ -1733,6 +1791,41 @@ mod tests {
                 )
                 .unwrap();
             assert!(outputs[0].tangent().is_zero());
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![outputs[0].primal().atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let expected = match kind {
+                ReductionKind::Product => indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=product, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+                ReductionKind::LogSumExp => indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=log_sum_exp, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+                ReductionKind::Max => indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=max, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+                ReductionKind::Min => indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=min, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(program.to_string(), expected);
+
             let tangent = context.input(ArrayType::scalar(DataType::F32));
             assert!(matches!(
                 operation.jvp(
@@ -1984,7 +2077,8 @@ mod tests {
                             parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
                         %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %2
                         %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %2 %2
-                        %5:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %4 %3
+                        %5:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare \
+                            [direction=Equal] %4 %3
                         %6:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %5 %2 %3
                         %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %6
                         %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \

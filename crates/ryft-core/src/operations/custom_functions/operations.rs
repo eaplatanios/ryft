@@ -6149,6 +6149,30 @@ mod tests {
     }
 
     #[test]
+    fn test_zz_probe_custom_function_zero_tangents() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let primal = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let inputs = (0..2).map(|_| builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+            let outputs = inputs
+                .iter()
+                .map(|&input| builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0])
+                .collect::<Vec<_>>();
+            builder
+                .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let operation = CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Primal, false);
+        let program = custom_function_call_program(
+            ArrayOperation::CustomFunction(operation),
+            vec![primal],
+            vec![scalar_type.clone(), scalar_type],
+        );
+        println!("PROBE custom mixed linearize: {:?}", program.linearize_with_respect_to(&[0]).map(|_| ()));
+        println!("PROBE custom mixed jvp: {:?}", program.jvp_with_respect_to(&[0]).map(|p| p.to_string()));
+    }
+
+    #[test]
     fn test_custom_function_differentiation_jvp_from_primal_linearization() {
         // Reusable linearization partitions a derived JVP like the primal region's own derivative: the primal program
         // saves `cos(x)` and the tangent program applies it.

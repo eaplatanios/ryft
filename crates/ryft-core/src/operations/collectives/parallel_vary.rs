@@ -563,7 +563,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, ValueProjection};
-    use crate::tracing::{DomainTracingContext, TracingContext};
+    use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
 
@@ -629,7 +629,7 @@ mod tests {
                     .clone()
                     .with_sharding(sharding.clone().with_varying_manual_axes(["m", "outer"]).unwrap())
                     .unwrap(),
-            ]
+            ],
         );
         assert!(matches!(
             ParallelVaryOperation::new("explicit".to_string()).infer_output_types(&[input.clone()], &[]),
@@ -649,7 +649,7 @@ mod tests {
             ParallelVaryOperation::new("m".to_string()).interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::from_elements(invariant, &[2.0_f32]).unwrap()],
+                &[Array::from_elements(invariant, &[2.0f32]).unwrap()],
             ),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`parallel_vary` requires an active non-empty manual mesh axis `m`",
@@ -665,7 +665,7 @@ mod tests {
             .add_instruction(ParallelVaryOperation::new("m".to_string()), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let constant = Array::from_elements(invariant, &[2.0_f32]).unwrap();
+        let constant = Array::from_elements(invariant, &[2.0f32]).unwrap();
         let evaluation = program.to_flat_program().partially_evaluate(&[PartialValue::Known(constant)]).unwrap();
         assert_eq!(evaluation.program().output_types(), vec![varying]);
         assert_eq!(
@@ -681,25 +681,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_vary_partial_evaluation_known_staging() {
-        let (invariant, varying) = scalar_types();
-        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(invariant));
-        let context = PartialEvaluationContext::new(trace);
-        let outputs = ParallelVaryOperation::new("m".to_string())
-            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
-            .unwrap();
-        assert!(outputs[0].is_known());
-        assert_eq!(outputs[0].r#type().as_ref(), &varying);
-    }
-
-    #[test]
     fn test_parallel_vary_partial_evaluation_composite() {
         let (invariant, varying) = scalar_types();
         let operation = ArrayIrOperation::<Array>::from(ParallelVaryOperation::new("m".to_string()));
         let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let input = PartialEvaluationValue::known(ArrayIrValue::Array(
-            Array::from_elements(invariant.clone(), &[2.0_f32]).unwrap(),
+            Array::from_elements(invariant.clone(), &[2.0f32]).unwrap(),
         ));
         let outputs = operation.partially_evaluate(&eager, &EmptyRegionDriver, &[input]).unwrap();
         assert!(outputs[0].is_unknown());
@@ -707,10 +694,63 @@ mod tests {
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = PartialEvaluationValue::known(trace.input(invariant.into()));
-        let context = PartialEvaluationContext::new(trace);
+        let context = PartialEvaluationContext::new(trace.clone());
         let outputs = operation.partially_evaluate(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert!(outputs[0].is_known());
         assert_eq!(outputs[0].r#type().as_ref(), &varying.into());
+        let builder = trace.builder().borrow().clone();
+        let input_count = builder.input_ids().len();
+        let output_ids = vec![outputs[0].as_known().unwrap().atom_id().unwrap()];
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                output_ids,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                in (%1)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_parallel_vary_partial_evaluation_known_staging() {
+        let (invariant, varying) = scalar_types();
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = PartialEvaluationValue::known(trace.input(invariant));
+        let context = PartialEvaluationContext::new(trace.clone());
+        let outputs = ParallelVaryOperation::new("m".to_string())
+            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
+            .unwrap();
+        assert!(outputs[0].is_known());
+        assert_eq!(outputs[0].r#type().as_ref(), &varying);
+        let builder = trace.builder().borrow().clone();
+        let input_count = builder.input_ids().len();
+        let output_ids = vec![outputs[0].as_known().unwrap().atom_id().unwrap()];
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                output_ids,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=2:manual]>, []}] .
+                let %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                in (%1)"
+            },
+        );
     }
 
     #[test]
@@ -727,7 +767,7 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
             .unwrap();
-        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
         let operation = ParallelVaryOperation::new("m".to_string());
         let outputs =
             operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
@@ -738,6 +778,26 @@ mod tests {
             &BTreeSet::from(["m".to_string()]),
         );
 
+        let builder = trace.builder().borrow().clone();
+        let input_count = builder.input_ids().len();
+        let output_ids = vec![outputs[0].value().atom_id().unwrap()];
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                output_ids,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}]}], %1:i32[2] .
+                let %2:f32[2, 3][sharding={mesh<['m'=2:manual]>, [{}, {}], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
+                in (%2)"
+            },
+        );
         let named_batch =
             BatchingContext::<_, ArrayBatchingPolicy>::new(context.parent().clone(), 2).with_axis_name("m".to_string());
         assert!(matches!(
@@ -759,7 +819,7 @@ mod tests {
         let packed = trace.input(packed_type.into());
         let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            ProjectedContext::new(trace),
+            ProjectedContext::new(trace.clone()),
             extent,
         );
         let output = ParallelVaryOperation::new("m".to_string())
@@ -771,6 +831,27 @@ mod tests {
         assert_eq!(
             output[0].value().r#type().sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["m".to_string()]),
+        );
+        let value: Tracer<_> = ValueProjection::<ArrayType>::from_projected(output[0].value().clone());
+        let builder = trace.builder().borrow().clone();
+        let input_count = builder.input_ids().len();
+        let output_ids = vec![value.atom_id().unwrap()];
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                output_ids,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [0, 4)>, %1:f32[items][sharding={mesh<['m'=2:manual]>, [{}]}] .
+                let %2:f32[items][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %1
+                in (%2)"
+            },
         );
     }
 
@@ -840,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_vary_capability() {
+    fn test_parallel_vary_parallel_vary() {
         let (invariant, varying) = scalar_types();
         let mesh = invariant.sharding().unwrap().mesh().clone();
         let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
@@ -881,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_vary_capability_on_mesh() {
+    fn test_parallel_vary_parallel_vary_on_mesh() {
         // With an explicit mesh, a trace that binds no named axes still varies invariant and unsharded values.
         let (invariant, varying) = scalar_types();
         let mesh = invariant.sharding().unwrap().mesh().clone();
@@ -935,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_variation_alignment() {
+    fn test_manual_variation_alignment_align_manual_variation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let varying = ArrayType::scalar(DataType::F32)
@@ -963,32 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_variation_alignment_unbound_axis() {
-        // A trace that does not bind an axis name (e.g., the fresh trace of `Region` transposition) still aligns over
-        // it, using the mesh of the input whose type varies over the axis.
-        let (_, varying) = scalar_types();
-        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(left, right)| Add::add(&left, &right),
-            (ArrayType::scalar(DataType::F32), varying.clone()),
-        )
-        .unwrap();
-        assert_eq!(output, varying);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[], %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
-                let %2:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
-                    [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
-                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
-                        [axis_name=\"m\"] %2
-                    %4:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = add %3 %1
-                in (%4)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_manual_variation_alignment_mixed_ir() {
+    fn test_manual_variation_alignment_align_manual_variation_array_ir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
@@ -1015,7 +1071,32 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_variation_alignment_mixed_ir_preserves_positions() {
+    fn test_manual_variation_alignment_align_manual_variation_unbound_axis() {
+        // A trace that does not bind an axis name (e.g., the fresh trace of `Region` transposition) still aligns over
+        // it, using the mesh of the input whose type varies over the axis.
+        let (_, varying) = scalar_types();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| Add::add(&left, &right),
+            (ArrayType::scalar(DataType::F32), varying.clone()),
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %2
+                    %4:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = add %3 %1
+                in (%4)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_align_manual_variation_array_ir_preserves_positions() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
@@ -1046,12 +1127,14 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f32[], %1:dimension<extent ∈ [1, 4)>, %2:f32[][sharding={mesh<['devices'=2:manual]>, [], \
-                    varying_manual={'devices'}}] .
-                let %3:f32[][sharding={mesh<['devices'=2:manual]>, []}] = broadcast \
-                    [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
-                    %4:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = parallel_vary \
-                        [axis_name=\"devices\"] %3
+                lambda \
+                    %0:f32[], \
+                    %1:dimension<extent ∈ [1, 4)>, \
+                    %2:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
+                let %3:f32[][sharding={mesh<['devices'=2:manual]>, []}] = \
+                        broadcast [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
+                    %4:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
+                        parallel_vary [axis_name=\"devices\"] %3
                 in (%4, %1, %2)"
             },
         );
