@@ -150,15 +150,19 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ## Enum-Level Attributes
 ///
-/// Every enum-level attribute is optional and may appear at most once. These are the supported enum-level attributes:
+/// Every enum-level attribute is optional and may appear at most once. Attributes may share one `#[ryft(...)]` list or
+/// be split across several, and `type(T)` and `constant(V)` may also be declared in separate lists. These are the
+/// supported enum-level attributes:
 ///
 /// | Attribute                                  | Default  | Role                                               |
 /// | ------------------------------------------ | -------- | -------------------------------------------------- |
 /// | `#[ryft(crate = "...")]`                   | `ryft`   | Path through which generated code names Ryft items |
-/// | `#[ryft(type = T, constant = V)]`          | inferred | Primary operation type and stored constant type    |
+/// | `#[ryft(type(T), constant(V))]`            | inferred | Primary operation type and stored constant type    |
 /// | `#[ryft(members(U [, structural(S)]...))]` | none     | Member universes the operation family declares     |
-/// | `#[ryft(dispatch(...))]`                   | none     | Optional transform dispatchers to generate         |
-/// | `#[ryft(identity)]`                        | none     | Payload-delegating `PartialEq`, `Eq`, and `Hash`   |
+/// | `#[ryft(dispatch(...))]`                   | none     | Optional identity and transform dispatchers        |
+///
+/// The earlier `#[ryft(identity)]`, `#[ryft(type = T)]`, and `#[ryft(constant = V)]` forms are rejected with
+/// diagnostics that name their `dispatch(identity)`, `type(T)`, and `constant(V)` replacements.
 ///
 /// ### Crate Path
 ///
@@ -172,10 +176,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// The operation type `T` is selected as follows:
 ///
 ///   - An enum whose stored values belong to a member type rather than its primary type may declare both contracts
-///     explicitly with `#[ryft(type = T, constant = C)]`. Here, `T` is the enum's primary operation type and `C` is
+///     explicitly with `#[ryft(type(T), constant(C))]`. Here, `T` is the enum's primary operation type and `C` is
 ///     the concrete value type stored as constants in programs using the enum. Both attributes must be supplied
-///     together. For example, a composite operation enum parameterized by an array-member value `A` can declare
-///     `#[ryft(type = CompositeType, constant = CompositeValue<A>)]` without adding a phantom composite-value generic.
+///     together, and each declares exactly one complete Rust type (e.g., a generic, qualified, or tuple type). For
+///     example, a composite operation enum parameterized by an array-member value `A` can declare
+///     `#[ryft(type(CompositeType), constant(CompositeValue<A>))]` without adding a phantom composite-value generic.
 ///     Composite families declare them explicitly because their stored constants live in a member universe, so no
 ///     single `Value<Type = T>` bound mentions the composite type the family's instructions actually flow.
 ///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T`
@@ -189,7 +194,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// The value types used for interpretation are inferred from the enum's `Value<Type = T>` generic parameters:
 ///
-///   - For an enum with an explicit `#[ryft(type = T, constant = C)]` declaration, `C` is the nested program's stored
+///   - For an enum with an explicit `#[ryft(type(T), constant(C))]` declaration, `C` is the nested program's stored
 ///     constant type. The derived interpretation implementation remains generic over the context's runtime value type
 ///     and requires the context to lift `C` into that runtime value type.
 ///   - For enums with one `Value<Type = T>` parameter, the payload parameter is treated as the nested program's
@@ -216,12 +221,14 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// marker's type is checked against the declaration, and (iii) the generated structural mixed forward-mode arm knows
 /// every computational universe an output may belong to.
 ///
-/// ### Transform Dispatchers
+/// ### Dispatchers
 ///
-/// `#[ryft(dispatch(...))]` selects the optional transform dispatchers, in any order:
+/// `#[ryft(dispatch(...))]` selects the optional dispatchers. They are accepted in any order, although by convention
+/// `identity` is typically listed first:
 ///
 /// | Token             | Generated Dispatcher                                                        |
 /// | ----------------- | --------------------------------------------------------------------------- |
+/// | `identity`        | Payload-delegating `PartialEq`, `Eq`, and `Hash` (see below)                |
 /// | `discharge`       | [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) |
 /// | `batching`        | [`BatchableOperation`](crate::BatchableOperation)                           |
 /// | `differentiation` | [`DifferentiableOperation`](crate::DifferentiableOperation)                 |
@@ -231,6 +238,15 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// evaluation implementations are always generated and therefore never appear in `dispatch(...)`. The selected
 /// dispatchers generate the following per-variant arms:
 ///
+///   - `identity` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of each
+///     variant, under which two operations are considered equal when they are the same variant with equal payloads, and
+///     the hash covers the variant and its payload. Unlike the standard derives, which bound every generic parameter
+///     by the derived trait, the generated implementations are bounded by the payload types themselves. A family is
+///     therefore comparable exactly when its payloads are, even when a payload needs a different bound on the family's
+///     value parameter (e.g., a [`ConstantOperation`](crate::ConstantOperation) payload, which compares its literal
+///     through [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that
+///     payloads must compare every attribute that affects their semantics or lowering, because consumers such as eager
+///     dispatch caches reuse compiled programs for equal operations.
 ///   - `discharge` delegates native variants to the payload's own
 ///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
 ///     member variant and every bare generic extension variant as the complete enum through
@@ -243,12 +259,19 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     exclude a capture-lifted program, whose constants name its caller's captures rather than carrying the family's
 ///     values.
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
-///     implementation, batches projected variants in either role through
-///     [`batch_projected_operation`](crate::batch_projected_operation) under the policy projection named by
-///     [`BatchingPolicyProjection`](crate::BatchingPolicyProjection), and dispatches mixed variants in either role to
-///     the payload's parent-universe [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. A
-///     family whose constant type is inferred stays generic over its array batching mode, while an explicitly declared
-///     family uses the canonical policy named by [`BatchableType`](crate::BatchableType).
+///     implementation and dispatches mixed variants in either role to the payload's parent-universe
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy
+///     projection named by [`BatchingPolicyProjection`](crate::BatchingPolicyProjection): computational projected
+///     variants apply the payload's member batching rule through
+///     [`batch_projected_operation`](crate::batch_projected_operation), while structural projected variants bind the
+///     payload once in the parent context through
+///     [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation). The structural path
+///     requires the projected policy to implement [`ReplicatedBatchingPolicy`](crate::ReplicatedBatchingPolicy) and
+///     the payload to be region-free, and it reports default evidence; the payload family needs no batching rules of
+///     its own. A structural role alone never implies replication, so a family whose projected policy has not opted
+///     in fails to satisfy the generated implementation's bounds. A family whose constant type is inferred stays
+///     generic over its array batching mode, while an explicitly declared family uses the canonical policy named
+///     by [`BatchableType`](crate::BatchableType).
 ///   - `differentiation` delegates native variants to the payload's own forward-mode rule and computational member
 ///     variants to [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation), and generates the
 ///     structural arms described under [Variant Classes](#variant-classes) directly.
@@ -256,18 +279,6 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [`transpose_mixed_operation`](crate::transpose_mixed_operation), and computational projected variants to
 ///     [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural projected variant contributes
 ///     no cotangents.
-///
-/// ### Operation Identity
-///
-/// `#[ryft(identity)]` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of
-/// each variant, under which two operations are considered equal when they are the same variant with equal payloads,
-/// and the hash covers the variant and its payload. Unlike the standard derives, which bound every generic parameter by
-/// the derived trait, the generated implementations are bounded by the payload types themselves. A family is therefore
-/// comparable exactly when its payloads are, even when a payload needs a different bound on the family's value
-/// parameter (e.g., a [`ConstantOperation`](crate::ConstantOperation) payload, which compares its literal through
-/// [`LiteralIdentity`](crate::LiteralIdentity)). Operation identity must be _faithful_, meaning that payloads must
-/// compare every attribute that affects their semantics or lowering, because consumers such as eager dispatch caches
-/// reuse compiled programs for equal operations.
 ///
 /// ## Variant Classes
 ///
@@ -367,7 +378,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
 ///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
 ///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
-///     [`#[ryft(dispatch(...))]`](#transform-dispatchers).
+///     [`#[ryft(dispatch(...))]`](#dispatchers).
 ///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
 ///     indentation, so that the enum display matches the canonical program rendering format.
 ///   - `From<Payload> for Enum` conversions for concrete payload variants.
@@ -442,7 +453,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
-/// #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
+/// #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
 /// #[ryft(members(ArrayType, structural(DimensionType)))]
 /// enum CompositeOperation<A: Value<Type = ArrayType>> {
 ///     /// Mixed structural constructor whose inputs are the stored type's dynamic extents, its data universe

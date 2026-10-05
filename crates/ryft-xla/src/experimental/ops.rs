@@ -404,9 +404,13 @@ impl AssertionValue for XlaConstant {
 /// stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero and
 /// residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
 #[derive(Clone, Debug, ryft_macros::Operation)]
-#[ryft(crate = "ryft_core", type = ArrayIrType, constant = Constant)]
-#[ryft(members(ArrayType, structural(DimensionType)))]
-#[ryft(identity, dispatch(discharge, batching, differentiation, transposition))]
+#[ryft(
+    crate = "ryft_core",
+    type(ArrayIrType),
+    constant(Constant),
+    members(ArrayType, structural(DimensionType)),
+    dispatch(identity, discharge, batching, differentiation, transposition)
+)]
 pub enum XlaOperation<Constant = XlaConstant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1918,6 +1922,52 @@ mod tests {
         assert_eq!(evaluation.program().effects().classes(), EffectClasses::NONE);
         assert!(evaluation.program().instructions().is_empty());
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_xla_operation_batch_dimension_member() {
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, DimensionDivOperation,
+            DimensionOperation, EmptyRegionDriver,
+        };
+
+        // The first-class-dimension member family has no batching rules of its own, so the derived dispatcher binds a
+        // checked dimension division once in the parent trace under the replicated dimension policy. The staged
+        // division keeps its replicated inputs and its ordered zero-divisor assertion.
+        let dividend_type = DimensionType::new("dividend", DimensionBounds::new(0, Some(9)).unwrap());
+        let divisor_type = DimensionType::new("divisor", DimensionBounds::new(0, Some(5)).unwrap());
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let operation = XlaOperation::from(DimensionOperation::Div(DimensionDivOperation::new(
+                    &dividend_type,
+                    &divisor_type,
+                )?));
+                let (outputs, evidence) = operation
+                    .batch(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[ArrayIrBatch::replicated(inputs[0].clone()), ArrayIrBatch::replicated(inputs[1].clone())],
+                    )?
+                    .into_parts();
+                assert!(outputs.iter().all(|output| output.batch_axis().is_replicated()));
+                assert!(evidence.is_empty());
+                Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
+            },
+            vec![ArrayIrType::Dimension(dividend_type.clone()), ArrayIrType::Dimension(divisor_type.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<dividend ∈ [0, 9)>, %1:dimension<divisor ∈ [0, 5)> .
+                let %2:dimension<3> = const 3
+                    %3:dimension<dividend / divisor ∈ [0, 9)> = dimension_div [requires_runtime_assertion=true] %0 %1
+                in (%3)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 
     #[test]

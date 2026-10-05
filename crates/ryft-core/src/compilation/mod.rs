@@ -107,7 +107,7 @@
 //! application of the same operation and the relevant comparison is with _executing_ one small operation rather than
 //! with compiling it. Backends that execute eager operations through compiled programs therefore key applications of
 //! operations directly to compiled programs in front of tracing and lowering, using the operation's identity (refer to
-//! the `#[ryft(identity)]` attribute of `#[derive(Operation)]`) together with the input types, like JAX's
+//! the `#[ryft(dispatch(identity))]` attribute of `#[derive(Operation)]`) together with the input types, like JAX's
 //! `(primitive, params)` dispatch cache. For example, the XLA backend keeps such a cache in each of its sessions.
 //!
 //! Cloned [`CompiledFunctionDispatcher`] handles share one cache, and the dispatcher is usable from multiple threads

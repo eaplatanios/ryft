@@ -3,8 +3,8 @@
 This crate currently provides three derive macros that are aimed at improving ergonomics for the `ryft` library:
 
 - **`#[derive(Operation)]`:** Generates the base operation, interpretation, and partial-evaluation dispatchers
-  for an operation enum. Optional batching, differentiation, and transposition dispatchers can be generated with
-  `#[ryft(dispatch(...))]`.
+  for an operation enum. Optional payload-delegating identity (`PartialEq`, `Eq`, and `Hash`), reference discharge,
+  batching, differentiation, and transposition dispatchers can be generated with `#[ryft(dispatch(...))]`.
 
 - **`#[derive(Parameter)]`:** Implements the marker trait `Parameter` for the annotated type. This is mainly
   a convenience macro for leaf parameter types. It can be applied to Rust containers supported by derive macros
@@ -46,8 +46,27 @@ enum BackendOperation<V: Value<Type = DataType>> {
 }
 ```
 
-Optional transform dispatchers can be generated with
-`#[ryft(dispatch(batching, differentiation, transposition))]`, as described above.
+Optional dispatchers can be generated with
+`#[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]`, as described above. Composite
+operation families whose stored constants belong to a member universe declare their operation and constant types
+explicitly, together with their member universes:
+
+```rust,ignore
+#[derive(Clone, Debug, Operation)]
+#[ryft(
+    type(ArrayIrType),
+    constant(ArrayIrValue<A>),
+    members(ArrayType, structural(DimensionType)),
+    dispatch(identity, batching, differentiation, transposition),
+)]
+enum CompositeOperation<A: Value<Type = ArrayType>> {
+    #[ryft(projected(ArrayType))]
+    Array(ArrayOperation<A>),
+
+    #[ryft(projected(DimensionType, structural))]
+    Dimension(DimensionOperation<DimensionValue>),
+}
+```
 
 ### `Parameter` and `Parameterized`
 

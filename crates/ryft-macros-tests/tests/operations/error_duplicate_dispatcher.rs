@@ -7,7 +7,7 @@ trait Value {
 }
 
 #[derive(ryft::Operation)]
-#[ryft(dispatch(batching, batching))]
+#[ryft(dispatch(identity, batching, identity))]
 enum BadOperation<V: Value<Type = DataType>> {
     Operation(PhantomData<V>),
 }

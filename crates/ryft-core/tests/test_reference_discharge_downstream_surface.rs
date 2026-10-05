@@ -2379,7 +2379,7 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
     // providers on the operation family lets it opt into ordinary gradients without an orphan-rule conflict.
     /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
     #[derive(Clone, Debug, ryft_macros::Operation)]
-    #[ryft(crate = "ryft_core", type = ArrayType, constant = Array, dispatch(differentiation, transposition))]
+    #[ryft(crate = "ryft_core", type(ArrayType), constant(Array), dispatch(differentiation, transposition))]
     enum ValueOnlyArrayOperation {
         Constant(ConstantOperation<Array>),
         Zero(ZeroOperation<ArrayType>),
@@ -2421,8 +2421,8 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
     #[derive(Clone, Debug, ryft_macros::Operation)]
     #[ryft(
         crate = "ryft_core",
-        type = ArrayIrType,
-        constant = ArrayIrValue<Array>,
+        type(ArrayIrType),
+        constant(ArrayIrValue<Array>),
         members(ArrayType),
         dispatch(differentiation, transposition),
     )]

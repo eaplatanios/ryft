@@ -6,8 +6,10 @@ trait Value {
     type Type;
 }
 
+struct Constant;
+
 #[derive(ryft::Operation)]
-#[ryft(type(DataType))]
+#[ryft(type = DataType, constant = Constant)]
 enum BadOperation<V: Value<Type = DataType>> {
     Operation(PhantomData<V>),
 }

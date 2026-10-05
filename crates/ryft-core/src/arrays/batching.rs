@@ -29,6 +29,7 @@ use crate::batching::{
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    ReplicatedBatchingPolicy,
 };
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
@@ -2042,11 +2043,15 @@ where
 /// [`BatchingPolicy`] used while a homogeneous first-class-dimension operation runs inside an array IR batching
 /// transform. A dimension is shared shape metadata and so its projected value is itself the complete batch carrier.
 /// Replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
-/// item would require a ragged array representation. The policy still carries the outer transform's first-class mapped
-/// extent and ragged-dimension evidence representation and so
-/// [`batch_projected_operation`](crate::batch_projected_operation) can construct one uniform projected batching context
-/// for every member kind without specializing either. A dimension rule never consumes a ragged dimension, and so its
-/// evidence is always empty.
+/// item would require a ragged array representation.
+///
+/// The policy is a [`ReplicatedBatchingPolicy`], and so composite dispatchers batch a dimension operation through
+/// [`batch_replicated_projected_operation`](crate::batch_replicated_projected_operation), which binds the operation
+/// once in the parent context: every batch item shares the same dimension, so one evaluation is the result for every
+/// batch item, and [`DimensionOperation`](crate::DimensionOperation) needs no batching rules of its own. The policy
+/// still shares the outer transform's first-class mapped extent and ragged-dimension evidence representations, because
+/// [`BatchingPolicyProjection`] requires projected policies to preserve both. A dimension operation never consumes a
+/// ragged dimension, and so its evidence is always empty.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ReplicatedDimensionBatchingPolicy;
 
@@ -2143,6 +2148,18 @@ where
             collapse_fn,
         )
     }
+}
+
+// Every dimension carrier is the replicated dimension value itself: `batch` rejects mapped axes, `batch_axis` always
+// reports replication, and there is no carrier metadata beyond the value. Binding a dimension operation once in the
+// parent context is therefore its batched application.
+impl<C: Context<Type = ArrayIrType>> ReplicatedBatchingPolicy<ProjectedContext<C, DimensionType>>
+    for ReplicatedDimensionBatchingPolicy
+where
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType>,
+{
 }
 
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayExtentBatchingPolicy`]. The default
@@ -4337,7 +4354,7 @@ mod tests {
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;
-    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy,
@@ -4347,10 +4364,10 @@ mod tests {
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
-        DimensionAddOperation, DimensionFromScalar, DimensionSize, DimensionToScalar, DimensionToScalarOperation,
-        DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation, NegOperation, OneLike, ParallelReduceOperation,
-        Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
+        DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionSize, DimensionToScalar,
+        DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation, NegOperation,
+        OneLike, ParallelReduceOperation, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -8126,6 +8143,120 @@ mod tests {
                     %9:f32[batch, 3] = transpose [permutation=[1, 0]] %2
                     %10:f32[batch, 3] = add %1 %9
                 in (%5, %8, %10)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_bind_dispatch_replicated_dimension_operations() -> Result<(), ProgramError> {
+        // Homogeneous dimension operations have no batching rules of their own. The composite dispatcher binds each
+        // one once in the parent context under the replicated dimension policy, so a zero-input constant produces a
+        // replicated dimension, and checked arithmetic keeps its single ordered assertion and its runtime failure
+        // rather than running once per batch item.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            ArrayIrEagerContext::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let [constant] = context
+            .bind(
+                ArrayIrOperation::<Array>::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(5)?,
+                ))),
+                Vec::new(),
+                &[],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(constant.batch().batch_axis(), BatchAxis::replicated());
+        assert!(matches!(constant.batch().value(), ArrayIrValue::Dimension(value) if value.extent() == 5));
+
+        // Checked division by a divisor that may be zero succeeds for a nonzero divisor and preserves the underlying
+        // failure for a zero divisor.
+        let dividend = DimensionValue::constant(7)?;
+        let maybe_zero = DimensionType::new("maybe_zero", DimensionBounds::new(0, Some(5))?);
+        let operation = ArrayIrOperation::<Array>::Dimension(DimensionOperation::Div(DimensionDivOperation::new(
+            dividend.r#type().as_ref(),
+            &maybe_zero,
+        )?));
+        let [quotient] = context
+            .bind(
+                operation.clone(),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(
+                        context.clone(),
+                        ArrayIrBatch::replicated(ArrayIrValue::Dimension(dividend.clone())),
+                    ),
+                    BatchingTracer::new(
+                        context.clone(),
+                        ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::new(maybe_zero.clone(), 2)?)),
+                    ),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(quotient.batch().batch_axis(), BatchAxis::replicated());
+        assert!(matches!(quotient.batch().value(), ArrayIrValue::Dimension(value) if value.extent() == 3));
+        let error = context
+            .bind(
+                operation,
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(ArrayIrValue::Dimension(dividend))),
+                    BatchingTracer::new(
+                        context.clone(),
+                        ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::new(maybe_zero.clone(), 0)?)),
+                    ),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "maybe_zero > 0; observed 7=7, maybe_zero=0".to_string(),
+            }),
+        );
+
+        // Under a trace with a symbolic extent, the checked division is staged exactly once in the parent program,
+        // with its replicated inputs and its ordered assertion intact, and no extent-dependent alignment.
+        let trace = ArrayIrTraceContext::new();
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::from(batch_variable).into());
+        let dividend_type = DimensionType::new("dividend", DimensionBounds::new(0, Some(9))?);
+        let dividend = trace.input(dividend_type.clone().into());
+        let divisor = trace.input(maybe_zero.clone().into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let [quotient] = context
+            .bind(
+                ArrayIrOperation::<Array>::Dimension(DimensionOperation::Div(DimensionDivOperation::new(
+                    &dividend_type,
+                    &maybe_zero,
+                )?)),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(dividend)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(divisor)),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(quotient.batch().batch_axis(), BatchAxis::replicated());
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![quotient.into_batch().into_value().atom_id()?],
+            vec![Placeholder, Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda \
+                    %0:dimension<batch ∈ [1, 9)>, \
+                    %1:dimension<dividend ∈ [0, 9)>, \
+                    %2:dimension<maybe_zero ∈ [0, 5)> .
+                let %3:dimension<dividend / maybe_zero ∈ [0, 9)> = dimension_div [requires_runtime_assertion=true] %1 %2
+                in (%3)
             "}
             .trim_end(),
         );

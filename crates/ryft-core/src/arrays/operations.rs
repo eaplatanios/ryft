@@ -1,14 +1,12 @@
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
-use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
@@ -65,7 +63,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 /// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
-#[ryft(identity, dispatch(batching, differentiation, transposition))]
+#[ryft(dispatch(identity, batching, differentiation, transposition))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation<ArrayType>),
@@ -231,7 +229,7 @@ impl<
 
 /// [`Operation`] family used for staged [`Program`](crate::Program)s over [`DimensionValue`]s.
 #[derive(Clone, Debug, Operation)]
-#[ryft(identity)]
+#[ryft(dispatch(identity))]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
     Max(DimensionMaxOperation),
@@ -243,32 +241,6 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Div(DimensionDivOperation),
     Rem(DimensionRemOperation),
     Pow(DimensionPowOperation),
-}
-
-// TODO(eaplatanios): Is this not supported by our `Operation` derive macro in some way?
-// Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
-// dimension is rejected by `ReplicatedDimensionBatchingPolicy` before this rule is called because representing
-// one extent per batch item would require a ragged value model.
-impl<
-    C: Context<
-            Type = ArrayIrType,
-            Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-            Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-            Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-        >,
-> BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
-    for DimensionOperation<DimensionValue>
-{
-    #[inline]
-    fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
-        &self,
-        context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
-        _driver: &D,
-        inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
-    ) -> Result<BatchedOutputs<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>, BatchingError>
-    {
-        Ok(context.parent().bind(self.clone(), Vec::new(), inputs)?.into())
-    }
 }
 
 /// Value-level capability bundle that groups every operation Ryft supports on first-class dimension values, so that
@@ -322,11 +294,10 @@ impl<
 /// a first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug, Operation)]
 #[ryft(
-    identity,
-    type = ArrayIrType,
-    constant = ArrayIrValue<A>,
+    type(ArrayIrType),
+    constant(ArrayIrValue<A>),
     members(ArrayType, structural(DimensionType)),
-    dispatch(discharge, batching, differentiation, transposition),
+    dispatch(identity, discharge, batching, differentiation, transposition),
 )]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are

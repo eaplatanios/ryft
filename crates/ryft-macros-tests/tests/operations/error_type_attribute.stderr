@@ -1,4 +1,4 @@
-error: explicit operation-family declarations must specify both 'type' and 'constant'
+error: explicit operation-family declarations must specify both `type(...)` and `constant(...)`
   --> tests/operations/error_type_attribute.rs:11:6
    |
 11 | enum BadOperation<V: Value<Type = DataType>> {

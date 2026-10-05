@@ -44,7 +44,8 @@ pub use batching::{
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
     BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
-    RecursiveBatchingPolicy, batch, batch_projected_operation,
+    RecursiveBatchingPolicy, ReplicatedBatchingPolicy, batch, batch_projected_operation,
+    batch_replicated_projected_operation,
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
@@ -282,7 +283,7 @@ pub(crate) mod tests {
     /// fixtures, the rule-marker fixtures for nested rule selection, conditional regions, and a retained linear call.
     /// All regions use the fixed `Array` value family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]
-    #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
+    #[ryft(type(ArrayType), constant(Array), dispatch(batching, differentiation, transposition))]
     pub(crate) enum TestArrayOperation {
         Constant(ConstantOperation<Array>),
         Zero(ZeroOperation<ArrayType>),
@@ -365,7 +366,7 @@ pub(crate) mod tests {
     /// universe explicit avoids treating a reference as an ordinary array or importing the complete production mixed
     /// operation catalog.
     #[derive(Clone, Debug, Operation)]
-    #[ryft(type = ArrayIrType, constant = ArrayIrValue<Array>, members(ArrayType))]
+    #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(ArrayType))]
     pub(crate) enum TestArrayIrOperation {
         Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
         #[ryft(projected(ArrayType))]

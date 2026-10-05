@@ -25,19 +25,18 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// behave like whichever payload it holds. It always generates the `Operation` implementation, the
 /// `InterpretableOperation` and `PartiallyEvaluatableOperation` dispatchers, an `OperationProjection` implementation
 /// per projected member variant, `Display`, and the owned `From<Payload>` plus borrowed `TryFrom<&Enum>` payload
-/// conversions. Batching, forward-mode differentiation, and transposition dispatchers, as well as the
-/// payload-delegating `PartialEq`, `Eq`, and `Hash` implementations of `#[ryft(identity)]`, are generated only when
-/// selected.
+/// conversions. Reference discharge, batching, forward-mode differentiation, and transposition dispatchers, as well as
+/// the payload-delegating `PartialEq`, `Eq`, and `Hash` implementations of `dispatch(identity)`, are generated only
+/// when selected.
 ///
 /// The `#[ryft(...)]` attribute surface is the following, where enum-level attributes are all optional:
 ///
 /// ```text
 /// // Enum level:
 /// #[ryft(crate = "...")]                     // Path used to name Ryft items; defaults to `ryft`.
-/// #[ryft(type = T, constant = V)]            // Primary operation type and stored constant type; inferred otherwise.
+/// #[ryft(type(T), constant(V))]              // Primary operation type and stored constant type; inferred otherwise.
 /// #[ryft(members(U [, structural(S)]...))]   // Member universes the operation family declares.
-/// #[ryft(dispatch(batching, differentiation, transposition))]
-/// #[ryft(identity)]                          // Payload-delegating `PartialEq`, `Eq`, and `Hash` implementations.
+/// #[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]
 ///
 /// // Variant level:
 /// #[ryft(projected(U [, structural]))]       // Every input and output of the instruction belongs to `U`.

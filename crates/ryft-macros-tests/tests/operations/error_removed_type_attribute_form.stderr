@@ -1,0 +1,5 @@
+error: the `type = ...` attribute form was replaced by `type(...)`
+  --> tests/operations/error_removed_type_attribute_form.rs:12:8
+   |
+12 | #[ryft(type = DataType, constant = Constant)]
+   |        ^^^^

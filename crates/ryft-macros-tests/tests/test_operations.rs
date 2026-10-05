@@ -1423,8 +1423,8 @@ impl<const MEMBER: u8>
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(
     crate = "crate",
-    type = ProjectedProgramType,
-    constant = ProjectedProgramValue<A>,
+    type(ProjectedProgramType),
+    constant(ProjectedProgramValue<A>),
 )]
 enum ProjectedProgramOperation<A: Value<Type = ProjectedMemberType<0>>> {
     #[ryft(projected(ProjectedMemberType<0>))]
@@ -1722,7 +1722,7 @@ fn test_operation_default_crate_path_is_ryft() {
 }
 
 #[derive(Clone, Debug, ryft::Operation)]
-#[ryft(identity)]
+#[ryft(dispatch(identity))]
 enum IdentityOperation<V: ryft::Value<Type = ryft::ArrayType>> {
     Zero(ryft::ZeroOperation<ryft::ArrayType>),
     Add(ryft::AddOperation<ryft::ArrayType>),
@@ -1780,6 +1780,49 @@ fn test_operation_generates_payload_identity() {
 /// ([`MemberOperation`](ryft::MemberOperation), the member zero constructor selected per output universe, and
 /// [`transpose_mixed_operation`](ryft::transpose_mixed_operation)) are defined over real member universes, and a
 /// stand-in could not pin how the real machinery classifies an interleaved input list.
+mod structural_batching {
+    use ryft::arrays::Array;
+    use ryft::{
+        ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, BatchableOperation, BatchingContext,
+        DimensionAddOperation, DimensionOperation, DimensionType, DimensionValue, EagerContext, EmptyRegionDriver,
+        Typed,
+    };
+
+    /// Operation family whose only member is the structural first-class-dimension family. That family has no batching
+    /// rules of its own, so the derived batching dispatcher must forward it through the projected policy's
+    /// replicated contract.
+    #[derive(Clone, Debug, ryft::Operation)]
+    #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>), members(structural(DimensionType)), dispatch(batching))]
+    enum StructuralBatchingOperation {
+        #[ryft(projected(DimensionType, structural))]
+        Dimension(DimensionOperation<DimensionValue>),
+    }
+
+    #[test]
+    fn test_operation_generates_structural_projected_batching() {
+        type Context = EagerContext<ArrayIrValue<Array>, StructuralBatchingOperation>;
+
+        // Replicated dimension inputs are bound once through the parent context, and the result is rebuilt as a
+        // replicated composite carrier with default evidence.
+        let three = DimensionValue::constant(3).unwrap();
+        let four = DimensionValue::constant(4).unwrap();
+        let operation = StructuralBatchingOperation::from(DimensionOperation::Add(
+            DimensionAddOperation::new(three.r#type().as_ref(), four.r#type().as_ref()).unwrap(),
+        ));
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::with_policy(Context::new(), extent);
+        let inputs = [
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(three)),
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(four)),
+        ];
+        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &inputs).unwrap().into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].batch_axis().is_replicated());
+        assert!(matches!(outputs[0].value(), ArrayIrValue::Dimension(value) if value.extent() == 7));
+        assert!(evidence.is_empty());
+    }
+}
+
 mod mixed_members {
     use ryft::arrays::Array;
     use ryft::{
@@ -2040,7 +2083,7 @@ mod mixed_members {
     /// Operation family with two declared member universes: computational arrays and structural first-class
     /// dimensions. Its mixed variants take their data universe from that declaration instead of naming it.
     #[derive(Clone, Debug, ryft::Operation)]
-    #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
+    #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
     #[ryft(members(ArrayType, structural(DimensionType)))]
     #[ryft(dispatch(differentiation, transposition))]
     enum MixedProgramOperation<A: Value<Type = ArrayType>> {
@@ -3407,8 +3450,8 @@ impl<T: Type, Constant: Clone, C: Domain<Type = T>, P: ReferenceDischargePolicy<
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(
     crate = "crate",
-    type = ProjectedProgramType,
-    constant = ProjectedProgramValue<A>,
+    type(ProjectedProgramType),
+    constant(ProjectedProgramValue<A>),
 )]
 #[ryft(dispatch(discharge))]
 enum DischargeableProjectedOperation<A: Value<Type = ProjectedMemberType<0>>> {
@@ -3614,7 +3657,6 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_conflicting_variant_classes.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
-    test_cases.compile_fail("tests/operations/error_duplicate_identity_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
@@ -3624,8 +3666,13 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_misplaced_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_mismatched_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_multiple_operation_types.rs");
+    test_cases.compile_fail("tests/operations/error_removed_constant_attribute_form.rs");
+    test_cases.compile_fail("tests/operations/error_removed_identity_attribute.rs");
     test_cases.compile_fail("tests/operations/error_removed_structural_variant_class.rs");
+    test_cases.compile_fail("tests/operations/error_removed_type_attribute_form.rs");
+    test_cases.compile_fail("tests/operations/error_structural_batching_without_replicated_policy.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_type_attribute_arguments.rs");
     test_cases.compile_fail("tests/operations/error_undeclared_variant_member_type.rs");
     test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_unsupported_variant_class.rs");

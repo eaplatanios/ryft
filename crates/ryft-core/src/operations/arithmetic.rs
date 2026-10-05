@@ -1472,6 +1472,7 @@ mod tests {
         Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
         Sharding, ShardingDimension, StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
+    use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError, differentiate_at,
@@ -1940,6 +1941,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty.add(&varying_empty), expected);
+    }
+
+    #[test]
+    fn test_tracer_add_manual_variation() {
+        // A capability for an operation with several inputs (here, `add`) aligns its inputs before binding, so the
+        // `parallel_vary` transition precedes the operation and the operation's inputs share their variation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |(left, right)| Add::add(&left, &right),
+            (invariant, varying.clone()),
+            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['devices'=2:manual]>, []}], \
+                    %1:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] .
+                let %2:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
+                    parallel_vary [axis_name=\"devices\"] %0
+                    %3:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = add %2 %1
+                in (%3)"
+            },
+        );
     }
 
     #[test]

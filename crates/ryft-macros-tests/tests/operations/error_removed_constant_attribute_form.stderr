@@ -1,0 +1,11 @@
+error: the `constant = ...` attribute form was replaced by `constant(...)`
+  --> tests/operations/error_removed_constant_attribute_form.rs:12:24
+   |
+12 | #[ryft(type(DataType), constant = Constant)]
+   |                        ^^^^^^^^
+
+error: explicit operation-family declarations must specify both `type(...)` and `constant(...)`
+  --> tests/operations/error_removed_constant_attribute_form.rs:13:6
+   |
+13 | enum BadOperation<V: Value<Type = DataType>> {
+   |      ^^^^^^^^^^^^

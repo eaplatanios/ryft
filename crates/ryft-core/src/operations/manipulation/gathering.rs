@@ -3323,7 +3323,7 @@ mod tests {
 
         /// Narrow family for staging gathers with abstract stored values.
         #[derive(Clone, Debug, ryft_macros::Operation)]
-        #[ryft(type = ArrayType, constant = ArrayType)]
+        #[ryft(type(ArrayType), constant(ArrayType))]
         enum AbstractGatherOperation {
             Gather(GatherOperation<ArrayType>),
         }

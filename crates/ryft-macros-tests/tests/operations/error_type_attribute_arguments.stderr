@@ -1,0 +1,5 @@
+error: `#[ryft(type(...))]` must declare exactly one type
+  --> tests/operations/error_type_attribute_arguments.rs:12:21
+   |
+12 | #[ryft(type(DataType, DataType), constant(Constant))]
+   |                     ^

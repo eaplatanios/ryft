@@ -1,0 +1,5 @@
+error: the `identity` attribute was replaced by the `dispatch(identity)` dispatcher
+  --> tests/operations/error_removed_identity_attribute.rs:10:8
+   |
+10 | #[ryft(identity)]
+   |        ^^^^^^^^
