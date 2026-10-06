@@ -1157,7 +1157,8 @@ impl_differentiable_operation! {
 /// let output = input.dynamic_reshape(&[rows, columns, depth]).unwrap();
 /// assert_eq!(output.r#type().to_string(), "f32[batch, 2, 3]");
 /// ```
-pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reshapes `self` with optional explicit output sharding. Supplying `None` is equivalent to
     /// [`Self::dynamic_reshape`]. Explicit placement resolves ambiguous input-to-output sharding changes
     /// and is attached to the reshape itself for backend lowering.
@@ -1196,12 +1197,12 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     ///     exact extents rather than capacity bounds. Inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>,
     {
         // Validate the requested geometry before staging any dimension constant, so that an invalid element count
         // leaves no dead dimension literals behind in a trace.
         let input_type = self.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         let output_shape = Shape::new(output_sizes.iter().map(|extent| Dimension::Static(*extent)).collect());
         infer_dynamic_reshape_output_type(input_type, output_shape, None)?;
         let output_dimensions = output_sizes
@@ -1216,11 +1217,12 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize + ValueProjection<DimensionType, Projected: Mul>,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>
+            + DimensionSize
+            + ValueProjection<DimensionType, Projected: Mul>,
     {
         let input_type = self.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         if input_type.rank() == 1 {
             return Ok(self.clone());
         }
@@ -1255,11 +1257,10 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
     fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant> + DimensionSize,
     {
         let input_type = self.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         let axis = axis
             .into()
             .normalize(input_type.rank() + 1)
@@ -1281,7 +1282,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     }
 }
 
-impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
+impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_reshape_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1309,7 +1310,7 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
 
 impl<
     V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>>,
-> DynamicReshape for V
+> DynamicReshape<ArrayIrType> for V
 {
     fn dynamic_reshape_with_output_sharding(
         &self,

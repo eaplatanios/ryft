@@ -524,31 +524,6 @@ pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     }
 }
 
-// TODO(eaplatanios): Should we move this (and its test) to the main impl block right under where `Sharding` is declared/defined?
-impl Sharding {
-    /// Returns this [`Sharding`] with its per-dimension [`ShardingDimension`](crate::ShardingDimension) entries
-    /// reordered so that output dimension `i` carries the entry of input dimension `permutation[i]`, while its
-    /// reduction-state and manual-axis sets are unchanged. This is the sharding-level analogue of [`Transpose`], which
-    /// uses it to transpose the sharding of an [`ArrayType`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError::Type`] if `permutation` is not a permutation of `0..rank`, where `rank` is the rank
-    /// of this [`Sharding`].
-    pub fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        let permutation = permutation.into().normalize(self.rank())?;
-        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
-            return Ok(self.clone());
-        }
-        let dimensions = permutation.iter().map(|axis| self.dimensions()[*axis].clone()).collect();
-        Sharding::new(self.mesh().clone(), dimensions)
-            .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
-            .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
-            .and_then(|sharding| sharding.with_varying_manual_axes(self.varying_manual_axes().clone()))
-            .map_err(|error| TypeError::invalid(error.to_string()).into())
-    }
-}
-
 impl Transpose for ArrayType {
     fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
         // Validate that `permutation` has length equal to the input rank and is a permutation of `0..rank` (i.e.,
@@ -620,6 +595,30 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl Sharding {
+    /// Returns this [`Sharding`] with its per-dimension [`ShardingDimension`](crate::ShardingDimension) entries
+    /// reordered so that output dimension `i` carries the entry of input dimension `permutation[i]`, while its
+    /// reduction-state and manual-axis sets are unchanged. This is the sharding-level analogue of [`Transpose`],
+    /// which uses it to transpose the sharding of an [`ArrayType`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] if `permutation` is not a permutation of `0..rank`, where `rank` is the rank
+    /// of this [`Sharding`].
+    pub fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        let permutation = permutation.into().normalize(self.rank())?;
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
+            return Ok(self.clone());
+        }
+        let dimensions = permutation.iter().map(|axis| self.dimensions()[*axis].clone()).collect();
+        Sharding::new(self.mesh().clone(), dimensions)
+            .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
+            .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
+            .and_then(|sharding| sharding.with_varying_manual_axes(self.varying_manual_axes().clone()))
+            .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -1690,42 +1689,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_transpose() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained, ShardingDimension::Replicated],
-        )
-        .unwrap();
-        assert_eq!(
-            sharding.transpose([2, 0, 1]),
-            Ok(Sharding::new(
-                mesh,
-                vec![
-                    ShardingDimension::Replicated,
-                    ShardingDimension::sharded(["x"]),
-                    ShardingDimension::Unconstrained,
-                ],
-            )
-            .unwrap()),
-        );
-        // Direct sharding transposition validates the complete permutation even when duplicate axes refer to
-        // replicated or unconstrained dimensions.
-        assert_eq!(
-            sharding.transpose([1, 1, 0]),
-            Err(ProgramError::Type(TypeError::invalid("permutation contains duplicate axis 1"))),
-        );
-        assert_eq!(
-            sharding.transpose([0, 1]),
-            Err(ProgramError::Type(TypeError::invalid("permutation has length 2 but input has rank 3"))),
-        );
-        assert_eq!(
-            sharding.transpose([0, 1, 3]),
-            Err(ProgramError::Type(TypeError::invalid("permutation axis 3 is out of bounds"))),
-        );
-    }
-
-    #[test]
     fn test_array_type_transpose() {
         assert_eq!(
             ArrayType::new_static(DataType::F32, [2, 3]).transpose([1, 0]),
@@ -1885,6 +1848,43 @@ mod tests {
         assert_eq!(
             matrix.transpose(vec![0, 0]),
             Err(ProgramError::Type(TypeError::invalid("permutation contains duplicate axis 0"))),
+        );
+    }
+
+    #[test]
+    fn test_sharding_transpose() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained, ShardingDimension::Replicated],
+        )
+        .unwrap();
+        assert_eq!(
+            sharding.transpose([2, 0, 1]),
+            Ok(Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::Replicated,
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::Unconstrained,
+                ],
+            )
+            .unwrap()),
+        );
+
+        // Direct sharding transposition validates the complete permutation even when duplicate axes refer to
+        // replicated or unconstrained dimensions.
+        assert_eq!(
+            sharding.transpose([1, 1, 0]),
+            Err(ProgramError::Type(TypeError::invalid("permutation contains duplicate axis 1"))),
+        );
+        assert_eq!(
+            sharding.transpose([0, 1]),
+            Err(ProgramError::Type(TypeError::invalid("permutation has length 2 but input has rank 3"))),
+        );
+        assert_eq!(
+            sharding.transpose([0, 1, 3]),
+            Err(ProgramError::Type(TypeError::invalid("permutation axis 3 is out of bounds"))),
         );
     }
 }

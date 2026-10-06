@@ -213,6 +213,7 @@ pub use trigonometric::{
 /// [`Gather`]) keep handwritten implementations and use the bare attribute.
 ///
 /// ```rust
+/// # extern crate ryft_core as ryft;
 /// # use ryft_core::{Array, ArrayIrType, ArrayIrValue, ArrayType, Capability, ProgramError};
 /// # use ryft_macros::capability;
 ///
