@@ -51,8 +51,9 @@ pub use assertions::{
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveOperations, ManualVariationAlignment,
-    PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelPermute,
-    ParallelPermuteOperation, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
+    PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
+    ParallelRaggedAllToAllOperation, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use complex::{

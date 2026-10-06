@@ -1,9 +1,3 @@
-//! Contains the named-axis [`ParallelAllToAllOperation`], which exchanges chunks between the participants along a named
-//! axis, together with its interpretation, partial-evaluation, batching, forward-mode differentiation, and
-//! transposition rules.
-
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Display;
 
 use ryft_macros::capability;
@@ -54,40 +48,42 @@ use crate::tracing::{Tracer, TracingContext};
 /// Canonical operation name for [`ParallelAllToAllOperation`].
 pub const PARALLEL_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_all_to_all";
 
-/// [`Operation`] that exchanges chunks between participants along a named axis. Within each ordered participant
-/// group, every sender splits its input along `split_axis`; receiver `i` gets chunk `i` from every sender, in group
-/// order. The [`CollectiveMode`] of its [`CollectiveOptions`] determines the shape over a group of `n` participants:
+// TODO(eaplatanios): Review from here onwards.
+
+/// [`Operation`] that exchanges chunks between participants along a named axis. Within each ordered participant group,
+/// every sender splits its input along `split_axis` and receiver `i` gets chunk `i` from every sender, in group order.
+/// The [`CollectiveMode`] of its [`CollectiveOptions`] determines the shape over a group of `n` participants:
 ///
 ///   - [`CollectiveMode::Untiled`] requires extent `n` at `split_axis`, removes that input axis, and inserts extent
 ///     `n` at `concat_axis` in the output. Each receiver gets one slice from each sender along the inserted axis.
 ///   - [`CollectiveMode::Tiled`] requires the split extent to be divisible by `n`. It divides that extent by `n` and
-///     multiplies the concatenation extent by `n`; when the axes coincide, the shape is unchanged.
+///     multiplies the concatenation extent by `n`. When the axes coincide, the shape is unchanged.
 ///
-/// Both modes preserve rank and element data type. This is the analogue of
-/// [`jax.lax.all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html); tiled exchanges lower
+/// Both modes preserve rank and element data type. This is the Ryft analogue of JAX's
+/// [`jax.lax.all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html). Tiled exchanges lower
 /// directly to StableHLO's [`all_to_all`](https://openxla.org/stablehlo/spec#all_to_all), while untiled exchanges
 /// insert and remove singleton dimensions around it. The collective is linear; its transpose swaps the split and
 /// concatenation axes and retains the mode and ordered participant groups.
 ///
 /// An exchange over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
 /// [`ParallelAllToAll::parallel_all_to_all_with_options`] supplies the mesh automatically from the enclosing manual
-/// region, making an invariant input varying first. Such an exchange can give the receivers different values, so
-/// its input must vary over the axis (refer to [`ParallelVary`]) and its output varies over it too. A pending sum
-/// over that axis is rejected; sums over unrelated manual axes are preserved. An ordinary exchange carries no mesh
-/// and preserves the input's mesh variation and pending sums, even when its input carries a manual mesh axis with
-/// the same name, because a `batch` level whose axis name shadows that mesh axis may bind it instead. Type
-/// inference in the homogeneous array family requires static extents; the composite array/dimension family uses
-/// explicit result extents, with runtime assertions for dynamic split divisibility and untiled split size.
+/// region, making an invariant input varying first. Such an exchange can give the receivers different values, so its
+/// input must vary over the axis (refer to [`ParallelVary`]) and its output varies over it too. A pending sum over that
+/// axis is rejected; sums over unrelated manual axes are preserved. An ordinary exchange carries no mesh and preserves
+/// the input's mesh variation and pending sums, even when its input carries a manual mesh axis with the same name,
+/// because a `batch` level whose axis name shadows that mesh axis may bind it instead. Type inference in the
+/// homogeneous array family requires static extents; the composite array/dimension family uses explicit result
+/// extents, with runtime assertions for dynamic split divisibility and untiled split size.
 ///
 /// A matching `batch` level consumes the named axis of an ordinary exchange with a local reshape/transpose block
-/// exchange. Batch item `i` receives every item's chunk `i`, in sender order. A replicated input is broadcast
-/// before the exchange, since receivers can still get different chunks. Participant groups and exchanges over a
-/// manual mesh axis are unsupported at a matching level. Outside any binder, a single-participant tiled exchange is
-/// the identity; untiled mode relocates its size-one split axis to the concatenation position.
+/// exchange. Batch item `i` receives every item's chunk `i`, in sender order. A replicated input is broadcast before
+/// the exchange, since receivers can still get different chunks. Participant groups and exchanges over a manual mesh
+/// axis are unsupported at a matching level. Outside any binder, a single-participant tiled exchange is the identity;
+/// untiled mode relocates its size-one split axis to the concatenation position.
 ///
-/// Bounded ragged inputs are rejected. One extent per item does not determine how each sender partitions its live
-/// prefix among receivers; that requires the explicit offsets and per-destination sizes of
-/// [`ParallelRaggedAllToAllOperation`](crate::operations::collectives::ParallelRaggedAllToAllOperation).
+/// Bounded ragged inputs are rejected. One extent per item does not determine how each sender partitions
+/// its live prefix among receivers; that requires the explicit offsets and per-destination sizes of
+/// [`ParallelRaggedAllToAllOperation`](crate::ParallelRaggedAllToAllOperation).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelAllToAllOperation {
     /// Axis name referenced by this collective.
@@ -103,7 +99,7 @@ pub struct ParallelAllToAllOperation {
     /// Axis of the output along which the received chunks are concatenated.
     concat_axis: usize,
 
-    /// Shared rank and participant-group semantics.
+    /// [`CollectiveOptions`] of this [`ParallelAllToAllOperation`].
     options: CollectiveOptions,
 
     /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
