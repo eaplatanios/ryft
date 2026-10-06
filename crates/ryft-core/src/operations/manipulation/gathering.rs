@@ -38,8 +38,8 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// Determines how [`Gather`] handles windows extending outside its input. Negative indices are out of bounds and they
@@ -1844,14 +1844,13 @@ where
     }
 }
 
-// A composite tracer gathers through its array view. The capability's stored-constant parameter precedes its universe,
-// which the shared projection macro cannot express, and so this projection and the concrete one below are written out.
+// Composite values gather through their array views. The capability's stored-constant parameter precedes its universe,
+// which the shared projection macro cannot express, and so this projection is written out. It covers composite tracers
+// and concrete composite values alike.
 impl<
     Stored: Value<Type = ArrayType>,
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Gather<Stored, ArrayType>>,
 > Gather<Stored, ArrayIrType> for V
-where
-    ProjectedValue<ArrayType, V>: Gather<Stored, ArrayType>,
 {
     #[inline]
     fn gather(
@@ -1864,23 +1863,6 @@ where
         let input = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         let indices = ValueProjection::<ArrayType>::into_projected(indices.clone())?;
         Ok(V::from_projected(input.gather(&indices, dimensions, slice_sizes, options)?))
-    }
-}
-
-impl<Stored: Value<Type = ArrayType>, A: Gather<Stored, ArrayType> + Value<Type = ArrayType>>
-    Gather<Stored, ArrayIrType> for ArrayIrValue<A>
-{
-    #[inline]
-    fn gather(
-        &self,
-        indices: &Self,
-        dimensions: &GatherDimensionNumbers,
-        slice_sizes: &[usize],
-        options: &GatherOptions<Stored>,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
-        Ok(Self::Array(input.gather(indices, dimensions, slice_sizes, options)?))
     }
 }
 

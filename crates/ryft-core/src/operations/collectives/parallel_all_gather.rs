@@ -1018,12 +1018,12 @@ where
         + Assert
         + DimensionSize<V>
         + ValueProjection<DimensionType>
-        + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<ParallelAllGatherOperation>,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
-    ProjectedValue<ArrayType, V>: ParallelVary,
+    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
     fn parallel_all_gather_with_options(
         &self,

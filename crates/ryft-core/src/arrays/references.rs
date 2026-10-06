@@ -359,8 +359,10 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     }
 
     /// Returns a handle to the same allocation and view whose handle-local type identities are renamed by `renaming`,
-    /// which applies in both directions. The renamed handle compares equal to this one.
-    pub(crate) fn rename_type_identities(
+    /// which applies in both directions. The renamed handle compares equal to this one. Backend values that wrap
+    /// [`ArrayReference`]s (e.g., to bind them to a session) need this function to implement
+    /// [`Value::rename_type_identities`]. It never reads or locks the referent.
+    pub fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {

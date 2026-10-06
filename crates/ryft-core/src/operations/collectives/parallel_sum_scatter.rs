@@ -906,10 +906,8 @@ impl<
         > + Assert
         + DimensionSize<V>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>>
-        + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        + ValueProjection<ArrayType, Projected: ParallelVary>,
 > ParallelSumScatter<ArrayIrType> for V
-where
-    ProjectedValue<ArrayType, V>: ParallelVary,
 {
     fn parallel_sum_scatter_with_options(
         &self,

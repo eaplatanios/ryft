@@ -74,7 +74,7 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, Complex, DataType, Dimension, Shape, ShardingDimension,
+    ArrayType, Complex, DataType, Dimension, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -94,8 +94,7 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -773,12 +772,8 @@ impl<
 }
 
 // Composite values sort through their array views. Sorting has no receiver, which the shared projection macro cannot
-// express, and so this projection and the concrete one below are written out.
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
-    Sort<ArrayIrType> for V
-where
-    ProjectedValue<ArrayType, V>: Sort<ArrayType>,
-{
+// express, and so this projection is written out. It covers composite tracers and concrete composite values alike.
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Sort<ArrayType>>> Sort<ArrayIrType> for V {
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
         axis: A,
@@ -790,28 +785,8 @@ where
             .iter()
             .map(|input| ValueProjection::<ArrayType>::into_projected(input.clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs =
-            ProjectedValue::<ArrayType, V>::sort_with_ordering(&inputs, axis, key_count, direction, ordering)?;
+        let outputs = V::Projected::sort_with_ordering(&inputs, axis, key_count, direction, ordering)?;
         Ok(outputs.into_iter().map(V::from_projected).collect())
-    }
-}
-
-impl<A: Value<Type = ArrayType> + Sort<ArrayType>> Sort<ArrayIrType> for ArrayIrValue<A> {
-    fn sort_with_ordering<AxisValue: Into<Axis>>(
-        inputs: &[Self],
-        axis: AxisValue,
-        key_count: usize,
-        direction: SortDirection,
-        ordering: SortOrdering,
-    ) -> Result<Vec<Self>, ProgramError> {
-        let inputs = inputs
-            .iter()
-            .map(|input| ValueProjection::<ArrayType>::into_projected(input.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(A::sort_with_ordering(&inputs, axis, key_count, direction, ordering)?
-            .into_iter()
-            .map(Self::Array)
-            .collect())
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -343,7 +343,10 @@ impl<'c> XlaSession<'c> {
     /// Returns [`XlaDomainError::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
     /// failure is retained, so every later call returns the same error.
     pub fn target(&self) -> Result<&XlaTarget, XlaDomainError> {
-        self.target.get_or_init(|| XlaTarget::from_client(self.client)).as_ref().map_err(|error| error.clone().into())
+        self.target
+            .get_or_init(|| XlaTarget::from_client(self.client))
+            .as_ref()
+            .map_err(|error| error.clone().into())
     }
 
     /// Returns the shared compilation cache.
@@ -1494,6 +1497,9 @@ impl<'c> XlaDomain<'c> {
         let region_ids = driver.import_into(&builder, &region_input_types)?;
         let output_atoms = {
             let mut builder = builder.borrow_mut();
+            // A dimension constant defines its value's dimension identity, which may be defined only once per region,
+            // so repeated dimension inputs (equal by value, and hence by identity) share one constant instruction.
+            let mut dimension_atoms = HashMap::new();
             let input_atoms = inputs
                 .iter()
                 .map(|input| match input {
@@ -1501,9 +1507,18 @@ impl<'c> XlaDomain<'c> {
                         Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
                     }
                     ArrayIrValue::Dimension(dimension) => {
+                        if let Some(&atom) = dimension_atoms.get(dimension) {
+                            return Ok(atom);
+                        }
                         let operation = DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
-                        Ok(builder.add_instruction(XlaOperation::Dimension(operation), Vec::new(), Vec::new(), None)?
-                            [0])
+                        let atom = builder.add_instruction(
+                            XlaOperation::Dimension(operation),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        )?[0];
+                        dimension_atoms.insert(dimension, atom);
+                        Ok(atom)
                     }
                     ArrayIrValue::Reference(_) => {
                         unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
@@ -4282,11 +4297,9 @@ impl<'c> XlaDomain<'c> {
                 let replacements = replacement_transactions
                     .iter()
                     .map(|(logical_output_index, _)| {
-                        hidden_outputs
-                            .remove(logical_output_index)
-                            .ok_or_else(|| {
-                                ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
-                            })
+                        hidden_outputs.remove(logical_output_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
+                        })
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 if !hidden_outputs.is_empty() {
@@ -4346,13 +4359,8 @@ impl<'c> XlaDomain<'c> {
                         reason: "injected failure before public output reconstruction".to_string(),
                     });
                 }
-                let public_outputs = reconstruct_compiled_outputs(
-                    self,
-                    program,
-                    &mut physical_outputs,
-                    fence,
-                    0..program.output_count,
-                )?;
+                let public_outputs =
+                    reconstruct_compiled_outputs(self, program, &mut physical_outputs, fence, 0..program.output_count)?;
                 validate_compiled_output_refinements(
                     program,
                     &input_refinements,
@@ -4366,10 +4374,7 @@ impl<'c> XlaDomain<'c> {
                     .into());
                 }
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
-                Request::reconstruct(
-                    &executable,
-                    public_outputs.into_iter().map(ArrayIrValue::Array).collect(),
-                )
+                Request::reconstruct(&executable, public_outputs.into_iter().map(ArrayIrValue::Array).collect())
             })();
             Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
         })();
@@ -4980,7 +4985,11 @@ impl<'c> XlaDomain<'c> {
         if metadata.device_kinds != target.mesh_device_kinds(&mesh)? {
             return Ok(None);
         }
-        if mesh.devices().iter().any(|device| target.device(device.id()).is_none_or(|live| live.device != *device)) {
+        if mesh
+            .devices()
+            .iter()
+            .any(|device| target.device(device.id()).is_none_or(|live| live.device != *device))
+        {
             return Ok(None);
         }
         let (input_types, output_types) = metadata.signature.decode()?;
@@ -6606,11 +6615,8 @@ impl<'c> XlaDomain<'c> {
             }
         }
         let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
-        let mut reservation = if program.signature.has_effects() {
-            Some(self.effect_scope.reserve(device)?)
-        } else {
-            None
-        };
+        let mut reservation =
+            if program.signature.has_effects() { Some(self.effect_scope.reserve(device)?) } else { None };
         if let Some(reservation) = &reservation {
             if ordered {
                 let predecessor = reservation
@@ -14856,6 +14862,24 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_bind_shares_one_constant_for_repeated_dimension_inputs() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain();
+        let vector = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
+        let two = DimensionValue::constant(2).unwrap();
+        let inputs =
+            [ArrayIrValue::Array(vector), ArrayIrValue::Dimension(two.clone()), ArrayIrValue::Dimension(two.clone())];
+        let output = domain.bind(DynamicReshapeOperation::new(), Vec::new(), &inputs).unwrap().remove(0);
+        let output = program_array(&output);
+        assert_eq!(output.shape().as_slice(), &[2, 2]);
+        assert_eq!(read_f32s(&client, output), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
     fn test_eager_dispatch_cache_keys_attached_regions_structurally() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -15067,7 +15091,9 @@ mod tests {
                 branch(XlaOperation::Array(AddOperation::new().into())),
                 branch(XlaOperation::Array(MulOperation::new().into())),
             ];
-            domain.bind(XlaOperation::Condition(ConditionOperation::new()), branches, &condition_inputs).unwrap();
+            domain
+                .bind(XlaOperation::Condition(ConditionOperation::new()), branches, &condition_inputs)
+                .unwrap();
         });
 
         let array_type = ArrayIrType::Array(input.r#type().into_owned());
@@ -15083,8 +15109,9 @@ mod tests {
         let options = XlaOptions::new(mesh.clone());
         let lowered = domain.lower_xla_program(&program, 0, &options).unwrap();
         let key = domain.compilation_key(&lowered).unwrap();
-        let compiled =
-            domain.compilation_context().get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered));
+        let compiled = domain
+            .compilation_context()
+            .get_or_compile(&domain, key.clone(), || domain.compile_xla_program(&lowered));
         let compiled = compiled.unwrap();
         measure("stage: trace one-instruction program", &mut || {
             trace();

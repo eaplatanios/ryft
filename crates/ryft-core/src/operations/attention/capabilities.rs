@@ -129,13 +129,12 @@ where
     }
 }
 
-// A composite tracer computes attention through the array views of its inputs. Attention takes its inputs as one
+// Composite values compute attention through the array views of their inputs. Attention takes its inputs as one
 // `AttentionInputs` structure without a receiver, which the shared projection macro cannot express, and so this
-// projection and the concrete one below are written out.
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
-    DotProductAttention<ArrayIrType> for V
+// projection is written out. It covers composite tracers and concrete composite values alike.
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> DotProductAttention<ArrayIrType> for V
 where
-    ProjectedValue<ArrayType, V>: DotProductAttention<ArrayType>,
+    V::Projected: DotProductAttention<ArrayType>,
 {
     fn dot_product_attention(
         inputs: AttentionInputs<Self>,
@@ -144,21 +143,8 @@ where
         let inputs = inputs.try_map_parameters(|input| {
             ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)
         })?;
-        let (output, residual) = ProjectedValue::<ArrayType, V>::dot_product_attention(inputs, configuration)?;
+        let (output, residual) = V::Projected::dot_product_attention(inputs, configuration)?;
         Ok((V::from_projected(output), residual.map(V::from_projected)))
-    }
-}
-
-impl<A: Value<Type = ArrayType> + DotProductAttention<ArrayType>> DotProductAttention<ArrayIrType> for ArrayIrValue<A> {
-    fn dot_product_attention(
-        inputs: AttentionInputs<Self>,
-        configuration: AttentionConfiguration,
-    ) -> Result<(Self, Option<Self>), ProgramError> {
-        let inputs = inputs.try_map_parameters(|input| {
-            ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)
-        })?;
-        let (output, residual) = A::dot_product_attention(inputs, configuration)?;
-        Ok((Self::Array(output), residual.map(Self::Array)))
     }
 }
 

@@ -36,8 +36,8 @@ use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue, RegionInterface, TypeError,
-    Typed, Value, ValueProjection,
+    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueProjection,
 };
 
 mod batching;

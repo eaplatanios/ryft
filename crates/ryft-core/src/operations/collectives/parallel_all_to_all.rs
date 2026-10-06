@@ -938,12 +938,12 @@ where
         + Assert
         + DimensionSize<V>
         + ValueProjection<DimensionType>
-        + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+        + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<ParallelAllToAllOperation>,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Rem + Div + Mul,
-    ProjectedValue<ArrayType, V>: ParallelVary,
+    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
     fn parallel_all_to_all_with_options(
         &self,

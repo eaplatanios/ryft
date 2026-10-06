@@ -4,8 +4,8 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
+    ArrayType, LogicalMesh, MeshAxisType, RaggedAxis, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -27,8 +27,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -528,18 +527,6 @@ impl ParallelPermute<ArrayType> for Array {
     }
 }
 
-impl<A: Value<Type = ArrayType> + ParallelPermute<ArrayType>> ParallelPermute<ArrayIrType> for ArrayIrValue<A> {
-    #[inline]
-    fn parallel_permute(
-        &self,
-        axis_name: &str,
-        source_target_pairs: Vec<(usize, usize)>,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        Ok(Self::Array(input.parallel_permute(axis_name, source_target_pairs)?))
-    }
-}
-
 impl<
     V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
         + ParallelVary,
@@ -576,10 +563,8 @@ impl<
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: ParallelPermute<ArrayType>>>
     ParallelPermute<ArrayIrType> for V
-where
-    ProjectedValue<ArrayType, V>: ParallelPermute<ArrayType>,
 {
     #[inline]
     fn parallel_permute(

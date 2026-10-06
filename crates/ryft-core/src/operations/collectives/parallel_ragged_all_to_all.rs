@@ -11,7 +11,7 @@ use ryft_macros::capability;
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LogicalMesh, Shape, Sharding, ShardingDimension,
+    ArrayType, DataType, Dimension, DimensionVariable, LogicalMesh, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
@@ -52,9 +52,8 @@ use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
-    OperationProvider, ProgramError, ProjectedValue, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming,
-    Typed, Value, ValueProjection, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1639,59 +1638,8 @@ where
     }
 }
 
-// A concrete composite value performs the collective through its array member.
-impl<A: Value<Type = ArrayType> + ParallelRaggedAllToAll<ArrayType>> ParallelRaggedAllToAll<ArrayIrType>
-    for ArrayIrValue<A>
-{
-    fn parallel_ragged_all_to_all(
-        &self,
-        axis_name: &str,
-        output: &Self,
-        input_offsets: &Self,
-        send_sizes: &Self,
-        output_offsets: &Self,
-        receive_sizes: &Self,
-    ) -> Result<Self, ProgramError> {
-        let project = |input: &Self| ValueProjection::<ArrayType>::into_projected(input.clone());
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(project(self)?.parallel_ragged_all_to_all(
-            axis_name,
-            &project(output)?,
-            &project(input_offsets)?,
-            &project(send_sizes)?,
-            &project(output_offsets)?,
-            &project(receive_sizes)?,
-        )?))
-    }
-
-    fn parallel_ragged_all_to_all_with_axis_index_groups(
-        &self,
-        axis_name: &str,
-        output: &Self,
-        input_offsets: &Self,
-        send_sizes: &Self,
-        output_offsets: &Self,
-        receive_sizes: &Self,
-        axis_index_groups: Vec<Vec<usize>>,
-    ) -> Result<Self, ProgramError> {
-        let project = |input: &Self| ValueProjection::<ArrayType>::into_projected(input.clone());
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(
-            project(self)?.parallel_ragged_all_to_all_with_axis_index_groups(
-                axis_name,
-                &project(output)?,
-                &project(input_offsets)?,
-                &project(send_sizes)?,
-                &project(output_offsets)?,
-                &project(receive_sizes)?,
-                axis_index_groups,
-            )?,
-        ))
-    }
-}
-
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: ParallelRaggedAllToAll<ArrayType>>>
     ParallelRaggedAllToAll<ArrayIrType> for V
-where
-    ProjectedValue<ArrayType, V>: ParallelRaggedAllToAll<ArrayType>,
 {
     fn parallel_ragged_all_to_all(
         &self,
@@ -1783,8 +1731,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, ArrayTracingContext, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
-        RaggedAxis,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayTracingContext, DimensionBounds, DimensionType, MeshAxis,
+        MeshAxisType, RaggedAxis,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
