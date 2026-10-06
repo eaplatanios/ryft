@@ -544,8 +544,6 @@ impl ShapeChangingCollectiveOperation for ParallelAllToAllOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatching<C> for ParallelAllToAllOperation {
     fn batch_matching_axis<P: CollectiveArrayExtentBatchingPolicy<C>>(
         &self,
@@ -554,6 +552,9 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         output_extents: Vec<P::ShapeExtent>,
         output_sharding: Option<Sharding>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        // Materialize the exchange locally: batch items initially index senders, and chunk indices along the split
+        // axis index receivers. Swapping these two axes makes output batch item `i` contain chunk `i` from every
+        // sender.
         let logical_input_rank = input.unbatched_type().rank();
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
@@ -576,18 +577,26 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         let axis_extent =
             P::collective_axis_extent(context, PARALLEL_ALL_TO_ALL_OPERATION_NAME, &self.axis_name, self.axis_size)?;
 
+        // Recover each sender's input shape from the inferred per-receiver output extents. The extent policy keeps
+        // this calculation shared between static shapes and symbolic shapes that need runtime divisibility checks.
         let (input_extents, chunk_extent) = match self.options.mode {
             CollectiveMode::Untiled => {
+                // Undo insertion of the sender axis and restore the receiver axis removed from each input.
+                // Each receiver takes one slice, represented below as a size-one chunk axis.
                 let mut input_extents = output_extents.clone();
                 input_extents.remove(self.concatenation_axis);
                 input_extents.insert(self.split_axis, axis_extent.clone());
                 (input_extents, P::collective_extent_constant(context, 1)?)
             }
             CollectiveMode::Tiled if self.split_axis == self.concatenation_axis => {
+                // Splitting and concatenating along the same axis preserves its total extent, but each receiver
+                // still takes only one participant's share of that axis from each sender.
                 let chunk_extent = P::divide_extents_exactly(context, &output_extents[self.split_axis], &axis_extent)?;
                 (output_extents.clone(), chunk_extent)
             }
             CollectiveMode::Tiled => {
+                // Undo concatenation along the received axis and splitting along the sent axis.
+                // The output split extent is already the size of a chunk sent to one receiver.
                 let mut input_extents = output_extents.clone();
                 input_extents[self.concatenation_axis] =
                     P::divide_extents_exactly(context, &output_extents[self.concatenation_axis], &axis_extent)?;
@@ -596,25 +605,39 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
             }
         };
 
+        // Put the sender batch axis first, broadcasting replicated inputs to all senders when necessary. Even equal
+        // sender inputs can give different receiver outputs, since each receiver selects a different chunk.
         let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
+
+        // Factor the logical split axis into `[receiver, chunk]`, with every logical axis offset by the leading sender
+        // axis. Intermediate reshapes omit sharding; the final reshape installs the inferred output placement.
         let mut split_extents = Vec::with_capacity(input_extents.len() + 2);
         split_extents.push(axis_extent.clone());
         split_extents.extend(input_extents.iter().cloned());
         split_extents[self.split_axis + 1] = axis_extent.clone();
         split_extents.insert(self.split_axis + 2, chunk_extent);
         let split = P::reshape_collective(context, input.into_value(), split_extents.as_slice(), None)?;
+
+        // The receiver axis becomes the leading batch axis, while the old sender axis moves next to the chunk axis.
         let exchanged = split.swap_axes(0, self.split_axis + 1)?;
         let received = match self.options.mode {
             CollectiveMode::Untiled => {
+                // Remove the size-one chunk axis, then move the sender axis to the output's concatenation position.
                 let mut squeezed_extents = Vec::with_capacity(input_extents.len() + 1);
                 squeezed_extents.push(axis_extent.clone());
                 squeezed_extents.extend(input_extents);
                 P::reshape_collective(context, exchanged, squeezed_extents.as_slice(), None)?
                     .move_axis(self.split_axis + 1, self.concatenation_axis + 1)?
             }
-            CollectiveMode::Tiled => exchanged.move_axis(self.split_axis + 1, self.concatenation_axis + 1)?,
+            CollectiveMode::Tiled => {
+                // Place senders immediately before the concatenation axis so the final reshape merges their chunks
+                // in sender order. The extra leading receiver axis accounts for the `+ 1` offsets in both modes.
+                exchanged.move_axis(self.split_axis + 1, self.concatenation_axis + 1)?
+            }
         };
 
+        // Restore the inferred per-receiver output shape and sharding, prepending the batching context's receiver
+        // axis to both. The result stays mapped because different receivers can receive different values.
         let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
         physical_output_extents.push(axis_extent);
         physical_output_extents.extend(output_extents);
@@ -634,8 +657,8 @@ impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for 
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Eager binding does not infer output types, so interpretation validates the shared input contract and the
-        // operation payload before applying the degenerate-axis rule.
+        // Eager binding does not infer output types, so interpretation validates the shared input contract
+        // and the operation payload before applying the degenerate-axis rule.
         check_count!("input", inputs, 1, ProgramError);
         self.check_degenerate_interpretation()?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -659,13 +682,6 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllToAllOperation>>> P
 {
 }
 
-// Batching rule for [`ParallelAllToAllOperation`]. A matching `batch` level consumes the mapped batch axis with a
-// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis is
-// swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is then
-// merged item-major into the per-item `concatenation_axis` — batch item `i` receives every item's chunk `i`,
-// concatenated along `concatenation_axis`. A non-matching level forwards the collective to the parent context,
-// unchanged for a replicated input (through `BatchingContext::forward_to_parent`) and with its array axes shifted past
-// the batch axis for a mapped one.
 impl<
     C: Context<Type = ArrayType, Value: Transpose, Operation: From<ParallelAllToAllOperation>>,
     P: CollectiveArrayExtentBatchingPolicy<C>,
@@ -678,6 +694,13 @@ impl<
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A matching `batch` level consumes the mapped batch axis with a reshape/transpose block exchange: the per-item
+        // `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis is swapped with the leading batch axis (so
+        // the batch axis indexes the *receiving* item), and the sender axis is then merged item-major into the per-item
+        // `concatenation_axis` (batch item `i` receives every item's chunk `i`, concatenated along
+        // `concatenation_axis`). A non-matching level forwards the collective to the parent context,
+        // unchanged for a replicated input (through `BatchingContext::forward_to_parent`) and with
+        // its array axes shifted past the batch axis for a mapped one.
         self.shape_changing_collective_batch(context, inputs)
     }
 }
@@ -762,8 +785,6 @@ impl<
     }
 }
 
-// Batching rule for array IR [`ParallelAllToAllOperation`]. Dimension SSA supplies its temporary split and merge
-// shapes directly, while matching-axis array mechanics reuse the homogeneous collective kernel.
 impl<
     C: Context<
             Type = ArrayIrType,
@@ -796,61 +817,31 @@ impl<
     }
 }
 
-impl ParallelAllToAll<ArrayType> for Array {
-    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
-    // a manual region are tracers, so every axis name is unbound for it.
-
-    #[inline]
-    fn parallel_all_to_all_with_options(
-        &self,
-        axis_name: &str,
-        _split_axis: usize,
-        _concatenation_axis: usize,
-        _options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
-    }
-}
-
-// A concrete composite value performs the collective through its array member.
-impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_all_to_all_with_options(
-        &self,
-        axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_to_all_with_options(
-            axis_name,
-            split_axis,
-            concatenation_axis,
-            options,
-        )?))
-    }
-}
-
-// Mixed array IR JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
-// transposed linear region swaps the split and concatenation axes.
-impl<C> MemberDifferentiableOperation<C> for ParallelAllToAllOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<ParallelAllToAllOperation>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<ConstantOperation<DimensionValue>>
+                           + From<ParallelAllToAllOperation>
+                           + From<DimensionSizeOperation>
+                           + From<LinearCallOperation<ArrayIrType>>
+                           + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        >,
+> MemberDifferentiableOperation<C> for ParallelAllToAllOperation
 {
+    #[inline]
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Explicit output extents are retained as ordinary residual values, and the
+        // transposed linear region swaps the split and concatenation axes.
         self.shape_changing_collective_jvp_in_parent(context, inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to exchange chunks between participants of a named axis by staging an
 /// [`ParallelAllToAllOperation`]. Refer to that operation for the tiling, grouping, variation, and transformation
@@ -963,6 +954,41 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
         concatenation_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
+}
+
+impl ParallelAllToAll<ArrayType> for Array {
+    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+    // a manual region are tracers, so every axis name is unbound for it.
+
+    #[inline]
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        _split_axis: usize,
+        _concatenation_axis: usize,
+        _options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
+    }
+}
+
+// A concrete composite value performs the collective through its array member.
+impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_all_to_all_with_options(
+        &self,
+        axis_name: &str,
+        split_axis: usize,
+        concatenation_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_to_all_with_options(
+            axis_name,
+            split_axis,
+            concatenation_axis,
+            options,
+        )?))
+    }
 }
 
 // Composite values stage the array followed by one result extent per axis. Only a manual mesh binder records its mesh
