@@ -53,7 +53,6 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::Accuracy;
 use crate::operations::arithmetic::{Abs, Add, Div, Mul, Neg, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::fill::Fill;
@@ -63,6 +62,7 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::Logistic;
 use crate::operations::extrema::Max;
+use crate::operations::{Accuracy, Capability};
 use crate::programs::{MaybeZero, ProgramError, Type, Typed, Value};
 
 /// Canonical operation name for [`SinOperation`].
@@ -519,9 +519,12 @@ impl_tanh_for_primitive!(f64);
 
 /// Group of the elementwise trigonometric capabilities [`Sin`], [`Cos`], [`Tan`], [`Tanh`], and [`Atan2`].
 /// It is implemented automatically for every type that implements all of its members.
-pub trait TrigonometricOperations: Sin + Cos + Tan + Tanh + Atan2 {}
+pub trait TrigonometricOperations<T = <Self as Capability>::Universe>:
+    Capability + Sin<T> + Cos<T> + Tan<T> + Tanh<T> + Atan2<T>
+{
+}
 
-impl<V: Sin + Cos + Tan + Tanh + Atan2> TrigonometricOperations for V {}
+impl<T, V: Sin<T> + Cos<T> + Tan<T> + Tanh<T> + Atan2<T>> TrigonometricOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {
@@ -547,7 +550,7 @@ mod tests {
     use crate::operations::Tolerance;
     use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::manipulation::conversions::ConvertElementType;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameterwise, Placeholder};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError};
     use crate::tracing::TracingContext;
 
@@ -1874,5 +1877,18 @@ mod tests {
         assert_eq!(Tanh::tanh(&0.0f32), Ok(0.0));
         assert_eq!(Tanh::tanh(&0.0f64), Ok(0.0));
         assert_eq!(Tanh::tanh_with_accuracy(&0.0f64, Accuracy::Highest), Ok(0.0));
+    }
+
+    #[test]
+    fn test_tanh_parameterwise() {
+        // Structures compute the hyperbolic tangent of every parameter with the requested accuracy.
+        let parameters = vec![Array::scalar(0.5f32).unwrap(), Array::scalar(-1.0f32).unwrap()];
+        let structure = Parameterwise::<Array, _>::from(parameters.clone());
+        let expected = parameters.iter().map(|parameter| parameter.tanh().unwrap()).collect::<Vec<_>>();
+        assert_eq!(structure.tanh().map(Parameterwise::into_inner), Ok(expected.clone()));
+        assert_eq!(
+            Tanh::<ArrayType>::tanh_with_accuracy(&structure, Accuracy::Highest).map(Parameterwise::into_inner),
+            Ok(expected),
+        );
     }
 }

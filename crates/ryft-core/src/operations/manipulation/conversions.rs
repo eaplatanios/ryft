@@ -66,9 +66,11 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension,
-    Layout, ShardingDimension, bf16, f16,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
+    DataType, Dimension, Layout, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
@@ -77,6 +79,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -490,6 +493,9 @@ impl ElementType for ArrayType {
 /// bind that operation through their own context, except for a numerical conversion to the input's own element type,
 /// which returns the input once validated, whereas concrete values execute their backend's conversion directly.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Examples
 ///
 /// ```rust
@@ -505,7 +511,8 @@ impl ElementType for ArrayType {
 /// # Ok(())
 /// # }
 /// ```
-pub trait ConvertElementType: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ConvertElementType<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Converts each element to `data_type`, following [`ElementType::with_element_type`] for layout and placement
     /// metadata. Narrowing and conversions between numerical categories are allowed, subject to the backend's element
     /// conversion rules. Real-to-integer conversion truncates toward zero and saturates in the destination range.
@@ -571,8 +578,8 @@ pub trait ConvertElementType: Sized {
     }
 }
 
-impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation<V::Type>>>>>
-    ConvertElementType for V
+impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation<T>>>>>
+    ConvertElementType<T> for V
 {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, false);
@@ -843,6 +850,9 @@ impl_differentiable_operation! {
 /// the reference [`Array`] backend, reduction supports [`DataType::F16`], [`DataType::BF16`], [`DataType::F32`], and
 /// [`DataType::F64`] elements.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -860,7 +870,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait ReducePrecision: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ReducePrecision<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value with each element rounded to a floating-point format with `exponent_bits` exponent bits and
     /// `mantissa_bits` mantissa bits. Refer to the documentation of [`ReducePrecision`] for the rounding semantics.
     /// Non-floating-point elements and `exponent_bits = 0` return a [`ProgramError`].
@@ -873,8 +884,8 @@ pub trait ReducePrecision: Sized {
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ReducePrecisionOperation<V::Type>>>>>
-    ReducePrecision for V
+impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<ReducePrecisionOperation<T>>>>>
+    ReducePrecision<T> for V
 {
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError> {
         let operation = ReducePrecisionOperation::<V::Type>::new(exponent_bits, mantissa_bits);

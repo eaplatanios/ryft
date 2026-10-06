@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType,
@@ -21,6 +23,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::Add;
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
@@ -1428,6 +1431,9 @@ impl_differentiable_operation! {
 /// primitive. Note that interior padding is the transpose counterpart of a strided [`SliceOperation`] as a stride
 /// of `s` corresponds to inserting `s - 1` padding elements between adjacent input elements.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example pads a vector before, after, and between its input elements:
@@ -1449,7 +1455,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Pad: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Pad<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Pads `self` with `padding_value` using the provided edge and interior padding amounts. Refer to the
     /// documentation of this trait for more information on what this operation does.
     ///
@@ -1622,7 +1629,7 @@ impl Pad for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Pad for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Pad<ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
 {

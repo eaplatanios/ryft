@@ -35,6 +35,8 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
@@ -48,6 +50,7 @@ use crate::macros::{
     check_count, check_types, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sqrt, Sub};
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::Complex;
@@ -546,6 +549,12 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers,
 /// and so their derivative is a structural zero.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
+/// Note that composite values also generate random bits through their array views, which stages the static array
+/// generator; the native composite generator with dynamic output dimensions is [`DynamicRngBitGenerator`].
+///
 /// # Example
 ///
 /// ```rust
@@ -563,7 +572,8 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// # Ok(())
 /// # }
 /// ```
-pub trait RngBitGenerator: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait RngBitGenerator<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Generates random bits of `output_type` from this generator state using `algorithm`, returning the advanced state
     /// together with the bits.
     ///
@@ -647,7 +657,7 @@ impl<
             Type = ArrayType,
             DispatchDomain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
         >,
-> RngBitGenerator for V
+> RngBitGenerator<ArrayType> for V
 {
     fn rng_bit_generator(
         &self,
@@ -820,6 +830,12 @@ pub enum CategoricalSamplingMode {
 /// samples differ bitwise because JAX derives its bits differently and draws normal samples through the inverse error
 /// function.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
+/// Note that composite values sample through their array views, so that the whole composition runs in the array
+/// universe.
+///
 /// # Example
 ///
 /// ```rust
@@ -836,7 +852,8 @@ pub enum CategoricalSamplingMode {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Random: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Random<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Splits this generator state into `count` fresh, statistically independent states of the same algorithm,
     /// returning the advanced state followed by the fresh states.
     ///
@@ -918,7 +935,7 @@ impl<
         + Slice
         + ConvertElementType
         + RngBitGenerator,
-> Random for V
+> Random<ArrayType> for V
 {
     fn split_rng_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
         let state_type = self.r#type();
@@ -1214,8 +1231,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Sharding, StridedLayout,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, StridedLayout,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
@@ -2141,6 +2158,30 @@ mod tests {
                 if message == "random generator states must have type `u64[2]` (i.e., for `three_fry`) or \
                                `u64[3]` (i.e., for `philox`) but got `u32[2]`",
         ));
+    }
+
+    #[test]
+    fn test_random_composite() {
+        // Concrete composite values generate bits and sample through their array members.
+        let state = threefry_state(42, 7);
+        let composite = ArrayIrValue::Array(state.clone());
+        let output_type = ArrayType::new_static(DataType::U32, [2]);
+        let (next_state, bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
+        assert_eq!(
+            composite.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
+            Ok((ArrayIrValue::Array(next_state), ArrayIrValue::Array(bits))),
+        );
+        let (next_state, keys) = state.split_rng_key(2).unwrap();
+        assert_eq!(
+            composite.split_rng_key(2),
+            Ok((ArrayIrValue::Array(next_state), keys.into_iter().map(ArrayIrValue::Array).collect())),
+        );
+        let sample_type = ArrayType::new_static(DataType::F32, [3]);
+        let (next_state, samples) = state.random_uniform(&sample_type).unwrap();
+        assert_eq!(
+            composite.random_uniform(&sample_type),
+            Ok((ArrayIrValue::Array(next_state), ArrayIrValue::Array(samples))),
+        );
     }
 
     #[test]

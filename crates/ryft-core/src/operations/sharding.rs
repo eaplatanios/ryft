@@ -74,8 +74,10 @@
 
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, MeshAxisType, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, MeshAxisType, Sharding,
     ShardingDimension,
 };
 use crate::batching::{
@@ -86,6 +88,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -345,14 +348,18 @@ impl_differentiable_operation! {
 /// stage the operation instead, so that transforms that apply operations through interpretation (e.g., program batching
 /// and re-tracing) preserve the resharding. Every implementation validates the target exactly like [`ReshardOperation`]
 /// type inference does, so that eager and staged evaluation accept the same programs.
-pub trait Reshard: Clone {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Reshard<T = <Self as Capability>::Universe>: Capability + Clone {
     /// Reshards `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid target for `self` or
     /// the resharding cannot be recorded in the value's context.
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>> Reshard
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>>
+    Reshard<ArrayType> for V
 {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         // Any context-carrying value reshards by binding a `ReshardOperation` through its own context. The
@@ -661,14 +668,18 @@ impl_differentiable_operation! {
 /// instead, so that transforms that apply operations through interpretation preserve the constraint. Every
 /// implementation validates the constraint exactly like [`ConstrainShardingOperation`] type inference does,
 /// so that eager and staged evaluation accept the same programs.
-pub trait ConstrainSharding: Clone {
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ConstrainSharding<T = <Self as Capability>::Universe>: Capability + Clone {
     /// Constrains the placement of `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid
     /// constraint for `self` or the constraint cannot be recorded in the value's context.
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ConstrainShardingOperation>>>>
-    ConstrainSharding for V
+    ConstrainSharding<ArrayType> for V
 {
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         // Any context-carrying value constrains its sharding by binding a `ConstrainShardingOperation` through its own
@@ -697,9 +708,12 @@ impl ConstrainSharding for Array {
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
 /// for every type that implements all of its members.
-pub trait ShardingOperations: Reshard + ConstrainSharding {}
+pub trait ShardingOperations<T = <Self as Capability>::Universe>:
+    Capability + Reshard<T> + ConstrainSharding<T>
+{
+}
 
-impl<V: Reshard + ConstrainSharding> ShardingOperations for V {}
+impl<T, V: Reshard<T> + ConstrainSharding<T>> ShardingOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

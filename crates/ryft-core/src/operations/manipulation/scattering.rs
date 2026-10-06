@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
+    ArrayIrType, ArrayType, AsArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
     materialize_array_tangent,
 };
 use crate::axes::Axis;
@@ -21,6 +23,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
@@ -1472,6 +1475,9 @@ where
 /// corresponding arithmetic [`Operation`]s. Use [`DynamicScatter::dynamic_scatter_axis`] when the query shape must
 /// remain dynamic.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -1489,7 +1495,8 @@ where
 /// ).unwrap();
 /// assert_eq!(output, Array::matrix(3, 2, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]).unwrap());
 /// ```
-pub trait Scatter: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Scatter<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Scatters `updates` into `self` at the positions named by `indices`, combining each update with the existing
     /// input value according to `kind`. The dimension numbers describe the windows, and `options` controls bounds
     /// handling, index promises, and output placement.
@@ -1557,20 +1564,24 @@ pub trait Scatter: Sized {
         mode: ScatterMode,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType> + Reshape,
+        Self: Typed<Type: AsArrayType> + Reshape<T>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
         let indices_type = indices.r#type();
+        let indices_type = indices_type.as_array_type()?;
+        let updates_type = updates.r#type();
+        let updates_type = updates_type.as_array_type()?;
         let mut expected_dimensions = input_type.shape().dimensions()[..axis].to_vec();
         expected_dimensions.extend_from_slice(indices_type.shape().dimensions());
         expected_dimensions.extend_from_slice(&input_type.shape().dimensions()[axis + 1..]);
         let expected_shape = Shape::new(expected_dimensions);
-        if updates.r#type().shape() != &expected_shape {
+        if updates_type.shape() != &expected_shape {
             return Err(TypeError::invalid(format!(
                 "`scatter_axis` updates shape must be `{}` but got `{}`",
                 expected_shape,
-                updates.r#type().shape()
+                updates_type.shape(),
             ))
             .into());
         }
@@ -2075,23 +2086,7 @@ impl Scatter for Array {
     }
 }
 
-impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
-    fn scatter(
-        &self,
-        indices: &Self,
-        updates: &Self,
-        dimensions: &ScatterDimensionNumbers,
-        kind: ScatterReductionKind,
-        options: &ScatterOptions,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
-        let updates = <Self as ValueProjection<ArrayType>>::projected(updates)?;
-        Ok(Self::Array(input.scatter(indices, updates, dimensions, kind, options)?))
-    }
-}
-
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Scatter for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Scatter<ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
 {
@@ -2343,9 +2338,9 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::batch;
@@ -6603,6 +6598,26 @@ mod tests {
                 Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap(),
             )),
             Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[12_i32, 20, 31]),
+        );
+    }
+
+    #[test]
+    fn test_scatter_scatter_axis_composite() {
+        // Concrete composite values scatter through their array members, including through the provided functions.
+        let input = Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap();
+        let indices = Array::vector(vec![2i32, 0]).unwrap();
+        let updates = Array::matrix(2, 2, vec![10i32, 20, 30, 40]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(input.clone()).scatter_axis(
+                &ArrayIrValue::Array(indices.clone()),
+                &ArrayIrValue::Array(updates.clone()),
+                -1,
+                ScatterReductionKind::Add,
+                ScatterMode::Clip,
+            ),
+            Ok(ArrayIrValue::Array(
+                input.scatter_axis(&indices, &updates, -1, ScatterReductionKind::Add, ScatterMode::Clip).unwrap(),
+            )),
         );
     }
 

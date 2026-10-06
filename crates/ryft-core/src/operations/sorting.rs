@@ -70,9 +70,11 @@
 use std::fmt::Display;
 use std::num::NonZeroUsize;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayType,
-    Complex, DataType, Dimension, Shape, ShardingDimension,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
+    ArrayIrValue, ArrayType, Complex, DataType, Dimension, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -83,6 +85,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::iota::{Iota, IotaOperation};
 use crate::operations::manipulation::broadcasting::Broadcast;
@@ -91,7 +94,8 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -562,6 +566,9 @@ impl_differentiable_operation! {
 /// [`Self::sort_with_key_count`] shortcut functions for single-key and canonically ordered sorts, which share
 /// the axis and error contract of [`Self::sort_with_ordering`].
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example sorts by a primary key whose ties are broken by a secondary key:
@@ -577,7 +584,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Sort: Sized {
+#[capability]
+pub trait Sort<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Sorts `inputs` along `axis` by the values of their first input in the provided `direction` under the default
     /// [`SortOrdering::Canonical`] ordering, co-permuting every other input. Refer to [`Self::sort_with_ordering`]
     /// for the semantics of the parameters and for the errors that this function may return.
@@ -746,7 +754,7 @@ impl Sort for Array {
 impl<
     V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<SortOperation>>>
         + ManualVariationAlignment<ArrayType>,
-> Sort for V
+> Sort<ArrayType> for V
 {
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
@@ -761,6 +769,49 @@ impl<
         let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let aligned_inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
         inputs[0].dispatch_domain().bind(operation, Vec::new(), &aligned_inputs)
+    }
+}
+
+// Composite values sort through their array views. Sorting has no receiver, which the shared projection macro cannot
+// express, and so this projection and the concrete one below are written out.
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    Sort<ArrayIrType> for V
+where
+    ProjectedValue<ArrayType, V>: Sort<ArrayType>,
+{
+    fn sort_with_ordering<A: Into<Axis>>(
+        inputs: &[Self],
+        axis: A,
+        key_count: usize,
+        direction: SortDirection,
+        ordering: SortOrdering,
+    ) -> Result<Vec<Self>, ProgramError> {
+        let inputs = inputs
+            .iter()
+            .map(|input| ValueProjection::<ArrayType>::into_projected(input.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs =
+            ProjectedValue::<ArrayType, V>::sort_with_ordering(&inputs, axis, key_count, direction, ordering)?;
+        Ok(outputs.into_iter().map(V::from_projected).collect())
+    }
+}
+
+impl<A: Value<Type = ArrayType> + Sort<ArrayType>> Sort<ArrayIrType> for ArrayIrValue<A> {
+    fn sort_with_ordering<AxisValue: Into<Axis>>(
+        inputs: &[Self],
+        axis: AxisValue,
+        key_count: usize,
+        direction: SortDirection,
+        ordering: SortOrdering,
+    ) -> Result<Vec<Self>, ProgramError> {
+        let inputs = inputs
+            .iter()
+            .map(|input| ValueProjection::<ArrayType>::into_projected(input.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(A::sort_with_ordering(&inputs, axis, key_count, direction, ordering)?
+            .into_iter()
+            .map(Self::Array)
+            .collect())
     }
 }
 
@@ -780,6 +831,12 @@ impl<
 /// when the ranked axis is the trailing axis, the leading size-1 dimensions are reshaped away before the composition
 /// and reinserted afterward, which leaves the values and indices unchanged.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
+/// Note that composite values select through their array views, so that the composition (and its index `iota`)
+/// runs in the array universe.
+///
 /// # Example
 ///
 /// The following example selects the three largest scores, where the tie between the two `3.0` scores selects the
@@ -794,7 +851,8 @@ impl<
 /// # Ok(())
 /// # }
 /// ```
-pub trait TopK: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait TopK<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the `k` largest elements of this value along `axis` in descending order together with their indices,
     /// both with the `axis` dimension resized to `k`.
     ///
@@ -810,7 +868,7 @@ pub trait TopK: Sized {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshape> TopK for V {
+impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshape> TopK<ArrayType> for V {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
         // Complex values have no total order, and the index passenger and the slices below need static extents,
         // so both are rejected before the axis is normalized and `k` is checked against its extent.
@@ -908,8 +966,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DimensionBounds, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis,
-        Sharding, StridedLayout, i4,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Sharding, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::contexts::EagerContext;
@@ -922,7 +980,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
-    use crate::tracing::{DomainTracer, DomainTracingContext, Trace};
+    use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -1599,6 +1657,45 @@ mod tests {
             .unwrap();
         assert!(rule_context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_sort_composite() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Composite tracers stage the array sort and the array top-k composition of their members.
+        let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let (_, program) = CompositeContext::trace(
+            |inputs: Vec<Tracer<CompositeContext>>| Tracer::sort(&inputs, 0, SortDirection::Ascending),
+            vec![vector_type.clone(), vector_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f32[3] .
+                let %2:f32[3], %3:f32[3] = sort [axis=0, direction=ascending] %0 %1
+                in (%2, %3)"
+            },
+        );
+
+        // Concrete composite values sort and select through their array members.
+        let keys = Array::vector(vec![3.0f32, 1.0, 2.0]).unwrap();
+        let values = Array::vector(vec![1i32, 2, 3]).unwrap();
+        let sorted = Array::sort(&[keys.clone(), values.clone()], 0, SortDirection::Ascending).unwrap();
+        assert_eq!(
+            ArrayIrValue::sort(
+                &[ArrayIrValue::Array(keys.clone()), ArrayIrValue::Array(values)],
+                0,
+                SortDirection::Ascending,
+            ),
+            Ok(sorted.into_iter().map(ArrayIrValue::Array).collect()),
+        );
+        let (top_values, top_indices) = keys.top_k(2, 0).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(keys).top_k(2, 0),
+            Ok((ArrayIrValue::Array(top_values), ArrayIrValue::Array(top_indices))),
+        );
     }
 
     #[test]

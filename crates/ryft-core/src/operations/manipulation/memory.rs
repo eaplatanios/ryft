@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, Complex, Memory,
     RaggedAxis, bf16, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
@@ -10,6 +12,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
@@ -219,6 +222,9 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// performs the transfer if the destination is supported. Transfer and staging failures are returned to the caller.
 /// Native scalar values have no memory placement metadata and are returned unchanged.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Examples
 ///
 /// ```
@@ -231,7 +237,8 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// # Ok(())
 /// # }
 /// ```
-pub trait TransferToMemory: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait TransferToMemory<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this value placed in `destination`, preserving its contents and all other type metadata. Note that
     /// reference [`Array`]s model the placement in their type without physically moving storage.
     ///
@@ -243,7 +250,7 @@ pub trait TransferToMemory: Sized {
 }
 
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>>>
-    TransferToMemory for V
+    TransferToMemory<ArrayType> for V
 {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
         // Context-carrying values bind through their owning context. The operation conversion bound keeps this disjoint

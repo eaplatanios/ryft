@@ -2,11 +2,13 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
-    DimensionValue, Layout, LinearResiduals, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
-    StridedLayout, TiledLayout,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType, Dimension,
+    DimensionType, DimensionValue, Layout, LinearResiduals, MeshAxisType, RaggedAxis, Shape, Sharding,
+    ShardingDimension, StridedLayout, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -18,6 +20,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -361,6 +364,9 @@ impl<O: Operation<Type = ArrayType> + From<BroadcastOperation>> OperationProvide
 /// computing array values. The geometry is stored in the operation rather than supplied through dimension inputs,
 /// allowing mixed-operation transform rules to use this capability once their input extents have been resolved.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Examples
 ///
 /// ```rust
@@ -374,7 +380,8 @@ impl<O: Operation<Type = ArrayType> + From<BroadcastOperation>> OperationProvide
 /// # Ok(())
 /// # }
 /// ```
-pub trait Broadcast: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Broadcast<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Replicates or reorders the axes of `self` into the supplied output type. Mapped axes must have equal extents,
     /// except that a static input extent of one may expand to any static output extent, including zero. Unmapped output
     /// axes replicate the entire input and must have static extents. Invalid mappings, incompatible extents, or a
@@ -401,7 +408,7 @@ pub trait Broadcast: Sized {
     #[inline]
     fn broadcast_to<S: Into<Shape>>(&self, output_shape: S) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         self.broadcast_to_with_output_sharding(output_shape, None)
     }
@@ -421,9 +428,10 @@ pub trait Broadcast: Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let output_shape = output_shape.into();
         let offset = output_shape.rank().checked_sub(input_type.rank()).ok_or_else(|| {
             TypeError::invalid(format!(
@@ -442,7 +450,7 @@ pub trait Broadcast: Sized {
                 .map_err(|error| TypeError::invalid(error.to_string()))?,
         };
         let output_type = if input_type.shape() == &output_shape {
-            input_type.into_owned()
+            input_type.clone()
         } else {
             ArrayType::new(input_type.data_type(), output_shape).with_memory(input_type.memory())
         }
@@ -463,7 +471,7 @@ pub trait Broadcast: Sized {
     #[inline]
     fn broadcast_leading<S: Into<Vec<usize>>>(&self, leading_shape: S) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         self.broadcast_leading_with_output_sharding(leading_shape, None)
     }
@@ -482,10 +490,10 @@ pub trait Broadcast: Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let mut dimensions = leading_shape.into().into_iter().map(Dimension::Static).collect::<Vec<_>>();
-        dimensions.extend_from_slice(self.r#type().shape().dimensions());
+        dimensions.extend_from_slice(self.r#type().as_array_type()?.shape().dimensions());
         self.broadcast_to_with_output_sharding(Shape::new(dimensions), output_sharding)
     }
 
@@ -515,12 +523,15 @@ pub trait Broadcast: Sized {
     ///     [`DynamicBroadcast::dynamic_broadcast_arrays`] when replication needs runtime dimension values.
     fn broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let shapes = inputs.iter().map(|input| input.r#type().shape().clone()).collect::<Vec<_>>();
+        let shapes = inputs
+            .iter()
+            .map(|input| Ok(input.r#type().as_array_type()?.shape().clone()))
+            .collect::<Result<Vec<_>, TypeError>>()?;
         let output_shape: Shape = crate::arrays::Broadcastable::broadcasted(&shapes)
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         inputs.iter().map(|input| input.broadcast_to(output_shape.clone())).collect()
@@ -664,7 +675,7 @@ impl Broadcast for Array {
 }
 
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
-    Broadcast for V
+    Broadcast<ArrayType> for V
 {
     #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
@@ -3150,6 +3161,25 @@ mod tests {
         assert_eq!(
             ArrayType::broadcast_arrays(&shapes),
             Err(TypeError::invalid("failed to broadcast shape `[2]` to shape `[3]`").into()),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_provided_functions_composite() {
+        // The provided functions read the array metadata of composite values through their array view.
+        let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let composite = ArrayIrValue::Array(vector.clone());
+        assert_eq!(composite.broadcast_to([3, 2]), Ok(ArrayIrValue::Array(vector.broadcast_to([3, 2]).unwrap())));
+        assert_eq!(composite.broadcast_leading([3]), Ok(ArrayIrValue::Array(vector.broadcast_leading([3]).unwrap())));
+        let scalar = Array::scalar(5.0f32).unwrap();
+        assert_eq!(
+            ArrayIrValue::broadcast_arrays(&[composite, ArrayIrValue::Array(scalar.clone())]),
+            Ok(Array::broadcast_arrays(&[vector, scalar]).unwrap().into_iter().map(ArrayIrValue::Array).collect()),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.broadcast_to([2]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
         );
     }
 

@@ -2,8 +2,11 @@ use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, Shape, Sharding,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
+    AsArrayType, Shape, Sharding,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -14,6 +17,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -360,6 +364,9 @@ impl_differentiable_operation! {
 /// [`Transpose`] fills the same role for [`TransposeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
 /// their corresponding arithmetic [`Operation`]s.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Examples
 ///
 /// ```rust
@@ -373,7 +380,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Transpose: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Transpose<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reorders the axes of `self` according to the provided [`Permutation`], validating that the permutation is a
     /// bijection of the input axes. Negative indices count from the end. Use [`Self::transpose_reversed`] to
     /// reverse every axis, or [`Self::matrix_transpose`] to exchange only the last two axes.
@@ -394,9 +402,9 @@ pub trait Transpose: Sized {
     #[inline]
     fn transpose_reversed(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
-        self.transpose((0..self.r#type().rank()).rev().collect::<Vec<_>>())
+        self.transpose((0..self.r#type().as_array_type()?.rank()).rev().collect::<Vec<_>>())
     }
 
     /// Exchanges the last two axes while retaining all leading batch axes. This is an ordinary transpose, without
@@ -414,9 +422,9 @@ pub trait Transpose: Sized {
     #[inline]
     fn matrix_transpose(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
-        let rank = self.r#type().rank();
+        let rank = self.r#type().as_array_type()?.rank();
         if rank < 2 {
             return Err(TypeError::invalid(format!(
                 "matrix transpose requires rank at least 2 but input has rank {rank}",
@@ -454,9 +462,9 @@ pub trait Transpose: Sized {
     #[inline]
     fn move_axis<S: Into<Axes>, D: Into<Axes>>(&self, source: S, destination: D) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
-        let rank = self.r#type().rank();
+        let rank = self.r#type().as_array_type()?.rank();
         let source = source.into();
         let destination = destination.into();
         if source.len() != destination.len() {
@@ -499,9 +507,9 @@ pub trait Transpose: Sized {
     #[inline]
     fn swap_axes<I: Into<Axis>, J: Into<Axis>>(&self, i: I, j: J) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
-        let rank = self.r#type().rank();
+        let rank = self.r#type().as_array_type()?.rank();
         let i = i.into();
         let i = i.normalize(rank).map_err(|_| {
             TypeError::invalid(format!("`{TRANSPOSE_OPERATION_NAME}` swap axis {i} is out of bounds for rank {rank}"))
@@ -516,12 +524,18 @@ pub trait Transpose: Sized {
     }
 }
 
-impl Transpose for Sharding {
-    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        // Reorder the per-dimension `ShardingDimension` entries so that output dimension `i` carries the entry of input
-        // dimension `permutation[i]`, while leaving the reduction-state and manual-axis sets unchanged. This is the
-        // sharding-level analogue of an array axis permutation. `permutation` must be a permutation of `0..rank`
-        // matching this sharding's rank. Otherwise, a type error describing the offending dimension is returned.
+// TODO(eaplatanios): Should we move this (and its test) to the main impl block right under where `Sharding` is declared/defined?
+impl Sharding {
+    /// Returns this [`Sharding`] with its per-dimension [`ShardingDimension`](crate::ShardingDimension) entries
+    /// reordered so that output dimension `i` carries the entry of input dimension `permutation[i]`, while its
+    /// reduction-state and manual-axis sets are unchanged. This is the sharding-level analogue of [`Transpose`], which
+    /// uses it to transpose the sharding of an [`ArrayType`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] if `permutation` is not a permutation of `0..rank`, where `rank` is the rank
+    /// of this [`Sharding`].
+    pub fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.into().normalize(self.rank())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
@@ -590,7 +604,7 @@ impl Transpose for Array {
 }
 
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
-    Transpose for V
+    Transpose<ArrayType> for V
 {
     #[inline]
     fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
@@ -618,9 +632,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension,
-        TiledLayout, f8e8m0fnu,
+        Array, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
+        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
+        Tile, TileDimension, TiledLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -1617,6 +1631,39 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`transpose` swap axis 0 is out of bounds for rank 0",
         ));
+    }
+
+    #[test]
+    fn test_transpose_provided_functions_composite() {
+        // The provided functions read the array metadata of composite values through their array view.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let composite = ArrayIrValue::Array(matrix.clone());
+        assert_eq!(composite.transpose_reversed(), Ok(ArrayIrValue::Array(matrix.transpose_reversed().unwrap())));
+        assert_eq!(composite.matrix_transpose(), Ok(ArrayIrValue::Array(matrix.matrix_transpose().unwrap())));
+        assert_eq!(composite.move_axis(0, 1), Ok(ArrayIrValue::Array(matrix.move_axis(0, 1).unwrap())));
+        assert_eq!(composite.swap_axes(0, -1), Ok(ArrayIrValue::Array(matrix.swap_axes(0, -1).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.transpose_reversed(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+        );
+    }
+
+    #[test]
+    fn test_transpose_universes() {
+        // An unchanged generic bound resolves to each implementor's own universe: the array universe of an array type
+        // and of a reference array.
+        fn exchanged<T: Transpose>(value: &T) -> Result<T, ProgramError> {
+            value.transpose([1, 0])
+        }
+        assert_eq!(
+            exchanged(&ArrayType::new_static(DataType::F32, [2, 3])),
+            Ok(ArrayType::new_static(DataType::F32, [3, 2])),
+        );
+        assert_eq!(
+            exchanged(&Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            Ok(Array::matrix(3, 2, vec![1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()),
+        );
     }
 
     #[test]

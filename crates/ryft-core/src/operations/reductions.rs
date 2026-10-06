@@ -59,6 +59,8 @@ use std::sync::Arc;
 use half::{bf16, f16};
 use num_complex::Complex;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrContext, ArrayIrType, ArrayType,
     DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, FloatingPointArrayElement, LinearResiduals,
@@ -82,6 +84,7 @@ use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_non_differentiable_operation,
     impl_non_transposable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, DivOperation, Mul, MulOperation, Sub};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
@@ -1127,6 +1130,9 @@ where
 /// input. The other numeric kinds retain the runtime extents of their inputs as residuals during linearization, and
 /// so they also support dynamically shaped inputs.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -1139,7 +1145,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait Reduce: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Reduce<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reduces `self` along `axes` using the reduction selected by `kind`.
     ///
     /// # Parameters
@@ -1392,8 +1399,8 @@ impl Reduce for Array {
 // Any context-carrying value reduces by binding a `ReduceOperation` through its context. The `From<ReduceOperation>`
 // bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
 // the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>> Reduce
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>>
+    Reduce<ArrayType> for V
 {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() && !(kind == ReductionKind::LogSumExp && self.r#type().data_type().is_complex()) {
@@ -1874,6 +1881,9 @@ impl_non_transposable_operation!(ArgMaxOperation);
 /// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMaxOperation`]
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example finds the largest element of each row, where the first row's tie selects the lower index and
@@ -1888,7 +1898,8 @@ impl_non_transposable_operation!(ArgMaxOperation);
 /// # Ok(())
 /// # }
 /// ```
-pub trait ArgMax: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ArgMax<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the `i32` indices of the largest elements of this value along `axis`, with that axis dropped from the
     /// result shape. Refer to [`Self::argmax_with_index_data_type`] for the semantics of `axis` and for the errors that
     /// this function may return.
@@ -1934,8 +1945,8 @@ impl ArgMax for Array {
 // Any context-carrying value computes the index by binding an `ArgMaxOperation` through its context. The
 // `From<ArgMaxOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>> ArgMax
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>>
+    ArgMax<ArrayType> for V
 {
     fn argmax_with_index_data_type<A: Into<Axis>>(
         &self,
@@ -2083,6 +2094,9 @@ impl_non_transposable_operation!(ArgMinOperation);
 /// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMinOperation`]
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example finds the smallest element of each row, where the first row's tie selects the lower index and
@@ -2097,7 +2111,8 @@ impl_non_transposable_operation!(ArgMinOperation);
 /// # Ok(())
 /// # }
 /// ```
-pub trait ArgMin: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ArgMin<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the `i32` indices of the smallest elements of this value along `axis`, with that axis dropped from the
     /// result shape. Refer to [`Self::argmin_with_index_data_type`] for the semantics of `axis` and for the errors that
     /// this function may return.
@@ -2143,8 +2158,8 @@ impl ArgMin for Array {
 // Any context-carrying value computes the index by binding an `ArgMinOperation` through its context. The
 // `From<ArgMinOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>> ArgMin
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>>
+    ArgMin<ArrayType> for V
 {
     fn argmin_with_index_data_type<A: Into<Axis>>(
         &self,
@@ -2329,9 +2344,12 @@ fn batch_index_reduction<
 
 /// Group of the reduction capabilities [`Reduce`], [`ArgMax`], and [`ArgMin`]. It is implemented automatically
 /// for every type that implements all of its members.
-pub trait ReductionOperations: Reduce + ArgMax + ArgMin {}
+pub trait ReductionOperations<T = <Self as Capability>::Universe>:
+    Capability + Reduce<T> + ArgMax<T> + ArgMin<T>
+{
+}
 
-impl<V: Reduce + ArgMax + ArgMin> ReductionOperations for V {}
+impl<T, V: Reduce<T> + ArgMax<T> + ArgMin<T>> ReductionOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

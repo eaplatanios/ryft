@@ -2,11 +2,13 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
-    ArrayTypeRefinements, DataType, Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape,
-    Sharding, ShardingDimension, StaticShape,
+    ArrayTypeRefinements, AsArrayType, DataType, Dimension, DimensionType, DimensionValue, LinearResiduals,
+    MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -22,6 +24,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
@@ -572,6 +575,9 @@ where
 /// first-class dimension values. A slice covering the complete input with unit strides passes it through unchanged. Any
 /// other output preserves the input memory space and clears explicit physical layout metadata.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example shows how to use [`Slice`] in practice:
@@ -595,7 +601,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait Slice: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Slice<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Slices `self` between `start_indices` and `limits` with `strides`. Refer to the documentation of this trait for
     /// more information on what this operation does.
     ///
@@ -633,9 +640,10 @@ pub trait Slice: Sized {
         stride: usize,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let axis = axis.into().normalize(input_type.rank())?;
         let mut starts = vec![0; input_type.rank()];
         let mut limits = input_type.shape().dimensions().to_vec();
@@ -657,9 +665,9 @@ pub trait Slice: Sized {
     ///   - `keep_axis`: Whether the selected axis remains in the result shape.
     fn index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType> + Reshape,
+        Self: Typed<Type: AsArrayType> + Reshape<T>,
     {
-        let axis = axis.into().normalize(self.r#type().rank())?;
+        let axis = axis.into().normalize(self.r#type().as_array_type()?.rank())?;
         let limit = index.checked_add(1).ok_or_else(|| TypeError::invalid("`index_axis` index overflows `usize`"))?;
         let output = self.slice_axis(axis, index, limit, 1)?;
         if keep_axis { Ok(output) } else { output.squeeze([axis]) }
@@ -803,20 +811,8 @@ impl Slice for Array {
     }
 }
 
-impl<A: Slice + Value<Type = ArrayType>> Slice for ArrayIrValue<A> {
-    fn slice<L: Clone + Into<Dimension>>(
-        &self,
-        start_indices: &[usize],
-        limits: &[L],
-        strides: &[usize],
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        Ok(Self::Array(input.slice(start_indices, limits, strides)?))
-    }
-}
-
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<SliceOperation>>>> Slice
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<SliceOperation>>>>
+    Slice<ArrayType> for V
 {
     fn slice<L: Clone + Into<Dimension>>(
         &self,
@@ -1146,6 +1142,9 @@ where
 /// axes. The output preserves the input shape, physical layout, and memory placement. Variation over manual mesh axes
 /// from the update is included in the result because the written block may vary even when the input is invariant.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example shows how to use [`UpdateSlice`] in practice:
@@ -1163,7 +1162,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait UpdateSlice: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait UpdateSlice<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Overwrites the block of `self` starting at `start_indices` with `update`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     ///
@@ -1247,18 +1247,10 @@ impl UpdateSlice for Array {
     }
 }
 
-impl<A: UpdateSlice + Value<Type = ArrayType>> UpdateSlice for ArrayIrValue<A> {
-    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
-        Ok(Self::Array(input.update_slice(update, start_indices)?))
-    }
-}
-
 impl<
     V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
         + ManualVariationAlignment<ArrayType>,
-> UpdateSlice for V
+> UpdateSlice<ArrayType> for V
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         // Any context-carrying value updates a slice by binding an `UpdateSliceOperation` through its own context. The
@@ -2454,6 +2446,9 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// Refer to the documentation of [`dynamic_slice`](Self::dynamic_slice) for the wrapping and clamping semantics,
 /// and to [`DynamicSliceWithDimensions`] for windows whose starts and sizes are first-class dimension values.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -2465,7 +2460,8 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicSlice: Sized {
+#[capability]
+pub trait DynamicSlice<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Extracts a statically shaped sub-array at runtime start indices, with the semantics of StableHLO's
     /// [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation. `t.dynamic_slice(start_indices,
     /// sizes)` extracts the block of shape `sizes` whose origin is given by the scalar integer values in
@@ -2762,7 +2758,7 @@ impl<
                 >,
             >,
         > + ManualVariationAlignment<T>,
-> DynamicSlice for V
+> DynamicSlice<T> for V
 {
     fn dynamic_slice_with_negative_indices(
         &self,
@@ -3714,6 +3710,9 @@ impl<
 /// layout, and memory placement, and includes variation over manual axes contributed by the update or start indices.
 /// Start indices cannot carry reduction state.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// The following example shows how to use [`DynamicUpdateSlice`] in practice:
@@ -3732,7 +3731,8 @@ impl<
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicUpdateSlice: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait DynamicUpdateSlice<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Overwrites the block of `self` starting at `start_indices` with `update`. Refer to the documentation of this
     /// trait for more information on what this operation does.
     ///
@@ -3982,32 +3982,10 @@ impl DynamicUpdateSlice for Array {
     }
 }
 
-impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for ArrayIrValue<A> {
-    fn dynamic_update_slice_with_negative_indices(
-        &self,
-        update: &Self,
-        start_indices: &[Self],
-        allow_negative_indices: bool,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
-        let start_indices = start_indices
-            .iter()
-            .cloned()
-            .map(ValueProjection::<ArrayType>::into_projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Array(input.dynamic_update_slice_with_negative_indices(
-            update,
-            &start_indices,
-            allow_negative_indices,
-        )?))
-    }
-}
-
 impl<
     V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>
         + ManualVariationAlignment<ArrayType>,
-> DynamicUpdateSlice for V
+> DynamicUpdateSlice<ArrayType> for V
 {
     fn dynamic_update_slice_with_negative_indices(
         &self,
@@ -5404,6 +5382,20 @@ mod tests {
         assert_eq!(input.index_axis(-1, 1, true), Ok(Array::matrix(2, 1, vec![20i32, 50]).unwrap()));
         assert!(matches!(input.index_axis(0, usize::MAX, false), Err(ProgramError::Type(error))
             if error == TypeError::invalid("`index_axis` index overflows `usize`")));
+    }
+
+    #[test]
+    fn test_slice_provided_functions_composite() {
+        // The provided functions read the array metadata of composite values through their array view.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let composite = ArrayIrValue::Array(matrix.clone());
+        assert_eq!(composite.slice_axis(1, 0, 2, 1), Ok(ArrayIrValue::Array(matrix.slice_axis(1, 0, 2, 1).unwrap())));
+        assert_eq!(composite.index_axis(0, 1, false), Ok(ArrayIrValue::Array(matrix.index_axis(0, 1, false).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.slice_axis(0, 0, 1, 1),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+        );
     }
 
     #[test]

@@ -1,7 +1,11 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
-use crate::arrays::{Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
+use ryft_macros::capability;
+
+use crate::arrays::{
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
+};
 use crate::axes::Axes;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -11,6 +15,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -186,6 +191,9 @@ impl_differentiable_operation! {
 /// Non-empty reversals of bounded ragged batches are rejected because reversing their padded storage would move
 /// padding into valid data. Empty axis lists preserve the ragged batch unchanged.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust
@@ -194,7 +202,8 @@ impl_differentiable_operation! {
 /// assert_eq!(input.reverse([0])?.to_f64s(), vec![3.0, 2.0, 1.0]);
 /// # Ok::<(), ProgramError>(())
 /// ```
-pub trait Reverse: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Reverse<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reverses the elements of `self` along `axes`, resolving signed axes against the input rank.
     fn reverse<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>;
 }
@@ -244,8 +253,8 @@ impl Reverse for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReverseOperation>>>> Reverse
-    for V
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReverseOperation>>>>
+    Reverse<ArrayType> for V
 {
     fn reverse<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let axes =

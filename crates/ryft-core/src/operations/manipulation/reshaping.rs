@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType,
+    Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -19,6 +21,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::Mul;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -318,6 +321,9 @@ impl_differentiable_operation! {
 /// [`Reshape`] fills the same role for [`ReshapeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
 /// their corresponding arithmetic [`Operation`]s.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Examples
 ///
 /// ```rust
@@ -331,7 +337,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Reshape: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait Reshape<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reshapes `self` to `shape` with optional explicit output placement. Supplying `None` is equivalent to
     /// [`Self::reshape`]. An explicit placement is needed when a split, merge, or singleton change cannot infer an
     /// unambiguous placement from the input. The placement is attached to the reshape itself so backends can lower
@@ -365,9 +372,9 @@ pub trait Reshape: Sized {
     #[inline]
     fn reshape_to_sizes(&self, output_sizes: &[isize]) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
-        let input_count = self.r#type().shape().element_count()?.ok_or_else(|| {
+        let input_count = self.r#type().as_array_type()?.shape().element_count()?.ok_or_else(|| {
             TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count",
             ))
@@ -424,9 +431,10 @@ pub trait Reshape: Sized {
     #[inline]
     fn flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         if input_type.rank() == 1 {
             // An existing vector needs no inferred element count or newly introduced dimension identity.
             self.reshape(input_type.shape().clone())
@@ -444,9 +452,10 @@ pub trait Reshape: Sized {
     ///   - `axis`: Position of the inserted axis, normalized against the result rank.
     fn expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let axis = axis
             .into()
             .normalize(input_type.rank() + 1)
@@ -466,9 +475,10 @@ pub trait Reshape: Sized {
     ///   - `axes`: Input axes to remove; each must have the statically known size one.
     fn squeeze<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let axes = axes.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
         for axis in &axes {
             if input_type.dimension(*axis) != Dimension::Static(1) {
@@ -493,10 +503,11 @@ pub trait Reshape: Sized {
     /// becomes scalar; a shape with no singleton axes is unchanged.
     fn squeeze_all(&self) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType>,
+        Self: Typed<Type: AsArrayType>,
     {
         let axes = self
             .r#type()
+            .as_array_type()?
             .shape()
             .dimensions()
             .iter()
@@ -587,7 +598,7 @@ impl Reshape for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Reshape for V
+impl<V: Value<Type = ArrayType>> Reshape<ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ReshapeOperation>>,
 {
@@ -1679,8 +1690,8 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
-        DimensionOperation, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis,
-        Sharding, StridedLayout,
+        DimensionOperation, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        RaggedAxis, Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
@@ -2673,6 +2684,26 @@ mod tests {
         assert_eq!(
             dynamic_type.squeeze_all(),
             Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]))),
+        );
+    }
+
+    #[test]
+    fn test_reshape_provided_functions_composite() {
+        // The provided functions read the array metadata of composite values through their array view.
+        let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
+        let composite = ArrayIrValue::Array(matrix.clone());
+        assert_eq!(composite.flatten(), Ok(ArrayIrValue::Array(matrix.flatten().unwrap())));
+        assert_eq!(
+            composite.reshape_to_sizes(&[3, -1]),
+            Ok(ArrayIrValue::Array(matrix.reshape_to_sizes(&[3, -1]).unwrap()))
+        );
+        assert_eq!(composite.expand_dimensions(0), Ok(ArrayIrValue::Array(matrix.expand_dimensions(0).unwrap())));
+        assert_eq!(composite.squeeze([0]), Ok(ArrayIrValue::Array(matrix.squeeze([0]).unwrap())));
+        assert_eq!(composite.squeeze_all(), Ok(ArrayIrValue::Array(matrix.squeeze_all().unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.flatten(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
         );
     }
 

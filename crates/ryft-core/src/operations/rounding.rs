@@ -30,7 +30,8 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation,
 };
-use crate::programs::ProgramError;
+use crate::operations::Capability;
+use crate::programs::{ProgramError, Type};
 
 /// Canonical operation name for [`CeilOperation`].
 pub const CEIL_OPERATION_NAME: &str = "ceil";
@@ -202,9 +203,9 @@ impl_round_for_primitive!(f64);
 
 /// Group of the elementwise rounding capabilities [`Floor`], [`Ceil`], and [`Round`]. It is implemented automatically
 /// for every type that implements all of its members.
-pub trait RoundingOperations: Floor + Ceil + Round {}
+pub trait RoundingOperations<T = <Self as Capability>::Universe>: Capability + Floor<T> + Ceil<T> + Round<T> {}
 
-impl<V: Floor + Ceil + Round> RoundingOperations for V {}
+impl<T, V: Floor<T> + Ceil<T> + Round<T>> RoundingOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

@@ -850,6 +850,7 @@ impl std::ops::Rem for Array {
 }
 
 impl_tracer_operator!(@binary std::ops::Rem, rem, Rem, rem);
+impl_parameterwise_operator!(@binary Rem, rem);
 
 /// Implements [`Rem`] for one host primitive type.
 macro_rules! impl_rem_for_primitive {
@@ -3367,6 +3368,16 @@ mod tests {
             }),
         );
         assert!(Rem::rem(&1.0f64, &0.0).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_rem_parameterwise() {
+        // Structures combine corresponding parameters, or every parameter with a single parameter on the right.
+        let model = Parameterwise::<i32, _>::from((vec![10i32, 20], 30i32));
+        let divisor = Parameterwise::from((vec![3i32, 6], 7i32));
+        assert_eq!(Rem::rem(&model, &divisor).map(Parameterwise::into_inner), Ok((vec![1, 2], 2)));
+        assert_eq!((model.clone() % divisor).into_inner(), (vec![1, 2], 2));
+        assert_eq!((model % 4).into_inner(), (vec![2, 0], 2));
     }
 
     #[test]

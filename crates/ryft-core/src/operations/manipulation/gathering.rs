@@ -3,10 +3,12 @@ use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape, Sharding,
-    ShardingDimension,
+    ArrayIrType, ArrayIrValue, ArrayType, AsArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape,
+    Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -22,6 +24,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
+use crate::operations::Capability;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
@@ -35,8 +38,8 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
-    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// Determines how [`Gather`] handles windows extending outside its input. Negative indices are out of bounds and they
@@ -1039,6 +1042,9 @@ where
 /// [`DynamicGather::dynamic_gather_axis`] when query or untouched input extents must remain dynamic.
 /// The general [`Self::gather`] function exposes the mapping below.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # From Indices to Output Axes
 ///
 /// Suppose `indices` has shape `[Q0, Q1, ..., K]`. Every position in `[Q0, Q1, ...]` is a _query_, and its last-axis
@@ -1199,7 +1205,10 @@ where
 ///     Ok(Array::vector(vec![30_i32, 40]).unwrap()),
 /// );
 /// ```
-pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
+#[capability]
+pub trait Gather<Stored: Value<Type = ArrayType> = Array, T = <Self as Capability>::Universe>:
+    Capability + Sized
+{
     /// Reads windows of `slice_sizes` from the input at the starts given by `indices`, using `dimensions` to arrange
     /// their axes and `options` to select bounds behavior, index promises, and output placement. Refer to the
     /// documentation of [`Gather`] for how index vectors, window sizes, and output-axis positions interact. Negative
@@ -1255,9 +1264,10 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
         mode: GatherMode<Stored>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Typed<Type = ArrayType> + Reshape,
+        Self: Typed<Type: AsArrayType> + Reshape<T>,
     {
         let input_type = self.r#type();
+        let input_type = input_type.as_array_type()?;
         let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
         let slice_sizes = input_type
             .shape()
@@ -1273,6 +1283,7 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let indices_type = indices.r#type();
+        let indices_type = indices_type.as_array_type()?;
         let mut indices_dimensions = indices_type.shape().dimensions().to_vec();
         indices_dimensions.push(Dimension::Static(1));
         let expanded_indices = indices.reshape(Shape::new(indices_dimensions))?;
@@ -1810,23 +1821,8 @@ impl Gather for Array {
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, A: Gather<Stored> + Value<Type = ArrayType>> Gather<Stored> for ArrayIrValue<A> {
-    #[inline]
-    fn gather(
-        &self,
-        indices: &Self,
-        dimensions: &GatherDimensionNumbers,
-        slice_sizes: &[usize],
-        options: &GatherOptions<Stored>,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
-        Ok(Self::Array(input.gather(indices, dimensions, slice_sizes, options)?))
-    }
-}
-
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Gather<Stored>
-    for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>>
+    Gather<Stored, ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
 {
@@ -1845,6 +1841,46 @@ where
         let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+// A composite tracer gathers through its array view. The capability's stored-constant parameter precedes its universe,
+// which the shared projection macro cannot express, and so this projection and the concrete one below are written out.
+impl<
+    Stored: Value<Type = ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+> Gather<Stored, ArrayIrType> for V
+where
+    ProjectedValue<ArrayType, V>: Gather<Stored, ArrayType>,
+{
+    #[inline]
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError> {
+        let input = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        let indices = ValueProjection::<ArrayType>::into_projected(indices.clone())?;
+        Ok(V::from_projected(input.gather(&indices, dimensions, slice_sizes, options)?))
+    }
+}
+
+impl<Stored: Value<Type = ArrayType>, A: Gather<Stored, ArrayType> + Value<Type = ArrayType>>
+    Gather<Stored, ArrayIrType> for ArrayIrValue<A>
+{
+    #[inline]
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
+        Ok(Self::Array(input.gather(indices, dimensions, slice_sizes, options)?))
     }
 }
 
@@ -4608,6 +4644,23 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             ProgramError::Type(TypeError::invalid("`gather_axis` requires a static extent on unselected axis 0")),
+        );
+    }
+
+    #[test]
+    fn test_gather_composite() {
+        // Concrete composite values gather through their array members, including through the provided functions.
+        let input = Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap();
+        let indices = Array::vector(vec![2i32, 0]).unwrap();
+        let gathered = input.gather_axis(&indices, 1, GatherMode::Clip).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(input.clone()).gather_axis(&ArrayIrValue::Array(indices.clone()), 1, GatherMode::Clip),
+            Ok(ArrayIrValue::Array(gathered)),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.gather_axis(&ArrayIrValue::Array(indices), 0, GatherMode::Clip),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 

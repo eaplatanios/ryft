@@ -4,6 +4,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionOperation,
@@ -21,6 +23,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::Add;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::constant::ConstantOperation;
@@ -947,7 +950,7 @@ impl_differentiable_operation! {
 /// Represents the ability to join arrays end-to-end along one axis. [`Self::concatenate`] preserves input order and
 /// requires the same element [`DataType`](crate::DataType), rank, [`Memory`](crate::Memory) space, and dimensions other
 /// than the concatenated axis. Negative axes count from the final axis. There must be at least one input. A single
-/// input is returned unchanged without inspecting the axis.
+/// input is returned unchanged without inspecting the axis, although a composite input must still be an array.
 ///
 /// For multiple inputs, the result preserves the common memory space, clears explicit physical
 /// [`Layout`](crate::Layout) metadata, and infers [`Sharding`] independently. The concatenated axis must have static
@@ -956,6 +959,9 @@ impl_differentiable_operation! {
 ///
 /// These are the strict semantics of StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate)
 /// operation.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
 ///
 /// # Example
 ///
@@ -973,7 +979,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait Concatenate: Sized {
+#[capability]
+pub trait Concatenate<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Joins `inputs` end-to-end along `axis`. Negative axes index from the final axis. If `inputs` contains only one
     /// value, returns that value unchanged without inspecting `axis`. Refer to the documentation of this trait for more
     /// information on what this operation does.
@@ -1086,7 +1093,7 @@ impl Concatenate for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Concatenate for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Concatenate<ArrayType> for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
 {
@@ -1122,12 +1129,59 @@ where
     }
 }
 
+// A composite value concatenates through `DynamicConcatenate`, deriving the result extent as the sum of the input
+// extents on `axis`. Each extent is read with `DimensionSize::dimension_size` and the extents are summed with `Add`
+// on their `DimensionType` projections, so the derivation stages dimension operations under a tracer and evaluates
+// eagerly on concrete values. Exact extents fold to a static output axis, and dynamic extents produce a fresh dimension
+// identity whose equality with the concatenated size is asserted at runtime. Unlike homogeneous concatenation, a single
+// input still has its axis and extent validated.
+impl<V: DynamicConcatenate + DimensionSize + ValueProjection<DimensionType, Projected: Add>> Concatenate<ArrayIrType>
+    for V
+{
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: 'i,
+    {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let Some(first) = inputs.first() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one input but got none",
+            ))
+            .into());
+        };
+
+        // Validate input kinds, ranks, element types, memory spaces, and non-concatenated dimensions before staging
+        // the extent derivation. Sharding compatibility is checked when constructing the concatenation output type.
+        // A single array input is returned unchanged without inspecting the axis, as for homogeneous values.
+        let input_types = inputs
+            .iter()
+            .map(|input| <&ArrayType>::try_from(input.r#type().as_ref()).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        if inputs.len() == 1 {
+            return Ok((*first).clone());
+        }
+        let axis = ConcatenateOperation::<ArrayType>::normalize_axis(axis.into(), input_types[0].rank())?;
+        validate_concatenation_inputs(&input_types.iter().collect::<Vec<_>>(), axis)?;
+
+        let mut extent = first.dimension_size(axis)?.into_projected()?;
+        for input in &inputs[1..] {
+            extent = extent.add(&input.dimension_size(axis)?.into_projected()?)?;
+        }
+        let extent = Self::from_projected(extent);
+        Self::concatenate_with_known_extent(inputs, &extent, axis)
+    }
+}
+
 /// Represents the ability to concatenate mixed array inputs whose concatenated extents can be static or dynamic. The
 /// array inputs obey [`Concatenate`]'s element [`DataType`](crate::DataType), rank, [`Memory`](crate::Memory), and
 /// non-concatenated dimension requirements. The output axis is described by a first-class result extent that must
-/// equal the exact runtime sum of the input extents. [`Self::concatenate`] derives that extent by summing the inputs'
-/// [`DimensionSize`]s through their [`DimensionType`] projection with [`Add`], and
-/// [`Self::concatenate_with_known_extent`] takes it from the caller.
+/// equal the exact runtime sum of the input extents. [`Concatenate::concatenate`] (which every [`DynamicConcatenate`]
+/// value implements for the [`ArrayIrType`] universe) derives that extent by summing the inputs' [`DimensionSize`]s
+/// through their [`DimensionType`] projection with [`Add`], and [`Self::concatenate_with_known_extent`] takes it from
+/// the caller.
 ///
 /// The result extent's type describes the concatenated output axis. An exact dimension type yields a static axis, so
 /// statically shaped inputs stay pure under both entry points. Otherwise, its variable and bounds are retained. A
@@ -1143,7 +1197,9 @@ where
 /// called with context-carrying mixed tracers:
 ///
 /// ```rust
-/// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DimensionValue, DynamicConcatenate, ProgramError};
+/// # use ryft_core::{
+/// #     Array, ArrayIrValue, ArrayType, Concatenate, DataType, DimensionValue, DynamicConcatenate, ProgramError,
+/// # };
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Shapes: left [2], right [1] -> output [3] for both concatenation calls below.
@@ -1157,66 +1213,6 @@ where
 /// # }
 /// ```
 pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
-    /// Joins array `inputs` along `axis`, deriving the result extent as the sum of the input extents on that axis.
-    /// Each extent is read with [`DimensionSize::dimension_size`] and the extents are summed with
-    /// [`Add`] on their [`DimensionType`] projections, so the derivation stages dimension operations under a tracer
-    /// and evaluates eagerly on concrete values. Exact extents fold to a static output axis; dynamic extents produce a
-    /// fresh dimension identity whose equality with the concatenated size is asserted at runtime.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: One or more array values, in concatenation order. Dimension and reference values are rejected.
-    ///   - `axis`: Axis along which to join the inputs. Negative axes count from the final axis.
-    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
-        inputs: I,
-        axis: A,
-    ) -> Result<Self, ProgramError>
-    where
-        Self: 'i + DimensionSize + ValueProjection<DimensionType, Projected: Add>,
-    {
-        let inputs = inputs.into_iter().collect::<Vec<_>>();
-        let Some(first) = inputs.first() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` expects at least one input but got none",
-            ))
-            .into());
-        };
-
-        // Validate input kinds, ranks, element types, memory spaces, and non-concatenated dimensions before staging
-        // the extent derivation. Sharding compatibility is checked when constructing the concatenation output type.
-        let input_types = inputs
-            .iter()
-            .map(|input| <&ArrayType>::try_from(input.r#type().as_ref()).cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let axis = ConcatenateOperation::<ArrayType>::normalize_axis(axis.into(), input_types[0].rank())?;
-        validate_concatenation_inputs(&input_types.iter().collect::<Vec<_>>(), axis)?;
-
-        let mut extent = first.dimension_size(axis)?.into_projected()?;
-        for input in &inputs[1..] {
-            extent = extent.add(&input.dimension_size(axis)?.into_projected()?)?;
-        }
-        let extent = Self::from_projected(extent);
-        Self::concatenate_with_known_extent(inputs, &extent, axis)
-    }
-
-    /// Joins `self` followed by `others` along `axis`, deriving the result extent as [`Self::concatenate`] does.
-    ///
-    /// # Parameters
-    ///
-    ///   - `others`: Array values to append to `self`, in order.
-    ///   - `axis`: Axis along which to join the inputs. Negative axes count from the final axis.
-    #[inline]
-    fn concatenate_with<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
-        &'i self,
-        others: I,
-        axis: A,
-    ) -> Result<Self, ProgramError>
-    where
-        Self: 'i + DimensionSize + ValueProjection<DimensionType, Projected: Add>,
-    {
-        Self::concatenate(std::iter::once(self).chain(others), axis)
-    }
-
     /// Joins array `inputs` along `axis`, checking that their extents sum to `extent`. Unlike the singleton
     /// convenience in [`Concatenate`], this function validates the axis and result extent even for one input.
     ///
@@ -2249,6 +2245,10 @@ mod tests {
         /// A capability receiver need not be cloneable when concatenation constructs its result.
         #[derive(Debug, PartialEq)]
         struct NonCloneArray(Vec<i32>);
+
+        impl Capability for NonCloneArray {
+            type Universe = NonCloneArray;
+        }
 
         impl Concatenate for NonCloneArray {
             fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
@@ -3817,7 +3817,7 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left = context.input(ArrayType::new(DataType::F32, Shape::new(vec![left_size.into()])).into());
         let right = context.input(ArrayType::new(DataType::F32, Shape::new(vec![right_size.into()])).into());
-        let output = DynamicConcatenate::concatenate([&left, &right], 0).unwrap();
+        let output = Concatenate::concatenate([&left, &right], 0).unwrap();
         let ArrayIrType::Array(output_type) = output.r#type().into_owned() else { panic!("expected an array output") };
         assert_eq!(output_type.data_type(), DataType::F32);
         assert!(matches!(output_type.dimension(0), Dimension::Dynamic(_)));
@@ -3848,7 +3848,7 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left = context.input(ArrayType::new_static(DataType::F32, [2]).into());
         let right = context.input(ArrayType::new_static(DataType::F32, [1]).into());
-        let output = DynamicConcatenate::concatenate([&left, &right], -1).unwrap();
+        let output = Concatenate::concatenate([&left, &right], -1).unwrap();
         let program = context.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![output.atom_id().unwrap()],
             vec![Placeholder; 2],
@@ -3885,6 +3885,18 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` expects at least one input but got none"
             ))))
+        );
+
+        // A sole array input is returned unchanged without inspecting the axis or staging anything,
+        // exactly as for homogeneous values, while a sole first-class dimension is still rejected.
+        assert_eq!(ArrayIrValue::concatenate([&first], 100), Ok(first.clone()));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
+        assert_eq!(Concatenate::concatenate([&input], 100), Ok(input.clone()));
+        assert!(context.builder().borrow().instructions().is_empty());
+        assert_eq!(
+            ArrayIrValue::<Array>::concatenate([&ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())], 0),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 

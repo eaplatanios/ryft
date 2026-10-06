@@ -34,7 +34,7 @@ use std::sync::Arc;
 use crate::arrays::{Array, ArrayAddressing, ArrayType, Broadcastable, DataType};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
-    impl_tracer_operator,
+    impl_parameterwise_operator, impl_tracer_operator,
 };
 use crate::operations::Capability;
 use crate::programs::{ProgramError, TypeError, Typed};
@@ -91,6 +91,7 @@ define_elementwise_capability!(
 );
 
 impl_tracer_operator!(@unary std::ops::Not, not, Not, not);
+impl_parameterwise_operator!(@unary Not, not);
 
 impl_capability_for_primitive!(@unary Not, not, !, bool);
 impl_capability_for_primitive!(@unary Not, not, !, i8);
@@ -180,6 +181,7 @@ define_elementwise_capability!(
 );
 
 impl_tracer_operator!(@binary std::ops::BitAnd, bitand, And, and);
+impl_parameterwise_operator!(@binary BitAnd, bitand);
 
 impl_capability_for_primitive!(@binary And, and, &, bool);
 impl_capability_for_primitive!(@binary And, and, &, i8);
@@ -241,6 +243,7 @@ define_elementwise_capability!(
 );
 
 impl_tracer_operator!(@binary std::ops::BitOr, bitor, Or, or);
+impl_parameterwise_operator!(@binary BitOr, bitor);
 
 impl_capability_for_primitive!(@binary Or, or, |, bool);
 impl_capability_for_primitive!(@binary Or, or, |, i8);
@@ -303,6 +306,7 @@ define_elementwise_capability!(
 );
 
 impl_tracer_operator!(@binary std::ops::BitXor, bitxor, Xor, xor);
+impl_parameterwise_operator!(@binary BitXor, bitxor);
 
 impl_capability_for_primitive!(@binary Xor, xor, ^, bool);
 impl_capability_for_primitive!(@binary Xor, xor, ^, i8);
@@ -419,6 +423,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::parameters::Parameterwise;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero};
     use crate::tracing::TracingContext;
@@ -559,6 +564,14 @@ mod tests {
     }
 
     #[test]
+    fn test_not_parameterwise() {
+        // Structures negate every parameter through the capability and through the `!` operator.
+        let structure = Parameterwise::<bool, _>::from((vec![true, false], true));
+        assert_eq!(Not::not(&structure).map(Parameterwise::into_inner), Ok((vec![false, true], false)));
+        assert_eq!((!structure).into_inner(), (vec![false, true], false));
+    }
+
+    #[test]
     fn test_and() {
         assert_eq!(AndOperation::<ArrayType>::new().to_string(), "and");
     }
@@ -687,6 +700,16 @@ mod tests {
     }
 
     #[test]
+    fn test_and_parameterwise() {
+        // Structures combine corresponding parameters, or every parameter with a single parameter on the right.
+        let left = Parameterwise::<u8, _>::from((vec![0b1100u8, 0b1010], 0b1111u8));
+        let right = Parameterwise::from((vec![0b1010u8, 0b0110], 0b0101u8));
+        assert_eq!(And::and(&left, &right).map(Parameterwise::into_inner), Ok((vec![0b1000, 0b0010], 0b0101)));
+        assert_eq!((left.clone() & right).into_inner(), (vec![0b1000, 0b0010], 0b0101));
+        assert_eq!((left & 0b0001u8).into_inner(), (vec![0b0000, 0b0000], 0b0001));
+    }
+
+    #[test]
     fn test_or() {
         assert_eq!(OrOperation::<ArrayType>::new().to_string(), "or");
     }
@@ -803,6 +826,16 @@ mod tests {
 
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(left.clone() | right.clone(), left.or(&right).unwrap());
+    }
+
+    #[test]
+    fn test_or_parameterwise() {
+        // Structures combine corresponding parameters, or every parameter with a single parameter on the right.
+        let left = Parameterwise::<u8, _>::from((vec![0b1100u8, 0b1010], 0b0000u8));
+        let right = Parameterwise::from((vec![0b1010u8, 0b0110], 0b0101u8));
+        assert_eq!(Or::or(&left, &right).map(Parameterwise::into_inner), Ok((vec![0b1110, 0b1110], 0b0101)));
+        assert_eq!((left.clone() | right).into_inner(), (vec![0b1110, 0b1110], 0b0101));
+        assert_eq!((left | 0b0001u8).into_inner(), (vec![0b1101, 0b1011], 0b0001));
     }
 
     #[test]
@@ -925,6 +958,16 @@ mod tests {
     }
 
     #[test]
+    fn test_xor_parameterwise() {
+        // Structures combine corresponding parameters, or every parameter with a single parameter on the right.
+        let left = Parameterwise::<u8, _>::from((vec![0b1100u8, 0b1010], 0b1111u8));
+        let right = Parameterwise::from((vec![0b1010u8, 0b0110], 0b0101u8));
+        assert_eq!(Xor::xor(&left, &right).map(Parameterwise::into_inner), Ok((vec![0b0110, 0b1100], 0b1010)));
+        assert_eq!((left.clone() ^ right).into_inner(), (vec![0b0110, 0b1100], 0b1010));
+        assert_eq!((left ^ 0b0001u8).into_inner(), (vec![0b1101, 0b1011], 0b1110));
+    }
+
+    #[test]
     fn test_array_binary_logical() {
         let xor = |left: u8, right: u8| left ^ right;
 
@@ -933,7 +976,7 @@ mod tests {
             Array::matrix(2, 1, vec![true, false]).unwrap().binary_logical(
                 &Array::matrix(1, 3, vec![true, false, true]).unwrap(),
                 "xor",
-                xor
+                xor,
             ),
             Array::matrix(2, 3, vec![false, true, false, true, false, true]),
         );
