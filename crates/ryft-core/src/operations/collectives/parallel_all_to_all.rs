@@ -3393,10 +3393,19 @@ mod tests {
         let tiled_type = || ArrayType::new_static(DataType::F32, [4, 6]);
         let untiled = CollectiveOptions::default;
         let tiled = CollectiveOptions::tiled;
-        assert_eq!(homogeneous(untiled_type(), -1, -3, untiled()), homogeneous(untiled_type(), 2, 0, untiled()));
-        assert_eq!(homogeneous(tiled_type(), -2, -1, tiled()), homogeneous(tiled_type(), 0, 1, tiled()));
-        assert_eq!(composite(untiled_type(), -1, -3, untiled()), composite(untiled_type(), 2, 0, untiled()));
-        assert_eq!(composite(tiled_type(), -2, -1, tiled()), composite(tiled_type(), 0, 1, tiled()));
+        assert_eq!(
+            homogeneous(untiled_type(), -1, -3, untiled()).unwrap(),
+            homogeneous(untiled_type(), 2, 0, untiled()).unwrap(),
+        );
+        assert_eq!(
+            homogeneous(tiled_type(), -2, -1, tiled()).unwrap(),
+            homogeneous(tiled_type(), 0, 1, tiled()).unwrap(),
+        );
+        assert_eq!(
+            composite(untiled_type(), -1, -3, untiled()).unwrap(),
+            composite(untiled_type(), 2, 0, untiled()).unwrap(),
+        );
+        assert_eq!(composite(tiled_type(), -2, -1, tiled()).unwrap(), composite(tiled_type(), 0, 1, tiled()).unwrap());
         assert_eq!(
             homogeneous(untiled_type(), -4, 0, untiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),

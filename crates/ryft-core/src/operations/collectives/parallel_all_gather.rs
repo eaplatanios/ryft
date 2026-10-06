@@ -4002,11 +4002,11 @@ mod tests {
         };
         let untiled = CollectiveOptions::default;
         let tiled = CollectiveOptions::tiled;
-        assert_eq!(homogeneous(-1, untiled()), homogeneous(2, untiled()));
-        assert_eq!(homogeneous(-3, untiled()), homogeneous(0, untiled()));
-        assert_eq!(homogeneous(-1, tiled()), homogeneous(1, tiled()));
-        assert_eq!(composite(-1, untiled()), composite(2, untiled()));
-        assert_eq!(composite(-2, tiled()), composite(0, tiled()));
+        assert_eq!(homogeneous(-1, untiled()).unwrap(), homogeneous(2, untiled()).unwrap());
+        assert_eq!(homogeneous(-3, untiled()).unwrap(), homogeneous(0, untiled()).unwrap());
+        assert_eq!(homogeneous(-1, tiled()).unwrap(), homogeneous(1, tiled()).unwrap());
+        assert_eq!(composite(-1, untiled()).unwrap(), composite(2, untiled()).unwrap());
+        assert_eq!(composite(-2, tiled()).unwrap(), composite(0, tiled()).unwrap());
         assert_eq!(
             homogeneous(-4, untiled()),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
