@@ -83,9 +83,7 @@ pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
 pub use parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
 };
-pub use parallel_all_to_all::{
-    PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation, ParallelSwapAxes,
-};
+pub use parallel_all_to_all::{PARALLEL_ALL_TO_ALL_OPERATION_NAME, ParallelAllToAll, ParallelAllToAllOperation};
 pub use parallel_permute::{PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation};
 pub use parallel_ragged_all_to_all::{
     PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
@@ -2644,13 +2642,13 @@ mod tests {
                 ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2])),
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 3], %2:dimension<3>, %3:dimension<2> .
-                    let %4:f32[3, 2] = parallel_all_to_all [\
-                            axis_name=\"inner\", \
-                            axis_size=2, \
-                            split_axis=0, \
-                            concatenation_axis=1, \
-                            options=Untiled\
-                        ] %1 %2 %3
+                    let %4:f32[3, 2] = parallel_all_to_all [
+                        axis_name=\"inner\",
+                        axis_size=2,
+                        split_axis=0,
+                        concatenation_axis=1,
+                        options=Untiled,
+                    ] %1 %2 %3
                     in (%4)"
                 }
                 .to_string(),
@@ -2666,13 +2664,13 @@ mod tests {
                 ArrayIrType::Array(ArrayType::new_static(DataType::F32, [5, 3, 2])),
                 indoc! {"
                     lambda %0:dimension<5>, %1:f32[2, 5, 3], %2:dimension<3>, %3:dimension<2> .
-                    let %4:f32[5, 3, 2] = parallel_all_to_all [\
-                            axis_name=\"inner\", \
-                            axis_size=2, \
-                            split_axis=0, \
-                            concatenation_axis=2, \
-                            options=Untiled\
-                        ] %1 %0 %2 %3
+                    let %4:f32[5, 3, 2] = parallel_all_to_all [
+                        axis_name=\"inner\",
+                        axis_size=2,
+                        split_axis=0,
+                        concatenation_axis=2,
+                        options=Untiled,
+                    ] %1 %0 %2 %3
                     in (%4)"
                 }
                 .to_string(),
