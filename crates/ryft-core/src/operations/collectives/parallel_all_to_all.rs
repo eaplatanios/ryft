@@ -558,17 +558,17 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` axis index groups are not supported when a batch transform \
-                     binds the collective axis",
+                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` axis index groups are not supported \
+                     when a batch transform binds the collective axis",
                 ),
             });
         }
+
         if self.split_axis >= logical_input_rank || self.concatenation_axis >= logical_input_rank {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {} or concatenation axis {} is out of bounds for rank \
-                     {logical_input_rank}",
-                    self.split_axis, self.concatenation_axis,
+                    "`{}` split axis {} or concatenation axis {} is out of bounds for rank {}",
+                    PARALLEL_ALL_TO_ALL_OPERATION_NAME, self.split_axis, self.concatenation_axis, logical_input_rank,
                 ),
             });
         }
@@ -595,6 +595,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
                 (input_extents, output_extents[self.split_axis].clone())
             }
         };
+
         let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
         let mut split_extents = Vec::with_capacity(input_extents.len() + 2);
         split_extents.push(axis_extent.clone());
@@ -613,6 +614,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
             }
             CollectiveMode::Tiled => exchanged.move_axis(self.split_axis + 1, self.concatenation_axis + 1)?,
         };
+
         let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
         physical_output_extents.push(axis_extent);
         physical_output_extents.extend(output_extents);
