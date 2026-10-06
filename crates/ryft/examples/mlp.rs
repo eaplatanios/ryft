@@ -294,10 +294,10 @@ mod xla_backend {
     use ryft::pjrt::{ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
-    use ryft::xla::{Array, FromPjrt, XlaDomain, XlaSession};
+    use ryft::xla::{Array, FromPjrt, XlaDomain, XlaSession, XlaValue};
     use ryft::{
-        ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType,
-        Parameterized, ProjectedContext, Shape, Sharding,
+        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Parameterized,
+        ProjectedContext, Shape, Sharding,
     };
 
     use super::{ExampleResult, Linear, Mlp, Training, initial_layer_values, input_values, target_values};
@@ -436,13 +436,13 @@ mod xla_backend {
         super::train(
             "xla-ir",
             &domain,
-            model.map_parameters(ArrayIrValue::Array)?,
-            ArrayIrValue::Array(inputs),
-            ArrayIrValue::Array(targets),
-            ArrayIrValue::Array(learning_rate),
-            ArrayIrValue::Array(mean_scale),
+            model.map_parameters(XlaValue::Array)?,
+            XlaValue::Array(inputs),
+            XlaValue::Array(targets),
+            XlaValue::Array(learning_rate),
+            XlaValue::Array(mean_scale),
             |value| match value {
-                ArrayIrValue::Array(array) => Ok(read_f32s(array)?.into_iter().map(f64::from).collect()),
+                XlaValue::Array(array) => Ok(read_f32s(array)?.into_iter().map(f64::from).collect()),
                 _ => Err("xla-ir result is not an array".into()),
             },
         )

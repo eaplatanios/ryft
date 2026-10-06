@@ -72,21 +72,31 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work
     /// executes in the [`ExecutionDomain`](Self::ExecutionDomain). The two domains coincide for every transform and
     /// staged value (e.g., a staged [`Tracer`]'s trace, a [`BatchingTracer`]'s batching level, etc.): dispatch and
-    /// execution both happen in the live context such a value flows through. However, they become separate for concrete
-    /// backend values (e.g., concrete arrays). In those cases, the [`DispatchDomain`](Self::DispatchDomain) is the
-    /// constant-only [`EagerContext`](crate::EagerContext) such that capability calls dispatch to direct
-    /// implementations instead of a context, while the [`ExecutionDomain`](Self::ExecutionDomain) names the backend's
-    /// _rich_, operation-executing eager domain. Backend values whose rich domain requires state or defaults that
-    /// cannot be derived from a value (e.g., a client handle) keep the constant-only domain here too, which simply
-    /// means free transform entry points do not serve them and an explicit context must be used instead.
+    /// execution both happen in the live context such a value flows through. Concrete backend values (e.g., concrete
+    /// arrays) follow one of two strategies:
+    ///
+    ///   - **Direct Implementations:** Concrete values defined in this crate (e.g., [`Array`](crate::Array) and
+    ///     [`ArrayIrValue`](crate::ArrayIrValue)) use the constant-only [`EagerContext`](crate::EagerContext) as
+    ///     their [`DispatchDomain`](Self::DispatchDomain), so that capability calls dispatch to direct implementations
+    ///     instead of a context, while their [`ExecutionDomain`](Self::ExecutionDomain) names a _rich_,
+    ///     operation-executing eager domain. A value whose rich domain requires state that cannot be derived from the
+    ///     value (e.g., a client handle) keeps the constant-only domain there too, which means free transform entry
+    ///     points do not serve it and an explicit context must be used instead.
+    ///   - **Rich Dispatch:** Concrete values defined in downstream backend crates cannot provide direct capability
+    ///     implementations next to the blanket ones (see below), so both of their domains are their backend's rich
+    ///     domain, and every capability binds an operation that the backend executes eagerly. Such values must carry
+    ///     the state that their domain requires in every member and in every projected representation (e.g., the XLA
+    ///     backend's composite values carry their session in their array, dimension, and reference members), because
+    ///     [`ValueProjection::from_projected`] is infallible and receives no state.
     ///
     /// Blanket capability implementations (e.g., the value-level arithmetic sugar) bind through this domain and use its
     /// operation universe as their coherence discriminator: the sugar applies when `V::DispatchDomain::Operation` can
     /// accept the operation being bound. A staged [`Tracer`]'s dispatch domain is its live trace, so the sugar records
-    /// instructions there. A concrete backend value's dispatch domain is the constant-only
-    /// [`EagerContext`](crate::EagerContext), whose [`ConstantOperation`](crate::ConstantOperation) universe accepts
-    /// nothing. This is precisely what keeps the blanket implementations coherent with (i.e., disjoint from) the direct
-    /// capability implementations that concrete values provide instead.
+    /// instructions there, and a rich-dispatch backend value's dispatch domain executes the operation eagerly. A
+    /// direct-implementation value's dispatch domain is the constant-only [`EagerContext`](crate::EagerContext),
+    /// whose [`ConstantOperation`](crate::ConstantOperation) universe accepts nothing. This is precisely what keeps
+    /// the blanket implementations coherent with (i.e., disjoint from) the direct capability implementations of those
+    /// values.
     type DispatchDomain: Domain<Type = Self::Type, Value = Self>;
 
     /// [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the documentation of

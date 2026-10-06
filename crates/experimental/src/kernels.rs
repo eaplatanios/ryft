@@ -1257,14 +1257,14 @@ mod cutile {
 
     use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayIrValue, ArrayOperation, CompilationCacheDomain, CompilationDomain,
+        AddOperation, ArrayIrType, ArrayOperation, CompilationCacheDomain, CompilationDomain,
         CompilationStagingRequest, ConstantOperation, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
         call_function,
     };
     use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
     use ryft_xla::experimental::XlaDomainError;
     use ryft_xla::kernels::{CuTileEmbedding, XlaKernelCompilerBinding, stage_kernel};
-    use ryft_xla::{FromPjrt, XlaDomain, XlaSession};
+    use ryft_xla::{FromPjrt, XlaDomain, XlaSession, XlaValue};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1407,8 +1407,8 @@ mod cutile {
             arrays[1] = arrays[0].clone();
         }
         let original = arrays[0].clone();
-        let results = call_function(&runtime, &executable, arrays.into_iter().map(ArrayIrValue::Array).collect())?;
-        let ArrayIrValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
+        let results = call_function(&runtime, &executable, arrays.into_iter().map(XlaValue::Array).collect())?;
+        let XlaValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
         let bytes =
             result.device_shard(device.id().unwrap()).unwrap().buffer().unwrap().copy_to_host(None)?.r#await()?;
         let values = bytes
@@ -1704,15 +1704,15 @@ mod tuning {
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
     use ryft_core::{
-        ArrayIrType, ArrayIrValue, CompilationCall, CompilationDomain, CompilationStagingRequest, CompilationTracer,
-        Device, DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution,
+        ArrayIrType, CompilationCall, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device,
+        DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution,
         StatefulCompilationDomain,
     };
     use ryft_xla::kernels::{
         KernelOutputEmbedding, KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest,
         KernelTuningRunner, XlaKernelCompilerBinding, XlaKernelExecutionFacts, XlaKernelTarget, stage_kernel,
     };
-    use ryft_xla::{Array as XlaArray, FromPjrt, XlaDomain, XlaOptions, XlaSession};
+    use ryft_xla::{Array as XlaArray, FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1736,13 +1736,13 @@ mod tuning {
         executable: Option<ExecutableFunction<XlaDomain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
 
         /// Fixed functional inputs reused across all samples.
-        inputs: Vec<ArrayIrValue<XlaArray<'c>>>,
+        inputs: Vec<XlaValue<'c>>,
     }
 
     impl<'c> KernelTuningRunner for Runner<'c> {
         fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
             for input in &self.inputs {
-                let ArrayIrValue::Array(input) = input else {
+                let XlaValue::Array(input) = input else {
                     unreachable!();
                 };
                 input.block_until_ready().map_err(error)?;
@@ -1772,7 +1772,7 @@ mod tuning {
                     .call_statefully_async(CompilationCall::new(self.executable.as_ref().unwrap(), self.inputs.clone()))
                     .r#await()
                     .map_err(error)?;
-                let ArrayIrValue::Array(output) = &outputs[0] else {
+                let XlaValue::Array(output) = &outputs[0] else {
                     return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
                 };
                 let bytes = output
@@ -1872,7 +1872,7 @@ mod tuning {
             .iter()
             .zip(&case.inputs)
             .map(|(r#type, values)| {
-                ArrayIrValue::Array(
+                XlaValue::Array(
                     session
                         .array(
                             r#type.clone(),
@@ -2258,12 +2258,12 @@ mod triton {
 
     use ryft_core::kernels::{KernelCompiler, KernelSchedule};
     use ryft_core::{
-        ArrayIrType, ArrayIrValue, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device,
-        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, call_function,
+        ArrayIrType, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device, DeviceMesh,
+        LogicalMesh, MeshAxis, MeshAxisType, call_function,
     };
     use ryft_triton::kernels::{Compiler, Options, Target};
     use ryft_xla::kernels::{TritonEmbedding, XlaKernelCompilerBinding, stage_kernel};
-    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession};
+    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -2337,9 +2337,8 @@ mod triton {
             .collect::<Vec<_>>();
         for _ in 0..3 {
             let outputs =
-                call_function(&runtime, &executable, inputs.iter().cloned().map(ArrayIrValue::Array).collect())
-                    .unwrap();
-            let ArrayIrValue::Array(output) = &outputs[0] else { panic!("expected array output") };
+                call_function(&runtime, &executable, inputs.iter().cloned().map(XlaValue::Array).collect()).unwrap();
+            let XlaValue::Array(output) = &outputs[0] else { panic!("expected array output") };
             let bytes = output
                 .device_shard(device.id().unwrap())
                 .unwrap()

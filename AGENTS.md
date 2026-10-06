@@ -399,24 +399,44 @@ Consult that file before writing or revising unit tests.
   comment, because the transpose of the skipped `parallel_vary` is a cross-device sum. Stage any value that can carry
   a tangent through the value-level capabilities, which call `align_manual_variation`. Cover such rules with a test
   that runs them inside a manual region with varying inputs.
-- Capability traits are universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where
-  the universe is a coherence marker that need not be a `Type`, and host types are their own universe), carry the
-  `#[capability]` attribute that checks those conventions, and declare exactly one composite strategy: a projection
-  through `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the composite family
-  plus an eager `ArrayIrValue` delegation (S2), an existing composite-native path (S3), or member-kind dispatch through
-  an operation provider (S4). Give capability functions default bodies only when the default is correct for every
-  implementor (e.g., by composing required functions), and make implementor-dependent functions required instead.
-  Only elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations
-  that `define_elementwise_capability!` generates (and `impl_parameterwise_operator!` for their `std::ops` operators,
-  invoked right after the corresponding `impl_tracer_operator!`), never through derive-generated code. In generic
-  bounds, use each capability's default universe (or a bundle such as `ArrayOperations`) and never mix it with an
-  explicitly named universe for the same value, and never pin `Typed<Type = T>` next to capability bounds at `T`; the
-  trait solver cannot equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or projected `V`, so
-  mixed bounds fail to unify and pinned equalities make bounds on `V::Type` unusable. Never bound a universe parameter
-  by `Type`, including in bundle blanket implementations, because host types are universes too, and keep compile-time
-  assertions that host types satisfy the bundles whose members they implement. Every universe's implementation of a
-  capability must honor the same documented contract, including edge cases such as singleton or empty inputs, so test
-  those edge cases for each universe.
+- Every value-level capability trait, including dynamic-geometry, dimension, reference, and alignment capabilities, is
+  universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where the universe is a coherence
+  marker that need not be a `Type`, and host types are their own universe), with any other parameters (e.g.,
+  `Transform`, `Binding`, or `Output`) before the universe, and every capability bundle has the same universe parameter
+  with a blanket implementation. Never pin a capability's receiver to one universe through a super-trait such as
+  `Value<Type = ArrayIrType>`: provided functions bound a type view instead (e.g.,
+  `Self: Value<Type: AsArrayType + AsDimensionType>`), implementations name their universe explicitly (e.g.,
+  `DynamicPad<ArrayIrType>`), and a blanket implementation that serves several universes introduces the universe as its
+  own type parameter (e.g., `impl<U, V: Value<Type = U>> X<U> for V`). Capability traits carry the `#[capability]`
+  attribute that checks those conventions, and declare exactly one composite strategy: a projection through
+  `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the composite family plus an
+  eager `ArrayIrValue` delegation (S2), an existing composite-native path (S3), or member-kind dispatch through an
+  operation provider (S4). Give capability functions default bodies only when the default is correct for every
+  implementor (e.g., by composing required functions), and make implementor-dependent functions required instead. Only
+  elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations that
+  `define_elementwise_capability!` generates (and `impl_parameterwise_operator!` for their `std::ops` operators, invoked
+  right after the corresponding `impl_tracer_operator!`), never through derive-generated code. In generic bounds, use
+  each capability's default universe (or a bundle such as `ArrayOperations`) and never mix it with an explicitly named
+  universe for the same value, and never pin `Typed<Type = T>` next to capability bounds at `T`; the trait solver cannot
+  equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or projected `V`, so mixed bounds fail to
+  unify and pinned equalities make bounds on `V::Type` unusable. Never bound a universe parameter by `Type`, including
+  in bundle blanket implementations, because host types are universes too, and keep compile-time assertions that host
+  types satisfy the bundles whose members they implement. Every universe's implementation of a capability must honor the
+  same documented contract, including edge cases such as singleton or empty inputs, so test those edge cases for each
+  universe.
+- Document the universe parameter of every trait bounded by `Capability`, including bundles and macro-generated
+  capabilities, with a paragraph that starts with "The universe parameter `T` defaults to the `Capability` universe
+  of the implementor, so that ..." and names the universes that actually implement it (e.g., `ArrayType` and
+  `ArrayIrType`). Place it as the last paragraph before the first section heading of the trait documentation.
+- Hand-written composite projections (i.e., capabilities whose irregular signatures the `#[capability]` attribute cannot
+  project) bound the projected member by the capability (e.g., `V::Projected: Sort<ArrayType>`) and rebuild results
+  through `from_projected`. Never pin `Projected = ProjectedValue<ArrayType, V>`: that serves only composite tracers and
+  forces concrete composite values (e.g., `ArrayIrValue<A>` or a backend's composite value) to duplicate the forwarding.
+- Backend composite values that dispatch through a stateful rich domain (e.g., `ryft-xla`'s `XlaValue`) carry that state
+  (e.g., the session) in every member and in every projected representation, because `ValueProjection::from_projected`
+  is infallible and receives no state. Host-side values enter such a domain through its constants (`Context::lift`),
+  never through a state-less constructor, and host-side semantics that do not depend on the state (e.g., predicate and
+  reference-handle contracts) delegate to the generic `ArrayIrValue` implementations instead of being reimplemented.
 
 ### `ryft-mlir`
 
