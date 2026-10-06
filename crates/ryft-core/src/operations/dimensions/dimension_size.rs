@@ -288,6 +288,10 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
+/// composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust

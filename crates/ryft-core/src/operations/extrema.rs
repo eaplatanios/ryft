@@ -627,6 +627,10 @@ impl_clamp_for_primitive!(f64);
 
 /// Group of the elementwise extrema capabilities [`Min`], [`Max`], and [`Clamp`]. It is implemented automatically
 /// for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
 pub trait ExtremaOperations<T = <Self as Capability>::Universe>: Capability + Min<T> + Max<T> + Clamp<T> {}
 
 impl<T, V: Min<T> + Max<T> + Clamp<T>> ExtremaOperations<T> for V {}

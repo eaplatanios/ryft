@@ -87,6 +87,9 @@ pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, Refere
 /// Group of the reference capabilities over references addressed through `Transform` paths: [`ReferenceNew`],
 /// [`ReferenceRead`], [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and
 /// [`ReferenceFreeze`]. It is implemented automatically for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that composite array IR values implement this bundle for [`ArrayIrType`](crate::ArrayIrType).
 pub trait ReferenceOperations<Transform: ReferenceTransform, T = <Self as Capability>::Universe>:
     Capability
     + ReferenceNew<Self, T>

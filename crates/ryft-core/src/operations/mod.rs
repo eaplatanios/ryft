@@ -196,7 +196,7 @@ pub use trigonometric::{
 ///
 /// # The `capability` Attribute
 ///
-/// Capability traits are declared with the [`capability`](macro@capability) attribute, which checks their
+/// Capability traits are declared with the [`capability`](macro@ryft_macros::capability) attribute, which checks their
 /// conventions at compile time (i.e., exactly one type parameter defaults to `<Self as Capability>::Universe`, that
 /// parameter is unbounded because host types are their own universes, and [`Capability`] is a direct super-trait).
 /// Its `projection(Composite => Member)` argument additionally implements the capability for every value of the

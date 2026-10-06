@@ -2814,6 +2814,11 @@ impl<
 /// Backends may require finite bounds on dimension-sized windows (e.g., the XLA backend). That is, accepting a dynamic
 /// shape in the core does not imply support for unbounded allocation or runtime byte strides for all backends.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
+/// universes with array and dimension members can implement it as well.
+///
 /// # Example
 ///
 /// ```rust

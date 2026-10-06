@@ -449,6 +449,12 @@ impl<
 /// the update operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a
 /// family without reference operations may reject construction. This capability supports arbitrary reference-aware type
 /// universes so reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that staged values
+/// implement this capability for every universe with reference members (e.g., [`ArrayIrType`]), concrete composite
+/// array IR values implement it for [`ArrayIrType`], their projected reference members implement it for
+/// [`ReferenceType<ArrayType>`](crate::ReferenceType), and [`ReferenceView`](crate::ReferenceView)s implement it for
+/// the [`ReferenceType`](crate::ReferenceType) of their referent.
 #[capability]
 pub trait ReferenceAddUpdate<
     Transform: ReferenceTransform,

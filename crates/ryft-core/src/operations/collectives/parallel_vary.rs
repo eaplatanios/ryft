@@ -479,6 +479,10 @@ impl<
 /// stages its rules, still aligns over it, using the mesh of an input that varies over the axis (refer to
 /// [`ParallelVary::parallel_vary_on_mesh`]). Scalar data-type and dimension values have no manual variation
 /// and pass through unchanged, and a composite [`ArrayIrType`] value aligns only its array members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that data-type scalar
+/// values, homogeneous array values, first-class dimension values, and composite array IR values implement this
+/// capability for [`DataType`], [`ArrayType`], [`DimensionType`], and [`ArrayIrType`], respectively.
 #[capability]
 pub trait ManualVariationAlignment<T = <Self as Capability>::Universe>: Capability + Clone {
     /// Returns `inputs` with their manual variation aligned, in the same order.

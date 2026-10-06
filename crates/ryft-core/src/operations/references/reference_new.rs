@@ -294,6 +294,10 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, Ar
 }
 
 /// Capability for creating new references initialized from a value.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`] and their projected array members implement it for
+/// [`ArrayType`].
 #[capability]
 pub trait ReferenceNew<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Creates an independent reference whose initial state is this value.

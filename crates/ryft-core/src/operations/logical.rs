@@ -404,6 +404,10 @@ impl Array {
 
 /// Group of the elementwise logical and bitwise capabilities [`Not`], [`And`], [`Or`], and [`Xor`]. It is implemented
 /// automatically for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their own universes.
 pub trait LogicalOperations<T = <Self as Capability>::Universe>: Capability + Not<T> + And<T> + Or<T> + Xor<T> {}
 
 impl<T, V: Not<T> + And<T> + Or<T> + Xor<T>> LogicalOperations<T> for V {}

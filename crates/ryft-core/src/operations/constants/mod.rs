@@ -331,6 +331,10 @@ pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 /// Group of the value-driven constant capabilities [`ZeroLike`] and [`OneLike`]. It is implemented automatically for
 /// every type that implements all of its members. The context-side constructors (e.g., [`Zero`] and [`One`]) are
 /// implemented by contexts rather than values and are therefore not members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`].
 pub trait ConstantOperations<T = <Self as Capability>::Universe>: Capability + ZeroLike<T> + OneLike<T> {}
 
 impl<T, V: ZeroLike<T> + OneLike<T>> ConstantOperations<T> for V {}

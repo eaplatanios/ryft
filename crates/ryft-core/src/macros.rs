@@ -633,6 +633,10 @@ macro_rules! define_arithmetic_dimension_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that first-class dimension values implement this capability for"]
+        #[doc = "[`DimensionType`](crate::DimensionType)."]
         #[::ryft_macros::capability]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized

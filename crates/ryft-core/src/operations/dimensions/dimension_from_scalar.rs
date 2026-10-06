@@ -212,6 +212,10 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
 /// batch carrier and become ragged geometry only when a shape-consuming batching rule accepts them.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
+/// composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust

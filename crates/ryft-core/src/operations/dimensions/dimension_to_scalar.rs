@@ -127,6 +127,10 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 /// through `Output`. The returned scalar cannot define an array extent and converting it back into a first-class
 /// dimension requires a separate checked gateway.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that first-class dimension
+/// values (including the projected dimension members of composite values) implement this capability for
+/// [`DimensionType`] and composite array IR values implement it for [`ArrayIrType`].
+///
 /// # Example
 ///
 /// ```rust

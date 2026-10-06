@@ -519,6 +519,11 @@ impl_tanh_for_primitive!(f64);
 
 /// Group of the elementwise trigonometric capabilities [`Sin`], [`Cos`], [`Tan`], [`Tanh`], and [`Atan2`].
 /// It is implemented automatically for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
+/// values implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their
+/// own universes.
 pub trait TrigonometricOperations<T = <Self as Capability>::Universe>:
     Capability + Sin<T> + Cos<T> + Tan<T> + Tanh<T> + Atan2<T>
 {

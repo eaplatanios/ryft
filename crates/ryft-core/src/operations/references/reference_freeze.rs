@@ -277,6 +277,10 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType,
 }
 
 /// Capability to consume a reference, returning its final value and invalidating its complete alias family.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`] and their projected reference members implement it for
+/// [`ReferenceType<ArrayType>`](crate::ReferenceType).
 #[capability]
 pub trait ReferenceFreeze<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the final stored value and invalidates this reference and all aliases.

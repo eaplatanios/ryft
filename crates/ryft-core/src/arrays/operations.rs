@@ -259,6 +259,9 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 /// capabilities alongside the dedicated [`DimensionMin`], [`DimensionMax`], [`DimensionSaturatingSub`], and
 /// [`DimensionPow`]. It is implemented automatically for every value that implements all of its members, and so it
 /// must never be implemented manually.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that first-class dimension values implement this bundle for [`DimensionType`].
 pub trait DimensionOperations<T = <Self as Capability>::Universe>:
     Value
     + DimensionMax<T>

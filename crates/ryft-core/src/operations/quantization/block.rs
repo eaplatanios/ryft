@@ -41,6 +41,9 @@ use crate::programs::{ProgramError, TypeError, Value};
 /// `exp(exponent · log(2))` to `f8e8m0fnu` rounds to the nearest power of two, absorbing the remaining approximation
 /// error entirely. All-zero (and denormal-tiny) blocks clamp their scale up to a small representable positive value
 /// instead of producing a zero or infinite scale.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Quantizes `self` into `(elements, scales)` per block of `block_size` trailing-dimension values, where

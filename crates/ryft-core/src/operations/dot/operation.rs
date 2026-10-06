@@ -475,6 +475,10 @@ where
 
 /// Group of the dot product capabilities [`Dot`] and [`RaggedDot`]. It is implemented automatically for every type that
 /// implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`].
 pub trait DotOperations<T = <Self as Capability>::Universe>: Capability + Dot<Self, T> + RaggedDot<T> {}
 
 impl<T, V: Dot<V, T> + RaggedDot<T>> DotOperations<T> for V {}

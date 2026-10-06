@@ -1890,6 +1890,10 @@ impl<Stored: Value<Type = ArrayType>, A: Gather<Stored, ArrayType> + Value<Type 
 /// according to their bounds. The output retains the exact runtime dimensions of the input and queries. Like
 /// [`Gather::gather_axis`], negative indices are out of bounds rather than indexing backward from the end.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents.
+///
 /// # Examples
 ///
 /// ```rust

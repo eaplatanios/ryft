@@ -2344,6 +2344,10 @@ fn batch_index_reduction<
 
 /// Group of the reduction capabilities [`Reduce`], [`ArgMax`], and [`ArgMin`]. It is implemented automatically
 /// for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`].
 pub trait ReductionOperations<T = <Self as Capability>::Universe>:
     Capability + Reduce<T> + ArgMax<T> + ArgMin<T>
 {

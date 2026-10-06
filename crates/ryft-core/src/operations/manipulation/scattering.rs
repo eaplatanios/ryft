@@ -2241,6 +2241,10 @@ impl Array {
 /// Both the query shape and the input shape can therefore retain symbolic dimensions. This introduces no separate
 /// scatter operation or bounds policy.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents.
+///
 /// # Example
 ///
 /// ```rust

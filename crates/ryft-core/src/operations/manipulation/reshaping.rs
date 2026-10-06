@@ -1117,6 +1117,11 @@ impl_differentiable_operation! {
 /// whose input and output physical capacities cannot be represented by their runtime reshape support; equal logical
 /// element counts alone do not guarantee that every bounded shape can be compiled.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
+/// universes with array and dimension members can implement it as well.
+///
 /// # Examples
 ///
 /// Exact host sizes can use [`Self::dynamic_reshape_to_sizes`]:

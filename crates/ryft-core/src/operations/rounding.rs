@@ -203,6 +203,11 @@ impl_round_for_primitive!(f64);
 
 /// Group of the elementwise rounding capabilities [`Floor`], [`Ceil`], and [`Round`]. It is implemented automatically
 /// for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
+/// values implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their
+/// own universes.
 pub trait RoundingOperations<T = <Self as Capability>::Universe>: Capability + Floor<T> + Ceil<T> + Round<T> {}
 
 impl<T, V: Floor<T> + Ceil<T> + Round<T>> RoundingOperations<T> for V {}

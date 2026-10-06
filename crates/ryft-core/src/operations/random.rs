@@ -682,6 +682,10 @@ impl<
 /// [`ArrayIrValue`]s generate exactly the bits that [`RngBitGenerator`] generates for the resolved static shape, while
 /// context-carrying values bind an [`RngBitGeneratorOperation<ArrayIrType>`].
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents.
+///
 /// # Example
 ///
 /// ```rust

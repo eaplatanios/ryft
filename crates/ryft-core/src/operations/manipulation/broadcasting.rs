@@ -1361,6 +1361,11 @@ impl_differentiable_operation! {
 /// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and
 /// [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
+/// universes with array and dimension members can implement it as well.
+///
 /// # Examples
 ///
 /// Exact host sizes can use [`DynamicBroadcast::dynamic_broadcast_to_sizes`]:

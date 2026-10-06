@@ -1668,6 +1668,11 @@ where
 /// padded sizes or supplied dimensions that disagree with the padding formula. The padding configuration itself is
 /// static; this capability does not represent StableHLO's separate runtime-padding-amount operation `dynamic_pad`.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents. Its provided functions only require views of the receiver's type (e.g., [`AsArrayType`]), so that other
+/// universes with array and dimension members can implement it as well.
+///
 /// # Example
 ///
 /// The following example pads a mixed array value using a first-class output extent. Context-carrying mixed values use

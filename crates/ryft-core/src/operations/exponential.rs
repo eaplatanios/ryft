@@ -527,6 +527,11 @@ impl_logistic_for_primitive!(f64);
 
 /// Group of the elementwise exponential and logarithmic capabilities [`Exp`], [`Log`], [`Ln1p`], [`LogAddExp`],
 /// and [`Logistic`]. It is implemented automatically for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and composite array IR
+/// values implement it for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their
+/// own universes.
 pub trait ExponentialOperations<T = <Self as Capability>::Universe>:
     Capability + Exp<T> + Log<T> + Ln1p<T> + LogAddExp<T> + Logistic<T>
 {

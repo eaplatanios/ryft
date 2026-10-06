@@ -708,6 +708,10 @@ impl ConstrainSharding for Array {
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
 /// for every type that implements all of its members.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`].
 pub trait ShardingOperations<T = <Self as Capability>::Universe>:
     Capability + Reshard<T> + ConstrainSharding<T>
 {

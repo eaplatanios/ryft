@@ -1382,6 +1382,10 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 /// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
 /// automatically for every type that implements all of its members. The context-side [`AxisIndex`] is implemented by
 /// contexts rather than values and is therefore not a member.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
+/// for [`ArrayIrType`].
 pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     Capability
     + ParallelReduce<T>

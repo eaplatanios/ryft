@@ -1192,6 +1192,12 @@ where
 /// the output unify statically with other values typed by it, and keeps its computation available to staging and
 /// differentiation.
 ///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic
+/// extents. Its provided functions only require views of the receiver's type (e.g.,
+/// [`AsArrayType`](crate::AsArrayType)), so that other universes with array and dimension members can implement it as
+/// well.
+///
 /// # Example
 ///
 /// The following example uses concrete mixed values. The same functions stage a mixed [`ConcatenateOperation`] when

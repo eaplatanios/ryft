@@ -391,6 +391,11 @@ impl_differentiable_operation! {
 }
 
 /// Capability to replace the value stored by a reference without observing the previous value.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that composite array IR
+/// values implement this capability for [`ArrayIrType`], their projected reference members implement it for
+/// [`ReferenceType<ArrayType>`](crate::ReferenceType), and [`ReferenceView`](crate::ReferenceView)s implement it for
+/// the [`ReferenceType`](crate::ReferenceType) of their referent.
 #[capability]
 pub trait ReferenceWrite<
     Transform: ReferenceTransform,
