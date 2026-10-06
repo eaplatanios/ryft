@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -11,6 +13,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::constants::zero::Zero;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
@@ -388,7 +391,14 @@ impl_differentiable_operation! {
 }
 
 /// Capability to replace the value stored by a reference without observing the previous value.
-pub trait ReferenceWrite<Transform: ReferenceTransform, Binding = Self, Replacement = Self>: Sized {
+#[capability]
+pub trait ReferenceWrite<
+    Transform: ReferenceTransform,
+    Binding = Self,
+    Replacement = Self,
+    T = <Self as Capability>::Universe,
+>: Capability + Sized
+{
     /// Replaces the state selected by the supplied transforms with `replacement` in program order, without observing
     /// the previous value.
     ///
@@ -413,7 +423,7 @@ pub trait ReferenceWrite<Transform: ReferenceTransform, Binding = Self, Replacem
 }
 
 impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + UpdateSlice>
-    ReferenceWrite<ArrayReferenceTransform> for ArrayIrValue<A>
+    ReferenceWrite<ArrayReferenceTransform, Self, Self, ArrayIrType> for ArrayIrValue<A>
 {
     fn write_through(
         &self,
@@ -433,7 +443,7 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + Update
     }
 }
 
-impl<Transform, V> ReferenceWrite<Transform, V, V> for V
+impl<Transform, V> ReferenceWrite<Transform, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
@@ -455,7 +465,7 @@ where
     }
 }
 
-impl<Transform, V> ReferenceWrite<Transform, V, ProjectedValue<ArrayType, V>>
+impl<Transform, V> ReferenceWrite<Transform, V, ProjectedValue<ArrayType, V>, ReferenceType<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,

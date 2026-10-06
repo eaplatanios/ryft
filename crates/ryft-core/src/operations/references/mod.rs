@@ -63,6 +63,7 @@
 //! # }
 //! ```
 
+use crate::operations::Capability;
 use crate::programs::ReferenceTransform;
 
 mod reference_add_update;
@@ -86,27 +87,29 @@ pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, Refere
 /// Group of the reference capabilities over references addressed through `Transform` paths: [`ReferenceNew`],
 /// [`ReferenceRead`], [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and
 /// [`ReferenceFreeze`]. It is implemented automatically for every type that implements all of its members.
-pub trait ReferenceOperations<Transform: ReferenceTransform>:
-    ReferenceNew
-    + ReferenceRead<Transform>
-    + ReferenceWrite<Transform>
-    + ReferenceSwap<Transform>
-    + ReferenceAddUpdate<Transform>
-    + ReferenceAtomicAddUpdate<Transform>
-    + ReferenceFreeze
+pub trait ReferenceOperations<Transform: ReferenceTransform, T = <Self as Capability>::Universe>:
+    Capability
+    + ReferenceNew<Self, T>
+    + ReferenceRead<Transform, Self, Self, T>
+    + ReferenceWrite<Transform, Self, Self, T>
+    + ReferenceSwap<Transform, Self, Self, Self, T>
+    + ReferenceAddUpdate<Transform, Self, Self, T>
+    + ReferenceAtomicAddUpdate<Transform, Self, Self, T>
+    + ReferenceFreeze<Self, T>
 {
 }
 
 impl<
     Transform: ReferenceTransform,
-    V: ReferenceNew
-        + ReferenceRead<Transform>
-        + ReferenceWrite<Transform>
-        + ReferenceSwap<Transform>
-        + ReferenceAddUpdate<Transform>
-        + ReferenceAtomicAddUpdate<Transform>
-        + ReferenceFreeze,
-> ReferenceOperations<Transform> for V
+    T,
+    V: ReferenceNew<V, T>
+        + ReferenceRead<Transform, V, V, T>
+        + ReferenceWrite<Transform, V, V, T>
+        + ReferenceSwap<Transform, V, V, V, T>
+        + ReferenceAddUpdate<Transform, V, V, T>
+        + ReferenceAtomicAddUpdate<Transform, V, V, T>
+        + ReferenceFreeze<V, T>,
+> ReferenceOperations<Transform, T> for V
 {
 }
 

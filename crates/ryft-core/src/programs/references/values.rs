@@ -1868,7 +1868,8 @@ impl<
     Transform: ReferenceTransform,
     Binding: Clone + Typed<Type = Transform::Type>,
     Output,
-> ReferenceRead<Transform, Binding, Output> for ReferenceView<Root, Transform, Binding>
+> ReferenceRead<Transform, Binding, Output, ReferenceType<Transform::Referent>>
+    for ReferenceView<Root, Transform, Binding>
 {
     #[inline]
     fn read_through(&self, transforms: &[Transform], bindings: &[Binding]) -> Result<Output, ProgramError> {
@@ -1882,7 +1883,8 @@ impl<
     Transform: ReferenceTransform,
     Binding: Clone + Typed<Type = Transform::Type>,
     Replacement,
-> ReferenceWrite<Transform, Binding, Replacement> for ReferenceView<Root, Transform, Binding>
+> ReferenceWrite<Transform, Binding, Replacement, ReferenceType<Transform::Referent>>
+    for ReferenceView<Root, Transform, Binding>
 {
     #[inline]
     fn write_through(
@@ -1902,7 +1904,8 @@ impl<
     Binding: Clone + Typed<Type = Transform::Type>,
     Replacement,
     Output,
-> ReferenceSwap<Transform, Binding, Replacement, Output> for ReferenceView<Root, Transform, Binding>
+> ReferenceSwap<Transform, Binding, Replacement, Output, ReferenceType<Transform::Referent>>
+    for ReferenceView<Root, Transform, Binding>
 {
     #[inline]
     fn swap_through(
@@ -1921,7 +1924,8 @@ impl<
     Transform: ReferenceTransform,
     Binding: Clone + Typed<Type = Transform::Type>,
     Update,
-> ReferenceAddUpdate<Transform, Binding, Update> for ReferenceView<Root, Transform, Binding>
+> ReferenceAddUpdate<Transform, Binding, Update, ReferenceType<Transform::Referent>>
+    for ReferenceView<Root, Transform, Binding>
 {
     #[inline]
     fn add_update_through(
@@ -1940,7 +1944,8 @@ impl<
     Transform: ReferenceTransform,
     Binding: Clone + Typed<Type = Transform::Type>,
     Update,
-> ReferenceAtomicAddUpdate<Transform, Binding, Update> for ReferenceView<Root, Transform, Binding>
+> ReferenceAtomicAddUpdate<Transform, Binding, Update, ReferenceType<Transform::Referent>>
+    for ReferenceView<Root, Transform, Binding>
 {
     #[inline]
     fn atomic_add_update_through(

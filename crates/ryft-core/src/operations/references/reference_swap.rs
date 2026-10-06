@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -11,6 +13,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::constants::zero::Zero;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
@@ -402,8 +405,14 @@ impl_differentiable_operation! {
 }
 
 /// Capability to replace the value stored by a reference in program order and return its previous immutable snapshot.
-pub trait ReferenceSwap<Transform: ReferenceTransform, Binding = Self, Replacement = Self, Output = Replacement>:
-    Sized
+#[capability]
+pub trait ReferenceSwap<
+    Transform: ReferenceTransform,
+    Binding = Self,
+    Replacement = Self,
+    Output = Replacement,
+    T = <Self as Capability>::Universe,
+>: Capability + Sized
 {
     /// Replaces the selected state and returns its previous immutable snapshot.
     ///
@@ -427,7 +436,7 @@ pub trait ReferenceSwap<Transform: ReferenceTransform, Binding = Self, Replaceme
 }
 
 impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + UpdateSlice>
-    ReferenceSwap<ArrayReferenceTransform> for ArrayIrValue<A>
+    ReferenceSwap<ArrayReferenceTransform, Self, Self, Self, ArrayIrType> for ArrayIrValue<A>
 {
     fn swap_through(
         &self,
@@ -447,7 +456,7 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + Update
     }
 }
 
-impl<Transform, V> ReferenceSwap<Transform, V, V, V> for V
+impl<Transform, V> ReferenceSwap<Transform, V, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
@@ -469,8 +478,13 @@ where
 }
 
 impl<Transform, V>
-    ReferenceSwap<Transform, V, ProjectedValue<ArrayType, V>, <V as ValueProjection<ArrayType>>::Projected>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
+    ReferenceSwap<
+        Transform,
+        V,
+        ProjectedValue<ArrayType, V>,
+        <V as ValueProjection<ArrayType>>::Projected,
+        ReferenceType<ArrayType>,
+    > for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<

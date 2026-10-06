@@ -53,6 +53,7 @@ use crate::differentiation::{
     DifferentiationPolicy, DifferentiationTracer, TranspositionContext,
 };
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -1378,12 +1379,13 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 }
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
-/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`].
-/// It is implemented automatically for every type that implements all of its members. The group is parameterized by the
-/// [`Capability`](crate::Capability) universe `T` of its values because several of its members are. The context-side
-/// [`AxisIndex`] is implemented by contexts rather than values and is therefore not a member.
-pub trait CollectiveOperations<T>:
-    ParallelReduce<T>
+/// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
+/// automatically for every type that implements all of its members. The group is parameterized by the [`Capability`]
+/// universe `T` of its values because several of its members are. The context-side [`AxisIndex`] is implemented by
+/// contexts rather than values and is therefore not a member.
+pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + ParallelReduce<T>
     + ParallelVary<T>
     + ParallelAllGather<T>
     + ParallelSumScatter<T>

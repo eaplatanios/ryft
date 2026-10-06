@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType};
 use crate::axes::Axis;
 use crate::batching::{
@@ -12,6 +14,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::constants::zero::Zero;
 use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -291,12 +294,13 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, Ar
 }
 
 /// Capability for creating new references initialized from a value.
-pub trait ReferenceNew<Output = Self>: Sized {
+#[capability]
+pub trait ReferenceNew<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Creates an independent reference whose initial state is this value.
     fn reference_new(&self) -> Result<Output, ProgramError>;
 }
 
-impl<A: Value<Type = ArrayType>> ReferenceNew for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType>> ReferenceNew<Self, ArrayIrType> for ArrayIrValue<A> {
     fn reference_new(&self) -> Result<Self, ProgramError> {
         let operation = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
         operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
@@ -310,7 +314,7 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         >,
-> ReferenceNew<V> for V
+> ReferenceNew<V, ArrayIrType> for V
 {
     fn reference_new(&self) -> Result<V, ProgramError> {
         Ok(self
@@ -325,7 +329,8 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         > + ValueProjection<ReferenceType<ArrayType>>,
-> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
+> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ArrayType>
+    for ProjectedValue<ArrayType, V>
 {
     fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
         self.value()

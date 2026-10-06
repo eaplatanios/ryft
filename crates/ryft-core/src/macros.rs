@@ -632,12 +632,16 @@ macro_rules! define_arithmetic_dimension_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: $crate::programs::types::Typed<Type = $crate::arrays::DimensionType> + Sized {
+        #[::ryft_macros::capability]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
             $(#[$method_documentation])*
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError>;
         }
 
-        impl<__V: $crate::programs::values::Value<Type = $crate::arrays::DimensionType>> $capability for __V
+        impl<__V: $crate::programs::values::Value<Type = $crate::arrays::DimensionType>>
+            $capability<$crate::arrays::DimensionType> for __V
         where
             __V::DispatchDomain: $crate::contexts::Context<Type = $crate::arrays::DimensionType>,
             <__V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,

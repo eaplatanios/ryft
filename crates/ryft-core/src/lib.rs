@@ -116,7 +116,7 @@ pub use operations::{
     DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOperations, DotOps,
+    DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOperations,
     DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicFill, DynamicGather, DynamicIota,
     DynamicManipulationOperations, DynamicOne, DynamicPad, DynamicReshape, DynamicReshapeOperation,
     DynamicRngBitGenerator, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,

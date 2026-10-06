@@ -1,4 +1,7 @@
-use crate::arrays::{ArrayType, DataType, Dimension, Shape};
+use ryft_macros::capability;
+
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, Shape};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Abs, Div, Mul, Sub};
 use crate::operations::constants::fill::Fill;
 use crate::operations::exponential::{Exp, Log};
@@ -38,7 +41,8 @@ use crate::programs::{ProgramError, TypeError, Value};
 /// `exp(exponent · log(2))` to `f8e8m0fnu` rounds to the nearest power of two, absorbing the remaining approximation
 /// error entirely. All-zero (and denormal-tiny) blocks clamp their scale up to a small representable positive value
 /// instead of producing a zero or infinite scale.
-pub trait BlockQuantize: Sized {
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Quantizes `self` into `(elements, scales)` per block of `block_size` trailing-dimension values, where
     /// `elements` carries `element_type` with the shape of `self` and `scales` carries `scale_type` with the
     /// trailing dimension divided by `block_size`. Refer to the trait documentation for the exact recipes. Returns
@@ -51,10 +55,9 @@ pub trait BlockQuantize: Sized {
     ) -> Result<(Self, Self), ProgramError>;
 }
 
-/// Every value with the elementwise, reduction, and reshaping capabilities used by the recipe (which covers both
-/// the concrete reference [`Array`](crate::arrays::Array) backend and the transform tracers) quantizes
-/// through the shared composition.
-impl<V> BlockQuantize for V
+// Every value with the elementwise, reduction, and reshaping capabilities used by the recipe (which covers both
+// the concrete reference `Array` backend and the transform tracers) quantizes through the shared composition.
+impl<V> BlockQuantize<ArrayType> for V
 where
     V: Value<Type = ArrayType>
         + Abs

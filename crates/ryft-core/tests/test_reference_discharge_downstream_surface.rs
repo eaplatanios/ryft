@@ -327,14 +327,14 @@ impl Value for RegisterValue {
 // handle accesses its root through the root handle: a read extracts the bit, a write replaces it and preserves the
 // other bits, and a swap or additive update is a read followed by a write, which is the eager form of the discharge
 // policy's default.
-impl ReferenceNew for RegisterValue {
+impl ReferenceNew<Self, RegisterIrType> for RegisterValue {
     fn reference_new(&self) -> Result<Self, ProgramError> {
         self.register()?;
         Ok(Self::Reference(Reference::new(self.clone()).map_err(ProgramError::custom)?))
     }
 }
 
-impl ReferenceRead<RegisterTransform> for RegisterValue {
+impl ReferenceRead<RegisterTransform, Self, Self, RegisterIrType> for RegisterValue {
     fn read_through(&self, transforms: &[RegisterTransform], bindings: &[Self]) -> Result<Self, ProgramError> {
         if !transforms.is_empty() || !bindings.is_empty() {
             let path = ReferenceTransformPath::from_transforms(transforms, bindings)?;
@@ -344,7 +344,7 @@ impl ReferenceRead<RegisterTransform> for RegisterValue {
     }
 }
 
-impl ReferenceWrite<RegisterTransform> for RegisterValue {
+impl ReferenceWrite<RegisterTransform, Self, Self, RegisterIrType> for RegisterValue {
     fn write_through(
         &self,
         replacement: &Self,
@@ -366,7 +366,7 @@ impl ReferenceWrite<RegisterTransform> for RegisterValue {
     }
 }
 
-impl ReferenceSwap<RegisterTransform> for RegisterValue {
+impl ReferenceSwap<RegisterTransform, Self, Self, Self, RegisterIrType> for RegisterValue {
     fn swap_through(
         &self,
         replacement: &Self,
@@ -383,7 +383,7 @@ impl ReferenceSwap<RegisterTransform> for RegisterValue {
     }
 }
 
-impl ReferenceFreeze for RegisterValue {
+impl ReferenceFreeze<Self, RegisterIrType> for RegisterValue {
     fn freeze(self) -> Result<Self, ProgramError> {
         self.reference()?.freeze().map_err(ProgramError::custom)
     }

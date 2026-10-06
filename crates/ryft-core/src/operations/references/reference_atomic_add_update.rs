@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -11,6 +13,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
@@ -455,7 +458,14 @@ impl<
 /// atomic operation so parallel lowering must implement its scope and ordering or reject it. The operation still
 /// carries [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) and so generic transforms gain no
 /// permission to reorder state effects.
-pub trait ReferenceAtomicAddUpdate<Transform: ReferenceTransform, Binding = Self, Update = Self>: Sized {
+#[capability]
+pub trait ReferenceAtomicAddUpdate<
+    Transform: ReferenceTransform,
+    Binding = Self,
+    Update = Self,
+    T = <Self as Capability>::Universe,
+>: Capability + Sized
+{
     /// Atomically adds `update` to the elements selected by the supplied transforms under the capability's ordering
     /// contract.
     ///
@@ -480,7 +490,7 @@ pub trait ReferenceAtomicAddUpdate<Transform: ReferenceTransform, Binding = Self
 }
 
 impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + UpdateSlice>
-    ReferenceAtomicAddUpdate<ArrayReferenceTransform> for ArrayIrValue<A>
+    ReferenceAtomicAddUpdate<ArrayReferenceTransform, Self, Self, ArrayIrType> for ArrayIrValue<A>
 {
     fn atomic_add_update_through(
         &self,
@@ -507,15 +517,15 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + 
 // Staged values delegate selection to their operation family, including a downstream reference universe's family,
 // over the referent of the reference being updated. A value that is not a reference member of its universe has no
 // referent and is rejected before any selection.
-impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, V> for V
+impl<U: ReferenceMemberType, Transform, V> ReferenceAtomicAddUpdate<Transform, V, V, U> for V
 where
-    Transform: ReferenceTransform<Type = V::Type, Referent = <V::Type as ReferenceMemberType>::Referent>,
+    Transform: ReferenceTransform<Type = U, Referent = U::Referent>,
     V: Value<
-            Type: ReferenceMemberType,
+            Type = U,
             DispatchDomain: Context<
                 Operation: OperationProvider<
-                    V::Type,
-                    ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type, Transform>,
+                    U,
+                    ReferenceAtomicAddUpdateOperation<U::Referent, U, Transform>,
                     Operation = <V::DispatchDomain as Domain>::Operation,
                 >,
             >,
@@ -543,7 +553,7 @@ where
     }
 }
 
-impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, ProjectedValue<ArrayType, V>>
+impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, ProjectedValue<ArrayType, V>, ReferenceType<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,

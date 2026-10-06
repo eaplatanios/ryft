@@ -38,8 +38,7 @@ pub use dimensions::{
 };
 pub(crate) use inference::{dot_abstract, ragged_dot_abstract};
 pub use operation::{
-    DOT_OPERATION_NAME, Dot, DotOperation, DotOperations, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotOperation,
+    DOT_OPERATION_NAME, Dot, DotOperation, DotOperations, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotOperation,
 };
 
 #[cfg(test)]

@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -11,6 +13,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
@@ -446,7 +449,14 @@ impl<
 /// the update operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a
 /// family without reference operations may reject construction. This capability supports arbitrary reference-aware type
 /// universes so reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
-pub trait ReferenceAddUpdate<Transform: ReferenceTransform, Binding = Self, Update = Self>: Sized {
+#[capability]
+pub trait ReferenceAddUpdate<
+    Transform: ReferenceTransform,
+    Binding = Self,
+    Update = Self,
+    T = <Self as Capability>::Universe,
+>: Capability + Sized
+{
     /// Adds `update` to the state selected by the supplied transforms in program order.
     ///
     /// # Parameters
@@ -470,7 +480,7 @@ pub trait ReferenceAddUpdate<Transform: ReferenceTransform, Binding = Self, Upda
 }
 
 impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + UpdateSlice>
-    ReferenceAddUpdate<ArrayReferenceTransform> for ArrayIrValue<A>
+    ReferenceAddUpdate<ArrayReferenceTransform, Self, Self, ArrayIrType> for ArrayIrValue<A>
 {
     fn add_update_through(
         &self,
@@ -493,15 +503,15 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + 
 // Staged values delegate selection to their operation family, including a downstream reference universe's family,
 // over the referent of the reference being updated. A value that is not a reference member of its universe has no
 // referent and is rejected before any selection.
-impl<Transform, V> ReferenceAddUpdate<Transform, V, V> for V
+impl<U: ReferenceMemberType, Transform, V> ReferenceAddUpdate<Transform, V, V, U> for V
 where
-    Transform: ReferenceTransform<Type = V::Type, Referent = <V::Type as ReferenceMemberType>::Referent>,
+    Transform: ReferenceTransform<Type = U, Referent = U::Referent>,
     V: Value<
-            Type: ReferenceMemberType,
+            Type = U,
             DispatchDomain: Context<
                 Operation: OperationProvider<
-                    V::Type,
-                    ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type, Transform>,
+                    U,
+                    ReferenceAddUpdateOperation<U::Referent, U, Transform>,
                     Operation = <V::DispatchDomain as Domain>::Operation,
                 >,
             >,
@@ -529,7 +539,7 @@ where
     }
 }
 
-impl<Transform, V> ReferenceAddUpdate<Transform, V, ProjectedValue<ArrayType, V>>
+impl<Transform, V> ReferenceAddUpdate<Transform, V, ProjectedValue<ArrayType, V>, ReferenceType<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,

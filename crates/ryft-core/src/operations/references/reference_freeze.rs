@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -15,6 +17,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
 use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -274,7 +277,8 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType,
 }
 
 /// Capability to consume a reference, returning its final value and invalidating its complete alias family.
-pub trait ReferenceFreeze<Output = Self>: Sized {
+#[capability]
+pub trait ReferenceFreeze<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the final stored value and invalidates this reference and all aliases.
     ///
     /// This handle is taken by value, because consumption is _linear_. That is, after this call the reference denotes
@@ -310,7 +314,7 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     fn freeze(self) -> Result<Output, ProgramError>;
 }
 
-impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType>> ReferenceFreeze<Self, ArrayIrType> for ArrayIrValue<A> {
     fn freeze(self) -> Result<Self, ProgramError> {
         let operation = ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new();
         operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
@@ -327,7 +331,7 @@ impl<
                 Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
             >,
         >,
-> ReferenceFreeze<V> for V
+> ReferenceFreeze<V, ArrayIrType> for V
 {
     fn freeze(self) -> Result<V, ProgramError> {
         let domain = self.dispatch_domain();
@@ -343,7 +347,8 @@ impl<
                 Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
             >,
         > + ValueProjection<ArrayType>,
-> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
+> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected, ReferenceType<ArrayType>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
 {
     fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
         let domain = self.value().dispatch_domain();

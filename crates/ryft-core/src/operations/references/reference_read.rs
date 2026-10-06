@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ryft_macros::capability;
+
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -15,6 +17,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
@@ -347,7 +350,14 @@ where
 }
 
 /// Capability to read an immutable snapshot from a reference value.
-pub trait ReferenceRead<Transform: ReferenceTransform, Binding = Self, Output = Self>: Sized {
+#[capability]
+pub trait ReferenceRead<
+    Transform: ReferenceTransform,
+    Binding = Self,
+    Output = Self,
+    T = <Self as Capability>::Universe,
+>: Capability + Sized
+{
     /// Reads an immutable snapshot through the supplied transforms.
     ///
     /// # Parameters
@@ -363,8 +373,8 @@ pub trait ReferenceRead<Transform: ReferenceTransform, Binding = Self, Output = 
     }
 }
 
-impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice> ReferenceRead<ArrayReferenceTransform>
-    for ArrayIrValue<A>
+impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice>
+    ReferenceRead<ArrayReferenceTransform, Self, Self, ArrayIrType> for ArrayIrValue<A>
 {
     fn read_through(&self, transforms: &[ArrayReferenceTransform], bindings: &[Self]) -> Result<Self, ProgramError> {
         let operation = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
@@ -378,7 +388,7 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice> Referen
     }
 }
 
-impl<Transform, V> ReferenceRead<Transform, V, V> for V
+impl<Transform, V> ReferenceRead<Transform, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
@@ -394,7 +404,7 @@ where
     }
 }
 
-impl<Transform, V> ReferenceRead<Transform, V, <V as ValueProjection<ArrayType>>::Projected>
+impl<Transform, V> ReferenceRead<Transform, V, <V as ValueProjection<ArrayType>>::Projected, ReferenceType<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,

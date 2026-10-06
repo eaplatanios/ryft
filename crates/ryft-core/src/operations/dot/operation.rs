@@ -473,14 +473,6 @@ where
     }
 }
 
-/// Combined generalized dot product and transposition capability.
-///
-/// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
-/// [`DotOperation`] and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation) primitives.
-pub trait DotOps: Dot + Transpose {}
-
-impl<T: Dot + Transpose> DotOps for T {}
-
 /// Group of the dot product capabilities [`Dot`] and [`RaggedDot`]. It is implemented automatically for every type that
 /// implements all of its members.
 pub trait DotOperations<T = <Self as Capability>::Universe>: Capability + Dot<Self, T> + RaggedDot<T> {}

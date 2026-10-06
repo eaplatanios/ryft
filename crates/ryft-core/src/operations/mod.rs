@@ -98,8 +98,8 @@ pub use dimensions::{
     DimensionToScalarOperation,
 };
 pub use dot::{
-    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOperations, DotOps, RAGGED_DOT_OPERATION_NAME,
-    RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
+    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOperations, RAGGED_DOT_OPERATION_NAME, RaggedDot,
+    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
 pub use exponential::{
     EXP_OPERATION_NAME, Exp, ExpOperation, ExponentialOperations, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME,
