@@ -1262,7 +1262,7 @@ where
 /// [`Tracer`](crate::Tracer)'s poison, the deferred [`ProgramError`] itself is carried, so boundaries report the
 /// original failure rather than a generic poison error.
 #[derive(Clone)]
-pub enum PartialTracerState<C: Context> {
+pub(crate) enum PartialTracerState<C: Context> {
     /// The corresponding [`PartialTracer`] is _live_ and has a corresponding [`PartialEvaluationValue`].
     Live(PartialEvaluationValue<C::Value>),
 

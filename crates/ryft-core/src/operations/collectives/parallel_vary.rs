@@ -574,9 +574,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable, MeshAxis, RaggedAxis, Shape,
+        ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy,
+        MeshAxis, RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};

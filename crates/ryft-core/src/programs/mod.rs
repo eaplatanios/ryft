@@ -118,7 +118,8 @@ pub mod values;
 pub use atoms::{Atom, AtomId, MaybeZero};
 pub use builders::{ProgramBuilder, ProgramBuilderId};
 pub use effects::{
-    EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary, ReferenceAccessMode, ReferenceEffect,
+    EffectClass, EffectClassOccurrence, EffectClasses, EffectClassesIterator, Effects, EffectsSummary,
+    ReferenceAccessMode, ReferenceEffect,
 };
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
@@ -136,18 +137,19 @@ pub use references::{
     ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceAliasEdge,
     ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition,
     ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
-    ReferenceDischargeBoundaryWidening, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult,
-    ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceError, ReferenceGeneration, ReferenceId,
-    ReferenceIdentity, ReferenceMemberType, ReferenceObservation, ReferenceRegionInputBinding,
-    ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource,
-    ReferenceTransform, ReferenceTransformPath, ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements,
-    ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOverlap, TakenReferenceGuard,
-    ValidatedPendingReplacementTransaction, batch_reference_transforms, discharge_local_reference_operation,
-    discharge_positional_region_operation, discharge_reference_free_operation, infer_reference_view_type,
-    rewrite_reference_access_transforms, validate_reference_boundary, validated_reference_access_descriptors,
+    ReferenceDischargeBoundaryWidening, ReferenceDischargeCaptureScope, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput,
+    ReferenceDischargeRegionResult, ReferenceDischargeRegionSummary, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeTargets, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceError, ReferenceGeneration, ReferenceId, ReferenceIdentity,
+    ReferenceMemberType, ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
+    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransform, ReferenceTransformPath,
+    ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis,
+    ReferenceViewAnalysisError, ReferenceViewOverlap, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
+    batch_reference_transforms, discharge_local_reference_operation, discharge_positional_region_operation,
+    discharge_reference_free_operation, infer_reference_view_type, rewrite_reference_access_transforms,
+    validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,

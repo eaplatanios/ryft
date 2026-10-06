@@ -2341,11 +2341,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::batch;

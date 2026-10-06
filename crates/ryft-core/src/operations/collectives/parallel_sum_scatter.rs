@@ -107,6 +107,19 @@ pub struct ParallelSumScatterOperation {
 
 impl ParallelSumScatterOperation {
     /// Creates a new [`ParallelSumScatterOperation`] over the axis with the provided name and resolved axis size.
+    /// Construction preserves the supplied axis and options, while type inference validates the geometry, groups, and
+    /// mesh state. Unlike the [`ParallelSumScatter`] functions, which accept negative axes, this constructor takes a
+    /// non-negative axis position.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis whose participants' inputs are summed and scattered.
+    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `scatter_axis`: Axis of the input along which the sum is scattered. In untiled mode its extent must
+    ///     equal the number of participants and it is removed from the output, and in tiled mode its extent must
+    ///     be divisible by that number and is divided by it.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     #[inline]
     pub fn new(axis_name: String, axis_size: usize, scatter_axis: usize, options: CollectiveOptions) -> Self {
         Self { axis_name, axis_size, scatter_axis, options, mesh: None }
@@ -758,10 +771,9 @@ impl<
 /// Sum two rows elementwise and give each batch item half of the summed row:
 ///
 /// ```
-/// # use ryft_core::operations::collectives::ParallelSumScatter;
 /// # use ryft_core::{
 /// #     Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, BatchAxis, BatchAxisSpecification,
-/// #     BatchingTracer, EagerContext, batch,
+/// #     BatchingTracer, EagerContext, ParallelSumScatter, batch,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rows = ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])?);
@@ -829,7 +841,8 @@ pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + S
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
-    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///
     /// # Errors
     ///

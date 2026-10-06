@@ -106,6 +106,20 @@ pub struct ParallelAllToAllOperation {
 
 impl ParallelAllToAllOperation {
     /// Creates a new [`ParallelAllToAllOperation`] over the axis with the provided name and resolved axis size.
+    /// Construction preserves the supplied axes and options, while type inference validates the geometry, groups,
+    /// and mesh state. Unlike the [`ParallelAllToAll`] functions, which accept negative axes, this constructor takes
+    /// non-negative axis positions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis whose participants exchange chunks.
+    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `split_axis`: Axis of the input that is split into one slice or chunk per receiver.
+    ///   - `concatenation_axis`: Axis of the output that holds the received slices or chunks in the order of their
+    ///     senders. In untiled mode it is the position at which the new sender axis is inserted after `split_axis` is
+    ///     removed, and in tiled mode it is the existing axis along which the received chunks are concatenated.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     #[inline]
     pub fn new(
         axis_name: String,
@@ -844,13 +858,10 @@ impl<
     }
 }
 
-/// Represents the ability to exchange chunks between participants of a named axis by staging an
+/// Represents the ability to exchange chunks between participants of a named axis by staging a
 /// [`ParallelAllToAllOperation`]. Refer to that operation for the tiling, grouping, variation, and transformation
 /// semantics. Dynamic result extents are staged as first-class dimension values, and runtime assertions validate
 /// dynamic split extents.
-///
-/// The type-family parameter defaults to this value's type, so that homogeneous array values and composite array
-/// values share the same call syntax.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
@@ -881,13 +892,14 @@ impl<
 /// ```
 #[capability]
 pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Exchanges single slices, removing `split_axis` from the input and inserting the sender axis at
-    /// `concatenation_axis` in the output. The split extent must equal the participant count, and rank
-    /// is preserved.
+    /// Exchanges single slices between the participants of the named axis `axis_name`. The extent of `split_axis`
+    /// must equal the number of participants, and participant `r` receives slice `r` along `split_axis` of the value
+    /// of every participant. The received slices drop `split_axis` and are stacked in the order of their senders
+    /// along a new axis inserted at `concatenation_axis`, so the rank is preserved.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `split_axis`: Input axis split into one slice per receiver. Negative axes count from the end.
     ///   - `concatenation_axis`: Output position at which sender slices are stacked after removing `split_axis`.
     ///     Negative positions count from the end of the output, whose rank equals the rank of this value.
@@ -905,13 +917,15 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
         self.parallel_all_to_all_with_options(axis_name, split_axis, concatenation_axis, CollectiveOptions::default())
     }
 
-    /// Exchanges equal contiguous chunks, dividing the extent of `split_axis` and multiplying that of
-    /// `concatenation_axis` by the participant count. Coincident axes preserve the shape. The split
-    /// extent must be divisible by that count.
+    /// Exchanges equal contiguous chunks between the participants of the named axis `axis_name`. The extent of
+    /// `split_axis` must be divisible by the number of participants `n`, and participant `r` receives chunk `r` along
+    /// `split_axis` of the value of every participant. The received chunks are concatenated in the order of their
+    /// senders along `concatenation_axis`, so the extent of `split_axis` is divided by `n` and that of
+    /// `concatenation_axis` is multiplied by `n`. Coincident axes therefore preserve the shape.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `split_axis`: Input axis split into one chunk per receiver. Negative axes count from the end.
     ///   - `concatenation_axis`: Array axis along which received chunks are concatenated in sender order. Negative axes
     ///     count from the end.
@@ -934,16 +948,19 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
         )
     }
 
-    /// Exchanges chunks with the tiling mode and ordered participant groups of `options`. Over a manual mesh axis,
-    /// an invariant input is first made varying through [`ParallelVary`].
+    /// Exchanges slices or chunks between the participants of the named axis `axis_name`,
+    /// like [`parallel_all_to_all`](Self::parallel_all_to_all) in untiled mode and like
+    /// [`parallel_all_to_all_tiled`](Self::parallel_all_to_all_tiled) in tiled mode, within the participant groups
+    /// of `options`. Over a manual mesh axis, an invariant input is first made varying through [`ParallelVary`].
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `split_axis`: Input axis split into one slice or chunk per receiver. Negative axes count from the end.
-    ///   - `concatenation_axis`: Output axis holding the received slices or chunks, as selected by `options`. Negative
-    ///     axes count from the end of the output, whose rank equals the rank of this value in both modes.
-    ///   - `options`: Tiling mode and optional ordered participant groups.
+    ///   - `concatenation_axis`: Output axis holding the received slices or chunks, as selected by `options`.
+    ///     Negative axes count from the end of the output, whose rank equals the rank of this value in both modes.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///
     /// # Errors
     ///
@@ -961,12 +978,13 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     ) -> Result<Self, ProgramError>;
 
     /// Swaps `axis` with `axis_name` over the full named axis, exchanging one ranked array axis with the named axis.
-    /// The ranked axis must have the participant count as its extent. This is [`Self::parallel_all_to_all`] with
-    /// identical split and concatenation positions.
+    /// The ranked axis must have the participant count as its extent. Index `j` along `axis` of the result of
+    /// participant `i` holds index `i` along `axis` of the value of participant `j`. This is
+    /// [`Self::parallel_all_to_all`] with identical split and concatenation positions.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `axis`: Ranked axis to exchange with the named axis. Negative axes count from the end.
     ///
     /// # Errors
@@ -983,13 +1001,17 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     }
 
     /// Swaps `axis` with `axis_name` within the provided ordered participant groups. The ranked axis extent must
-    /// equal the common group size, and senders are stacked in the order specified by their group.
+    /// equal the common group size, and positions within each group replace axis indices: index `q` along `axis` of
+    /// the result of the member at position `p` holds index `p` along `axis` of the value of the member at position
+    /// `q`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
     ///   - `axis`: Ranked axis to exchange with the named axis. Negative axes count from the end.
-    ///   - `axis_index_groups`: Ordered equal-sized partition of the named-axis participant coordinates.
+    ///   - `axis_index_groups`: Participant groups, each listing axis indices of `axis_name`, that
+    ///     together partition all of its indices into groups of equal size (refer to the documentation
+    ///     of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///
     /// # Errors
     ///

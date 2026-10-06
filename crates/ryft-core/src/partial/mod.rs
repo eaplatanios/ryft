@@ -110,7 +110,7 @@ pub mod partitions;
 pub mod residuals;
 pub mod values;
 
-pub use contexts::{PartialEvaluationContext, PartialTracer, PartialTracerState, ReferencePlacement};
+pub use contexts::{PartialEvaluationContext, PartialTracer, ReferencePlacement};
 pub use evaluations::PartialEvaluation;
 pub use operations::{PartialEvaluationDriver, PartiallyEvaluatableOperation};
 pub use partitions::{PartitionMetadata, PartitionedProgram};

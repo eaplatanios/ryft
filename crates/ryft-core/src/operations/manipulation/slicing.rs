@@ -4405,12 +4405,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceDischarge, DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
-        ShardingDimension, StridedLayout, f8e8m0fnu, i4,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, batch};

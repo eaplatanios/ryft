@@ -2747,10 +2747,9 @@ mod tests {
 
     #[test]
     fn test_shard_map_operation_batch() {
-        use ryft_core::batching::RecursiveBatchingDriver;
         use ryft_core::{
             ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, BatchingError,
-            CalleeRegionDriver, DimensionValue,
+            CalleeRegionDriver, DimensionValue, RecursiveBatchingDriver,
         };
 
         let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));

@@ -2,11 +2,10 @@ use std::fmt::Display;
 
 use ryft_macros::capability;
 
-use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType,
     ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    DimensionVariable, LinearResiduals, LogicalMesh, RaggedAxis, Shape, Sharding,
+    DimensionVariable, DynamicArrayExtentBatchingPolicy, LinearResiduals, LogicalMesh, RaggedAxis, Shape, Sharding,
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
@@ -140,6 +139,18 @@ pub struct ParallelAllGatherOperation {
 impl ParallelAllGatherOperation {
     /// Creates a new [`ParallelAllGatherOperation`] over the axis with the provided name and resolved axis size.
     /// Construction preserves the supplied options while type inference validates the geometry, groups, and mesh state.
+    /// Unlike the [`ParallelAllGather`] functions, which accept negative axes, this constructor takes a non-negative
+    /// axis position.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis whose participants' inputs are gathered.
+    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `concatenation_axis`: Position of the inserted participant axis in the output in untiled mode,
+    ///     or axis of the input along which the inputs are concatenated in tiled mode.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
+    ///   - `output_variance`: [`ParallelAllGatherOutputVariance`] of the result over a manual mesh axis.
     #[inline]
     pub fn new(
         axis_name: String,
@@ -1455,7 +1466,8 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     ///     along which the values are concatenated in tiled mode. Negative axes count from the end of the result in
     ///     untiled mode, whose rank is one more than the rank of this value, and from the end of this value in tiled
     ///     mode.
-    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective (refer to the
+    ///     documentation of [`CollectiveOptions::with_axis_index_groups`] for how the groups route the data).
     ///   - `output_variance`: Manual variation of the result over a manual mesh axis. An ordinary all-gather
     ///     preserves the mesh state of this value.
     ///

@@ -2666,8 +2666,10 @@ mod tests {
 
     #[test]
     fn test_jit_call_operation_batch() {
-        use ryft_core::batching::RecursiveBatchingDriver;
-        use ryft_core::{ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, CalleeRegionDriver};
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, CalleeRegionDriver,
+            RecursiveBatchingDriver,
+        };
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());

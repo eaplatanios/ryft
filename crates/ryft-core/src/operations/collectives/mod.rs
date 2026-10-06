@@ -39,11 +39,10 @@
 
 use std::fmt::Debug;
 
-use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, LogicalMesh, MeshAxisType,
-    Shape, Sharding, StaticArrayExtentBatchingPolicy,
+    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy,
+    LinearResiduals, LogicalMesh, MeshAxisType, Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};

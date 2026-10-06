@@ -2363,14 +2363,13 @@ mod tests {
     /// preserves the result's ragged metadata, and lets a downstream sum mask the padded suffix.
     #[test]
     fn test_eager_ragged_custom_call_contract_composes_with_masked_reduction() {
-        use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
         use ryft_core::operations::custom_call::{
             CustomCallBatching, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
             CustomCallRaggedOutputBinding,
         };
         use ryft_core::{
-            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, DimensionValue, EmptyRegionDriver,
-            RaggedAxis, ReduceOperation,
+            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, DimensionValue,
+            DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, RaggedAxis, ReduceOperation,
         };
 
         let plugin = load_cpu_plugin().unwrap();

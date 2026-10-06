@@ -1232,11 +1232,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, StridedLayout, f4e2m1fn, f8e4m3fn,
-        f8e4m3fnuz, f8e5m2, f8e8m0fnu,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, DimensionVariable,
+        DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape,
+        Sharding, StridedLayout, f4e2m1fn, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e8m0fnu,
     };
     use crate::batching::batch;
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};

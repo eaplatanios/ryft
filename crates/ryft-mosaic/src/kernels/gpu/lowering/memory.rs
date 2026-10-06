@@ -1,7 +1,8 @@
 //! Native global-to-shared copy groups and their emitted CTA communication contract.
 
-use ryft_core::kernels::memory::ASYNC_COPY_OPERATION_NAME;
-use ryft_core::kernels::{KernelExtension, KernelOperation, KernelParameterAccess, VerifiedKernel};
+use ryft_core::kernels::{
+    ASYNC_COPY_OPERATION_NAME, KernelExtension, KernelOperation, KernelParameterAccess, VerifiedKernel,
+};
 use ryft_core::{
     ArrayAddressing, ArrayIrOperation, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Operation, Typed,
     ValueId,

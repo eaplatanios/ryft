@@ -68,6 +68,8 @@
 
 // TODO(eaplatanios): Review this module and all of its submodules.
 
+pub use ryft_macros::kernel;
+
 pub mod authoring;
 pub mod calls;
 pub mod compilation;
@@ -83,11 +85,6 @@ pub mod serialization;
 pub mod transforms;
 pub mod validation;
 
-#[cfg(test)]
-mod tests;
-
-pub use ryft_macros::kernel;
-
 pub use authoring::{
     KernelCall, condition, dot, for_loop, shape_div_ceil, static_extent, tile_load, tile_store, tiled_call,
     whole_array_parameter, zeros,
@@ -98,7 +95,7 @@ pub use calls::{
 };
 pub use compilation::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
 pub use grids::{Grid, GridDimension, GridError, GridExecution, GridPoints};
-pub use indexing::TileLoadOperation;
+pub use indexing::{TILE_LOAD_OPERATION_NAME, TileLoadOperation};
 pub use initialization::{KernelInitializationError, validate_kernel_initialization};
 pub use interpretation::{
     DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS, DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_STEPS, KernelDebugOptions,
@@ -106,15 +103,18 @@ pub use interpretation::{
 };
 pub use mappings::{BlockMapping, BlockMappingError, BlockWindow, BoundaryPolicy};
 pub use memory::{
-    AsyncCopyOperation, KernelMemoryError, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation,
-    ScratchOperation, WaitOperation,
+    ASYNC_COPY_OPERATION_NAME, AsyncCopyOperation, KernelMemoryError, MASKED_LOAD_OPERATION_NAME,
+    MASKED_STORE_OPERATION_NAME, MASKED_SWAP_OPERATION_NAME, MaskedLoadOperation, MaskedStoreOperation,
+    MaskedSwapOperation, SCRATCH_OPERATION_NAME, ScratchOperation, WAIT_OPERATION_NAME, WaitOperation,
 };
 pub use operations::{KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension};
 pub use scheduling::{KernelInterleaving, KernelSchedulingError};
 pub use serialization::KernelSerializationError;
 pub use transforms::KernelTransformError;
-
 pub use validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelParameterSummary, KernelReferenceOperation,
     KernelReferenceSummary, KernelSwapLowering, KernelValidationError, validate_kernel_body,
 };
+
+#[cfg(test)]
+mod tests;

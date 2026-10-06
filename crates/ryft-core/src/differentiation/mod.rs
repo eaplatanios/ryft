@@ -194,8 +194,8 @@ pub use elementwise::{
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
     DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiationPolicy, Linearization, LinearizationContext,
-    LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy, Pushforward,
-    jvp_for_transpose_projected_operation, jvp_projected_operation,
+    LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
+    ProjectedDifferentiationPolicy, Pushforward, jvp_for_transpose_projected_operation, jvp_projected_operation,
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};

@@ -11,18 +11,17 @@ use ryft_core::kernels::{
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
-    AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
-    Context, CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
-    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OutputRegionProvenance,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionLiveness, RegionSlot,
-    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
+    CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource, DifferentiableOperation,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver, MaybeZero,
+    Operation, OperationBoundaryPruning, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramError,
+    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    Region, RegionInterface, RegionLiveness, RegionSlot, Tracer, TracingContext, TransposableOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::XlaTarget;
@@ -590,10 +589,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(
-            CustomFunctionJvpRule::Explicit,
-            false,
-        ),
+        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(CustomFunctionJvpRule::Explicit, false),
         vec![kernel_primal(definition)?, jvp.clone()],
         inputs,
     )
@@ -616,10 +612,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(
-            CustomFunctionJvpRule::Absent,
-            true,
-        ),
+        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(CustomFunctionJvpRule::Absent, true),
         vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
         inputs,
     )
@@ -1453,8 +1446,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_xla_kernel_operation_batch() {
-        use ryft_core::batching::RecursiveBatchingDriver;
-        use ryft_core::{ArrayType, CalleeRegionDriver, DataType, DimensionValue, StagingContext};
+        use ryft_core::{
+            ArrayType, CalleeRegionDriver, DataType, DimensionValue, RecursiveBatchingDriver, StagingContext,
+        };
 
         let definition = differentiable_definition();
         let callees = [Arc::new(stage_body(&definition).unwrap())];

@@ -6831,7 +6831,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use ryft_core::operations::attention::{
         AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionBackwardOperation,
         DotProductAttentionOperation,
@@ -6848,10 +6847,10 @@ mod tests {
         CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
         DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
-        DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation,
-        DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        DotOperation, DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
+        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
         OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation,
         ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
         ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,

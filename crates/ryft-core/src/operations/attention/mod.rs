@@ -2,10 +2,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, Shape, StaticArrayExtentBatchingPolicy,
+    Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, Shape, StaticArrayExtentBatchingPolicy,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,

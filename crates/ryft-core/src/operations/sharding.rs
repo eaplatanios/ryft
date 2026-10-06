@@ -723,10 +723,9 @@ impl<T, V: Reshard<T> + ConstrainSharding<T>> ShardingOperations<T> for V {}
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, LogicalMesh, MeshAxis, RaggedAxis, Shape, f8e8m0fnu,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis, RaggedAxis, Shape, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};

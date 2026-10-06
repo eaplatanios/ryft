@@ -100,6 +100,15 @@ impl ParallelReduceOperation {
     /// Creates a new grouped [`ParallelReduceOperation`] with the provided `kind` over `axis_name`, after validating
     /// that `axis_index_groups` is an equal-sized exact partition of `0..axis_size`.
     ///
+    /// # Parameters
+    ///
+    ///   - `kind`: [`ReductionKind`] that determines how the values of the group members are combined.
+    ///   - `axis_name`: Name of the axis whose participants are reduced.
+    ///   - `axis_size`: Full number of participants along `axis_name`, across all groups.
+    ///   - `axis_index_groups`: Participant groups, each listing axis indices in `0..axis_size`. Every participant
+    ///     receives the reduction of the values of the members of its own group. The order within a group does not
+    ///     affect the result.
+    ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] if `axis_size` is zero or if `axis_index_groups` is empty, contains an empty group,
@@ -765,10 +774,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType,
+        Shape, Sharding,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
