@@ -1146,29 +1146,47 @@ impl<
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The explicit output extents are retained as ordinary residuals. A varying or reduced result transposes to
-        // its adjoint sum-scatter. An invariant result has no adjoint collective, so its tangent is one linear call
-        // whose transpose selects the current participant's chunk of the output cotangent using the retained input
-        // geometry and reshapes an untiled size-one participant axis away, like the homogeneous transposition rule.
+        // A varying or reduced result transposes to its adjoint sum-scatter, which the shared rule stages with
+        // the explicit output extents and the exact input shape as residuals. An invariant result has no adjoint
+        // collective, so its tangent is instead one linear call whose transpose selects the current participant's
+        // chunk of the output cotangent locally, like the homogeneous transposition rule.
         if self.output_variance != ParallelAllGatherOutputVariance::Invariant {
             return self.shape_changing_collective_jvp_in_parent(context, inputs);
         }
 
+        // The composite inputs are the gathered array followed by one explicit extent per output axis. Only the array
+        // can carry a live tangent, because the extents are integer-valued dimensions.
         let Some((array, _)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
 
+        // The primal output is the same invariant gather applied to the primal inputs. A structurally zero array
+        // tangent stays symbolic, retyped to the output tangent type because the gather changes the shape.
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = match array.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(array_tangent) => {
+                // The linear call is staged in the tangent context, so the primal values that its regions need are
+                // first transferred there. Splitting cannot fail, because the inputs were checked to be non-empty.
                 let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
                 let (array, output_extents) = tangent_inputs.split_first().unwrap();
                 let context = context.tangent();
+
+                // The two regions of the linear call are traced as separate programs whose only inputs are the call's
+                // residuals followed by its linear inputs or output cotangents, so every primal value that they read
+                // must be retained as a residual. The forward region needs the explicit output extents, while the
+                // transpose region needs the exact runtime shape of the primal input to size and reshape its selected
+                // chunk. `retain_all` returns the residual slot of each extent, and `retain_shape` returns a plan that
+                // rebuilds every input dimension inside a region. That plan retains nothing for static axes and reuses
+                // an already-retained extent with the same dimension variable (e.g., an output extent of an axis that
+                // the gather leaves unchanged), so only the remaining dynamic axes bind `dimension_size` reads.
                 let mut residuals = LinearResiduals::new();
                 let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
                 let input_shape = residuals.retain_shape(context, array.primal())?;
+
+                // Each region closure owns its copy of the operation and of the residual slots that it reads. The
+                // input cotangent type supplies the sharding that the transpose region restores on its result.
                 let forward_operation = self.clone();
                 let forward_output_extents = output_extents.clone();
                 let transpose_operation = self.clone();
@@ -1178,6 +1196,8 @@ impl<
                     residuals.into_values(),
                     vec![array_tangent.clone()],
                     move |residuals, linear_inputs| {
+                        // The forward region applies the same invariant gather to the tangent, with the explicit output
+                        // extents read from the region's residual inputs.
                         let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
                         collective_inputs.push(linear_inputs[0].clone());
                         collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
@@ -1188,11 +1208,23 @@ impl<
                         )
                     },
                     move |residuals, output_cotangents| {
+                        // The transpose region maps the output cotangent to the input cotangent by selecting the
+                        // current participant's chunk of it along the concatenation axis, which needs no communication
+                        // because every participant holds the complete invariant output cotangent. All extents and
+                        // offsets are first-class dimension values, so that they remain exact for dynamically shaped
+                        // inputs.
+
+                        // Rebuild the exact input dimensions from the retained shape, staging static extents as
+                        // dimension constants in the transpose context.
                         let transpose_context = output_cotangents[0].dispatch_domain();
                         let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
                         let output_cotangent_type = output_cotangents[0].r#type();
                         let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
                         let output_rank = output_cotangent_type.rank();
+
+                        // Every participant contributes one chunk along the concatenation axis. A tiled gather
+                        // concatenates chunks whose extent is the input extent along that axis, while an untiled
+                        // gather stacks one size-one row per participant along its inserted participant axis.
                         let zero = transpose_context
                             .bind(
                                 DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
@@ -1210,6 +1242,13 @@ impl<
                                 )?
                                 .remove(0),
                         };
+
+                        // The chunk of participant `i` starts at offset `i * chunk_extent`. A degenerate axis has only
+                        // participant zero, so its offset is zero and needs no `axis_index`, which keeps the pullback
+                        // interpretable without an enclosing binder. Otherwise, the participant index is read through
+                        // `axis_index` (on the operation's mesh for a manual mesh axis) and converted into a dimension
+                        // whose variable is bounded by the axis size, so that the offset becomes a symbolic dimension
+                        // product (e.g., `x_index * 2`) with known bounds, which the dynamic slice below checks.
                         let start = if transpose_operation.axis_size() == 1 {
                             zero.clone()
                         } else {
@@ -1243,6 +1282,9 @@ impl<
                                 )?
                                 .remove(0)
                         };
+
+                        // Every other axis starts at zero and spans its full input extent. An untiled output cotangent
+                        // also has the participant axis, along which the slice keeps one size-one row.
                         let mut starts = vec![zero; output_rank];
                         starts[transpose_operation.concatenation_axis()] = start;
                         let mut slice_sizes = input_dimensions.clone();
@@ -1268,6 +1310,9 @@ impl<
                             }
                             _ => output_cotangents[0].clone(),
                         };
+
+                        // The composite `dynamic_slice` consumes the sliced array followed by all start offsets and
+                        // then all slice extents, with one of each per array axis.
                         let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
                         slice_inputs.push(output_cotangent);
                         slice_inputs.extend(starts);
@@ -1279,6 +1324,10 @@ impl<
                                 slice_inputs.as_slice(),
                             )?
                             .remove(0);
+
+                        // Reshaping to the exact input dimensions removes the size-one participant axis of an untiled
+                        // chunk and leaves a tiled chunk's shape unchanged, while assigning the input cotangent's
+                        // sharding to the result in both modes.
                         let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
                         reshape_inputs.push(selected);
                         reshape_inputs.extend(input_dimensions);
