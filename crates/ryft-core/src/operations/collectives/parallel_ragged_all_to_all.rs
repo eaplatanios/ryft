@@ -12,7 +12,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation, batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
+use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
@@ -1107,20 +1107,9 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelRaggedAllToAllOperation
+impl<C: Context<Type = ArrayIrType> + DomainProjection<ArrayType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
+    for ParallelRaggedAllToAllOperation
 where
-    C: Context<
-            Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<ArrayType>,
-        >,
-    ProjectedContext<C, ArrayType>: Context<
-            Type = ArrayType,
-            Value = <C::Value as ValueProjection<ArrayType>>::Projected,
-            Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
-            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
-        >,
     ParallelRaggedAllToAllOperation:
         BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
 {
