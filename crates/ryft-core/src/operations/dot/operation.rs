@@ -202,7 +202,7 @@ pub trait Dot<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Size
     /// for the result. The requested sharding overrides the inferred output sharding and is validated by the
     /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). Staging
     /// values attach it to the staged operation, composite values project it onto their array members, and concrete
-    /// [`Array`]s record it on their result, rejecting unreduced axes because they always hold fully reduced results.
+    /// [`Array`]s record it on their result.
     fn dot_with_output_sharding(
         &self,
         rhs: &Rhs,
@@ -228,31 +228,14 @@ impl Dot for Array {
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Result<Self, ProgramError> {
-        // An `Array` is a concrete single-device value, so the requested sharding only describes the placement of its
-        // result. The `DotOperation` type inference rule validates the request exactly as it does for staged programs,
-        // and the result records the validated sharding. Unreduced axes are rejected because a concrete array always
-        // holds the fully reduced result, whereas an unreduced sharding would claim pending per-device partial sums.
-        let input_types = [self.r#type().into_owned(), rhs.r#type().into_owned()];
-        let mut output_types = DotOperation::new(dimensions.clone())
-            .with_output_sharding(output_sharding.clone())
-            .infer_output_types(&input_types, &[])?;
-        check_count!("output", output_types, 1, ProgramError);
-        let inferred_type = output_types.remove(0);
-        if !inferred_type.unreduced_axes().is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{DOT_OPERATION_NAME}` cannot produce unreduced outputs for concrete arrays, which always hold \
-                     fully reduced results; stage the computation to request unreduced output axes",
-                ),
-            });
-        }
-        let output = self.dot(rhs, dimensions)?;
-        let output_type = output
-            .r#type()
-            .into_owned()
-            .with_sharding(inferred_type.sharding().cloned())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        Ok(Self::new_unchecked(output_type, output.shared_storage_bytes().clone()))
+        // An `Array` is a concrete single-device value whose payload is always its logical (i.e., fully reduced) value,
+        // so the requested sharding only describes the placement of its result, exactly as for `Reshard`. That holds
+        // for unreduced axes as well, which describe partial sums whose total is that payload. The `DotOperation` type
+        // inference rule validates the request exactly as it does for staged programs and determines the result type.
+        let data_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.dot_elements::<Element>(rhs, dimensions, Some(output_sharding))
+        })
     }
 
     fn dot_with_accumulation_type(
@@ -270,7 +253,7 @@ impl Dot for Array {
         // TODO(eaplatanios): What about the accumulation type?
         let data_type = self.r#type().data_type();
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.dot_elements::<Element>(rhs, dimensions)
+            self.dot_elements::<Element>(rhs, dimensions, None)
         })
     }
 }
@@ -535,7 +518,7 @@ impl Array {
         let ragged_axis = dimensions.lhs_ragged_dimensions()[0];
         let mode = dimensions.mode(self.r#type().rank())?;
         if mode == RaggedDotMode::Batch {
-            return self.dot_elements::<T>(rhs, dot_dimensions);
+            return self.dot_elements::<T>(rhs, dot_dimensions, None);
         }
         let prefix_axes = dimensions.group_sizes_prefix_dimensions(self.r#type().rank())?;
         let prefix_shape = prefix_axes
@@ -690,7 +673,7 @@ impl Array {
                         let rhs_slice = rhs.slice(&rhs_starts, &rhs_limits, &rhs_strides)?;
                         let rhs_slice = rhs_slice.reshape(rhs_slice_shape.clone())?;
                         output_starts[*ragged_output_axis] = ragged_start;
-                        lhs_slice.dot_elements::<T>(&rhs_slice, dense_dimensions)?
+                        lhs_slice.dot_elements::<T>(&rhs_slice, dense_dimensions, None)?
                     }
                     RaggedDotMode::Contracting => {
                         let rhs_ragged_axis = contracting_rhs_ragged_axis.unwrap();
@@ -699,7 +682,7 @@ impl Array {
                         let rhs_slice = rhs.slice(&rhs_starts, &rhs_limits, &rhs_strides)?;
                         output_starts[0] = group;
                         output_limits[0] = group + 1;
-                        let dot = lhs_slice.dot_elements::<T>(&rhs_slice, dot_dimensions)?;
+                        let dot = lhs_slice.dot_elements::<T>(&rhs_slice, dot_dimensions, None)?;
                         let mut dimensions = vec![Dimension::Static(1)];
                         dimensions.extend_from_slice(dot.r#type().shape().dimensions());
                         let dot = dot.reshape(Shape::new(dimensions))?;
@@ -714,16 +697,24 @@ impl Array {
         Ok(output)
     }
 
-    /// Contracts typed elements using each input's physical layout and the declared contraction dimensions.
+    /// Contracts typed elements using each input's physical layout and the declared contraction dimensions. The result
+    /// type comes from the type inference of the corresponding [`DotOperation`], which uses `output_sharding` (when
+    /// provided) instead of the inferred output sharding.
     fn dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
+        output_sharding: Option<&Sharding>,
     ) -> Result<Self, ProgramError> {
         debug_assert_eq!(self.r#type().data_type(), T::data_type());
         debug_assert_eq!(rhs.r#type().data_type(), T::data_type());
-        let mut output_types = DotOperation::new(dimensions.clone())
-            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
+        let operation = DotOperation::new(dimensions.clone());
+        let operation = match output_sharding {
+            Some(output_sharding) => operation.with_output_sharding(output_sharding.clone()),
+            None => operation,
+        };
+        let mut output_types =
+            operation.infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
         let output_type = output_types.remove(0);
         let lhs_shape = self.r#type().static_shape().unwrap();
         let rhs_shape = rhs.r#type().static_shape().unwrap();

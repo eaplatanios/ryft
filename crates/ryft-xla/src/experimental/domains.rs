@@ -8689,7 +8689,9 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let left_input = builder.add_input(input_type.clone().into());
         let right_input = builder.add_input(input_type.clone().into());
-        builder.add_instruction(PrintOperation::new("left"), Vec::new(), vec![left_input], None).unwrap();
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("left"), Vec::new(), vec![left_input], None)
+            .unwrap();
         let left = builder
             .add_instruction(
                 DimensionFromScalarOperation::new(left_type.variable().clone()),
@@ -8723,8 +8725,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let output =
-            builder.add_instruction(PrintOperation::new("right"), Vec::new(), vec![right_input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("right"), Vec::new(), vec![right_input], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![output],
@@ -15892,7 +15895,9 @@ mod tests {
         let input = f64_vector(&domain, &mesh, &[3.0]);
         let mut builder = XlaProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
-        builder.add_instruction(PrintOperation::new("ordered"), Vec::new(), vec![argument], None).unwrap();
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
+            .unwrap();
         let source = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
@@ -15919,7 +15924,7 @@ mod tests {
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
             .add_instruction(
-                PrintOperation::new("unordered").with_effect_class(EffectClass::UnorderedIo),
+                PrintOperation::<ArrayType>::new("unordered").with_effect_class(EffectClass::UnorderedIo),
                 Vec::new(),
                 vec![argument],
                 None,
@@ -16126,7 +16131,7 @@ mod tests {
         )
         .unwrap();
         let (outputs, lines) =
-            with_captured_prints(|| domain.bind(PrintOperation::new("x"), Vec::new(), &[input]).unwrap());
+            with_captured_prints(|| domain.bind(PrintOperation::<ArrayType>::new("x"), Vec::new(), &[input]).unwrap());
 
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);

@@ -68,6 +68,8 @@
 //! # }
 //! ```
 
+use crate::operations::Capability;
+
 pub mod broadcasting;
 pub mod concatenation;
 pub mod conversions;
@@ -112,42 +114,44 @@ pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, Transp
 /// [`Concatenate`], [`Gather`], [`Scatter`], [`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`],
 /// [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`]. It is implemented automatically for every
 /// type that implements all of its members.
-pub trait ManipulationOperations:
-    Transpose
-    + Reverse
-    + Reshape
-    + Broadcast
-    + Pad
-    + Concatenate
-    + Gather
-    + Scatter
-    + Slice
-    + UpdateSlice
-    + DynamicSlice
-    + DynamicUpdateSlice
-    + ConvertElementType
-    + ReducePrecision
-    + TransferToMemory
+pub trait ManipulationOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + Transpose<T>
+    + Reverse<T>
+    + Reshape<T>
+    + Broadcast<T>
+    + Pad<T>
+    + Concatenate<T>
+    + Gather<Array, T>
+    + Scatter<T>
+    + Slice<T>
+    + UpdateSlice<T>
+    + DynamicSlice<T>
+    + DynamicUpdateSlice<T>
+    + ConvertElementType<T>
+    + ReducePrecision<T>
+    + TransferToMemory<T>
 {
 }
 
 impl<
-    V: Transpose
-        + Reverse
-        + Reshape
-        + Broadcast
-        + Pad
-        + Concatenate
-        + Gather
-        + Scatter
-        + Slice
-        + UpdateSlice
-        + DynamicSlice
-        + DynamicUpdateSlice
-        + ConvertElementType
-        + ReducePrecision
-        + TransferToMemory,
-> ManipulationOperations for V
+    T,
+    V: Transpose<T>
+        + Reverse<T>
+        + Reshape<T>
+        + Broadcast<T>
+        + Pad<T>
+        + Concatenate<T>
+        + Gather<Array, T>
+        + Scatter<T>
+        + Slice<T>
+        + UpdateSlice<T>
+        + DynamicSlice<T>
+        + DynamicUpdateSlice<T>
+        + ConvertElementType<T>
+        + ReducePrecision<T>
+        + TransferToMemory<T>,
+> ManipulationOperations<T> for V
 {
 }
 

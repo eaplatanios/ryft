@@ -186,6 +186,51 @@ pub use trigonometric::{
 /// generic or projected type, and so such mixed bounds may fail to unify. Likewise, traits must not state
 /// `Typed<Type = T>` alongside a universe-parameterized capability bound at `T`, because the resulting
 /// equality makes bounds on `V::Type` unusable.
+///
+/// # The `capability` Attribute
+///
+/// Capability traits are declared with the [`capability`](macro@capability) attribute, which checks their
+/// conventions at compile time (i.e., exactly one type parameter defaults to `<Self as Capability>::Universe`, that
+/// parameter is unbounded because host types are their own universes, and [`Capability`] is a direct super-trait).
+/// Its `projection(Composite => Member)` argument additionally implements the capability for every value of the
+/// `Composite` universe whose [`ValueProjection`](crate::ValueProjection) onto `Member` implements it. The
+/// generated functions project the receiver and every `&Self`, `&[Self]`, and `Option<&Self>` input, apply the member
+/// implementation, and lift `Self` outputs (also inside `Vec`s and tuples) back, while passing other inputs and outputs
+/// through unchanged. Projecting a member of another kind fails with the projection's error (e.g., a [`TypeError`] for
+/// a first-class dimension). This is how composite array IR values (i.e., [`ArrayIrValue`](crate::ArrayIrValue) and the
+/// tracers over [`ArrayIrType`](crate::ArrayIrType)) implement most array capabilities, through
+/// `#[capability(projection(ArrayIrType => ArrayType))]`, so that their staged programs contain
+/// the same array instructions as homogeneous programs.
+///
+/// The projection covers the required functions of a capability, and provided functions keep their default bodies.
+/// A default must therefore be correct for every implementor, typically by composing required functions. A function
+/// whose behavior depends on the implementor (e.g., one whose configuration staging values record in the staged
+/// operation while concrete values only validate it) must be required instead, so that composite values project it too.
+/// Type parameters that precede the universe must default to `Self` (e.g., a right input declared as `Rhs = Self`), and
+/// they resolve to the composite value in the implemented capability and to its projection in the delegated one. The
+/// generated code refers to the `ryft` crate, and a `crate = "path"` argument overrides that path (e.g., for crates
+/// that depend on `ryft-core` directly). Capabilities whose composite implementations are irregular (e.g., [`Sort`] or
+/// [`Gather`]) keep handwritten implementations and use the bare attribute.
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrType, ArrayIrValue, ArrayType, Capability, ProgramError};
+/// # use ryft_macros::capability;
+///
+/// #[capability(projection(ArrayIrType => ArrayType))]
+/// trait Double<T = <Self as Capability>::Universe>: Capability + Sized {
+///     fn double(&self) -> Result<Self, ProgramError>;
+/// }
+///
+/// impl Double<ArrayType> for Array {
+///     fn double(&self) -> Result<Self, ProgramError> {
+///         Ok(self.clone() + self.clone())
+///     }
+/// }
+///
+/// let value = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0])?);
+/// assert_eq!(value.double()?, ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0])?));
+/// # Ok::<(), ProgramError>(())
+/// ```
 pub trait Capability {
     /// Universe that this implementor belongs to (e.g., the [`Typed::Type`] of a value, or a host type itself).
     type Universe;
@@ -408,14 +453,17 @@ impl Hash for Tolerance {
 mod tests {
     use std::collections::HashMap;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::capability;
+
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::programs::RegionInterface;
+    use crate::programs::{RegionInterface, Value};
     use crate::tests::hash_of;
     use crate::tracing::{Tracer, TracingContext};
 
@@ -465,6 +513,83 @@ mod tests {
         assert_integer_bundles::<i8>();
         assert_integer_bundles::<i128>();
         assert_integer_bundles::<usize>();
+    }
+
+    #[test]
+    fn test_capability_attribute() {
+        // Two projected capabilities cover projected `&Self` inputs, passed-through inputs, functions without inputs,
+        // several functions per capability, a provided function that keeps its default body, and a right-input type
+        // parameter that precedes the universe.
+        #[capability(projection(ArrayIrType => ArrayType))]
+        trait Scale<T = <Self as Capability>::Universe>: Capability + Sized {
+            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError>;
+
+            fn double(&self) -> Result<Self, ProgramError>;
+
+            fn triple(&self) -> Result<Self, ProgramError> {
+                self.scale(self, 2)
+            }
+        }
+
+        #[capability(projection(ArrayIrType => ArrayType))]
+        trait Combine<Rhs = Self, T = <Self as Capability>::Universe>: Capability + Sized {
+            fn combine(&self, right: &Rhs) -> Result<Self, ProgramError>;
+        }
+
+        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Scale<ArrayType> for V {
+            fn scale(&self, right: &Self, count: usize) -> Result<Self, ProgramError> {
+                (0..count).try_fold(self.clone(), |sum, _| sum.add(right))
+            }
+
+            fn double(&self) -> Result<Self, ProgramError> {
+                self.add(self)
+            }
+        }
+
+        impl<V: Value<Type = ArrayType> + Add<ArrayType>> Combine<V, ArrayType> for V {
+            fn combine(&self, right: &V) -> Result<Self, ProgramError> {
+                self.add(right)
+            }
+        }
+
+        // Composite tracers stage the homogeneous array instructions of every generated function.
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = CompositeContext::trace(
+            |inputs: Vec<Tracer<CompositeContext>>| inputs[0].scale(&inputs[1], 2)?.double()?.combine(&inputs[1]),
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = add %0 %1
+                    %3:f32[2] = add %2 %1
+                    %4:f32[2] = add %3 %3
+                    %5:f32[2] = add %4 %1
+                in (%5)"
+            },
+        );
+
+        // Concrete composite values apply the capabilities to their array members, and the provided
+        // function composes them, while first-class dimension members are rejected by the projection.
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
+        assert_eq!(left.scale(&right, 2), Ok(ArrayIrValue::Array(Array::vector(vec![7.0f32, 10.0]).unwrap())));
+        assert_eq!(left.double(), Ok(ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap())));
+        assert_eq!(left.triple(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0f32, 6.0]).unwrap())));
+        assert_eq!(left.combine(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            left.scale(&dimension, 1),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+        assert_eq!(
+            dimension.combine(&left),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]

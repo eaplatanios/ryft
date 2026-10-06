@@ -1206,11 +1206,13 @@ fn test_array_dot_with_output_sharding() {
     let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap();
     assert_eq!(
         lhs.dot_with_output_sharding(&rhs, &dimensions, &rank_one),
-        Err(ProgramError::Type(TypeError::invalid("TODO")))
+        Err(ProgramError::Type(TypeError::invalid(
+            "`dot` output sharding rank (1) does not match the output rank (2)"
+        ))),
     );
 
-    // Concrete arrays always hold fully reduced results, and so they reject unreduced outputs even when the request is
-    // valid for staged programs.
+    // Unreduced outputs are recorded as well, because a concrete array's payload is its fully reduced logical value,
+    // which is exactly the total of the partial sums that an unreduced sharding describes.
     let lhs = Array::from_elements(
         sharded_array(&mesh, &[2, 2], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]),
         &[1.0f32, 2.0, 3.0, 4.0],
@@ -1225,14 +1227,9 @@ fn test_array_dot_with_output_sharding() {
         .unwrap()
         .with_unreduced_axes(["k"])
         .unwrap();
-    assert_eq!(
-        lhs.dot_with_output_sharding(&rhs, &dimensions, &unreduced),
-        Err(ProgramError::UnsupportedOperation {
-            message: "`dot` cannot produce unreduced outputs for concrete arrays, which always hold fully reduced \
-                      results; stage the computation to request unreduced output axes"
-                .to_string(),
-        }),
-    );
+    let product = lhs.dot_with_output_sharding(&rhs, &dimensions, &unreduced).unwrap();
+    assert_eq!(product.r#type().into_owned(), plain_array(&[2, 2]).with_sharding(unreduced).unwrap());
+    assert_eq!(product.elements::<f32>(), Ok(vec![19.0, 22.0, 43.0, 50.0]));
 }
 
 #[test]

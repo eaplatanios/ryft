@@ -1,4 +1,8 @@
+use ryft_macros::capability;
+
+use crate::arrays::AsArrayType;
 use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+use crate::operations::Capability;
 
 use super::*;
 
@@ -304,7 +308,12 @@ where
 crate::impl_non_transposable_operation!(ScaledDotOperation);
 
 /// Value-level generalized block-scaled dot capability.
-pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
+///
+/// The universe parameter `T` defaults to the [`Capability`](crate::operations::Capability) universe of the
+/// implementor, so that homogeneous array values implement this capability for [`ArrayType`](crate::arrays::ArrayType)
+/// and composite array IR values implement it for [`ArrayIrType`](crate::arrays::ArrayIrType).
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait ScaledDot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Computes `(self * lhs_scale) · (rhs * rhs_scale)` using a generalized dot contraction. Each absent scale is
     /// the multiplicative identity. When `dimensions` is absent, the final left axis contracts with the penultimate
     /// right axis and every preceding axis is batched. The preferred element type defaults to `bf16`.
@@ -333,9 +342,14 @@ pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
         lhs_scale: &Self,
         rhs_scale: &Self,
         preferred_element_type: Option<DataType>,
-    ) -> Result<Self, ProgramError> {
-        if [self, rhs, lhs_scale, rhs_scale].iter().any(|value| value.r#type().rank() != 3) {
-            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs".to_string()).into());
+    ) -> Result<Self, ProgramError>
+    where
+        Self: Typed<Type: AsArrayType>,
+    {
+        for value in [self, rhs, lhs_scale, rhs_scale] {
+            if value.r#type().as_array_type()?.rank() != 3 {
+                return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs".to_string()).into());
+            }
         }
         self.scaled_dot(
             rhs,
@@ -376,7 +390,7 @@ impl ScaledDot for Array {
 // context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
 // context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
 // transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> ScaledDot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> ScaledDot<ArrayType> for V
 where
     V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
 {
@@ -638,6 +652,18 @@ mod tests {
                 ]
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_scaled_dot_composite() {
+        // Concrete composite values contract their array members, including their optional scales.
+        let lhs = Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let rhs = Array::matrix(2, 2, vec![5.0f32, 6.0, 7.0, 8.0]).unwrap();
+        let expected = lhs.scaled_dot(&rhs, None, None, None, Some(DataType::F32)).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(lhs).scaled_dot(&ArrayIrValue::Array(rhs), None, None, None, Some(DataType::F32)),
+            Ok(ArrayIrValue::Array(expected)),
         );
     }
 

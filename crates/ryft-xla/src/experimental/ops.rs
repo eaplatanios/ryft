@@ -11,7 +11,6 @@ use ryft_core::operations::collectives::{
     ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
     ParallelSumScatterOperation,
 };
-use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as ReferenceArray, ArrayBatch,
@@ -19,9 +18,9 @@ use ryft_core::{
     ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation, BatchAxis,
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, ClampOperation,
-    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
-    ConstantOperation, ConstrainShardingOperation, Context, ConvertElementTypeOperation, CosOperation,
-    CotangentDestinationKind, CotangentDestinations, CumulativeOperation, CustomFunctionOperation,
+    CompareOperation, CompiledCallOperation, ComplexOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    ConjugateOperation, ConstantOperation, ConstrainShardingOperation, Context, ConvertElementTypeOperation,
+    CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeOperation, CustomFunctionOperation,
     CustomFunctionTransposeOperation, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension,
     DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
@@ -29,24 +28,25 @@ use ryft_core::{
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation, LiteralIdentity,
-    Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationBoundaryPruning,
-    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
-    ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
-    ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness,
-    RegionSlot, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation,
-    RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation,
-    SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation,
-    SubOperation, TagOperation, TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
-    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
-    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    GatherOperation, ImaginaryOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation,
+    LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationBoundaryPruning, OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation,
+    ParallelReduceOperation, ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, RealOperation,
+    ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, RegionInterface, RegionLiveness, RegionSlot, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation, SliceOperation, SortOperation,
+    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation,
+    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -907,12 +907,54 @@ where
     }
 }
 
+// Composite operations whose generic capabilities bind them through any context lift into the array member exactly as
+// they do in the core composite family.
 impl<Constant> From<AddOperation<ArrayIrType>> for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: AddOperation<ArrayIrType>) -> Self {
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+    }
+}
+
+impl<Constant> From<SelectOperation<ArrayIrType>> for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: SelectOperation<ArrayIrType>) -> Self {
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+    }
+}
+
+impl<Constant> From<StopGradientOperation<ArrayIrType>> for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: StopGradientOperation<ArrayIrType>) -> Self {
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+    }
+}
+
+impl<Constant> From<TagOperation<ArrayIrType>> for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: TagOperation<ArrayIrType>) -> Self {
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
+    }
+}
+
+impl<Constant> From<PrintOperation<ArrayIrType>> for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: PrintOperation<ArrayIrType>) -> Self {
         ArrayIrOperation::<Constant::Projected>::from(operation).into()
     }
 }
@@ -1846,6 +1888,8 @@ mod tests {
 
         requires_array_operations::<Array<'static>>();
         requires_array_operations::<ShardMapTracer>();
+        requires_array_operations::<ryft_core::ArrayIrValue<Array<'static>>>();
+        requires_array_operations::<XlaTracer<'static>>();
         requires_array_ir_operations::<XlaTracer<'static>>();
         requires_array_ir_operations::<Tracer<TracingContext<XlaConstant, XlaOperation>>>();
     }

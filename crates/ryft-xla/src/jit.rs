@@ -2935,6 +2935,44 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_value_and_gradient_with_captures_on_the_xla_domain() {
+        use ryft_core::Add;
+
+        // Composite tracers dispatch `add` and `dot` through the array-IR capability universe without projecting to
+        // arrays first, and the captured gradient of `f(x; c) = (x + c) · c` is `c`.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaSession::new(&client).domain();
+        let array_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let vector = |values: &[f32]| {
+            ArrayIrValue::Array(
+                Array::from_host_buffer(
+                    &domain,
+                    array_type.clone(),
+                    mesh.clone(),
+                    values_to_bytes::<f32>(values).as_slice(),
+                )
+                .unwrap(),
+            )
+        };
+        let read = |value: ArrayIrValue<Array<'_>>| {
+            read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap())
+        };
+        let (value, gradient) = domain
+            .differentiate_at(vector(&[1.0, 2.0]))
+            .with_captures(vector(&[3.0, 4.0]))
+            .value_and_gradient(|x, c| x.add(&c)?.dot(&c, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])))
+            .unwrap();
+        assert_eq!(read(value), vec![36.0]);
+        assert_eq!(read(gradient), vec![3.0, 4.0]);
+    }
+
+    #[test]
     fn test_rematerialized_function_differentiates_on_the_xla_domain() {
         use ryft_core::{DotsSavable, ResidualPolicy, SaveAndOffloadOnlyTheseNames, Tag, rematerialize};
 

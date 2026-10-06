@@ -14,7 +14,6 @@ use ryft_core::operations::collectives::{
     CollectiveMode, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelSumScatterOperation,
 };
-use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
@@ -22,15 +21,16 @@ use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
     CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
-    CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ConstantOperation,
-    ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers,
-    DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation,
-    GatherMode, GatherOperation, Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation,
-    LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation,
-    MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, Parameterized, PowOperation, Program,
-    ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode,
-    RaggedDotOperation, RandomAlgorithm, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
+    CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ComplexOperation, ConjugateOperation,
+    ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME,
+    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
+    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
+    ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, ImaginaryOperation, Instruction,
+    IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
+    LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
+    PadOperation, ParallelReduceOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
+    Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
+    RandomAlgorithm, RealOperation, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
     RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RngBitGeneratorOperation, RoundOperation,
     RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
     ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
@@ -18162,8 +18162,9 @@ mod tests {
         let effectful_body_program = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output =
-                builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
+            let output = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -18185,8 +18186,9 @@ mod tests {
         let primal = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let printed =
-                builder.add_instruction(PrintOperation::new("primal"), Vec::new(), vec![input], None).unwrap()[0];
+            let printed = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("primal"), Vec::new(), vec![input], None)
+                .unwrap()[0];
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None).unwrap()[0];
             builder
@@ -18355,8 +18357,9 @@ mod tests {
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
-            let output =
-                builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
+            let output = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -18364,7 +18367,9 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
-        let before = builder.add_instruction(PrintOperation::new("before"), Vec::new(), vec![input], None).unwrap()[0];
+        let before = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("before"), Vec::new(), vec![input], None)
+            .unwrap()[0];
         let rematerialized = builder
             .add_instruction(
                 XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
@@ -18374,7 +18379,7 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(PrintOperation::new("after"), Vec::new(), vec![rematerialized], None)
+            .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![rematerialized], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -22539,8 +22544,9 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let predicate =
-                builder.add_instruction(PrintOperation::new("condition"), Vec::new(), vec![state], None).unwrap()[0];
+            let predicate = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -23550,7 +23556,9 @@ mod tests {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
-        let printed = builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
+            .unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -23588,9 +23596,12 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-        let first = builder.add_instruction(PrintOperation::new("first"), Vec::new(), vec![input], None).unwrap()[0];
-        let second =
-            builder.add_instruction(PrintOperation::new("second"), Vec::new(), vec![doubled], None).unwrap()[0];
+        let first = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("first"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("second"), Vec::new(), vec![doubled], None)
+            .unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -23629,7 +23640,7 @@ mod tests {
             let input = builder.add_input(array_type.clone());
             builder
                 .add_instruction(
-                    PrintOperation::new("value").with_effect_class(effect_class),
+                    PrintOperation::<ArrayType>::new("value").with_effect_class(effect_class),
                     Vec::new(),
                     vec![input],
                     None,
@@ -23694,8 +23705,9 @@ mod tests {
                 .unwrap()
                 .with_side_effect();
         builder.add_instruction(effectful, Vec::new(), vec![left, right], None).unwrap();
-        let printed =
-            builder.add_instruction(PrintOperation::new("between"), Vec::new(), vec![right], None).unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("between"), Vec::new(), vec![right], None)
+            .unwrap()[0];
         let chained = builder
             .add_instruction(
                 CustomCallOperation::new("ryft.test.record", vec![array_type.clone()]).with_side_effect(),
@@ -25445,8 +25457,9 @@ mod tests {
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f64.clone().into());
         let x = body_builder.add_input(scalar_f64.clone().into());
-        let printed =
-            body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
+        let printed = body_builder
+            .add_instruction(PrintOperation::<ArrayType>::new("iteration"), Vec::new(), vec![x], None)
+            .unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -25536,7 +25549,7 @@ mod tests {
             )
             .unwrap();
         body_builder
-            .add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![value], None)
+            .add_instruction(PrintOperation::<ArrayType>::new("iteration"), Vec::new(), vec![value], None)
             .unwrap();
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -25592,7 +25605,7 @@ mod tests {
         let mut true_builder = CompositeXlaProgramBuilder::new();
         let true_input = true_builder.add_input(input_type.clone().into());
         let printed = true_builder
-            .add_instruction(PrintOperation::new("taken"), Vec::new(), vec![true_input], None)
+            .add_instruction(PrintOperation::<ArrayType>::new("taken"), Vec::new(), vec![true_input], None)
             .unwrap()[0];
         let negated = true_builder.add_instruction(NegOperation::new(), Vec::new(), vec![printed], None).unwrap()[0];
         let true_branch = true_builder
@@ -25680,8 +25693,9 @@ mod tests {
         let false_branch = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
-            let output =
-                builder.add_instruction(PrintOperation::new("false"), Vec::new(), vec![input], None).unwrap()[0];
+            let output = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("false"), Vec::new(), vec![input], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -25820,7 +25834,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        builder.add_instruction(PrintOperation::new("value"), Vec::new(), vec![left], None).unwrap();
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![left], None)
+            .unwrap();
         let predicate = builder
             .add_instruction(
                 CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
@@ -25951,7 +25967,7 @@ mod tests {
         let mut callee_builder = XlaProgramBuilder::new();
         let callee_input = callee_builder.add_input(array_type.clone());
         let printed = callee_builder
-            .add_instruction(PrintOperation::new("callee"), Vec::new(), vec![callee_input], None)
+            .add_instruction(PrintOperation::<ArrayType>::new("callee"), Vec::new(), vec![callee_input], None)
             .unwrap()[0];
         let callee_output = callee_builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None)
@@ -26062,8 +26078,9 @@ mod tests {
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f64.clone().into());
         let x = body_builder.add_input(scalar_f64.clone().into());
-        let printed =
-            body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
+        let printed = body_builder
+            .add_instruction(PrintOperation::<ArrayType>::new("iteration"), Vec::new(), vec![x], None)
+            .unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -26717,8 +26734,9 @@ mod tests {
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
-            let state =
-                builder.add_instruction(PrintOperation::new("condition"), Vec::new(), vec![state], None).unwrap()[0];
+            let state = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
+                .unwrap()[0];
             let zero = builder
                 .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
@@ -26742,7 +26760,9 @@ mod tests {
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
-            let next = builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![next], None).unwrap()[0];
+            let next = builder
+                .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![next], None)
+                .unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
@@ -28439,7 +28459,9 @@ mod tests {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone().into());
-        let output = builder.add_instruction(PrintOperation::new("zero"), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("zero"), Vec::new(), vec![input], None)
+            .unwrap()[0];
         let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
