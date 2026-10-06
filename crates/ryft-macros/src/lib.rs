@@ -1,5 +1,6 @@
 use proc_macro::TokenStream;
 
+mod capabilities;
 mod helpers;
 mod kernels;
 mod operations;
@@ -19,6 +20,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
     CodeGenerator::generate_parameterized_impl(input)
 }
 
+// TODO(eaplatanios): Review this.
 /// Generates an operation enum's `Operation` contract and its selected semantic dispatchers.
 ///
 /// The derivation applies to enums whose every variant wraps exactly one operation payload, and it makes the enum
@@ -64,6 +66,21 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
     operations::generate_operation_impl(input)
 }
 
+// TODO(eaplatanios): Review this.
+/// Validates a capability trait and optionally generates the implementations through which composite values apply it
+/// by projecting onto their members (e.g., `#[capability(projection(ArrayIrType => ArrayType))]`).
+///
+/// Refer to the documentation of `ryft-core`'s `Capability` trait for the canonical reference, which covers the checked
+/// conventions, the generated projection implementations, the supported function signatures, and the `crate = "path"`
+/// argument.
+#[proc_macro_attribute]
+pub fn capability(attributes: TokenStream, input: TokenStream) -> TokenStream {
+    capabilities::expand(attributes.into(), input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+// TODO(eaplatanios): Review this.
 /// Defines an experimental portable kernel using canonical `Array` signature annotations.
 ///
 /// The current subset supports whole-array and padded tiled access, shape requirements, local arithmetic,

@@ -136,7 +136,8 @@ update this file so that they do not need to remind you again in the future.
   structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`,
   into `where` clauses.
 - Declare the type-descriptor parameter before the value parameter in generic parameter lists (e.g.,
-  `<T: Type, V: Value<Type = T>>`, not `<V, T>`).
+  `<T: Type, V: Value<Type = T>>`, not `<V, T>`). Likewise, declare a parameter type before the structure
+  that is parameterized by it (e.g., `Parameterwise<P, S>` and `impl<P: Parameter, S: Parameterized<P>>`).
 - Use `C` for generic parameters whose semantic role is a context or domain (e.g., `Context`, `StagingContext`,
   `BatchingContext`, `DifferentiationContext`, `Domain`, or `CompilationDomain`), and `D` for driver parameters. When a
   function accepts a driver, reserve `D` for that driver and use `C` for its context or domain; do not rename the driver
@@ -398,6 +399,24 @@ Consult that file before writing or revising unit tests.
   comment, because the transpose of the skipped `parallel_vary` is a cross-device sum. Stage any value that can carry
   a tangent through the value-level capabilities, which call `align_manual_variation`. Cover such rules with a test
   that runs them inside a manual region with varying inputs.
+- Capability traits are universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where
+  the universe is a coherence marker that need not be a `Type`, and host types are their own universe), carry the
+  `#[capability]` attribute that checks those conventions, and declare exactly one composite strategy: a projection
+  through `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the composite family
+  plus an eager `ArrayIrValue` delegation (S2), an existing composite-native path (S3), or member-kind dispatch through
+  an operation provider (S4). Give capability functions default bodies only when the default is correct for every
+  implementor (e.g., by composing required functions), and make implementor-dependent functions required instead.
+  Only elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations
+  that `define_elementwise_capability!` generates (and `impl_parameterwise_operator!` for their `std::ops` operators,
+  invoked right after the corresponding `impl_tracer_operator!`), never through derive-generated code. In generic
+  bounds, use each capability's default universe (or a bundle such as `ArrayOperations`) and never mix it with an
+  explicitly named universe for the same value, and never pin `Typed<Type = T>` next to capability bounds at `T`; the
+  trait solver cannot equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or projected `V`, so
+  mixed bounds fail to unify and pinned equalities make bounds on `V::Type` unusable. Never bound a universe parameter
+  by `Type`, including in bundle blanket implementations, because host types are universes too, and keep compile-time
+  assertions that host types satisfy the bundles whose members they implement. Every universe's implementation of a
+  capability must honor the same documented contract, including edge cases such as singleton or empty inputs, so test
+  those edge cases for each universe.
 
 ### `ryft-mlir`
 
