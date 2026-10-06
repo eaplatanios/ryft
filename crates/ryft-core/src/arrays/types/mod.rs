@@ -8,8 +8,8 @@ pub mod memories;
 pub use arrays::{ArrayType, ArrayTypeRefinements, AsArrayType};
 pub use data::{DataType, DataTypeError};
 pub use dimensions::{
-    Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape,
-    StaticShape,
+    AsDimensionType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable,
+    MAX_DIMENSION_EXTENT, Shape, StaticShape,
 };
 pub use ir::{ArrayIrType, ArrayIrTypeRefinements};
 pub use layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};

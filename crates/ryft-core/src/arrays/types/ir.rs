@@ -4,7 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements, AsArrayType};
-use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable};
+use crate::arrays::types::dimensions::{AsDimensionType, Dimension, DimensionType, DimensionVariable};
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
 use crate::programs::{
@@ -273,6 +273,13 @@ impl Type for ArrayIrType {
 impl AsArrayType for ArrayIrType {
     #[inline]
     fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
+        self.try_into()
+    }
+}
+
+impl AsDimensionType for ArrayIrType {
+    #[inline]
+    fn as_dimension_type(&self) -> Result<&DimensionType, TypeError> {
         self.try_into()
     }
 }
