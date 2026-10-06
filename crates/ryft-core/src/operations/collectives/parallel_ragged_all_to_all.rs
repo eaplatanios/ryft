@@ -76,8 +76,6 @@ enum ParallelRaggedAllToAllUpdateKind {
     Add,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical name of the [`ParallelRaggedAllToAllOperation`].
 pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all_to_all";
 
@@ -85,20 +83,21 @@ pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all
 ///
 /// The six inputs, in order, are `operand (N, A, ...)`, `output (M, A, ...)`, and rank-one integer arrays
 /// `input_offsets`, `send_sizes`, `output_offsets`, and `receive_sizes`, each of length `K`, which must be positive and
-/// divisible by the effective participant-group size. The result has exactly `output`'s type and starts with
-/// `output`'s value, so elements outside received regions pass through unchanged. The batching rule uses one internal
-/// physical form that prefixes every input with the participant axis, making the data inputs `(P, N, A, ...)` and
-/// `(P, M, A, ...)` and the metadata inputs `(P, K)`; this representation is normalized back to the public contract
-/// during type inference and eager interpretation.
+/// divisible by the effective participant-group size. The result has exactly `output`'s type and starts with `output`'s
+/// value, so elements outside received regions pass through unchanged. The batching rule uses one internal physical
+/// form that prefixes every input with the participant axis, making the data inputs `(P, N, A, ...)` and
+/// `(P, M, A, ...)` and the metadata inputs `(P, K)`. This representation is normalized back to the public
+/// contract during type inference and eager interpretation.
 ///
 /// `output_offsets` are supplied by each sender but are expressed in the corresponding receiver's coordinate frame.
 /// Runtime metadata must satisfy that `receive_sizes` equals the tiled exchange of `send_sizes` within the same
 /// participant groups (e.g., `send_sizes.parallel_all_to_all_tiled(axis_name, 0, 0)` for an ungrouped exchange; refer
-/// to [`ParallelAllToAll`](crate::operations::collectives::ParallelAllToAll)), that every source and destination region
-/// is in bounds, and that received regions within one output are disjoint. Send regions may overlap, which
-/// intentionally permits resending a source slice. Concrete eager execution validates these conditions with
-/// overflow-safe host arithmetic. Staged XLA execution treats them as preconditions, as does [JAX's
-/// `ragged_all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_all_to_all.html).
+/// to the documentation of [`ParallelAllToAll`](crate::operations::collectives::ParallelAllToAll) for more
+/// information), that every source and destination region is in bounds, and that received regions within one output
+/// are disjoint. Send regions may overlap, which intentionally permits resending a source slice. Concrete eager
+/// execution validates these conditions with overflow-safe host arithmetic. Staged XLA execution treats them as
+/// preconditions, as does JAX's
+/// [`jax.lax.ragged_all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_all_to_all.html).
 ///
 /// An exchange over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
 /// [`ParallelRaggedAllToAll::parallel_ragged_all_to_all`] supplies the mesh automatically from the enclosing manual
@@ -112,11 +111,11 @@ pub const PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "parallel_ragged_all
 /// level whose axis name shadows a manual mesh axis may bind it instead, and a matching `batch` level rejects an
 /// exchange over a manual mesh axis.
 ///
-/// [`RaggedAxis`](crate::arrays::RaggedAxis) is batching-time metadata and does not participate in this explicitly
-/// packed operation contract. Batching rejects inputs that carry it because one per-item logical extent does not
-/// determine the per-source/per-destination sizes and two coordinate-frame offset vectors required by this operation.
-/// A future adapter must therefore accept an explicit routing descriptor; it cannot infer routing from
-/// [`RaggedAxis`](crate::arrays::RaggedAxis) alone. The two representations also describe different frames:
+/// [`RaggedAxis`](crate::RaggedAxis) is batching-time metadata and does not participate in this explicitly packed
+/// operation contract. Batching rejects inputs that carry it because one per-item logical extent does not determine
+/// the per-source/per-destination sizes and two coordinate-frame offset vectors required by this operation. A future
+/// adapter must therefore accept an explicit routing descriptor; it cannot infer routing from
+/// [`RaggedAxis`](crate::RaggedAxis) alone. The two representations also describe different frames:
 /// `ParallelRaggedAllToAllOperation` metadata describes participant chunks, whereas a `RaggedAxis` describes packed
 /// batch items and has no carrier outside a batching transform. A batch transform whose named axis matches this
 /// operation executes concrete array metadata eagerly. Unresolved non-constant metadata are deliberately gated:
@@ -170,13 +169,25 @@ impl ParallelRaggedAllToAllOperation {
         }
     }
 
-    /// Creates a grouped operation after validating that `axis_index_groups` is an equal-sized exact partition of
-    /// `0..axis_size`.
+    /// Creates a grouped operation after validating that `axis_index_groups` is an equal-sized exact partition
+    /// of `0..axis_size`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis over which segments are exchanged.
+    ///   - `axis_size`: Full number of participants along `axis_name`, across all groups.
+    ///   - `axis_index_groups`: Participant groups, each listing axis indices in `0..axis_size`. Every participant
+    ///     exchanges segments only with the members of its own group. The order within a group defines the position
+    ///     of each member, and the metadata address peers by that position rather than by axis index: with groups of
+    ///     size `G` and metadata of length `K`, the `K / G` entries starting at `p · K / G` describe the segments sent
+    ///     to, or received from, the member at position `p`. For example, with groups `[[0, 2], [3, 1]]`, the second
+    ///     block of metadata of participant `3` describes its exchange with participant `1`.
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if `axis_size` is zero, if there are no groups, if the groups are empty or differ in
-    /// size, or if they repeat, omit, or exceed a participant of `0..axis_size`.
+    /// Returns a [`TypeError`] if `axis_size` is zero, if there are no groups, if the groups are empty or differ
+    /// in size, or if they repeat, omit, or exceed a participant of `0..axis_size`.
+    #[inline]
     pub fn grouped(axis_name: String, axis_size: usize, axis_index_groups: Vec<Vec<usize>>) -> Result<Self, TypeError> {
         effective_collective_axis_size(
             PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
@@ -197,13 +208,34 @@ impl ParallelRaggedAllToAllOperation {
         self
     }
 
-    /// Returns a clone marked with the batching-internal physical input representation.
+    /// Returns a clone that uses the batching-internal physical input representation, in which every input carries
+    /// a leading participant axis whose extent is [`axis_size`](Self::axis_size). Row `p` of each input holds the
+    /// input of the participant with axis index `p`, so the data inputs are `(P, N, A, ...)` and `(P, M, A, ...)`,
+    /// the metadata inputs are `(P, K)`, and the result is `(P, M, A, ...)`. Type inference validates and strips the
+    /// leading axis before applying the logical contract, and eager interpretation then executes the exchanges of all
+    /// participants in one host-side evaluation without an enclosing binder. The clone keeps the axis name, groups,
+    /// and update semantics of this operation, and it renders with `representation=Physical`.
+    ///
+    /// This function is private because only the batching rule of a level that binds [`axis_name`](Self::axis_name)
+    /// can establish that the leading axis enumerates the participants of that axis. That level consumes the axis, so
+    /// every other level treats the physical operation as unrelated to its own axis. A physical operation has no
+    /// backend lowering (refer to the documentation of [`is_physical`](Self::is_physical)).
     #[inline]
     fn with_physical_representation(&self) -> Self {
         Self { representation: ParallelRaggedAllToAllRepresentation::Physical, ..self.clone() }
     }
 
-    /// Returns a clone whose received segments add into the output seed.
+    /// Returns a clone whose received segments are added into the output seed instead of overwriting it. Unlike the
+    /// overwriting exchange, the additive exchange accepts overlapping received regions and sums every contribution
+    /// to a region. The clone keeps the axis name, groups, and input representation of this operation, and it
+    /// renders with `update_kind=Add`.
+    ///
+    /// This function is private because only the transpose rule creates additive exchanges, as the adjoint of the
+    /// `operand` input: that adjoint sends the output cotangent back into a zero `operand` seed, and the forward
+    /// exchange may send one `operand` region to several destinations, whose cotangents must all be summed. The
+    /// additive exchange is linear in both data inputs, and transposing it passes the output cotangent through
+    /// unchanged. Backends need a dedicated lowering for it (refer to the documentation of
+    /// [`accumulates_updates`](Self::accumulates_updates)).
     #[inline]
     fn with_additive_updates(&self) -> Self {
         Self { update_kind: ParallelRaggedAllToAllUpdateKind::Add, ..self.clone() }
@@ -219,20 +251,6 @@ impl ParallelRaggedAllToAllOperation {
     #[inline]
     pub fn axis_size(&self) -> usize {
         self.axis_size
-    }
-
-    /// Returns the ordered participant groups, if any.
-    #[inline]
-    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
-        self.axis_index_groups.as_deref()
-    }
-
-    /// Returns the logical mesh whose manual axis this [`ParallelRaggedAllToAllOperation`] exchanges segments over, or
-    /// [`None`] for an ordinary exchange, whose named axis may be bound by any enclosing binder. Only an exchange over
-    /// a manual mesh axis requires its inputs to vary over that axis.
-    #[inline]
-    pub fn mesh(&self) -> Option<&LogicalMesh> {
-        self.mesh.as_ref()
     }
 
     /// Validates the participant partition and returns its common group size, which is the number of participants that
@@ -251,11 +269,25 @@ impl ParallelRaggedAllToAllOperation {
         )
     }
 
+    /// Returns the ordered participant groups, if any.
+    #[inline]
+    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
+        self.axis_index_groups.as_deref()
+    }
+
+    /// Returns the logical mesh whose manual axis this [`ParallelRaggedAllToAllOperation`] exchanges segments over, or
+    /// [`None`] for an ordinary exchange, whose named axis may be bound by any enclosing binder. Only an exchange over
+    /// a manual mesh axis requires its inputs to vary over that axis.
+    #[inline]
+    pub fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
+    }
+
     /// Returns whether this operation carries the batching-internal physical input representation, in which every input
     /// has one leading axis that enumerates the participants of the named axis. Batching over a named axis produces
     /// this representation so that one host-side evaluation can exchange segments between all participants.
     ///
-    /// Backend lowerings must check this predicate and reject physical operations, because a device-level
+    /// Backend lowering must check this predicate and reject physical operations, because a device-level
     /// `parallel_ragged_all_to_all` expects the public logical representation, in which each device holds only its own
     /// data inputs and rank-one metadata inputs. Lowering a physical operation as if it were logical would misread its
     /// leading participant axis as data.
@@ -269,7 +301,7 @@ impl ParallelRaggedAllToAllOperation {
     /// Operations constructed through the public API always overwrite. Only the transpose rule produces accumulating
     /// operations: its adjoint exchange sends the output cotangent back into a zero seed shaped like the `operand`
     /// array, and `operand` regions that several forward segments read must sum the cotangents of all those segments.
-    /// Backend lowerings must check this predicate, because a native `ragged_all_to_all` overwrites its output and
+    /// Backend lowering must check this predicate, because a native `ragged_all_to_all` overwrites its output and
     /// would keep only one of those contributions, so accumulating operations need a lowering that adds received
     /// segments explicitly.
     #[inline]
@@ -277,18 +309,22 @@ impl ParallelRaggedAllToAllOperation {
         self.update_kind == ParallelRaggedAllToAllUpdateKind::Add
     }
 
-    /// Returns the participant groups that exchange segments: the ordered participant groups of a grouped exchange,
-    /// or one group of all `axis_size` participants otherwise.
+    /// Returns the participant groups that exchange segments (i.e., the ordered participant groups of a grouped
+    /// exchange, or one group of all `axis_size` participants otherwise).
+    #[inline]
     fn participant_groups(&self) -> Vec<Vec<usize>> {
         self.axis_index_groups().map_or_else(|| vec![(0..self.axis_size).collect()], <[Vec<usize>]>::to_vec)
     }
 }
 
 impl Display for ParallelRaggedAllToAllOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for ParallelRaggedAllToAllOperation {
     type Type = ArrayType;
