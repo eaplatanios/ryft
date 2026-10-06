@@ -54,11 +54,9 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Named-axis variance carried by the result of a [`ParallelAllGatherOperation`], which corresponds to the `to`
+/// Named axis variance carried by the result of a [`ParallelAllGatherOperation`], which corresponds to the `to`
 /// argument of JAX's [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html)
-/// (i.e., `'varying'`, `'invarying'`, and `'reduced'`).
+/// (i.e., `"varying"`, `"invarying"`, and `"reduced"`).
 ///
 /// This is an operation option rather than parallel type metadata. Type inference maps it onto the canonical
 /// [`Sharding::varying_manual_axes`] and [`Sharding::reduced_axes`] sets of a result over a manual mesh axis.
@@ -75,11 +73,13 @@ pub enum ParallelAllGatherOutputVariance {
     Reduced,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Canonical operation name for [`ParallelAllGatherOperation`].
 pub const PARALLEL_ALL_GATHER_OPERATION_NAME: &str = "parallel_all_gather";
 
-/// [`Operation`] that gathers every participant's input across the named axis, so that every participant receives all
-/// inputs in participant order. This is the analogue of JAX's
+/// [`Operation`] that gathers every participant's input across the named axis, so that
+/// every participant receives all inputs in participant order. This is the Ryft analogue of JAX's
 /// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) and of StableHLO's
 /// [`all_gather`](https://openxla.org/stablehlo/spec#all_gather). The [`CollectiveMode`] of its options selects the
 /// output shape over a group of `n` participants:
@@ -129,10 +129,10 @@ pub struct ParallelAllGatherOperation {
     /// Axis at which participants are stacked in untiled mode, or along which inputs are concatenated in tiled mode.
     concatenation_axis: usize,
 
-    /// Shared rank and participant-group semantics.
+    /// [`CollectiveOptions`] of this [`ParallelAllGatherOperation`].
     options: CollectiveOptions,
 
-    /// Named-axis variance of the result.
+    /// Named axis variance of the result.
     output_variance: ParallelAllGatherOutputVariance,
 
     /// Refer to the documentation of [`mesh`](Self::mesh) for more information.
@@ -141,7 +141,7 @@ pub struct ParallelAllGatherOperation {
 
 impl ParallelAllGatherOperation {
     /// Creates a new [`ParallelAllGatherOperation`] over the axis with the provided name and resolved axis size.
-    /// Construction preserves the supplied options; type inference validates the geometry, groups, and mesh state.
+    /// Construction preserves the supplied options while type inference validates the geometry, groups, and mesh state.
     #[inline]
     pub fn new(
         axis_name: String,
@@ -181,13 +181,13 @@ impl ParallelAllGatherOperation {
         self.concatenation_axis
     }
 
-    /// Returns the shared rank and participant-group semantics.
+    /// Returns the [`CollectiveOptions`] of this [`ParallelAllGatherOperation`].
     #[inline]
     pub fn options(&self) -> &CollectiveOptions {
         &self.options
     }
 
-    /// Returns the named-axis variance of the result.
+    /// Returns the named axis variance of the result.
     #[inline]
     pub fn output_variance(&self) -> ParallelAllGatherOutputVariance {
         self.output_variance
@@ -290,6 +290,48 @@ impl ParallelAllGatherOperation {
             .with_varying_manual_axes(varying_axes)?
             .with_reduced_axes(reduced_axes)?;
         Ok(output_type.with_sharding(output_sharding)?)
+    }
+
+    /// Relocates the bounded ragged metadata of the input of an untiled all-gather whose named axis the `batch` level
+    /// of `context` binds. A mapped input's per-item extents follow its batch axis to the inserted participant axis,
+    /// while a replicated input's scalar extents are broadcast along that axis, which becomes their only extent axis.
+    fn gathered_ragged_axes<C: Context<Type = ArrayType>, P: CollectiveArrayExtentBatchingPolicy<C>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        ragged_axes: Vec<RaggedAxis<C::Value>>,
+        input_batch_axis: Option<usize>,
+        input_rank: usize,
+    ) -> Result<Vec<RaggedAxis<C::Value>>, BatchingError> {
+        if let Some(input_batch_axis) = input_batch_axis {
+            return Ok(ragged_axes
+                .into_iter()
+                .map(|ragged_axis| ragged_axis.moved(input_batch_axis, 0).moved(0, self.concatenation_axis))
+                .collect());
+        }
+
+        let output_axes = (1..=input_rank).collect::<Vec<_>>();
+        ragged_axes
+            .into_iter()
+            .map(|ragged_axis| {
+                if !ragged_axis.extent_axes().is_empty() {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` requires replicated ragged inputs to carry \
+                             scalar extents",
+                        ),
+                    });
+                }
+                let extents = P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?
+                    .into_value();
+                let ragged_axis = ragged_axis.broadcasted(output_axes.as_slice()).moved(0, self.concatenation_axis);
+                Ok(RaggedAxis::new(
+                    ragged_axis.axis(),
+                    extents,
+                    ragged_axis.dimension().clone(),
+                    vec![self.concatenation_axis],
+                ))
+            })
+            .collect()
     }
 }
 
@@ -626,18 +668,17 @@ impl<
                 ),
             });
         }
-        let input_type = if input.ragged_axes().is_empty() {
-            input.unbatched_type()
-        } else {
-            input.value().r#type().unbatched(input.batch_axis())?
-        };
+
+        // The gather moves the packed per-item array, so its geometry comes from the packed type rather than from the
+        // logical type, which restores the dynamic dimension of every bounded ragged axis that the static-shape type
+        // inference cannot consume.
+        let input_type = input.value().r#type().unbatched(input.batch_axis())?;
         let (output_type, output_extents) = context.infer_collective_output_type_and_extents(self, &input_type)?;
         let input_batch_axis = input.batch_axis_position();
         let ragged_axes = input.ragged_axes().to_vec();
         let mut output = self.batch_matching_axis(context, input, output_extents, output_type.sharding().cloned())?;
         if !ragged_axes.is_empty() {
-            let ragged_axes =
-                gathered_ragged_axes::<C, P>(self, context, ragged_axes, input_batch_axis, input_type.rank())?;
+            let ragged_axes = self.gathered_ragged_axes(context, ragged_axes, input_batch_axis, input_type.rank())?;
             output = output.with_ragged_axes(ragged_axes)?;
         }
         Ok(vec![output].into())
@@ -920,10 +961,8 @@ where
                 if output_extent_type.variable() != ragged_axis.dimension() {
                     return Err(BatchingError::InvalidBatchMetadata {
                         message: format!(
-                            "untiled `{}` output axis {} carries dimension `{}` instead of \
-                             bounded ragged dimension `{}`",
-                            PARALLEL_ALL_GATHER_OPERATION_NAME,
-                            output_axis,
+                            "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} carries \
+                             dimension `{}` instead of bounded ragged dimension `{}`",
                             output_extent_type.variable(),
                             ragged_axis.dimension(),
                         ),
@@ -934,10 +973,8 @@ where
                     let Some(extents) = output_extent.mapped_dimension_extents() else {
                         return Err(BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{}` output axis {} must carry mapped extents \
-                                 for bounded ragged dimension `{}`",
-                                PARALLEL_ALL_GATHER_OPERATION_NAME,
-                                output_axis,
+                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} must carry \
+                                 mapped extents for bounded ragged dimension `{}`",
                                 ragged_axis.dimension(),
                             ),
                         });
@@ -949,20 +986,17 @@ where
                         .map(BatchAxis::from_position)
                         .ok_or_else(|| BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{}` bounded ragged dimension `{}` does not \
-                                 carry extents for the mapped input axis",
-                                PARALLEL_ALL_GATHER_OPERATION_NAME,
+                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` bounded ragged dimension `{}` does \
+                                 not carry extents for the mapped input axis",
                                 ragged_axis.dimension(),
                             ),
                         })?;
                     if output_extent.batch_axis() != expected_extent_axis {
                         return Err(BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{}` output axis {} maps bounded ragged extents on {} instead of {}",
-                                PARALLEL_ALL_GATHER_OPERATION_NAME,
-                                output_axis,
+                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} maps \
+                                 bounded ragged extents on {} instead of {expected_extent_axis}",
                                 output_extent.batch_axis(),
-                                expected_extent_axis,
                             ),
                         });
                     }
@@ -1025,13 +1059,8 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         if !ragged_axes.is_empty() {
-            let ragged_axes = gathered_ragged_axes::<_, DynamicArrayExtentBatchingPolicy>(
-                self,
-                &projected_context,
-                ragged_axes,
-                input_batch_axis,
-                input_rank,
-            )?;
+            let ragged_axes =
+                self.gathered_ragged_axes(&projected_context, ragged_axes, input_batch_axis, input_rank)?;
             output = output.with_ragged_axes(ragged_axes)?;
         }
         let ragged_axes = output
@@ -1530,52 +1559,6 @@ where
         }
     };
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
-}
-
-/// Relocates the bounded ragged metadata of the input of an untiled all-gather whose named axis the `batch` level of
-/// `context` binds. A mapped input's per-item extents follow its batch axis to the inserted participant axis, while a
-/// replicated input's scalar extents are broadcast along that axis, which becomes their only extent axis.
-fn gathered_ragged_axes<C, P>(
-    operation: &ParallelAllGatherOperation,
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    ragged_axes: Vec<RaggedAxis<C::Value>>,
-    input_batch_axis: Option<usize>,
-    input_rank: usize,
-) -> Result<Vec<RaggedAxis<C::Value>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    P: CollectiveArrayExtentBatchingPolicy<C>,
-{
-    if let Some(input_batch_axis) = input_batch_axis {
-        return Ok(ragged_axes
-            .into_iter()
-            .map(|ragged_axis| ragged_axis.moved(input_batch_axis, 0).moved(0, operation.concatenation_axis))
-            .collect());
-    }
-
-    let output_axes = (1..=input_rank).collect::<Vec<_>>();
-    ragged_axes
-        .into_iter()
-        .map(|ragged_axis| {
-            if !ragged_axis.extent_axes().is_empty() {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` requires replicated ragged inputs \
-                         to carry scalar extents",
-                    ),
-                });
-            }
-            let extents =
-                P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?.into_value();
-            let ragged_axis = ragged_axis.broadcasted(output_axes.as_slice()).moved(0, operation.concatenation_axis);
-            Ok(RaggedAxis::new(
-                ragged_axis.axis(),
-                extents,
-                ragged_axis.dimension().clone(),
-                vec![operation.concatenation_axis],
-            ))
-        })
-        .collect()
 }
 
 #[cfg(test)]
