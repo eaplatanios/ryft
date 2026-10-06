@@ -41,7 +41,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -952,6 +952,50 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
         concatenation_axis: usize,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
+
+    /// Swaps `axis` with `axis_name` over the full named axis, exchanging one ranked array axis with the named axis.
+    /// The ranked axis must have the participant count as its extent. This is [`Self::parallel_all_to_all`] with
+    /// identical split and concatenation positions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis`: Ranked axis to exchange with the named axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::parallel_all_to_all_with_options`].
+    #[inline]
+    fn parallel_swap_axes(&self, axis_name: &str, axis: usize) -> Result<Self, ProgramError> {
+        self.parallel_all_to_all(axis_name, axis, axis)
+    }
+
+    /// Swaps `axis` with `axis_name` within the provided ordered participant groups. The ranked axis extent must
+    /// equal the common group size, and senders are stacked in the order specified by their group.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
+    ///   - `axis`: Ranked axis to exchange with the named axis.
+    ///   - `axis_index_groups`: Ordered equal-sized partition of the named-axis participant coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::parallel_all_to_all_with_options`].
+    #[inline]
+    fn parallel_swap_axes_with_axis_index_groups(
+        &self,
+        axis_name: &str,
+        axis: usize,
+        axis_index_groups: Vec<Vec<usize>>,
+    ) -> Result<Self, ProgramError> {
+        self.parallel_all_to_all_with_options(
+            axis_name,
+            axis,
+            axis,
+            CollectiveOptions::default().with_axis_index_groups(axis_index_groups),
+        )
+    }
 }
 
 impl ParallelAllToAll<ArrayType> for Array {
@@ -1171,58 +1215,6 @@ impl<
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.
-///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
-#[capability]
-pub trait ParallelSwapAxes<T = <Self as Capability>::Universe>: Capability + ParallelAllToAll<T> {
-    /// Swaps `axis` with `axis_name` over the full named axis. The ranked axis must have the participant count as its
-    /// extent. This is [`ParallelAllToAll::parallel_all_to_all`] with identical split and concatenation positions.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `axis`: Ranked axis to exchange with the named axis.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`ParallelAllToAll::parallel_all_to_all_with_options`].
-    #[inline]
-    fn parallel_swap_axes(&self, axis_name: &str, axis: usize) -> Result<Self, ProgramError> {
-        self.parallel_all_to_all(axis_name, axis, axis)
-    }
-
-    /// Swaps `axis` with `axis_name` within the provided ordered participant groups. The ranked axis extent must
-    /// equal the common group size, and senders are stacked in the order specified by their group.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `axis`: Ranked axis to exchange with the named axis.
-    ///   - `axis_index_groups`: Ordered equal-sized partition of the named-axis participant coordinates.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`ParallelAllToAll::parallel_all_to_all_with_options`].
-    #[inline]
-    fn parallel_swap_axes_with_axis_index_groups(
-        &self,
-        axis_name: &str,
-        axis: usize,
-        axis_index_groups: Vec<Vec<usize>>,
-    ) -> Result<Self, ProgramError> {
-        self.parallel_all_to_all_with_options(
-            axis_name,
-            axis,
-            axis,
-            CollectiveOptions::default().with_axis_index_groups(axis_index_groups),
-        )
-    }
-}
-
-impl<T: Type, V: ParallelAllToAll<T>> ParallelSwapAxes<T> for V {}
 
 #[cfg(test)]
 mod tests {
@@ -3778,7 +3770,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_swap_axes_parallel_swap_axes() {
+    fn test_parallel_all_to_all_parallel_swap_axes() {
         // Over a manual mesh axis, an unsharded invariant input is placed on the mesh and made varying before the
         // exchange, which stages identical split and concatenation positions.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
@@ -3837,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_swap_axes_parallel_swap_axes_with_axis_index_groups() {
+    fn test_parallel_all_to_all_parallel_swap_axes_with_axis_index_groups() {
         // The swapped ranked axis must have the common group size, rather than the full named-axis size, as its
         // extent, and the staged exchange records the ordered participant groups.
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
