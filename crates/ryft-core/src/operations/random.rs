@@ -704,7 +704,8 @@ impl<
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicRngBitGenerator: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicRngBitGenerator<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Generates random bits of `output_type` from this generator state using `algorithm`, returning the advanced state
     /// together with the bits.
     ///
@@ -727,7 +728,7 @@ pub trait DynamicRngBitGenerator: Value<Type = ArrayIrType> + Sized {
     ) -> Result<(Self, Self), ProgramError>;
 }
 
-impl<A: Value<Type = ArrayType> + RngBitGenerator> DynamicRngBitGenerator for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + RngBitGenerator> DynamicRngBitGenerator<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_rng_bit_generator(
         &self,
         algorithm: RandomAlgorithm,
@@ -769,7 +770,7 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
         >,
-> DynamicRngBitGenerator for V
+> DynamicRngBitGenerator<ArrayIrType> for V
 {
     fn dynamic_rng_bit_generator(
         &self,

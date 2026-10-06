@@ -1900,7 +1900,10 @@ impl<Stored: Value<Type = ArrayType>, A: Gather<Stored, ArrayType> + Value<Type 
 /// let output = input.dynamic_gather_axis(&indices, 1, GatherMode::Clip).unwrap();
 /// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 2, vec![3_i32, 1, 6, 4]).unwrap()));
 /// ```
-pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array>: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array, T = <Self as Capability>::Universe>:
+    Capability + Sized
+{
     /// Gathers along `axis`, replacing that axis with the complete shape of `indices` in the result.
     ///
     /// # Parameters
@@ -1916,7 +1919,7 @@ pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array>: Value<Type = A
     ) -> Result<Self, ProgramError>;
 }
 
-impl<Stored: Value<Type = ArrayType>, A> DynamicGather<Stored> for ArrayIrValue<A>
+impl<Stored: Value<Type = ArrayType>, A> DynamicGather<Stored, ArrayIrType> for ArrayIrValue<A>
 where
     A: Value<Type = ArrayType, DispatchDomain: Zero<A>>
         + ManualVariationAlignment<ArrayType>
@@ -1953,10 +1956,10 @@ where
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>> DynamicGather<Stored> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>> DynamicGather<Stored, ArrayIrType> for V
 where
     V: DimensionSize
-        + DynamicBroadcast
+        + DynamicBroadcast<ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
         + ValueProjection<ArrayType, Projected: Gather<Stored>>,
     V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,

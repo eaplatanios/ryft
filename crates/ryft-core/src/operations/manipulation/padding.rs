@@ -8,8 +8,8 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType,
-    ArrayTypeRefinements, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
-    RaggedAxis, Shape, materialize_array_tangent,
+    ArrayTypeRefinements, AsArrayType, AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType,
+    DimensionValue, LinearResiduals, RaggedAxis, Shape, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1690,7 +1690,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Pads `self` and validates the supplied result dimensions before returning the array value. Invalid input kinds,
     /// ranks, element data types, configuration lengths, and incompatible geometry return an error.
     ///
@@ -1746,27 +1747,27 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         extent: &Self,
     ) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize
+        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+            + DimensionSize
             + Assert
             + DimensionToScalar
             + DynamicBroadcast
             + DynamicReshape
-            + ManualVariationAlignment<ArrayIrType>
+            + ManualVariationAlignment
             + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Compare<Self>>,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
         // The padding value is aligned first because the fill is broadcast to the input's manual variation,
         // and a varying input may be padded with an invariant scalar.
         let inputs = ManualVariationAlignment::align_manual_variation(&[self.clone(), padding_value.clone()])?;
         let (input, padding_value) = (&inputs[0], &inputs[1]);
         let input_type = input.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         let padding_type = padding_value.r#type();
-        let padding_type = <&ArrayType>::try_from(padding_type.as_ref())?;
+        let padding_type = padding_type.as_array_type()?;
         let no_padding = vec![0; input_type.rank()];
         validate_pad_inputs(input_type, padding_type, &no_padding, &no_padding, &vec![0; input_type.rank()])?;
-        let extent_dimension = <&DimensionType>::try_from(extent.r#type().as_ref())?.to_dimension();
+        let extent_dimension = extent.r#type().as_dimension_type()?.to_dimension();
         let axis = axis.into().normalize(input_type.rank())?;
         let mut output_shape = input_type.shape().dimensions().to_vec();
         output_shape[axis] = extent_dimension;
@@ -1849,7 +1850,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_pad(
         &self,
         padding_value: &Self,
@@ -1899,7 +1900,7 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for Arr
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicPad for V
+impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicPad<ArrayIrType> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<PadOperation<ArrayIrType>>>,
 {

@@ -2255,7 +2255,8 @@ impl Array {
 /// ).unwrap();
 /// assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10_i32, 25, 30]).unwrap()));
 /// ```
-pub trait DynamicScatter: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicScatter<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Updates slices along `axis` using raw integer indices. Negative indices are out of bounds rather than
     /// counting backward from the end; `mode` specifies whether to clip, drop, or assume valid indices.
     ///
@@ -2277,9 +2278,9 @@ pub trait DynamicScatter: Value<Type = ArrayIrType> + Sized {
     ) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicScatter for V
+impl<V: Value<Type = ArrayIrType>> DynamicScatter<ArrayIrType> for V
 where
-    V: DimensionSize + DynamicReshape + ValueProjection<ArrayType, Projected: Scatter>,
+    V: DimensionSize + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType, Projected: Scatter>,
     V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     fn dynamic_scatter_axis<A: Into<Axis>>(

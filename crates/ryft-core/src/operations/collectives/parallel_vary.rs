@@ -19,7 +19,7 @@ use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed,
+    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed,
     Value, ValueProjection,
 };
 
@@ -479,7 +479,8 @@ impl<
 /// stages its rules, still aligns over it, using the mesh of an input that varies over the axis (refer to
 /// [`ParallelVary::parallel_vary_on_mesh`]). Scalar data-type and dimension values have no manual variation
 /// and pass through unchanged, and a composite [`ArrayIrType`] value aligns only its array members.
-pub trait ManualVariationAlignment<T: Type>: Value<Type = T> {
+#[capability]
+pub trait ManualVariationAlignment<T = <Self as Capability>::Universe>: Capability + Clone {
     /// Returns `inputs` with their manual variation aligned, in the same order.
     ///
     /// # Errors

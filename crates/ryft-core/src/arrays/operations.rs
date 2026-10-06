@@ -545,8 +545,8 @@ pub trait ArrayIrOperations:
     + DimensionFromScalar
     + DimensionToScalar
     + ReferenceOperations<ArrayReferenceTransform>
-    + DynamicManipulationOperations
-    + DynamicRngBitGenerator
+    + DynamicManipulationOperations<ArrayIrType>
+    + DynamicRngBitGenerator<ArrayIrType>
 {
 }
 
@@ -559,8 +559,8 @@ impl<
         + DimensionFromScalar
         + DimensionToScalar
         + ReferenceOperations<ArrayReferenceTransform>
-        + DynamicManipulationOperations
-        + DynamicRngBitGenerator,
+        + DynamicManipulationOperations<ArrayIrType>
+        + DynamicRngBitGenerator<ArrayIrType>,
 > ArrayIrOperations for V
 {
 }

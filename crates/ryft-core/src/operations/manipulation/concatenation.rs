@@ -1135,8 +1135,9 @@ where
 // eagerly on concrete values. Exact extents fold to a static output axis, and dynamic extents produce a fresh dimension
 // identity whose equality with the concatenated size is asserted at runtime. Unlike homogeneous concatenation, a single
 // input still has its axis and extent validated.
-impl<V: DynamicConcatenate + DimensionSize + ValueProjection<DimensionType, Projected: Add>> Concatenate<ArrayIrType>
-    for V
+impl<V: Value<Type = ArrayIrType> + DynamicConcatenate<ArrayIrType>> Concatenate<ArrayIrType> for V
+where
+    V: DimensionSize + ValueProjection<DimensionType, Projected: Add>,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
@@ -1212,7 +1213,8 @@ impl<V: DynamicConcatenate + DimensionSize + ValueProjection<DimensionType, Proj
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicConcatenate<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Joins array `inputs` along `axis`, checking that their extents sum to `extent`. Unlike the singleton
     /// convenience in [`Concatenate`], this function validates the axis and result extent even for one input.
     ///
@@ -1252,7 +1254,9 @@ pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicConcatenate for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicConcatenate<ArrayIrType>
+    for ArrayIrValue<A>
+{
     fn concatenate_with_known_extent<'i, I: IntoIterator<Item = &'i Self>, AxisValue: Into<Axis>>(
         inputs: I,
         extent: &Self,
@@ -1302,7 +1306,7 @@ impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicCon
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate for V
+impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate<ArrayIrType> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
 {

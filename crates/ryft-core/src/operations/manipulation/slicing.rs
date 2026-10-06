@@ -2829,7 +2829,8 @@ impl<
 /// # }
 /// # example().unwrap();
 /// ```
-pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
+#[capability]
+pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capability + DynamicSlice<T> {
     /// Extracts a window whose starts and sizes are dimension values, rejecting windows that extend outside the input
     /// (i.e., using the [`Checked`](DynamicSliceBounds::Checked) bounds policy). Refer to the documentation of
     /// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) for more information.
@@ -2948,13 +2949,13 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
         stride: usize,
     ) -> Result<Self, ProgramError>
     where
-        Self: DynamicGather
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+            + DynamicGather
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
         let input_type = self.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         let axis = axis.into().normalize(input_type.rank())?;
         if stride == 0 || start > limit {
             return Err(TypeError::invalid(
@@ -3040,15 +3041,15 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
     fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
-        Self: DynamicGather
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+            + DynamicGather
             + DynamicReshape
             + DimensionSize
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
         let input_type = self.r#type();
-        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let input_type = input_type.as_array_type()?;
         let axis = axis.into().normalize(input_type.rank())?;
         let limit = index
             .checked_add(1)
@@ -3065,7 +3066,7 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     }
 }
 
-impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSliceWithDimensions
+impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSliceWithDimensions<ArrayIrType>
     for ArrayIrValue<A>
 {
     fn dynamic_slice_with_bounds(
@@ -3158,7 +3159,7 @@ impl<
                 >,
             >,
         > + ManualVariationAlignment<ArrayIrType>,
-> DynamicSliceWithDimensions for V
+> DynamicSliceWithDimensions<ArrayIrType> for V
 {
     fn dynamic_slice_with_bounds(
         &self,
