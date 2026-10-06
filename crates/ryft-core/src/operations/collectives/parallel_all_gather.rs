@@ -649,8 +649,6 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> 
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     C: Context<Type = ArrayType, Value: Transpose, Operation: From<ParallelAllGatherOperation>>,
     P: CollectiveArrayExtentBatchingPolicy<C>,
@@ -697,6 +695,7 @@ impl<
             let ragged_axes = self.gathered_ragged_axes(context, ragged_axes, input_batch_axis, input_type.rank())?;
             output = output.with_ragged_axes(ragged_axes)?;
         }
+
         Ok(vec![output].into())
     }
 }
@@ -718,14 +717,14 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> 
 impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
+        + From<ZeroOperation<ArrayType>>
         + From<AddOperation<ArrayType>>
-        + From<AxisIndexOperation>
         + From<BroadcastOperation>
-        + From<DynamicSliceOperation>
-        + From<ParallelSumScatterOperation>
-        + From<ParallelVaryOperation>
         + From<ReshapeOperation>
-        + From<ZeroOperation<ArrayType>>,
+        + From<DynamicSliceOperation>
+        + From<AxisIndexOperation>
+        + From<ParallelVaryOperation>
+        + From<ParallelSumScatterOperation>,
 > TransposableOperation<V, O> for ParallelAllGatherOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -743,12 +742,15 @@ impl<
         if self.output_variance != ParallelAllGatherOutputVariance::Invariant {
             return self.linear_collective_transpose(context, inputs, outputs, accumulators);
         }
+
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
+
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(());
         };
+
         if inputs[0].is_known() {
             return Ok(());
         }
@@ -765,6 +767,7 @@ impl<
             ))
             .into());
         };
+
         let mut sizes = participants_shape.dimensions().to_vec();
         sizes[self.concatenation_axis] = 1;
 
@@ -807,6 +810,7 @@ impl<
             })
             .transpose()
             .map_err(TypeError::from)?;
+
         let start = if self.axis_size == 1 {
             None
         } else {
@@ -835,9 +839,11 @@ impl<
             }
             Some(start)
         };
+
         let zero = ZeroOperation::new(
             ArrayType::scalar(DataType::U64).with_sharding(index_sharding).map_err(TypeError::from)?,
         );
+
         let zero = context.bind(O::from(zero), Vec::new(), &[])?.remove(0);
         let start = start.unwrap_or_else(|| zero.clone());
         let mut slice_inputs = vec![zero; 1 + sizes.len()];
@@ -903,8 +909,7 @@ impl<
     }
 }
 
-impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllGatherOperation
-where
+impl<
     C: Context<
             Type = ArrayIrType,
             Value: Assert
@@ -923,6 +928,7 @@ where
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
+> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllGatherOperation
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -945,6 +951,7 @@ where
 
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
+
             // A result extent describes the shape shared by every batch item, so it must be replicated.
             for output_extent in output_extents {
                 output_extent.validate_replicated_dimension()?;
@@ -977,8 +984,10 @@ where
                 if output_extent_type.variable() != ragged_axis.dimension() {
                     return Err(BatchingError::InvalidBatchMetadata {
                         message: format!(
-                            "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} carries \
-                             dimension `{}` instead of bounded ragged dimension `{}`",
+                            "untiled `{}` output axis {} carries dimension `{}` instead of bounded \
+                             ragged dimension `{}`",
+                            PARALLEL_ALL_GATHER_OPERATION_NAME,
+                            output_axis,
                             output_extent_type.variable(),
                             ragged_axis.dimension(),
                         ),
@@ -989,12 +998,15 @@ where
                     let Some(extents) = output_extent.mapped_dimension_extents() else {
                         return Err(BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} must carry \
-                                 mapped extents for bounded ragged dimension `{}`",
+                                "untiled `{}` output axis {} must carry mapped extents for bounded \
+                                 ragged dimension `{}`",
+                                PARALLEL_ALL_GATHER_OPERATION_NAME,
+                                output_axis,
                                 ragged_axis.dimension(),
                             ),
                         });
                     };
+
                     let expected_extent_axis = ragged_axis
                         .extent_axes()
                         .iter()
@@ -1002,17 +1014,21 @@ where
                         .map(BatchAxis::from_position)
                         .ok_or_else(|| BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` bounded ragged dimension `{}` does \
-                                 not carry extents for the mapped input axis",
+                                "untiled `{}` bounded ragged dimension `{}` does not carry extents \
+                                 for the mapped input axis",
+                                PARALLEL_ALL_GATHER_OPERATION_NAME,
                                 ragged_axis.dimension(),
                             ),
                         })?;
+
                     if output_extent.batch_axis() != expected_extent_axis {
                         return Err(BatchingError::InvalidBatchMetadata {
                             message: format!(
-                                "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {output_axis} maps \
-                                 bounded ragged extents on {} instead of {expected_extent_axis}",
+                                "untiled `{}` output axis {} maps bounded ragged extents on {} instead of {}",
+                                PARALLEL_ALL_GATHER_OPERATION_NAME,
+                                output_axis,
                                 output_extent.batch_axis(),
+                                expected_extent_axis,
                             ),
                         });
                     }
@@ -1037,10 +1053,12 @@ where
                 ))
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
+
         let array = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
         )?;
+
         let input_rank = array.unbatched_type().rank();
         let projected_context = context.array_projection();
         let output_extents = output_extents
@@ -1057,8 +1075,10 @@ where
                     let extent_type = <&DimensionType>::try_from(&extent_type)?;
                     return Err(BatchingError::InvalidBatchMetadata {
                         message: format!(
-                            "untiled `{PARALLEL_ALL_GATHER_OPERATION_NAME}` output axis {axis} has mapped dimension \
-                             `{}` without a matching bounded ragged input axis",
+                            "untiled `{}` output axis {} has mapped dimension `{}` without a matching \
+                             bounded ragged input axis",
+                            PARALLEL_ALL_GATHER_OPERATION_NAME,
+                            axis,
                             extent_type.variable(),
                         ),
                     });
@@ -1067,6 +1087,7 @@ where
                 Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone())?)
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
+
         let ragged_axes = ragged_axes.into_iter().map(|(_, _, ragged_axis)| ragged_axis).collect::<Vec<_>>();
         let mut output = self.batch_matching_axis::<DynamicArrayExtentBatchingPolicy>(
             &projected_context,
@@ -1074,11 +1095,13 @@ where
             output_extents,
             logical_output_type.sharding().cloned(),
         )?;
+
         if !ragged_axes.is_empty() {
             let ragged_axes =
                 self.gathered_ragged_axes(&projected_context, ragged_axes, input_batch_axis, input_rank)?;
             output = output.with_ragged_axes(ragged_axes)?;
         }
+
         let ragged_axes = output
             .ragged_axes()
             .iter()
@@ -1094,24 +1117,28 @@ where
         let output =
             ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()))
                 .with_ragged_axes(ragged_axes)?;
+
         Ok(vec![output].into())
     }
 }
 
-impl<C> MemberDifferentiableOperation<C> for ParallelAllGatherOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<ConstantOperation<DimensionValue>>
-        + From<DimensionFromScalarOperation>
-        + From<DimensionSizeOperation>
-        + From<DynamicReshapeOperation>
-        + From<DynamicSliceOperation<ArrayIrType>>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ParallelAllGatherOperation>
-        + From<ParallelSumScatterOperation>
-        + OperationProjection<ArrayType>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<ConstantOperation<DimensionValue>>
+                           + From<DimensionFromScalarOperation>
+                           + From<DimensionSizeOperation>
+                           + From<DynamicReshapeOperation>
+                           + From<DynamicSliceOperation<ArrayIrType>>
+                           + From<LinearCallOperation<ArrayIrType>>
+                           + From<ParallelAllGatherOperation>
+                           + From<ParallelSumScatterOperation>
+                           + OperationProjection<
+                ArrayType,
+                Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
+            > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        >,
+> MemberDifferentiableOperation<C> for ParallelAllGatherOperation
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1130,6 +1157,7 @@ where
         let Some((array, _)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
+
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = match array.tangent() {
@@ -1221,6 +1249,7 @@ where
                         if transpose_operation.options().mode() == CollectiveMode::Untiled {
                             slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
                         }
+
                         // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
                         // every participant selects a different chunk of it, so the selected chunk varies over that
                         // axis. The cotangent can carry a tangent itself (e.g., under nested differentiation), and so
@@ -1265,9 +1294,12 @@ where
                 MaybeZero::Value(tangent)
             }
         };
+
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to gather values across the participants of a named axis, so that every participant
 /// receives all of them in participant order, by staging a [`ParallelAllGatherOperation`]. This is the analogue of
