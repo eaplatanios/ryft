@@ -1105,8 +1105,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayIrType> + DomainProjection<ArrayType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
     for ParallelRaggedAllToAllOperation
 where
@@ -1124,16 +1122,18 @@ where
     }
 }
 
-impl<C> MemberDifferentiableOperation<C> for ParallelRaggedAllToAllOperation
-where
+impl<
     C: Context<
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<ArrayType>,
+            Operation: OperationProjection<
+                ArrayType,
+                Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                               + From<ParallelRaggedAllToAllOperation>,
+            >,
         >,
-    <C::Operation as OperationProjection<ArrayType>>::Projected:
-        DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<ParallelRaggedAllToAllOperation>,
+> MemberDifferentiableOperation<C> for ParallelRaggedAllToAllOperation
 {
     #[inline]
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -1192,16 +1192,32 @@ where
 /// ```
 #[capability(projection(ArrayIrType => ArrayType))]
 pub trait ParallelRaggedAllToAll<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Exchanges segments over the full named axis.
+    /// Exchanges variable-length segments of the leading axis of this value, which is the `operand` of the exchange,
+    /// with every participant of `axis_name` (including itself), and returns `output` with the segments that this
+    /// participant receives written into it. Segments are ranges of leading-axis rows, so `output` must have the data
+    /// type and trailing dimensions of this value, while the two leading extents may differ.
+    ///
+    /// The four metadata inputs are rank-one arrays of one shared integer data type and of one length `K`, which must
+    /// be a positive multiple of the number of participants `P`. Each participant exchanges `K / P` segments with each
+    /// participant, some of which may be empty, and the `K / P` entries starting at `p · K / P` describe the segments
+    /// that it exchanges with participant `p`. For example, with `P = 2` and `K = 2`, entry `1` of `input_offsets`,
+    /// `send_sizes`, and `output_offsets` describes the segment sent to participant `1`, and entry `1` of
+    /// `receive_sizes` describes the segment received from participant `1`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of the mapped or mesh axis whose participants exchange segments.
-    ///   - `output`: Seed value updated at the received regions and returned with the same type.
-    ///   - `input_offsets`: Sender-local leading-axis offsets of the segments in `self`.
-    ///   - `send_sizes`: Sender-local leading-axis lengths of the segments in `self`.
-    ///   - `output_offsets`: Sender-owned offsets expressed in each corresponding receiver's output coordinate frame.
-    ///   - `receive_sizes`: Receiver-local leading-axis lengths, indexed by sending participant.
+    ///   - `axis_name`: Name of the batch axis or manual mesh axis whose participants exchange segments.
+    ///   - `output`: Value into which the received segments are written. Its rows outside every received region keep
+    ///     their values, and the received regions must not overlap.
+    ///   - `input_offsets`: Leading-axis offset in this value of the first row of each segment that this participant
+    ///     sends.
+    ///   - `send_sizes`: Number of rows of each segment that this participant sends.
+    ///   - `output_offsets`: Leading-axis offset of the first row of each segment that this participant sends, in the
+    ///     `output` of the receiving participant. Senders therefore decide where their segments land.
+    ///   - `receive_sizes`: Number of rows of each segment that this participant receives. Every entry must equal the
+    ///     `send_sizes` entry of the sending participant for the same segment, which means that `receive_sizes` must
+    ///     equal the tiled all-to-all of `send_sizes` (refer to the documentation of
+    ///     [`ParallelRaggedAllToAllOperation`] for more information).
     ///
     /// # Errors
     ///
@@ -1219,17 +1235,31 @@ pub trait ParallelRaggedAllToAll<T = <Self as Capability>::Universe>: Capability
         receive_sizes: &Self,
     ) -> Result<Self, ProgramError>;
 
-    /// Exchanges segments within the provided ordered participant groups.
+    /// Exchanges variable-length segments of the leading axis of this value like
+    /// [`parallel_ragged_all_to_all`](Self::parallel_ragged_all_to_all), except that every participant exchanges
+    /// segments only with the members of its own group in `axis_index_groups`. The metadata then address peers by
+    /// their position within that group rather than by axis index: with groups of size `G`, the metadata length `K`
+    /// must be a positive multiple of `G`, and the `K / G` entries starting at `p · K / G` describe the segments that
+    /// a participant exchanges with the member at position `p` of its group. For example, with groups
+    /// `[[0, 2], [3, 1]]` and `K = 2`, entry `1` of the `input_offsets`, `send_sizes`, and `output_offsets` of
+    /// participant `3` describes the segment that it sends to participant `1`.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of the mapped or mesh axis whose participants exchange segments.
-    ///   - `output`: Seed value updated at the received regions and returned with the same type.
-    ///   - `input_offsets`: Sender-local leading-axis offsets of the segments in `self`.
-    ///   - `send_sizes`: Sender-local leading-axis lengths of the segments in `self`.
-    ///   - `output_offsets`: Sender-owned offsets expressed in each corresponding receiver's output coordinate frame.
-    ///   - `receive_sizes`: Receiver-local leading-axis lengths, indexed by sending participant.
-    ///   - `axis_index_groups`: Ordered equal-sized partition of the full axis indices; exchange stays within groups.
+    ///   - `axis_name`: Name of the batch axis or manual mesh axis whose participants exchange segments.
+    ///   - `output`: Value into which the received segments are written. Its rows outside every received region keep
+    ///     their values, and the received regions must not overlap.
+    ///   - `input_offsets`: Leading-axis offset in this value of the first row of each segment that this participant
+    ///     sends.
+    ///   - `send_sizes`: Number of rows of each segment that this participant sends.
+    ///   - `output_offsets`: Leading-axis offset of the first row of each segment that this participant sends, in the
+    ///     `output` of the receiving group member. Senders therefore decide where their segments land.
+    ///   - `receive_sizes`: Number of rows of each segment that this participant receives. Every entry must equal the
+    ///     `send_sizes` entry of the sending group member for the same segment.
+    ///   - `axis_index_groups`: Participant groups, each listing axis indices of `axis_name`, that together partition
+    ///     all of its indices into groups of equal size. The order within each group defines the positions that the
+    ///     metadata use to address peers (refer to the documentation of [`ParallelRaggedAllToAllOperation::grouped`]
+    ///     for more information).
     ///
     /// # Errors
     ///
@@ -1247,8 +1277,6 @@ pub trait ParallelRaggedAllToAll<T = <Self as Capability>::Universe>: Capability
     ) -> Result<Self, ProgramError>;
 }
 
-// A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside a manual
-// region are tracers, so every axis name is unbound for it.
 impl ParallelRaggedAllToAll<ArrayType> for Array {
     #[inline]
     fn parallel_ragged_all_to_all(
@@ -1260,6 +1288,8 @@ impl ParallelRaggedAllToAll<ArrayType> for Array {
         _output_offsets: &Self,
         _receive_sizes: &Self,
     ) -> Result<Self, ProgramError> {
+        // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level
+        // or inside a manual region are tracers, so every axis name is unbound for it.
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 
@@ -1274,15 +1304,18 @@ impl ParallelRaggedAllToAll<ArrayType> for Array {
         _receive_sizes: &Self,
         _axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, ProgramError> {
+        // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level
+        // or inside a manual region are tracers, so every axis name is unbound for it.
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
 
-impl<V> ParallelRaggedAllToAll<ArrayType> for V
-where
+impl<
     V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
         + ParallelVary,
+> ParallelRaggedAllToAll<ArrayType> for V
 {
+    #[inline]
     fn parallel_ragged_all_to_all(
         &self,
         axis_name: &str,
@@ -1299,6 +1332,7 @@ where
         )
     }
 
+    #[inline]
     fn parallel_ragged_all_to_all_with_axis_index_groups(
         &self,
         axis_name: &str,
@@ -1316,6 +1350,8 @@ where
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Binds `operation` to `inputs`, given in their canonical order, through the context of the first input. Over a
 /// manual mesh axis, the operation records the mesh of that axis, and a first input that does not vary over the axis is
