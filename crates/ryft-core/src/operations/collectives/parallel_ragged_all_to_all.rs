@@ -324,8 +324,6 @@ impl Display for ParallelRaggedAllToAllOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Operation for ParallelRaggedAllToAllOperation {
     type Type = ArrayType;
 
@@ -360,9 +358,8 @@ impl Operation for ParallelRaggedAllToAllOperation {
                         };
                         if participant_extent != self.axis_size {
                             return Err(TypeError::invalid(format!(
-                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} leading \
-                                 participant dimension {participant_extent} must equal axis size {}",
-                                self.axis_size,
+                                "`{}` physical input {} leading participant dimension {} must equal axis size {}",
+                                PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, index, participant_extent, self.axis_size,
                             )));
                         }
                         Ok(input_type.without_dimension(0)?.0)
@@ -372,6 +369,7 @@ impl Operation for ParallelRaggedAllToAllOperation {
         } else {
             None
         };
+
         let input_types = normalized_input_types.as_deref().unwrap_or(input_types);
         let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = input_types else {
             unreachable!();
@@ -383,18 +381,21 @@ impl Operation for ParallelRaggedAllToAllOperation {
                  `{operand}` and `{output}`",
             )));
         }
+
         if operand.data_type() != output.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` data types must match but got \
+                "`{}` `operand` and `output` data types must match but got \
                  `{}` and `{}`",
+                PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
                 operand.data_type(),
                 output.data_type(),
             )));
         }
+
         if operand.shape().dimensions()[1..] != output.shape().dimensions()[1..] {
             return Err(TypeError::invalid(format!(
-                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` trailing dimensions must match \
-                 but got `{}` and `{}`",
+                "`{}` `operand` and `output` trailing dimensions must match but got `{}` and `{}`",
+                PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
                 operand.shape(),
                 output.shape(),
             )));
@@ -411,30 +412,38 @@ impl Operation for ParallelRaggedAllToAllOperation {
         for (name, r#type) in metadata {
             if r#type.rank() != 1 {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must be rank 1 but got `{}`",
-                    r#type,
+                    "`{}` `{}` must be rank 1 but got `{}`",
+                    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, name, r#type,
                 )));
             }
+
             if !r#type.data_type().is_integer() {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have an integer data type but got \
-                     `{}`",
+                    "`{}` `{}` must have an integer data type but got `{}`",
+                    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
+                    name,
                     r#type.data_type(),
                 )));
             }
+
             if r#type.data_type() != metadata_data_type {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must share one integer data type \
-                     but `input_offsets` has `{metadata_data_type}` and `{name}` has `{}`",
+                    "`{}` metadata inputs must share one integer data type but `input_offsets` \
+                     has `{}` and `{}` has `{}`",
+                    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
+                    metadata_data_type,
+                    name,
                     r#type.data_type(),
                 )));
             }
+
             let Some(length) = r#type.shape().dimensions()[0].value() else {
                 return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must have a static length but got `{}`",
-                    r#type,
+                    "`{}` `{}` must have a static length but got `{}`",
+                    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, name, r#type,
                 )));
             };
+
             match metadata_length {
                 Some(expected) if length != expected => {
                     return Err(TypeError::invalid(format!(
@@ -446,6 +455,7 @@ impl Operation for ParallelRaggedAllToAllOperation {
                 _ => {}
             }
         }
+
         let metadata_length = metadata_length.unwrap();
         if metadata_length == 0 {
             return Err(TypeError::invalid(format!(
@@ -509,15 +519,18 @@ impl Operation for ParallelRaggedAllToAllOperation {
                  state",
             )));
         }
+
         for (name, r#type) in metadata {
             let Some(sharding) = r#type.sharding() else {
                 continue;
             };
+
             if !sharding.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` `{name}` must not carry unreduced state",
                 )));
             }
+
             for axis in unreduced.union(&reduced) {
                 if sharding.varying_manual_axes().contains(axis)
                     || sharding
@@ -532,6 +545,7 @@ impl Operation for ParallelRaggedAllToAllOperation {
                 }
             }
         }
+
         Ok(vec![result_type])
     }
 
@@ -569,12 +583,14 @@ impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> Inter
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 6, ProgramError);
         let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
+            // This is unreachable because of the preceding `check_count!`.
             unreachable!();
         };
 
         let physical = self.is_physical();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice(), &[])?;
+
         // Outside a binder, only an exchange whose participant groups are singletons is degenerate: every participant
         // then exchanges segments only with itself, whatever the size of the full axis.
         let effective_axis_size = self.effective_axis_size()?;
@@ -583,14 +599,16 @@ impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> Inter
                 Some(_) => format!(" with participant groups of size {effective_axis_size}"),
                 None => String::new(),
             };
+
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "cannot interpret `{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` over axis `{}` of size {}{groups} \
+                    "cannot interpret `{}` over axis `{}` of size {}{} \
                      without an enclosing binder",
-                    self.axis_name, self.axis_size,
+                    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, self.axis_name, self.axis_size, groups,
                 ),
             });
         }
+
         Ok(vec![C::Value::evaluate_parallel_ragged_all_to_all(
             self,
             operand,
@@ -603,12 +621,12 @@ impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> Inter
     }
 }
 
-// Partial evaluation uses the default fold-or-residualize behavior. Known metadata remain ordinary runtime values;
-// the rule never assumes that a known primal input is a compile-time literal.
 impl<C: Context<Type = ArrayType, Operation: From<ParallelRaggedAllToAllOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelRaggedAllToAllOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // A matching named batch axis is the eager reference implementation's participant axis. All inputs are aligned to
 // physical axis zero before one parent bind executes the complete exchange. Unresolved non-constant metadata are gated
