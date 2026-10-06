@@ -1478,9 +1478,6 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
 }
 
 impl ParallelAllGather<ArrayType> for Array {
-    // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
-    // a manual region are tracers, so every axis name is unbound for it.
-
     #[inline]
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
@@ -1489,11 +1486,14 @@ impl ParallelAllGather<ArrayType> for Array {
         _options: CollectiveOptions,
         _output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
+        // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
+        // a manual region are tracers, so every axis name is unbound for it.
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
     }
 }
 
 impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
+    #[inline]
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
@@ -1512,9 +1512,8 @@ impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGathe
     }
 }
 
-impl<V> ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
-where
-    V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+impl<V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>>
+    ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
 {
     #[inline]
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
@@ -1531,10 +1530,11 @@ where
     }
 }
 
-impl<V> ParallelAllGather<ArrayType> for V
-where
-    V: ShapeChangingCollectiveValue + ParallelVary,
-    V::DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
+impl<
+    V: ShapeChangingCollectiveValue<
+            DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
+        > + ParallelVary,
+> ParallelAllGather<ArrayType> for V
 {
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
@@ -1543,8 +1543,8 @@ where
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
-        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation. Over a
-        // manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
+        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation. Over
+        // a manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
         // copy is gathered, while reduction state over the axis is rejected first, so that it is reported as an
         // all-gather error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its
         // concatenation axis is a position in the result, whose rank is one more than the rank of the input.
@@ -1574,13 +1574,16 @@ where
     }
 }
 
-impl<V> ParallelAllGather<ArrayIrType> for V
-where
-    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelAllGatherOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
-    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ParallelAllGatherOperation>>
+                                + DimensionConstant
+                                + NamedAxes,
+        > + DimensionSize<V>
+        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Mul>
+        + ValueProjection<ArrayType, Projected: ParallelVary>,
+> ParallelAllGather<ArrayIrType> for V
 {
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
@@ -1590,12 +1593,12 @@ where
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
         // A composite value binds a `ParallelAllGatherOperation` through its own context, followed by one explicit
-        // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that does
-        // not vary over the axis is first made varying through its array view, so that every device's copy is
+        // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that
+        // does not vary over the axis is first made varying through its array view, so that every device's copy is
         // gathered, while reduction state over the axis is rejected first, so that it is reported as an all-gather
-        // error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis is
-        // a position in the result, whose rank is one more than the rank of the input. The axis is normalized before
-        // the explicit result extents are derived from the input extents.
+        // error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis
+        // is a position in the result, whose rank is one more than the rank of the input. The axis is normalized
+        // before the explicit result extents are derived from the input extents.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let input_type = self.r#type();
@@ -1610,6 +1613,7 @@ where
             options,
             output_variance,
         );
+
         let effective_axis_size = operation.effective_axis_size()?;
         let mut input = self.clone();
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
