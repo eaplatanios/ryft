@@ -860,10 +860,9 @@ impl<
 /// Each row sends its first half to batch item zero and its second half to batch item one:
 ///
 /// ```
-/// # use ryft_core::operations::collectives::ParallelAllToAll;
 /// # use ryft_core::{
 /// #     Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, BatchAxis, BatchAxisSpecification,
-/// #     BatchingTracer, EagerContext, batch,
+/// #     BatchingTracer, EagerContext, ParallelAllToAll, batch,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rows = ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])?);

@@ -1348,15 +1348,13 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents the ability to gather values across the participants of a named axis, so that every participant
-/// receives all of them in participant order, by staging a [`ParallelAllGatherOperation`]. This is the analogue of
-/// JAX's [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html), whose default
+/// Represents the ability to gather values across the participants of a named axis, so that every participant receives
+/// all of them in participant order, by staging a [`ParallelAllGatherOperation`]. This is the Ryft analogue of JAX's
+/// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html), whose default
 /// `tiled = False` corresponds to [`ParallelAllGather::parallel_all_gather`], whose `tiled = True` corresponds to
 /// [`ParallelAllGather::parallel_all_gather_tiled`], and whose `to` argument corresponds to the
-/// [`ParallelAllGatherOutputVariance`] of [`ParallelAllGather::parallel_all_gather_with_options`]. Refer to
-/// [`ParallelAllGatherOperation`] for the semantics and transformation rules.
+/// [`ParallelAllGatherOutputVariance`] of [`ParallelAllGather::parallel_all_gather_with_options`].
+/// Refer to the documentation of [`ParallelAllGatherOperation`] for the semantics and transformation rules.
 ///
 /// Over a manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
 /// so that every device's copy is gathered. Homogeneous array values require static extents, while composite array IR
@@ -1370,10 +1368,9 @@ impl<
 /// Gather two rows, so that every batch item receives both of them:
 ///
 /// ```
-/// # use ryft_core::operations::collectives::ParallelAllGather;
 /// # use ryft_core::{
 /// #     Array, ArrayBatchingPolicy, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchingTracer, EagerContext,
-/// #     batch,
+/// #     ParallelAllGather, batch,
 /// # };
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rows = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])?;
@@ -1399,8 +1396,8 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `concatenation_axis`: Position of the inserted axis in the result, whose rank is one more than the rank of
-    ///     this value. Negative positions count from the end, so `-1` appends a new trailing axis.
+    ///   - `concatenation_axis`: Position of the inserted axis in the result, whose rank is one more than the rank
+    ///     of this value. Negative positions count from the end, so `-1` appends a new trailing axis.
     ///
     /// # Errors
     ///
@@ -1426,8 +1423,8 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `concatenation_axis`: Axis of this value along which the values are concatenated. Negative axes count from
-    ///     the end.
+    ///   - `concatenation_axis`: Axis of this value along which the values are concatenated.
+    ///     Negative axes count from the end.
     ///
     /// # Errors
     ///
@@ -1464,8 +1461,8 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
-    /// `axis_name` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`] if
-    /// the participant groups are invalid or combined with invariant or reduced output variance, if reduced output
+    /// `axis_name` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`]
+    /// if the participant groups are invalid or combined with invariant or reduced output variance, if reduced output
     /// variance is requested for an axis that is not a manual mesh axis, or if this value carries reduction state
     /// (i.e., is unreduced or reduced) over the gathered manual mesh axis.
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
@@ -1643,6 +1640,8 @@ impl<
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
