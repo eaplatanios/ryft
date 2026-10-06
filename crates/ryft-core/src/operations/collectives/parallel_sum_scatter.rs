@@ -310,7 +310,10 @@ impl Operation for ParallelSumScatterOperation {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
-            operation.field("options", format_args!("{:?}", &self.options))?;
+            operation.field("options", format_args!("{:?}", self.options.mode()))?;
+            if let Some(axis_index_groups) = self.options.axis_index_groups() {
+                operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;
+            }
             if let Some(mesh) = &self.mesh {
                 operation.field("mesh", mesh)?;
             }
@@ -2507,48 +2510,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_sum_scatter_parallel_sum_scatter_negative_axes() {
-        // Negative scatter axes count from the end of the input in both modes. Homogeneous and composite values
-        // normalize the axis alike.
-        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
-        let homogeneous = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
-                input_type,
-                named_axes(),
-            )
-            .map(|(_, program)| program.to_string())
-        };
-        let composite = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
-            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
-                ArrayIrType::Array(input_type),
-                named_axes(),
-            )
-            .map(|(_, program)| program.to_string())
-        };
-        let untiled_type = || ArrayType::new_static(DataType::F32, [3, 2]);
-        let tiled_type = || ArrayType::new_static(DataType::F32, [3, 4]);
-        let untiled = CollectiveOptions::default;
-        let tiled = CollectiveOptions::tiled;
-        assert_eq!(
-            homogeneous(untiled_type(), -1, untiled()).unwrap(),
-            homogeneous(untiled_type(), 1, untiled()).unwrap(),
-        );
-        assert_eq!(homogeneous(tiled_type(), -1, tiled()).unwrap(), homogeneous(tiled_type(), 1, tiled()).unwrap());
-        assert_eq!(composite(untiled_type(), -1, untiled()).unwrap(), composite(untiled_type(), 1, untiled()).unwrap());
-        assert_eq!(composite(tiled_type(), -1, tiled()).unwrap(), composite(tiled_type(), 1, tiled()).unwrap());
-        assert_eq!(
-            homogeneous(untiled_type(), -3, untiled()),
-            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
-        );
-        assert_eq!(
-            composite(tiled_type(), 2, tiled()),
-            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
-        );
-    }
-
-    #[test]
     fn test_parallel_sum_scatter_parallel_sum_scatter_tiled() {
         // Tiled mode gives batch item `i` the `i`-th contiguous chunk of the sum and preserves a non-leading mapped
         // axis, in both representations.
@@ -2604,10 +2565,53 @@ mod tests {
                         axis_name=\"x\",
                         axis_size=4,
                         scatter_axis=0,
-                        options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
+                        options=Untiled,
+                        axis_index_groups=[[0, 2], [3, 1]],
                     ] %0 %1
                 in (%2)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_parallel_sum_scatter_with_options_negative_axes() {
+        // Negative scatter axes count from the end of the input in both modes. Homogeneous and composite values
+        // normalize the axis alike.
+        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
+        let homogeneous = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
+                input_type,
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let composite = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
+                ArrayIrType::Array(input_type),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let untiled_type = || ArrayType::new_static(DataType::F32, [3, 2]);
+        let tiled_type = || ArrayType::new_static(DataType::F32, [3, 4]);
+        let untiled = CollectiveOptions::default;
+        let tiled = CollectiveOptions::tiled;
+        assert_eq!(
+            homogeneous(untiled_type(), -1, untiled()).unwrap(),
+            homogeneous(untiled_type(), 1, untiled()).unwrap(),
+        );
+        assert_eq!(homogeneous(tiled_type(), -1, tiled()).unwrap(), homogeneous(tiled_type(), 1, tiled()).unwrap());
+        assert_eq!(composite(untiled_type(), -1, untiled()).unwrap(), composite(untiled_type(), 1, untiled()).unwrap());
+        assert_eq!(composite(tiled_type(), -1, tiled()).unwrap(), composite(tiled_type(), 1, tiled()).unwrap());
+        assert_eq!(
+            homogeneous(untiled_type(), -3, untiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
+        assert_eq!(
+            composite(tiled_type(), 2, tiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
         );
     }
 
@@ -2971,7 +2975,8 @@ mod tests {
                         axis_name=\"x\",
                         axis_size=4,
                         scatter_axis=0,
-                        options=CollectiveOptions { mode: Untiled, axis_index_groups: [[0, 2], [3, 1]] },
+                        options=Untiled,
+                        axis_index_groups=[[0, 2], [3, 1]],
                     ] %0 %4
                 in (%5)"
             },
@@ -3025,7 +3030,8 @@ mod tests {
                         axis_name=\"x\",
                         axis_size=4,
                         scatter_axis=0,
-                        options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                        options=Tiled,
+                        axis_index_groups=[[0, 2], [3, 1]],
                     ] %0 %7 %2
                 in (%8)"
             },

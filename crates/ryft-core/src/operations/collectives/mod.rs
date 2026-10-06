@@ -186,7 +186,7 @@ impl CollectiveMode {
 
 /// Shared shape and grouping options for collective operations that resize an array axis (e.g.,
 /// [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]).
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CollectiveOptions {
     /// [`CollectiveMode`] of the collective.
     mode: CollectiveMode,
@@ -232,19 +232,6 @@ impl CollectiveOptions {
     #[inline]
     pub(super) fn effective_axis_size(&self, operation_name: &str, axis_size: usize) -> Result<usize, TypeError> {
         effective_collective_axis_size(operation_name, axis_size, self.axis_index_groups())
-    }
-}
-
-impl Debug for CollectiveOptions {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.axis_index_groups {
-            None => Debug::fmt(&self.mode, formatter),
-            Some(axis_index_groups) => formatter
-                .debug_struct("CollectiveOptions")
-                .field("mode", &self.mode)
-                .field("axis_index_groups", axis_index_groups)
-                .finish(),
-        }
     }
 }
 
@@ -1679,14 +1666,14 @@ mod tests {
         assert_eq!(options.mode(), CollectiveMode::Untiled);
         assert_eq!(options.axis_index_groups(), None);
         assert_eq!(options, CollectiveOptions::default());
-        assert_eq!(format!("{options:?}"), "Untiled");
+        assert_eq!(format!("{options:?}"), "CollectiveOptions { mode: Untiled, axis_index_groups: None }");
     }
 
     #[test]
     fn test_collective_options_tiled() {
         let options = CollectiveOptions::tiled();
         assert_eq!(options, CollectiveOptions::new(CollectiveMode::Tiled));
-        assert_eq!(format!("{options:?}"), "Tiled");
+        assert_eq!(format!("{options:?}"), "CollectiveOptions { mode: Tiled, axis_index_groups: None }");
     }
 
     #[test]
@@ -1694,7 +1681,10 @@ mod tests {
         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         assert_eq!(options.mode(), CollectiveMode::Tiled);
         assert_eq!(options.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
-        assert_eq!(format!("{options:?}"), "CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] }");
+        assert_eq!(
+            format!("{options:?}"),
+            "CollectiveOptions { mode: Tiled, axis_index_groups: Some([[0, 2], [3, 1]]) }",
+        );
     }
 
     #[test]

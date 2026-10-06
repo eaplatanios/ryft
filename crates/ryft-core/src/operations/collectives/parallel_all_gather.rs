@@ -346,7 +346,10 @@ impl Operation for ParallelAllGatherOperation {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
             operation.field("axis_size", self.axis_size)?;
             operation.field("concatenation_axis", format_args!("{:?}", &self.concatenation_axis))?;
-            operation.field("options", format_args!("{:?}", &self.options))?;
+            operation.field("options", format_args!("{:?}", self.options.mode()))?;
+            if let Some(axis_index_groups) = self.options.axis_index_groups() {
+                operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;
+            }
             operation.field("output_variance", format_args!("{:?}", &self.output_variance))?;
             if let Some(mesh) = &self.mesh {
                 operation.field("mesh", mesh)?;
@@ -1149,9 +1152,9 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
     /// `axis_name` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`] if
-    /// the participant groups are
-    /// invalid or combined with invariant or reduced output variance, if reduced output variance is requested for an
-    /// axis that is not a manual mesh axis, or if this value is unreduced over the gathered manual mesh axis.
+    /// the participant groups are invalid or combined with invariant or reduced output variance, if reduced output
+    /// variance is requested for an axis that is not a manual mesh axis, or if this value is unreduced over the
+    /// gathered manual mesh axis.
     fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
@@ -3793,7 +3796,8 @@ mod tests {
                     axis_name=\"x\",
                     axis_size=4,
                     scatter_axis=0,
-                    options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
+                    options=Tiled,
+                    axis_index_groups=[[0, 2], [3, 1]],
                 ] %0
                 in (%1)"
             },
@@ -3960,60 +3964,6 @@ mod tests {
         assert_eq!(
             ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()).parallel_all_gather("x", 0),
             Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
-        );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_parallel_all_gather_negative_axes() {
-        // Negative concatenation axes count from the end of the result. An untiled gather inserts an axis, so its
-        // result has one more axis than the input and `-1` appends a new trailing axis, while a tiled gather
-        // concatenates along an existing axis. Homogeneous and composite values normalize the axis alike.
-        let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
-        let homogeneous = |concatenation_axis: i32, options: CollectiveOptions| {
-            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-                move |input| {
-                    input.parallel_all_gather_with_options(
-                        "x",
-                        concatenation_axis,
-                        options,
-                        ParallelAllGatherOutputVariance::Varying,
-                    )
-                },
-                input_type.clone(),
-                named_axes(),
-            )
-            .map(|(_, program)| program.to_string())
-        };
-        let composite = |concatenation_axis: i32, options: CollectiveOptions| {
-            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
-                move |input| {
-                    input.parallel_all_gather_with_options(
-                        "x",
-                        concatenation_axis,
-                        options,
-                        ParallelAllGatherOutputVariance::Varying,
-                    )
-                },
-                ArrayIrType::Array(input_type.clone()),
-                named_axes(),
-            )
-            .map(|(_, program)| program.to_string())
-        };
-        let untiled = CollectiveOptions::default;
-        let tiled = CollectiveOptions::tiled;
-        assert_eq!(homogeneous(-1, untiled()).unwrap(), homogeneous(2, untiled()).unwrap());
-        assert_eq!(homogeneous(-3, untiled()).unwrap(), homogeneous(0, untiled()).unwrap());
-        assert_eq!(homogeneous(-1, tiled()).unwrap(), homogeneous(1, tiled()).unwrap());
-        assert_eq!(composite(-1, untiled()).unwrap(), composite(2, untiled()).unwrap());
-        assert_eq!(composite(-2, tiled()).unwrap(), composite(0, tiled()).unwrap());
-        assert_eq!(
-            homogeneous(-4, untiled()),
-            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
-        );
-        assert_eq!(
-            composite(-3, tiled()),
-            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
         );
     }
 
@@ -4210,6 +4160,60 @@ mod tests {
             ),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis, rank: 1 })) if axis == Axis::from(1),
         ));
+    }
+
+    #[test]
+    fn test_parallel_all_gather_parallel_all_gather_with_options_negative_axes() {
+        // Negative concatenation axes count from the end of the result. An untiled gather inserts an axis, so its
+        // result has one more axis than the input and `-1` appends a new trailing axis, while a tiled gather
+        // concatenates along an existing axis. Homogeneous and composite values normalize the axis alike.
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
+        let homogeneous = |concatenation_axis: i32, options: CollectiveOptions| {
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                move |input| {
+                    input.parallel_all_gather_with_options(
+                        "x",
+                        concatenation_axis,
+                        options,
+                        ParallelAllGatherOutputVariance::Varying,
+                    )
+                },
+                input_type.clone(),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let composite = |concatenation_axis: i32, options: CollectiveOptions| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                move |input| {
+                    input.parallel_all_gather_with_options(
+                        "x",
+                        concatenation_axis,
+                        options,
+                        ParallelAllGatherOutputVariance::Varying,
+                    )
+                },
+                ArrayIrType::Array(input_type.clone()),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let untiled = CollectiveOptions::default;
+        let tiled = CollectiveOptions::tiled;
+        assert_eq!(homogeneous(-1, untiled()).unwrap(), homogeneous(2, untiled()).unwrap());
+        assert_eq!(homogeneous(-3, untiled()).unwrap(), homogeneous(0, untiled()).unwrap());
+        assert_eq!(homogeneous(-1, tiled()).unwrap(), homogeneous(1, tiled()).unwrap());
+        assert_eq!(composite(-1, untiled()).unwrap(), composite(2, untiled()).unwrap());
+        assert_eq!(composite(-2, tiled()).unwrap(), composite(0, tiled()).unwrap());
+        assert_eq!(
+            homogeneous(-4, untiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
+        );
+        assert_eq!(
+            composite(-3, tiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
     }
 
     #[test]
