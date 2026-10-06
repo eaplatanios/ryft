@@ -1668,8 +1668,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_output_variance_default() {
-        // Varying is the default, which is also the output variance that `parallel_all_gather` and
-        // `parallel_all_gather_tiled` stage.
+        // Varying is the default, which is also the output variance that `parallel_all_gather`
+        // and `parallel_all_gather_tiled` stage.
         assert_eq!(ParallelAllGatherOutputVariance::default(), ParallelAllGatherOutputVariance::Varying);
     }
 
