@@ -225,7 +225,7 @@ impl Operation for ParallelAllToAllOperation {
         input_types: &[ArrayType],
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
-        let input_type = self.check_input(input_types, region_interfaces)?;
+        let input_type = self.validate_input(input_types, region_interfaces)?;
 
         // Result shape arithmetic in the homogeneous array family requires static extents.
         // Dynamic geometry uses explicit result extents in the composite array/dimension family.
@@ -663,7 +663,7 @@ impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for 
         // Eager binding does not infer output types, so interpretation validates the shared input contract
         // and the operation payload before applying the degenerate-axis rule.
         check_count!("input", inputs, 1, ProgramError);
-        self.check_degenerate_interpretation()?;
+        self.validate_degenerate_interpretation()?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
         let input = &inputs[0];

@@ -152,7 +152,7 @@ impl Operation for ParallelPermuteOperation {
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         // The permutation preserves its single input's type, including dynamic dimensions.
-        let input_type = self.check_input(input_types, region_interfaces)?;
+        let input_type = self.validate_input(input_types, region_interfaces)?;
         let axis_name = &self.axis_name;
         let mut sources = BTreeSet::new();
         let mut targets = BTreeSet::new();
@@ -265,7 +265,7 @@ impl<C: Domain<Type = ArrayType, Value: ZeroLike>> InterpretableOperation<C> for
         // Eager binding does not infer output types, so interpretation validates the shared input contract and the
         // operation payload before applying the degenerate-axis rule.
         check_count!("input", inputs, 1, ProgramError);
-        self.check_degenerate_interpretation()?;
+        self.validate_degenerate_interpretation()?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(&input_types, &[])?;
 

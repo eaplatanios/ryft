@@ -312,7 +312,7 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
 
     /// Validates the input contract that every linear collective shares (i.e., no regions, a non-zero axis size, and
     /// exactly one input) and returns that input's type.
-    fn check_input<'o>(
+    fn validate_input<'o>(
         &self,
         input_types: &'o [ArrayType],
         region_interfaces: &[RegionInterface<ArrayType>],
@@ -339,7 +339,7 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if the participant groups are invalid or require more than one participant per group.
-    fn check_degenerate_interpretation(&self) -> Result<(), ProgramError> {
+    fn validate_degenerate_interpretation(&self) -> Result<(), ProgramError> {
         let effective_axis_size = self.effective_axis_size()?;
         if effective_axis_size > 1 {
             return Err(ProgramError::UnsupportedOperation {
@@ -531,7 +531,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
         // A degenerate tiled collective leaves the array unchanged, and its untiled form only removes or inserts a
         // size-one axis, so reshaping to the validated result shape is sufficient and preserves element order.
-        self.check_degenerate_interpretation()?;
+        self.validate_degenerate_interpretation()?;
         let output = match self.collective_options().mode() {
             CollectiveMode::Tiled => input,
             CollectiveMode::Untiled => input.reshape(Shape::from(expected_extents))?,
@@ -1731,40 +1731,40 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_collective_operation_check_input() {
+    fn test_linear_collective_operation_validate_input() {
         let operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
         let input_type = ArrayType::new_static(DataType::F32, [4]);
-        assert_eq!(operation.check_input(std::slice::from_ref(&input_type), &[]), Ok(&input_type));
+        assert_eq!(operation.validate_input(std::slice::from_ref(&input_type), &[]), Ok(&input_type));
 
         // Regions are rejected first, then a zero-participant axis, and finally any input count other than one. The
         // region and axis cases use a zero-participant operation without inputs, so they also demonstrate this order.
         let zero_participant_operation = ParallelPermuteOperation::new("x".to_string(), 0, Vec::new());
         assert_eq!(
             zero_participant_operation
-                .check_input(&[], &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]),
+                .validate_input(&[], &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
         assert_eq!(
-            zero_participant_operation.check_input(&[], &[]),
+            zero_participant_operation.validate_input(&[], &[]),
             Err(TypeError::invalid("`parallel_permute` axis size must be greater than zero")),
         );
-        assert_eq!(operation.check_input(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
+        assert_eq!(operation.validate_input(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
         assert_eq!(
-            operation.check_input(&[input_type.clone(), input_type], &[]),
+            operation.validate_input(&[input_type.clone(), input_type], &[]),
             Err(TypeError::invalid("expected 1 input but got 2")),
         );
     }
 
     #[test]
-    fn test_linear_collective_operation_check_degenerate_interpretation() {
+    fn test_linear_collective_operation_validate_degenerate_interpretation() {
         // A single participant needs no exchange, so the collective can be evaluated locally.
         let operation = ParallelAllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled());
-        assert_eq!(operation.check_degenerate_interpretation(), Ok(()));
+        assert_eq!(operation.validate_degenerate_interpretation(), Ok(()));
 
         // Several participants per collective instance require an enclosing binder.
         let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
         assert_eq!(
-            operation.check_degenerate_interpretation(),
+            operation.validate_degenerate_interpretation(),
             Err(ProgramError::UnsupportedOperation {
                 message: "cannot interpret `parallel_all_to_all` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
@@ -1780,7 +1780,7 @@ mod tests {
                 0,
                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0], vec![1]]),
             )
-            .check_degenerate_interpretation(),
+            .validate_degenerate_interpretation(),
             Ok(()),
         );
 
@@ -1793,7 +1793,7 @@ mod tests {
                 0,
                 CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 0]]),
             )
-            .check_degenerate_interpretation(),
+            .validate_degenerate_interpretation(),
             Err(ProgramError::Type(TypeError::invalid(
                 "`parallel_all_to_all` axis index groups contain participant 0 more than once",
             ))),

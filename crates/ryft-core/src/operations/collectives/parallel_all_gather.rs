@@ -202,7 +202,7 @@ impl ParallelAllGatherOperation {
     /// Rejects an input that carries reduction state (i.e., pending or completed sum) over the gathered manual mesh
     /// axis, because gathering across that sum would change its reduction semantics. Independent sums over other mesh
     /// axes commute with the gather and are preserved.
-    fn check_input_reduction_state(&self, input_type: &ArrayType) -> Result<(), TypeError> {
+    fn validate_input_reduction_state(&self, input_type: &ArrayType) -> Result<(), TypeError> {
         let axis_name = &self.axis_name;
         if input_type.unreduced_axes().contains(axis_name) || input_type.reduced_axes().contains(axis_name) {
             return Err(TypeError::invalid(format!(
@@ -216,7 +216,7 @@ impl ParallelAllGatherOperation {
     /// Rejects a concatenation axis that is out of bounds for the output of an input with rank `input_rank`. An untiled
     /// gather inserts its participant axis, so its concatenation axis is a position in an output whose rank is one more
     /// than `input_rank`, while a tiled gather concatenates along an existing axis.
-    fn check_concatenation_axis(&self, input_rank: usize) -> Result<(), TypeError> {
+    fn validate_concatenation_axis(&self, input_rank: usize) -> Result<(), TypeError> {
         let output_rank = input_rank + usize::from(self.options.mode == CollectiveMode::Untiled);
         if self.concatenation_axis >= output_rank {
             return Err(TypeError::invalid(format!(
@@ -229,7 +229,7 @@ impl ParallelAllGatherOperation {
 
     /// Rejects local interpretation of a manual mesh all-gather, whose binder owns execution and output variance.
     /// A local reshape cannot change manual variance or reduction state, even for a single participant.
-    fn check_local_interpretation(&self) -> Result<(), ProgramError> {
+    fn validate_local_interpretation(&self) -> Result<(), ProgramError> {
         if self.mesh.is_some() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -268,7 +268,7 @@ impl ParallelAllGatherOperation {
 
         // Reduction state is diagnosed before the variation check below, whose diagnostic suggests a `parallel_vary`
         // transition that would also reject it.
-        self.check_input_reduction_state(input_type)?;
+        self.validate_input_reduction_state(input_type)?;
         let input_sharding = input_type.sharding().unwrap();
 
         // Gathering an input that is still invariant over the axis would concatenate identical copies under a type that
@@ -353,8 +353,6 @@ impl Display for ParallelAllGatherOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Operation for ParallelAllGatherOperation {
     type Type = ArrayType;
 
@@ -368,7 +366,7 @@ impl Operation for ParallelAllGatherOperation {
         input_types: &[ArrayType],
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
-        let input_type = self.check_input(input_types, region_interfaces)?;
+        let input_type = self.validate_input(input_types, region_interfaces)?;
         let effective_axis_size = self.effective_axis_size()?;
 
         // Result-shape arithmetic in the homogeneous array family requires static extents. Dynamic geometry uses
@@ -379,7 +377,7 @@ impl Operation for ParallelAllGatherOperation {
             )));
         };
 
-        self.check_concatenation_axis(input_type.rank())?;
+        self.validate_concatenation_axis(input_type.rank())?;
         let output_type = match self.options.mode {
             CollectiveMode::Untiled => {
                 input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
@@ -399,6 +397,7 @@ impl Operation for ParallelAllGatherOperation {
                 )?
             }
         };
+
         Ok(vec![self.finalize_output_type(input_type, output_type)?])
     }
 
@@ -438,6 +437,7 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
         self.mesh.as_ref()
     }
 
+    #[inline]
     fn effective_axis_size(&self) -> Result<usize, TypeError> {
         if self.output_variance != ParallelAllGatherOutputVariance::Varying && self.options.axis_index_groups.is_some()
         {
@@ -496,7 +496,8 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
-        self.check_concatenation_axis(input_type.rank())?;
+        self.validate_concatenation_axis(input_type.rank())?;
+
         let base_output_type = match self.options.mode {
             CollectiveMode::Untiled => {
                 input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
@@ -511,6 +512,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                     .with_sharding(sharding)?
             }
         };
+
         let mut output_types = infer_array_ir_shape_changing_collective_output_type(
             PARALLEL_ALL_GATHER_OPERATION_NAME,
             input_types,
@@ -522,9 +524,11 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                         let output_extent = &output_extents[self.concatenation_axis];
                         if output_extent != &Dimension::Static(effective_axis_size) {
                             return Err(TypeError::invalid(format!(
-                                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` inserted output axis {} extent must equal axis \
-                                 group size {effective_axis_size} but got {output_extent}",
+                                "`{}` inserted output axis {} extent must equal axis group size {} but got {}",
+                                PARALLEL_ALL_GATHER_OPERATION_NAME,
                                 self.concatenation_axis,
+                                effective_axis_size,
+                                output_extent,
                             )));
                         }
                     }
@@ -541,10 +545,14 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                             })?;
                             if *output_extent != expected {
                                 return Err(TypeError::invalid(format!(
-                                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` result extent must equal input axis {} \
-                                     extent {input_extent} multiplied by axis group size {effective_axis_size}; \
-                                     expected {expected} but got {output_extent}",
+                                    "`{}` result extent must equal input axis {} extent {} multiplied by axis \
+                                     group size {}; expected {} but got {}",
+                                    PARALLEL_ALL_GATHER_OPERATION_NAME,
                                     self.concatenation_axis,
+                                    input_extent,
+                                    effective_axis_size,
+                                    expected,
+                                    output_extent,
                                 )));
                             }
                         }
@@ -553,6 +561,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                 Ok(())
             },
         )?;
+
         let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
         if self.options.mode == CollectiveMode::Tiled {
             // The placeholder zero cannot prove divisibility of the actual result by its explicit mesh placement.
@@ -563,6 +572,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                 output_type = output_type.with_layout(input_type.layout().cloned());
             }
         }
+
         Ok(vec![self.finalize_output_type(input_type, output_type)?.into()])
     }
 }
@@ -575,8 +585,8 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         output_extents: Vec<P::ShapeExtent>,
         output_sharding: Option<Sharding>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
-        // The batching rules reject all-gathers over a manual mesh axis, which reduced output variance requires, and
-        // infer the output type first, so the concatenation axis is known to be within bounds for the input rank.
+        // The batching rules reject all-gathers over a manual mesh axis, which reduced output variance requires,
+        // and infer the output type first, so the concatenation axis is known to be within bounds for the input rank.
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -598,6 +608,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
                     P::divide_extents_exactly(context, &output_extents[self.concatenation_axis], &axis_extent)?;
             }
         }
+
         let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
         let moved = input.into_value().move_axis(0, self.concatenation_axis)?;
         let gathered = P::reshape_collective(context, moved, output_extents.as_slice(), output_sharding)?;
@@ -612,17 +623,18 @@ impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for 
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Eager binding does not infer output types, so interpretation validates the shared input contract and the
-        // operation payload before applying the degenerate-axis rule.
+        // Eager binding does not infer output types, so interpretation validates the shared input contract
+        // and the operation payload before applying the degenerate axis rule.
         check_count!("input", inputs, 1, ProgramError);
-        self.check_local_interpretation()?;
-        self.check_degenerate_interpretation()?;
+        self.validate_local_interpretation()?;
+        self.validate_degenerate_interpretation()?;
+
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
         let input = &inputs[0];
 
-        // A single participant gathers only its own value. Untiled mode inserts a size-one gathered axis, which a
-        // reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
+        // A single participant gathers only its own value. Untiled mode inserts a size-one gathered axis,
+        // which a reshape to the inferred output type expresses, while tiled mode leaves the shape unchanged.
         Ok(vec![match self.options.mode {
             CollectiveMode::Tiled => input.clone(),
             CollectiveMode::Untiled => {
@@ -636,6 +648,8 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> 
     for ParallelAllGatherOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     C: Context<Type = ArrayType, Value: Transpose, Operation: From<ParallelAllGatherOperation>>,
@@ -884,7 +898,7 @@ impl<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        self.check_local_interpretation()?;
+        self.validate_local_interpretation()?;
         self.shape_changing_collective_interpret_in_parent::<C>(inputs)
     }
 }
@@ -1467,7 +1481,7 @@ where
         operation.effective_axis_size()?;
         let mut input = self.clone();
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-            operation.check_input_reduction_state(self.r#type().as_ref())?;
+            operation.validate_input_reduction_state(self.r#type().as_ref())?;
             if !self.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 input = input.parallel_vary(axis_name)?;
             }
@@ -1518,7 +1532,7 @@ where
         let effective_axis_size = operation.effective_axis_size()?;
         let mut input = self.clone();
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-            operation.check_input_reduction_state(input_type)?;
+            operation.validate_input_reduction_state(input_type)?;
             if !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
                 let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
                 input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
