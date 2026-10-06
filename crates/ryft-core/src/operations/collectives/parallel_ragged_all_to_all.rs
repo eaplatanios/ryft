@@ -626,26 +626,19 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelRaggedAllToAllOperatio
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// A matching named batch axis is the eager reference implementation's participant axis. All inputs are aligned to
-// physical axis zero before one parent bind executes the complete exchange. Unresolved non-constant metadata are gated
-// because no existing slicing primitive carries a dynamic segment length. An exchange over a manual mesh axis belongs
-// to its manual region and requires devices, so a matching level, which can only shadow that mesh axis, rejects it. A
-// non-matching mapped axis merges its batch into the packed leading data and metadata axes with sender/receiver offsets
-// rebased by the mapped item index. The rebasing offsets are created with the placement and manual variation of the
-// metadata that they rebase, so a merge inside a manual region needs no variation transition. An all-replicated
-// application can be forwarded unchanged. The physical form has no backend lowering, so a matching level under a
-// staging parent stages it only for eager interpretation of the staged program.
-impl<C: Context<Type = ArrayType>, P: CollectiveArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelRaggedAllToAllOperation
-where
-    C::Operation: From<ConstantOperation<Array>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<IotaOperation<ArrayType>>
-        + From<ParallelRaggedAllToAllOperation>,
-    AddOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
-    MulOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: From<ConstantOperation<Array>>
+                           + From<AddOperation<ArrayType>>
+                           + From<MulOperation<ArrayType>>
+                           + From<BroadcastOperation>
+                           + From<ConvertElementTypeOperation<ArrayType>>
+                           + From<IotaOperation<ArrayType>>
+                           + From<ParallelRaggedAllToAllOperation>,
+        >,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelRaggedAllToAllOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -653,6 +646,16 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A matching named batch axis is the eager reference implementation's participant axis. All inputs are aligned
+        // to physical axis zero before one parent bind executes the complete exchange. Unresolved non-constant metadata
+        // are gated because no existing slicing primitive carries a dynamic segment length. An exchange over a manual
+        // mesh axis belongs to its manual region and requires devices, so a matching level, which can only shadow that
+        // mesh axis, rejects it. A non-matching mapped axis merges its batch into the packed leading data and metadata
+        // axes with sender/receiver offsets rebased by the mapped item index. The rebasing offsets are created with the
+        // placement and manual variation of the metadata that they rebase, so a merge inside a manual region needs no
+        // variation transition. An all-replicated application can be forwarded unchanged. The physical form has no
+        // backend lowering, so a matching level under a staging parent stages it only for eager interpretation of
+        // the staged program.
         check_count!("input", inputs, 6, ProgramError);
         ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
@@ -666,16 +669,16 @@ where
                 return Ok(vec![ArrayBatch::replicated(outputs.remove(0))].into());
             }
 
-            // An unrelated mapped axis is merged into the exchange: the batch items share the participants of the named
-            // axis, and the merged exchange routes the segments of every batch item independently.
+            // An unrelated mapped axis is merged into the exchange: the batch items share the participants
+            // of the named axis, and the merged exchange routes the segments of every batch item independently.
             let provenance_context = context.parent().clone();
             return provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("batching"), || {
                     provenance_context.invoke_with_provenance_scope(
                         ProvenanceScope::new(PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME),
                         || {
-                            // A physical operation keeps its leading participant axis in front of every input. The
-                            // mapped axis precedes the leading segment axis of the data inputs and follows the
+                            // A physical operation keeps its leading participant axis in front of every input.
+                            // The mapped axis precedes the leading segment axis of the data inputs and follows the
                             // metadata axis of the metadata inputs, which keeps the per-receiver metadata blocks
                             // contiguous after merging (see below).
                             let participant_axis_count = usize::from(self.is_physical());
@@ -692,10 +695,12 @@ where
                                     ),
                                 }
                             })?;
+
                             if batch_size == 0 {
                                 let output = P::match_axis(context, &inputs[1], output_batch_axis.into())?;
                                 return Ok(vec![output].into());
                             }
+
                             let static_extent = |r#type: &ArrayType, axis: usize, name: &str| {
                                 r#type.shape().dimensions()[axis].value().ok_or_else(|| {
                                     BatchingError::UnsupportedOperation {
@@ -706,6 +711,7 @@ where
                                     }
                                 })
                             };
+
                             let input_extent = static_extent(&logical_input_types[0], input_leading_axis, "operand")?;
                             let output_extent = static_extent(&logical_input_types[1], input_leading_axis, "output")?;
                             let metadata_length =
@@ -780,39 +786,53 @@ where
                                 .collect::<Result<Vec<_>, _>>()?;
 
                             // Rebase the `input_offsets` and `output_offsets` of batch item `b` by `b·N` and `b·M`,
-                            // the first rows of that item in the merged data inputs. Sizes need no rebasing.
+                            // the first rows of that item in the merged data inputs. Sizes need no rebasing. The
+                            // rebasing term is an `iota` along the mapped axis of the aligned metadata, scaled by the
+                            // leading extent broadcast to the full metadata type, so every operand of the `mul` and
+                            // `add` below has the physical type of the metadata, including its sharding and manual
+                            // variation.
                             for (metadata_index, leading_extent) in [(0, input_extent), (2, output_extent)] {
-                                let iota_type = metadata[metadata_index].r#type().into_owned();
+                                let metadata_type = metadata[metadata_index].r#type().into_owned();
+
                                 let mut iota = context.parent().bind(
-                                    IotaOperation::new(iota_type.clone(), metadata_batch_axis)?,
+                                    IotaOperation::new(metadata_type.clone(), metadata_batch_axis)?,
                                     Vec::new(),
                                     &[],
                                 )?;
                                 check_count!("output", iota, 1, ProgramError);
-                                let iota =
-                                    ArrayBatch::new(iota.remove(0), BatchAxis::from_position(metadata_batch_axis))?;
+
                                 let mut scale = context.parent().bind(
-                                    ConstantOperation::new(metadata_extent_scalar(&iota_type, leading_extent)?),
+                                    ConstantOperation::new(metadata_extent_scalar(&metadata_type, leading_extent)?),
                                     Vec::new(),
                                     &[],
                                 )?;
                                 check_count!("output", scale, 1, ProgramError);
-                                let scale = scale.remove(0);
-                                let scale = ArrayBatch::replicated(scale);
-                                let (mut rebasing, _) = MulOperation::new()
-                                    .batch(context, &EmptyRegionDriver, &[iota, scale])?
-                                    .into_parts();
+
+                                let mut scale = context.parent().bind(
+                                    BroadcastOperation::new(metadata_type, Vec::new()),
+                                    Vec::new(),
+                                    &[scale.remove(0)],
+                                )?;
+                                check_count!("output", scale, 1, ProgramError);
+
+                                let mut rebasing = context.parent().bind(
+                                    MulOperation::new(),
+                                    Vec::new(),
+                                    &[iota.remove(0), scale.remove(0)],
+                                )?;
                                 check_count!("output", rebasing, 1, ProgramError);
-                                let (mut rebased, _) = AddOperation::new()
-                                    .batch(
-                                        context,
-                                        &EmptyRegionDriver,
-                                        &[metadata[metadata_index].clone(), rebasing.remove(0)],
-                                    )?
-                                    .into_parts();
+
+                                let mut rebased = context.parent().bind(
+                                    AddOperation::new(),
+                                    Vec::new(),
+                                    &[metadata[metadata_index].value().clone(), rebasing.remove(0)],
+                                )?;
                                 check_count!("output", rebased, 1, ProgramError);
-                                metadata[metadata_index] = rebased.remove(0);
+
+                                metadata[metadata_index] =
+                                    ArrayBatch::new(rebased.remove(0), BatchAxis::from_position(metadata_batch_axis))?;
                             }
+
                             let mut metadata_extents = Vec::new();
                             if let Some(participant_extent) = &participant_extent {
                                 metadata_extents.push(participant_extent.clone());
@@ -862,17 +882,19 @@ where
         if self.mesh.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` over a manual mesh axis cannot bind a named batch \
-                     axis",
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` over a manual mesh axis \
+                     cannot bind a named batch axis",
                 ),
             });
         }
+
         P::collective_axis_extent(
             context,
             PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
             self.axis_name(),
             self.axis_size,
         )?;
+
         let inputs =
             inputs.iter().map(|input| P::match_axis(context, input, 0.into())).collect::<Result<Vec<_>, _>>()?;
         if inputs[2..]
@@ -886,6 +908,7 @@ where
                 ),
             });
         }
+
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let mut outputs =
             context.parent().bind(self.with_physical_representation(), Vec::new(), physical_inputs.as_slice())?;
@@ -894,8 +917,6 @@ where
     }
 }
 
-// The two data inputs are jointly linear. Metadata remain primal values and therefore become ordinary residuals
-// whenever the tangent exchange survives partial evaluation.
 impl_differentiable_operation! {
     ParallelRaggedAllToAllOperation,
     jvp<C>
@@ -904,6 +925,8 @@ impl_differentiable_operation! {
         C::Operation: From<ParallelRaggedAllToAllOperation>,
     {
         |operation, context, _driver, inputs| {
+            // The two data inputs are jointly linear. Metadata remain primal values and therefore become ordinary
+            // residuals whenever the tangent exchange survives partial evaluation.
             check_count!("input", inputs, 6, ProgramError);
             let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
                 unreachable!();
@@ -943,21 +966,21 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: From<ParallelAllToAllOperation>
+        O: From<ZeroOperation<ArrayType>>
+            + From<OneOperation<ArrayType>>
+            + From<NegOperation<ArrayType>>
             + From<BroadcastOperation>
             + From<ConcatenateOperation<ArrayType>>
             + From<CompareOperation<ArrayType>>
-            + From<ConvertElementTypeOperation<ArrayType>>
-            + From<CumulativeOperation>
-            + From<NegOperation<ArrayType>>
-            + From<OneOperation<ArrayType>>
-            + From<ParallelRaggedAllToAllOperation>
-            + From<ReshapeOperation>
-            + From<ScatterOperation>
             + From<SelectOperation<ArrayType>>
+            + From<ReshapeOperation>
             + From<SliceOperation>
+            + From<ScatterOperation>
+            + From<ConvertElementTypeOperation<ArrayType>>
             + From<TransferToMemoryOperation>
-            + From<ZeroOperation<ArrayType>>
+            + From<CumulativeOperation>
+            + From<ParallelAllToAllOperation>
+            + From<ParallelRaggedAllToAllOperation>
             + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
             + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
     {
@@ -1032,9 +1055,11 @@ impl_differentiable_operation! {
     },
 }
 
-// This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType` member in
-// `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous operation.
 impl MemberOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
+    // This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType`
+    // member in `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous
+    // operation.
+
     #[inline]
     fn infer_parent_region_input_types(
         &self,
@@ -1062,12 +1087,12 @@ impl MemberOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
     }
 }
 
-impl<C> MemberInterpretableOperation<C> for ParallelRaggedAllToAllOperation
-where
+impl<
     C: Domain<
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: ParallelRaggedAllToAllEvaluation + Value<Type = ArrayType>>,
         >,
+> MemberInterpretableOperation<C> for ParallelRaggedAllToAllOperation
 {
     #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -1079,6 +1104,8 @@ where
         interpret_projected_operation(context, self, driver, inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelRaggedAllToAllOperation
 where
