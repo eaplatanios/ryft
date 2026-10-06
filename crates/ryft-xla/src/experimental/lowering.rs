@@ -18,7 +18,7 @@ use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallA
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::{
-    AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
+    AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
     CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
     CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ComplexOperation, ConjugateOperation,
@@ -3271,7 +3271,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<CpuArray> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<Array> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -6028,7 +6028,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::Constant(constant) => {
-                <ConstantOperation<CpuArray> as LowerableXlaOperation<V>>::lower_to_mlir(
+                <ConstantOperation<Array> as LowerableXlaOperation<V>>::lower_to_mlir(
                     constant,
                     input_values,
                     output_types,
@@ -8421,7 +8421,7 @@ impl MlirLowerableValue for XlaArrayConstant {
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         match self {
             Self::Captured(value) => Err(LoweringError::MissingCapturedConstant { index: value.index() }),
-            Self::Boolean(value) => CpuArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+            Self::Boolean(value) => Array::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
         }
     }
 
@@ -8457,7 +8457,7 @@ impl MlirLowerableValue for ArrayType {
 }
 
 // Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
-impl MlirLowerableValue for CpuArray {
+impl MlirLowerableValue for Array {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -11503,11 +11503,12 @@ pub(super) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         CollectiveMode::Tiled => input_value,
         CollectiveMode::Untiled => {
             let mut dimensions = output_array_type.shape().dimensions().to_vec();
-            dimensions[operation.concat_axis()] = Dimension::Static(1);
+            dimensions[operation.concatenation_axis()] = Dimension::Static(1);
             let input_type =
                 lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
-            let broadcast_dimensions =
-                (0..output_array_type.rank()).filter(|&axis| axis != operation.concat_axis()).collect::<Vec<_>>();
+            let broadcast_dimensions = (0..output_array_type.rank())
+                .filter(|&axis| axis != operation.concatenation_axis())
+                .collect::<Vec<_>>();
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 input_value,
                 input_type,
@@ -11520,7 +11521,7 @@ pub(super) fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     let output_type = lower_tensor_type(output_array_type, context, location)?;
     let result = block.append_operation(stable_hlo::all_gather(
         &[input_value],
-        operation.concat_axis(),
+        operation.concatenation_axis(),
         stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
         Some(collective_state.next_channel_id()),
         Some(stable_hlo::ChannelHandleType::DeviceToDevice),
@@ -11621,25 +11622,25 @@ pub(super) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
         operation.options().axis_index_groups(),
     )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let (input_value, split_axis, concat_axis) = match operation.options().mode() {
-        CollectiveMode::Tiled => (input_value, operation.split_axis(), operation.concat_axis()),
-        CollectiveMode::Untiled if operation.split_axis() == operation.concat_axis() => {
-            (input_value, operation.split_axis(), operation.concat_axis())
+    let (input_value, split_axis, concatenation_axis) = match operation.options().mode() {
+        CollectiveMode::Tiled => (input_value, operation.split_axis(), operation.concatenation_axis()),
+        CollectiveMode::Untiled if operation.split_axis() == operation.concatenation_axis() => {
+            (input_value, operation.split_axis(), operation.concatenation_axis())
         }
         CollectiveMode::Untiled => {
             let mut split_axis = operation.split_axis();
-            let mut concat_axis = operation.concat_axis();
-            if split_axis < concat_axis {
-                concat_axis += 1;
+            let mut concatenation_axis = operation.concatenation_axis();
+            if split_axis < concatenation_axis {
+                concatenation_axis += 1;
             } else {
                 split_axis += 1;
             }
             let expanded_type = input_array_type
-                .with_inserted_dimension(concat_axis, Dimension::Static(1))
+                .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
                 .map_err(ProgramError::from)?;
             let expanded_type = lower_tensor_type(&expanded_type, context, location)?;
             let broadcast_dimensions =
-                (0..input_array_type.rank() + 1).filter(|&axis| axis != concat_axis).collect::<Vec<_>>();
+                (0..input_array_type.rank() + 1).filter(|&axis| axis != concatenation_axis).collect::<Vec<_>>();
             let expanded = block.append_operation(stable_hlo::broadcast(
                 input_value,
                 expanded_type,
@@ -11649,7 +11650,7 @@ pub(super) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
             (
                 expanded.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref(),
                 split_axis,
-                concat_axis,
+                concatenation_axis,
             )
         }
     };
@@ -11657,7 +11658,7 @@ pub(super) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
         &[input_value],
         split_axis,
         axis_size,
-        concat_axis,
+        concatenation_axis,
         stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
         Some(collective_state.next_channel_id()),
         Some(stable_hlo::ChannelHandleType::DeviceToDevice),
@@ -11665,7 +11666,7 @@ pub(super) fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let result = result.result(0).expect("stablehlo.all_to_all should return one result").as_ref();
-    if operation.options().mode() == CollectiveMode::Tiled || split_axis == concat_axis {
+    if operation.options().mode() == CollectiveMode::Tiled || split_axis == concatenation_axis {
         return Ok(vec![result]);
     }
     Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
@@ -14204,12 +14205,12 @@ mod tests {
     use crate::experimental::domains::{XlaDomain, XlaSession};
     use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array as DeviceArray, CompiledXlaFunction, FromPjrt, ToPjrt, compile};
+    use crate::{CompiledXlaFunction, FromPjrt, ToPjrt, XlaArray, compile};
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
     use ryft_core::{
-        AndOperation, Array as CpuArray, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
+        AndOperation, Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
         ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
         BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
         Context, Cos, CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension,
@@ -14264,7 +14265,7 @@ mod tests {
     }
 
     /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
-    fn test_literal_dense_bytes(literal: &CpuArray, byte_count: usize) -> Vec<u8> {
+    fn test_literal_dense_bytes(literal: &Array, byte_count: usize) -> Vec<u8> {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
@@ -14767,13 +14768,13 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -14802,13 +14803,13 @@ mod tests {
         let bounded = dynamic_dimension("n", Some(5));
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), bounded]));
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -14829,13 +14830,13 @@ mod tests {
         let unbounded = dynamic_dimension("n", None);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![unbounded.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), unbounded]));
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1, "{module}");
@@ -14972,13 +14973,13 @@ mod tests {
             let input_type = ArrayType::new(DataType::C128, Shape::new(vec![dimension.clone()]));
             let output_type = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2), dimension]))
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
-            let mut builder = ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+            let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
             let input = builder.add_input(input_type);
             let output = builder
                 .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 1, "{module}");
@@ -14993,13 +14994,13 @@ mod tests {
             (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
         ] {
             let output_type = ArrayType::new_static(DataType::F32, [4]).with_layout(layout.clone());
-            let mut builder = ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+            let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F32));
             let output = builder
                 .add_instruction(BroadcastOperation::new(output_type, Vec::new()), Vec::new(), vec![input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(
                 to_mlir_module_for_plain_program(&program, "main"),
@@ -15547,7 +15548,7 @@ mod tests {
     #[test]
     fn test_plain_transpose_then_reshape_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(input_type);
         let input =
             builder.add_instruction(TransposeOperation::new([-1, -2]), Vec::new(), vec![input], None).unwrap()[0];
@@ -15560,7 +15561,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -15582,11 +15583,11 @@ mod tests {
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
         let shape = Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
         let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -15609,14 +15610,14 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
         let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
         let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let input =
             builder.add_instruction(TransposeOperation::new([2, 0, 1]), Vec::new(), vec![input], None).unwrap()[0];
         let output =
             builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -16744,7 +16745,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, ReshapeOperation>::new();
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
@@ -16756,7 +16757,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -16783,13 +16784,13 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<Array, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -16850,7 +16851,7 @@ mod tests {
         let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);
         let incompatible_mesh = test_manual_mesh("x", 3);
         for operation in [
-            ArrayOperation::<CpuArray>::ParallelAllToAll(exchange.clone()),
+            ArrayOperation::<Array>::ParallelAllToAll(exchange.clone()),
             ArrayOperation::ParallelPermute(permute.clone()),
             ArrayOperation::ParallelAllToAll(exchange.with_mesh(incompatible_mesh.clone())),
             ArrayOperation::ParallelPermute(permute.with_mesh(incompatible_mesh)),
@@ -16917,7 +16918,7 @@ mod tests {
                 (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
             let mut block_ref = block.as_ref();
             let result = composite::lower_array_ir_operation(
-                &ArrayIrOperation::<CpuArray>::ParallelAllToAll(operation.clone()),
+                &ArrayIrOperation::<Array>::ParallelAllToAll(operation.clone()),
                 &inputs,
                 &input_types,
                 &output_types,
@@ -17374,7 +17375,7 @@ mod tests {
         use ryft_pjrt::{ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
 
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use crate::{Array, FromPjrt};
+        use crate::{FromPjrt, XlaArray};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -17438,7 +17439,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &XlaSession::new(&client).domain(),
             input_type,
             mesh,
@@ -17447,7 +17448,7 @@ mod tests {
         .unwrap();
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], execution_device_ids.as_slice()).unwrap();
+        let arguments = XlaArray::into_execute_arguments(vec![input], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -19130,10 +19131,10 @@ mod tests {
 
     #[test]
     fn test_parallel_ragged_all_to_all_lowering_rejects_batching_internal_physical_representation() {
-        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let operand = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
         let output = context.input(ArrayType::new_static(DataType::F32, [2, 4]));
-        let metadata = context.lift(CpuArray::matrix(2, 2, vec![0_i32; 4]).unwrap()).unwrap();
+        let metadata = context.lift(Array::matrix(2, 2, vec![0_i32; 4]).unwrap()).unwrap();
         let inputs = [operand, output, metadata.clone(), metadata.clone(), metadata.clone(), metadata]
             .into_iter()
             .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
@@ -19938,9 +19939,9 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let group_sizes_values = [1_i32, 0, 3];
-        let lhs = CpuArray::matrix(5, 2, lhs_values.to_vec()).unwrap();
-        let rhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
-        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
+        let lhs = Array::matrix(5, 2, lhs_values.to_vec()).unwrap();
+        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
+        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![12.0, 32.0, 50.0, 68.0, 0.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -19968,10 +19969,10 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 20.0, 30.0, 40.0, 50.0];
         let group_sizes_values = [2_i32, 0, 3];
-        let lhs = CpuArray::matrix(2, 5, lhs_values.to_vec()).unwrap();
-        let rhs = CpuArray::matrix(5, 1, rhs_values.to_vec()).unwrap();
+        let lhs = Array::matrix(2, 5, lhs_values.to_vec()).unwrap();
+        let rhs = Array::matrix(5, 1, rhs_values.to_vec()).unwrap();
         let eager = lhs
-            .ragged_dot_general(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap(), &dimensions)
+            .ragged_dot_general(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap(), &dimensions)
             .unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![50.0, 200.0, 0.0, 0.0, 500.0, 1_100.0]);
@@ -19995,9 +19996,9 @@ mod tests {
         let lhs_values = [1.0_f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
         let rhs_values = [2.0_f32, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0];
         let group_sizes_values = [u64::MAX, u64::MAX, 2, 1];
-        let lhs = CpuArray::matrix(4, 2, lhs_values.to_vec()).unwrap();
-        let rhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
-        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
+        let lhs = Array::matrix(4, 2, lhs_values.to_vec()).unwrap();
+        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
+        let eager = lhs.ragged_dot(&rhs, &Array::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![2.0, 4.0, 6.0, 8.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -21544,7 +21545,7 @@ mod tests {
                 let inputs = [
                     (values_to_bytes(&values), BufferType::I64, vec![4]),
                     (values_to_bytes(&[42_i64]), BufferType::I64, vec![1]),
-                    (index_bytes.clone(), DeviceArray::physical_buffer_type(index_type.data_type()), vec![]),
+                    (index_bytes.clone(), XlaArray::physical_buffer_type(index_type.data_type()), vec![]),
                     (values_to_bytes(&[size]), BufferType::I32, vec![]),
                 ]
                 .into_iter()
@@ -21689,23 +21690,23 @@ mod tests {
     fn test_lower_gather_fill_windows() {
         let client = execution_client();
         let input =
-            CpuArray::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
+            Array::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
                 .unwrap();
         let fill = 9_007_199_254_740_993_i64;
         let windows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![3])
             .with_mode(GatherMode::Fill { value: None });
         let cases = [
             (
-                CpuArray::scalar(7_i64).unwrap(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
+                Array::scalar(7_i64).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![], vec![]), vec![])
                     .with_mode(GatherMode::Fill { value: None }),
                 values_to_bytes(&[7_i64, 7]),
             ),
             (
-                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
+                Array::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
                     .unwrap(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
                 GatherOperation::new(
                     GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![(0, 0)]),
                     vec![1, 1],
@@ -21715,7 +21716,7 @@ mod tests {
             ),
             (
                 input.clone(),
-                CpuArray::from_elements(
+                Array::from_elements(
                     ArrayType::new_static(DataType::I1, [2, 1]),
                     &[i1::new(-1).unwrap(), i1::new(0).unwrap()],
                 )
@@ -21725,47 +21726,44 @@ mod tests {
             ),
             (
                 input.clone(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
                 windows
                     .clone()
-                    .with_mode(GatherMode::Fill { value: Some(Box::new(CpuArray::scalar(fill).unwrap())) }),
+                    .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(fill).unwrap())) }),
                 values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
             ),
             (
                 input.clone(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX]).unwrap(),
                 windows.clone(),
                 values_to_bytes(&[0_i64, 1, 2, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
                 input,
-                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
                 windows,
                 values_to_bytes(&[297_i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
-                CpuArray::from_elements(
-                    ArrayType::new_static(DataType::C64, [1]),
-                    &[ComplexNumber::new(2.0_f32, -3.0)],
-                )
-                .unwrap(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::C64, [1]), &[ComplexNumber::new(2.0_f32, -3.0)])
+                    .unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
                     GatherMode::Fill {
-                        value: Some(Box::new(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
+                        value: Some(Box::new(Array::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
                     },
                 ),
                 values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
             ),
         ];
         for (input, indices, operation, expected) in cases {
-            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input_atom = builder.add_input(input.r#type().into_owned());
             let indices_atom = builder.add_input(indices.r#type().into_owned());
             let output =
                 builder.add_instruction(operation, Vec::new(), vec![input_atom, indices_atom], None).unwrap()[0];
             let program = builder
-                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
@@ -21779,7 +21777,7 @@ mod tests {
                         client
                             .buffer(
                                 value.storage_bytes(),
-                                DeviceArray::physical_buffer_type(value.r#type().data_type()),
+                                XlaArray::physical_buffer_type(value.r#type().data_type()),
                                 value
                                     .r#type()
                                     .static_shape()
@@ -22065,9 +22063,9 @@ mod tests {
         let mut literal_cases = Vec::new();
         for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             literal_cases.push((
-                CpuArray::vector(vec![0_i64; 3]).unwrap(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
-                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
+                Array::vector(vec![0_i64; 3]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
                 ScatterOperation::new(
                     ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
                     ScatterReductionKind::Add,
@@ -22086,14 +22084,14 @@ mod tests {
                 ScatterReductionKind::Max,
             ] {
                 let input = if signed {
-                    CpuArray::vector(vec![i1::new(0).unwrap(), i1::new(-1).unwrap(), i1::new(-1).unwrap()]).unwrap()
+                    Array::vector(vec![i1::new(0).unwrap(), i1::new(-1).unwrap(), i1::new(-1).unwrap()]).unwrap()
                 } else {
-                    CpuArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap(), u1::new(1).unwrap()]).unwrap()
+                    Array::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap(), u1::new(1).unwrap()]).unwrap()
                 };
                 let updates = if signed {
-                    CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap()
+                    Array::vector(vec![i1::new(-1).unwrap(), i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap()
                 } else {
-                    CpuArray::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
+                    Array::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
                 };
                 let expected = match kind {
                     ScatterReductionKind::Overwrite => vec![1_u8, 1, 0],
@@ -22105,7 +22103,7 @@ mod tests {
                 };
                 literal_cases.push((
                     input,
-                    CpuArray::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
+                    Array::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
                     updates,
                     ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
                     expected,
@@ -22113,7 +22111,7 @@ mod tests {
             }
         }
         for (input, indices, updates, operation, expected) in literal_cases {
-            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let inputs = [input, indices, updates]
                 .into_iter()
                 .map(|value| {
@@ -22122,7 +22120,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
             let program =
-                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![], vec![Placeholder]).unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
@@ -22258,7 +22256,7 @@ mod tests {
     fn test_lower_indexed_output_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [2, 1]));
         let updates = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
@@ -22284,11 +22282,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(
-                vec![gathered, scattered],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Array>, Vec<Array>>(vec![gathered, scattered], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("sdy.sharding_constraint").count(), 2);
@@ -22296,7 +22290,7 @@ mod tests {
 
     #[test]
     fn test_lower_scatter_dynamic_window() {
-        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
         let updates = builder.add_input(ArrayType::new(
@@ -22318,7 +22312,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert_eq!(to_mlir_module_for_plain_program(&program, "main"), Err(LoweringError::UnsupportedOp {
             op: "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic windows are unsupported by XLA".to_string(),
@@ -26003,7 +25997,7 @@ mod tests {
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
         use crate::experimental::domains::XlaSession;
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use crate::{Array, CompiledXlaFunction, FromPjrt, compile};
+        use crate::{CompiledXlaFunction, FromPjrt, XlaArray, compile};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -26034,7 +26028,7 @@ mod tests {
 
         let values = [1.5f64, 2.5];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
                 .unwrap();
         let (output, lines) =
             with_captured_prints(|| engine.interpret(&compiled.executable_function(), source).unwrap());
@@ -26858,18 +26852,18 @@ mod tests {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }
 
-    static TEST_ARRAY_DOMAIN: EagerContext<CpuArray, ArrayOperation<CpuArray>> =
-        EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+    static TEST_ARRAY_DOMAIN: EagerContext<Array, ArrayOperation<Array>> =
+        EagerContext::<Array, ArrayOperation<Array>>::new();
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let (_, compiled): (
-            CpuArray,
-            ryft_core::programs::Program<CpuArray, ryft_core::ArrayOperation<CpuArray>, (CpuArray, CpuArray), CpuArray>,
+            Array,
+            ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, (Array, Array), Array>,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
             )
             .unwrap();
 
@@ -26892,8 +26886,8 @@ mod tests {
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let (_, compiled): (
-            CpuArray,
-            ryft_core::programs::Program<CpuArray, ryft_core::ArrayOperation<CpuArray>, CpuArray, CpuArray>,
+            Array,
+            ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, Array, Array>,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |x| {
@@ -26903,7 +26897,7 @@ mod tests {
                         .gradient(scalar_quartic_plus_sin)
                         .expect("scalar gradient should succeed"))
                 },
-                CpuArray::scalar(2.0).unwrap(),
+                Array::scalar(2.0).unwrap(),
             )
             .unwrap();
 
@@ -27439,15 +27433,10 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let first = DeviceArray::from_host_buffer(
-            &domain,
-            input_type.clone(),
-            mesh.clone(),
-            values_to_bytes(&[1_i64, 2, 3, 4]),
-        )
-        .unwrap();
-        let second =
-            DeviceArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
+        let first =
+            XlaArray::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1_i64, 2, 3, 4]))
+                .unwrap();
+        let second = XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
         let output = domain.interpret(&compiled.executable_function(), (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {
@@ -27658,12 +27647,8 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(
-                |x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()),
-                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                (),
-            )
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -27684,10 +27669,10 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
-                CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
+                Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -27709,13 +27694,13 @@ mod tests {
         // The pad pullback first edge-unpads the cotangent and then slices it with the non-unit interior stride for the
         // input. It constructs a Boolean padding-position mask for the padding-value cotangent so non-finite values at
         // input positions cannot contaminate its sum.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |(x, padding_value), ()| {
                     use ryft_core::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
-                (CpuArray::vector(vec![1.0, 2.0, 3.0]).unwrap(), CpuArray::scalar(9.0).unwrap()),
+                (Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Array::scalar(9.0).unwrap()),
                 (),
             )
             .unwrap();
@@ -27746,16 +27731,16 @@ mod tests {
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
         // integer constants through `lower_literal_value`.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |x, ()| {
                     let start = x
                         .context()
-                        .lift(CpuArray::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
+                        .lift(Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
                         .unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
-                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -27849,10 +27834,10 @@ mod tests {
         // backward pass as `stablehlo.multiply`s of the cotangent against those residual inputs rather than baking the
         // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
         // explicit arguments.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |inputs, ()| Ok(scalar_bilinear_sin(inputs)),
-                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
                 (),
             )
             .unwrap();
@@ -27888,8 +27873,8 @@ mod tests {
         // identity-looking transfer back to device memory, which `HostOffloader` needs to see. The program mirrors
         // the JAX example in `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom
         // calls are byte-identical to the ones JAX emits for it.
-        let (_, program) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::trace(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: ryft_core::tracing::DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true })?;
                 let back = on_host.transfer_to_memory(Memory::Device)?;
@@ -28503,13 +28488,13 @@ mod tests {
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
             let value =
-                CpuArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             let program =
-                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -28530,7 +28515,7 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_type = test_vector_type(4).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -28538,7 +28523,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -28554,7 +28539,7 @@ mod tests {
                 assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
             }
 
-            let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -28562,7 +28547,7 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
@@ -28580,14 +28565,14 @@ mod tests {
 
     #[test]
     fn test_rank_positive_literal_constant_preserves_signed_zero_elements() {
-        let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
-        let literal = CpuArray::from_elements(test_vector_type(2), &[-0.0_f32, 0.0]).unwrap();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let literal = Array::from_elements(test_vector_type(2), &[-0.0_f32, 0.0]).unwrap();
         let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
         let program = context
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -28597,13 +28582,13 @@ mod tests {
 
         // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
         // as a rank-zero constant plus broadcast.
-        let literal = CpuArray::from_elements(test_vector_type(1), &[2.5_f32]).unwrap();
-        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let literal = Array::from_elements(test_vector_type(1), &[2.5_f32]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let output = builder
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let program =
-            builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
@@ -28613,7 +28598,7 @@ mod tests {
     #[test]
     fn test_rank_positive_literal_dense_attributes_preserve_exact_payloads() {
         // Boolean values retain their logical order through MLIR's bit-packed dense representation.
-        let boolean = CpuArray::vector(vec![true, false, true]).unwrap();
+        let boolean = Array::vector(vec![true, false, true]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
@@ -28626,11 +28611,11 @@ mod tests {
         // One-bit integers use the same packed MLIR representation as Boolean while retaining their Ryft data type.
         for (literal, expected) in [
             (
-                CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
+                Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
             (
-                CpuArray::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
+                Array::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
         ] {
@@ -28641,10 +28626,10 @@ mod tests {
 
         // Wider sub-byte integers occupy one MLIR raw-buffer byte per element and preserve only their declared bits.
         for (literal, expected) in [
-            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
         ] {
             assert_eq!(test_literal_dense_bytes(&literal, expected.len()), expected);
         }
@@ -28652,24 +28637,24 @@ mod tests {
         // Every byte-aligned integer family preserves signedness, magnitude, and source order without floating-point
         // conversion. The `u64` case deliberately exceeds f64's exact-integer range.
         let integer_cases = vec![
-            (CpuArray::vector(vec![-127_i8, 126]).unwrap(), values_to_bytes(&[-127_i8, 126])),
-            (CpuArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (Array::vector(vec![-127_i8, 126]).unwrap(), values_to_bytes(&[-127_i8, 126])),
+            (Array::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                CpuArray::vector(vec![-0x1234_567_i32, 0x2345_678]).unwrap(),
+                Array::vector(vec![-0x1234_567_i32, 0x2345_678]).unwrap(),
                 values_to_bytes(&[-0x1234_567_i32, 0x2345_678]),
             ),
             (
-                CpuArray::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]).unwrap(),
+                Array::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]).unwrap(),
                 values_to_bytes(&[-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]),
             ),
-            (CpuArray::vector(vec![0x12_u8, 0xfe]).unwrap(), values_to_bytes(&[0x12_u8, 0xfe])),
-            (CpuArray::vector(vec![0x1234_u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234_u16, 0xfedc])),
+            (Array::vector(vec![0x12_u8, 0xfe]).unwrap(), values_to_bytes(&[0x12_u8, 0xfe])),
+            (Array::vector(vec![0x1234_u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234_u16, 0xfedc])),
             (
-                CpuArray::vector(vec![0x1234_5678_u32, 0xfedc_ba98]).unwrap(),
+                Array::vector(vec![0x1234_5678_u32, 0xfedc_ba98]).unwrap(),
                 values_to_bytes(&[0x1234_5678_u32, 0xfedc_ba98]),
             ),
             (
-                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                Array::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
         ];
@@ -28696,13 +28681,13 @@ mod tests {
             (DataType::F8E5M2FNUZ, [0x07, 0x80], "dense<[5.340580e-05, 0x80]>"),
             (DataType::F8E8M0FNU, [0x08, 0xff], "dense<[1.504630e-36, 0xFF]>"),
         ] {
-            let literal = CpuArray::from_logical_bytes(
+            let literal = Array::from_logical_bytes(
                 ArrayType::new(data_type, Shape::new(vec![Dimension::Static(bits.len())])),
                 &bits,
             )
             .unwrap();
             assert_eq!(test_literal_dense_bytes(&literal, bits.len()), bits, "low-precision literal type {data_type}");
-            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder
                 .add_instruction(
                     ArrayOperation::Constant(ConstantOperation::new(literal)),
@@ -28712,7 +28697,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let program =
-                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert!(stablehlo.contains(rendered_values), "low-precision literal {data_type}: {stablehlo}");
         }
@@ -28724,10 +28709,10 @@ mod tests {
         let f64_values =
             [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY, f64::from_bits(0x7ff8_0000_0000_1234)];
         for (literal, expected) in [
-            (CpuArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (CpuArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (CpuArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (CpuArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
         ] {
             assert_eq!(
                 test_literal_dense_bytes(&literal, expected.len()),
@@ -28740,7 +28725,7 @@ mod tests {
         // Complex storage interleaves independently exact real and imaginary components in source order.
         let c64_components =
             [f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234), f32::INFINITY, f32::NEG_INFINITY];
-        let c64 = CpuArray::vector(vec![
+        let c64 = Array::vector(vec![
             ComplexNumber::new(c64_components[0], c64_components[1]),
             ComplexNumber::new(c64_components[2], c64_components[3]),
         ])
@@ -28752,7 +28737,7 @@ mod tests {
             f64::INFINITY,
             f64::NEG_INFINITY,
         ];
-        let c128 = CpuArray::vector(vec![
+        let c128 = Array::vector(vec![
             ComplexNumber::new(c128_components[0], c128_components[1]),
             ComplexNumber::new(c128_components[2], c128_components[3]),
         ])
@@ -28762,12 +28747,12 @@ mod tests {
         // Explicit physical layouts are traversed in logical row-major order before constructing the literal.
         let layout_type = ArrayType::new(DataType::I16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
             .with_layout(Some(ryft_core::arrays::StridedLayout::new(vec![2, 4]).into()));
-        let layout_literal = CpuArray::from_elements(layout_type, &[1_i16, 2, 3, 4]).unwrap();
+        let layout_literal = Array::from_elements(layout_type, &[1_i16, 2, 3, 4]).unwrap();
         assert_eq!(layout_literal.storage_bytes(), values_to_bytes(&[1_i16, 3, 2, 4]));
         assert_eq!(test_literal_dense_bytes(&layout_literal, 8), values_to_bytes(&[1_i16, 2, 3, 4]));
 
         // Empty tensors remain valid dense constants and carry no raw payload bytes.
-        let empty = CpuArray::vector(Vec::<i32>::new()).unwrap();
+        let empty = Array::vector(Vec::<i32>::new()).unwrap();
         let tensor_type = lower_tensor_type(empty.r#type().as_ref(), &context, location).unwrap();
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
@@ -28778,7 +28763,7 @@ mod tests {
             .unwrap();
         for data_type in [DataType::Zero, DataType::Token] {
             let literal =
-                CpuArray::from_logical_bytes(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), &[])
+                Array::from_logical_bytes(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)])), &[])
                     .unwrap();
             assert_eq!(
                 literal.to_dense_elements_attribute(tensor_type, &context),
@@ -28802,18 +28787,18 @@ mod tests {
         let c128_components =
             [1.5_f64, -2.0, f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_1234)];
         let cases = vec![
-            (CpuArray::vector(vec![true, false, true]).unwrap(), vec![1_u8, 0, 1]),
-            (CpuArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (Array::vector(vec![true, false, true]).unwrap(), vec![1_u8, 0, 1]),
+            (Array::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
+                Array::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
-            (CpuArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
-            (CpuArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
-            (CpuArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
-            (CpuArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
+            (Array::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (Array::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (Array::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (Array::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
             (
-                CpuArray::vector(vec![
+                Array::vector(vec![
                     ComplexNumber::new(c64_components[0], c64_components[1]),
                     ComplexNumber::new(c64_components[2], c64_components[3]),
                 ])
@@ -28821,23 +28806,23 @@ mod tests {
                 values_to_bytes(&c64_components),
             ),
             (
-                CpuArray::vector(vec![
+                Array::vector(vec![
                     ComplexNumber::new(c128_components[0], c128_components[1]),
                     ComplexNumber::new(c128_components[2], c128_components[3]),
                 ])
                 .unwrap(),
                 values_to_bytes(&c128_components),
             ),
-            (CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
-            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
-            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
-            (CpuArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
-            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
-            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
-            (CpuArray::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
+            (Array::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
+            (Array::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (Array::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (Array::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
+            (Array::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (Array::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (Array::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
         ];
 
-        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let outputs = cases
             .iter()
             .map(|(literal, _)| {
@@ -28852,7 +28837,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
+            .build::<Vec<Array>, Vec<Array>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         for literal in [
@@ -28923,11 +28908,11 @@ mod tests {
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
             let value =
-                CpuArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder.add_constant(value);
             let program =
-                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -28947,8 +28932,8 @@ mod tests {
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), CpuArray::scalar(2.0).unwrap(), ())
+        let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), Array::scalar(2.0).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -28961,13 +28946,8 @@ mod tests {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the traced value-and-gradient path that traces through vjp+pullback.
         let (_, compiled): (
-            (CpuArray, CpuArray),
-            ryft_core::programs::Program<
-                CpuArray,
-                ryft_core::ArrayOperation<CpuArray>,
-                (CpuArray, CpuArray),
-                (CpuArray, CpuArray),
-            >,
+            (Array, Array),
+            ryft_core::programs::Program<Array, ryft_core::ArrayOperation<Array>, (Array, Array), (Array, Array)>,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| {
@@ -28977,7 +28957,7 @@ mod tests {
                         .gradient(scalar_bilinear_sin)
                         .expect("scalar gradient should succeed"))
                 },
-                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
             )
             .unwrap();
 

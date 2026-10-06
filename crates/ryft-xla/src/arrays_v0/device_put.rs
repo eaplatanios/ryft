@@ -1,4 +1,4 @@
-use crate::{Array, FromPjrt, XlaDomain};
+use crate::{FromPjrt, XlaArray, XlaDomain};
 
 use ryft_core::{ArrayType, Dimension, Shape};
 
@@ -6,11 +6,11 @@ use super::*;
 
 /// Leaf types accepted by the higher-level [`device_put()`] API.
 ///
-/// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft`
-/// currently provides implementations for runtime [`Array`] leaves, primitive scalar host values,
+/// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`XlaArray`] leaf. `ryft`
+/// currently provides implementations for runtime [`XlaArray`] leaves, primitive scalar host values,
 /// and owned `ndarray::Array`s when the `ndarray` feature is enabled.
 pub trait DevicePutLeaf<'c>: Parameter {
-    /// Converts `self` into one runtime [`Array`] using the provided leafwise placement options.
+    /// Converts `self` into one runtime [`XlaArray`] using the provided leafwise placement options.
     ///
     /// # Parameters
     ///
@@ -27,7 +27,7 @@ pub trait DevicePutLeaf<'c>: Parameter {
         src: Option<DevicePutTarget>,
         donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<Array<'c>, ArrayError>;
+    ) -> Result<XlaArray<'c>, ArrayError>;
 }
 
 impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
@@ -38,7 +38,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _src: Option<DevicePutTarget>,
         _donate: bool,
         _may_alias: Option<bool>,
-    ) -> Result<Array<'c>, ArrayError> {
+    ) -> Result<XlaArray<'c>, ArrayError> {
         let client = engine.client();
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match device {
@@ -51,11 +51,11 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         };
         let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)?;
-        Array::from_host_buffer(engine, r#type, mesh, bytes.as_slice())
+        XlaArray::from_host_buffer(engine, r#type, mesh, bytes.as_slice())
     }
 }
 
-impl<'c> DevicePutLeaf<'c> for Array<'c> {
+impl<'c> DevicePutLeaf<'c> for XlaArray<'c> {
     fn device_put_leaf(
         self,
         engine: &XlaDomain<'c>,
@@ -63,7 +63,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
         src: Option<DevicePutTarget>,
         _donate: bool,
         may_alias: Option<bool>,
-    ) -> Result<Array<'c>, ArrayError> {
+    ) -> Result<XlaArray<'c>, ArrayError> {
         let current_mesh = self.mesh().clone();
         let current_sharding = self.sharding().clone();
         if let Some(src) = src {
@@ -98,7 +98,7 @@ impl<'c> DevicePutLeaf<'c> for Array<'c> {
 /// semantics over `x`.
 ///
 /// Host leaves are committed to the default local device when `options.device` is absent. Existing
-/// [`Array`] leaves preserve their current placement when `options.device` is absent.
+/// [`XlaArray`] leaves preserve their current placement when `options.device` is absent.
 pub fn device_put<
     'c,
     P: DevicePutLeaf<'c>,
@@ -111,9 +111,9 @@ pub fn device_put<
     engine: &XlaDomain<'c>,
     x: Input,
     options: DevicePutOptions<DeviceTarget, SourceTarget, Donate, MayAlias>,
-) -> Result<<Input as Parameterized<P>>::To<Array<'c>>, ArrayError>
+) -> Result<<Input as Parameterized<P>>::To<XlaArray<'c>>, ArrayError>
 where
-    <Input as Parameterized<P>>::Family: ParameterizedFamily<Array<'c>>
+    <Input as Parameterized<P>>::Family: ParameterizedFamily<XlaArray<'c>>
         + ParameterizedFamily<DevicePutTarget>
         + ParameterizedFamily<bool>
         + ParameterizedFamily<Option<bool>>,
@@ -182,5 +182,5 @@ where
             )?,
         );
     }
-    Input::To::<Array<'c>>::from_parameters(structure, output_parameters).map_err(Into::into)
+    Input::To::<XlaArray<'c>>::from_parameters(structure, output_parameters).map_err(Into::into)
 }

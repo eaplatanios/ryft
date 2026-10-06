@@ -29,7 +29,7 @@ use ryft_core::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
-use ryft_xla::{Array, FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
+use ryft_xla::{FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaSession, XlaValue};
 
 type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
@@ -108,7 +108,7 @@ struct Measurement<'c> {
     execution: Duration,
 
     /// Computed gradients.
-    gradients: Vec<Array<'c>>,
+    gradients: Vec<XlaArray<'c>>,
 }
 
 /// Returns the dot product dimensions of a matrix multiplication.
@@ -194,14 +194,14 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 }
 
 /// Returns an array of the provided shape that is replicated over `mesh` with deterministic small values.
-fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize]) -> Array<'c> {
+fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize]) -> XlaArray<'c> {
     let size = shape.iter().product::<usize>();
     let bytes = (0..size).flat_map(|index| ((index % 97) as f32 / 970.0).to_ne_bytes()).collect::<Vec<_>>();
-    Array::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
+    XlaArray::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
 }
 
 /// Returns the values of `array`.
-fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
+fn values(client: &Client<'_>, array: &XlaArray<'_>) -> Vec<f32> {
     let device = client.addressable_devices().unwrap()[0].id().unwrap();
     let bytes = array.device_shard(device).unwrap().buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
     bytes.chunks_exact(4).map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap())).collect()
@@ -296,7 +296,7 @@ fn measure<'c>(
     domain: &XlaDomain<'c>,
     staged: BenchmarkStagedFunction<'c>,
     trace: Duration,
-    inputs: (Array<'c>, Array<'c>, Array<'c>),
+    inputs: (XlaArray<'c>, XlaArray<'c>, XlaArray<'c>),
 ) -> Measurement<'c> {
     let start = Instant::now();
     let lowered = domain.lower(staged).unwrap();

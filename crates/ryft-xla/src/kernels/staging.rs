@@ -11,7 +11,7 @@ use ryft_core::kernels::{
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
     AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
     Context, CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -742,10 +742,10 @@ fn definition_from_body(
                     Ok(match atom {
                         Atom::Variable(r#type) => Atom::Variable(r#type.clone()),
                         Atom::Constant(XlaConstant::Dimension(value)) => {
-                            Atom::Constant(ArrayIrValue::<CpuArray>::Dimension(value.clone()))
+                            Atom::Constant(ArrayIrValue::<Array>::Dimension(value.clone()))
                         }
                         Atom::Constant(XlaConstant::Boolean(value)) => {
-                            Atom::Constant(ArrayIrValue::Array(CpuArray::scalar(*value)?))
+                            Atom::Constant(ArrayIrValue::Array(Array::scalar(*value)?))
                         }
                         Atom::Constant(XlaConstant::Captured(_)) => {
                             return Err(ProgramError::MalformedProgram(
@@ -1360,7 +1360,7 @@ pub(crate) mod tests {
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
                 crate::XlaValue::Array(
-                    crate::Array::from_host_buffer(&domain, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
+                    crate::XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1416,7 +1416,7 @@ pub(crate) mod tests {
         };
 
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut mapping = ProgramBuilder::<ArrayIrValue<CpuArray>, ArrayIrOperation<CpuArray>>::new();
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         mapping.add_input(DimensionType::new("prefetched", DimensionBounds::non_negative(Some(4)).unwrap()).into());
         let parameter = KernelParameter::new(
             scalar.clone(),
@@ -1503,9 +1503,9 @@ pub(crate) mod tests {
     #[test]
     fn test_stage_body_materializes_array_literals() {
         let operation = crate::kernels::tests::definition().operation().clone();
-        let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<CpuArray>, KernelOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = builder.add_input(operation.body_input_types()[0].clone());
-        let literal = builder.add_constant(ArrayIrValue::Array(CpuArray::scalar(42_i32).unwrap()));
+        let literal = builder.add_constant(ArrayIrValue::Array(Array::scalar(42_i32).unwrap()));
         builder
             .add_instruction(
                 ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
@@ -1521,7 +1521,7 @@ pub(crate) mod tests {
         assert!(matches!(
             staged.instructions()[0].operation(),
             XlaOperation::Array(ryft_core::ArrayOperation::Constant(value))
-                if value.value() == &CpuArray::scalar(42_i32).unwrap(),
+                if value.value() == &Array::scalar(42_i32).unwrap(),
         ));
         assert_eq!(staged.instructions()[0].outputs(), &[literal]);
         let restored = definition_from_body(definition.operation(), staged.entry_region_ref()).unwrap();
@@ -1534,8 +1534,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            portable.interpret(vec![CpuArray::scalar(0_i32).unwrap()], 1).unwrap(),
-            vec![CpuArray::scalar(42_i32).unwrap()]
+            portable.interpret(vec![Array::scalar(0_i32).unwrap()], 1).unwrap(),
+            vec![Array::scalar(42_i32).unwrap()]
         );
     }
 
@@ -1805,11 +1805,11 @@ pub(crate) mod tests {
 
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut body = ProgramBuilder::<ArrayIrValue<CpuArray>, KernelOperation>::new();
+        let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
         let inputs =
             definition.body().input_types().into_iter().map(|r#type| body.add_input(r#type)).collect::<Vec<_>>();
         body.splice_program(definition.body(), &inputs).unwrap();
-        let predicate = body.add_constant(ArrayIrValue::Array(CpuArray::scalar(false).unwrap()));
+        let predicate = body.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
         body.add_instruction(
             KernelOperation::from(ArrayIrOperation::Assert(AssertOperation::new("check"))),
             vec![],
@@ -2284,7 +2284,7 @@ pub(crate) mod tests {
         let mut predicate = XlaProgramBuilder::new();
         predicate.add_input(scalar.clone());
         let result = predicate
-            .add_instruction(ConstantOperation::new(CpuArray::scalar(true).unwrap()), vec![], vec![], None)
+            .add_instruction(ConstantOperation::new(Array::scalar(true).unwrap()), vec![], vec![], None)
             .unwrap()[0];
         let predicate = predicate
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder], vec![Placeholder])
@@ -2307,7 +2307,7 @@ pub(crate) mod tests {
             let body_region = builder.import_region(body.entry_region_ref());
             let (regions, inputs) = if operation.name() == "condition" {
                 let choice = builder
-                    .add_instruction(ConstantOperation::new(CpuArray::scalar(true).unwrap()), vec![], vec![], None)
+                    .add_instruction(ConstantOperation::new(Array::scalar(true).unwrap()), vec![], vec![], None)
                     .unwrap()[0];
                 (vec![body_region, body_region], vec![choice, input])
             } else {
@@ -2545,7 +2545,7 @@ pub(crate) mod tests {
                 if index == 0 {
                     instructions.push(Instruction::new(
                         XlaOperation::Kernel(XlaKernelOperation::new(KernelOperation::Portable(
-                            ryft_core::ArrayOperation::<CpuArray>::CustomCall(
+                            ryft_core::ArrayOperation::<Array>::CustomCall(
                                 CustomCallOperation::new("test.external", vec![])
                                     .with_effect_class(EffectClass::OrderedIo),
                             )

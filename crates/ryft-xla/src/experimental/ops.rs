@@ -13,12 +13,12 @@ use ryft_core::operations::collectives::{
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as ReferenceArray, ArrayBatch,
-    ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
-    ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation, BatchAxis,
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, ClampOperation,
-    CompareOperation, CompiledCallOperation, ComplexOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayBatch, ArrayBatchingPolicy,
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform,
+    ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
+    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
+    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, ClampOperation, CompareOperation,
+    CompiledCallOperation, ComplexOperation, ConcatenateOperation, Concretizable, ConditionOperation,
     ConjugateOperation, ConstantOperation, ConstrainShardingOperation, Context, ConvertElementTypeOperation,
     CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeOperation, CustomFunctionOperation,
     CustomFunctionTransposeOperation, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
@@ -147,10 +147,10 @@ impl Concretizable<bool> for XlaArrayConstant {
 }
 
 impl AssertionValue for XlaArrayConstant {
-    fn assertion_array(&self) -> Result<Option<ReferenceArray>, ProgramError> {
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_array(),
-            Self::Boolean(value) => Ok(Some(ReferenceArray::scalar(*value)?)),
+            Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
         }
     }
 
@@ -369,10 +369,10 @@ impl Concretizable<bool> for XlaConstant {
 }
 
 impl AssertionValue for XlaConstant {
-    fn assertion_array(&self) -> Result<Option<ReferenceArray>, ProgramError> {
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
         match self {
             Self::Dimension(_) => Ok(None),
-            Self::Boolean(value) => Ok(Some(ReferenceArray::scalar(*value)?)),
+            Self::Boolean(value) => Ok(Some(Array::scalar(*value)?)),
             Self::Captured(_) => Err(ProgramError::Concretization {
                 message: "cannot read an assertion array from a captured constant reference".to_owned(),
             }),
@@ -813,7 +813,7 @@ macro_rules! impl_array_operation_conversion {
 impl_array_operation_conversion!(
     ZeroLikeOperation<ArrayType>,
     OneLikeOperation<ArrayType>,
-    ConstantOperation<ReferenceArray>,
+    ConstantOperation<Array>,
     AbsOperation<ArrayType>,
     NegOperation<ArrayType>,
     SubOperation<ArrayType>,
@@ -1770,7 +1770,7 @@ mod tests {
         WhileOperation, ZeroOperation,
     };
 
-    use crate::Array;
+    use crate::XlaArray;
     use crate::experimental::domains::{XlaDomain, XlaTracer};
     use crate::experimental::shard_map::ShardMapTracer;
 
@@ -1887,7 +1887,7 @@ mod tests {
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
         fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
 
-        requires_array_operations::<Array<'static>>();
+        requires_array_operations::<XlaArray<'static>>();
         requires_array_operations::<ShardMapTracer>();
         requires_array_operations::<crate::XlaValue<'static>>();
         requires_array_ir_operations::<crate::XlaValue<'static>>();

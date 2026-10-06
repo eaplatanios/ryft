@@ -7,11 +7,11 @@ use crate::arrays_v0::execution::ExecuteArguments;
 use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::arrays_v0::placement::DevicePutTarget;
 use crate::arrays_v0::transfers::copy_addressable_destination_shards_from_exact_source_shards;
-use crate::{Array, ToMlir, XlaDomain};
+use crate::{ToMlir, XlaArray, XlaDomain};
 
-impl<'o> Array<'o> {
+impl<'o> XlaArray<'o> {
     /// Moves or copies this array to the provided placement, **without** donating the source
-    /// buffers. The original [`Array`] remains fully usable after the call returns. `ryft`'s
+    /// buffers. The original [`XlaArray`] remains fully usable after the call returns. `ryft`'s
     /// analogue of JAX's `jax.device_put(arr, sharding, donate=False)`.
     ///
     /// `target` is resolved to a concrete [`DeviceMesh`] and [`Sharding`] via
@@ -27,7 +27,7 @@ impl<'o> Array<'o> {
     ///    `cache`, and execute.
     /// 3. **Host fallback** — materialize the global array on host via per-shard `copy_to_host`,
     ///    merge shard bytes into a row-major buffer, and re-upload via
-    ///    [`Array::from_host_buffer`]. Used only when the compiled path declines (Manual mesh
+    ///    [`XlaArray::from_host_buffer`]. Used only when the compiled path declines (Manual mesh
     ///    axes, etc.) and both endpoints are fully addressable from this process. JAX's
     ///    host-roundtrip path has the same restriction.
     ///
@@ -160,7 +160,7 @@ impl<'o> Array<'o> {
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
 
-    /// Same as [`Array::into_execute_arguments`] but with explicit per-input donation requests.
+    /// Same as [`XlaArray::into_execute_arguments`] but with explicit per-input donation requests.
     ///
     /// A requested donation is effective only when the consumed logical array uniquely owns every shard buffer.
     /// Donation is disabled for the whole input when any shard is shared by an ordinary clone or a retained bounded

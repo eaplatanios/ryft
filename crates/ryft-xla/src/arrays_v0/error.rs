@@ -2,7 +2,7 @@ use super::*;
 
 use ryft_core::{DataTypeError, ParameterError};
 
-/// Error type for [`Array`](crate::Array) construction and execution-input preparation.
+/// Error type for [`XlaArray`](crate::XlaArray) construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum ArrayError {
     /// Underlying crate-level error.
@@ -46,7 +46,7 @@ pub enum ArrayError {
     )]
     CrossHostTransferKeyTooLarge { source_shard_index: ShardIndex, destination_shard_index: ShardIndex },
 
-    /// Error returned when [`Array::to_placement`](crate::Array::to_placement) needs a source shard that is not
+    /// Error returned when [`XlaArray::to_placement`](crate::XlaArray::to_placement) needs a source shard that is not
     /// addressable locally.
     #[error(
         "array move requires shard #{shard_index} on device {device_id} to be addressable from the current process"

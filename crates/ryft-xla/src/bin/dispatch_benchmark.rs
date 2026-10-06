@@ -20,7 +20,7 @@ use ryft_core::{
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
-use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDimension, XlaSession, XlaValue, jitted};
+use ryft_xla::{FromPjrt, JittedXlaFunction, XlaArray, XlaCompileTracer, XlaDimension, XlaSession, XlaValue, jitted};
 use serde_json::json;
 
 /// Command-line arguments of this benchmark.
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?;
     let bytes = (0..8).flat_map(|index| (index as f32).to_ne_bytes()).collect::<Vec<_>>();
-    let input = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), bytes.as_slice())?;
+    let input = XlaArray::from_host_buffer(&domain, input_type.clone(), mesh.clone(), bytes.as_slice())?;
     input.block_until_ready()?;
 
     let mut results = HashMap::new();
@@ -171,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
     };
     let predicate_type = ArrayType::scalar(DataType::Boolean).replicated(&mesh)?;
-    let predicate = Array::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
+    let predicate = XlaArray::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
     let condition_inputs = [XlaValue::Array(predicate), XlaValue::Array(input.clone())];
     if arguments.selects("eager_condition") {
         results.insert(

@@ -3,16 +3,16 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use ryft_core::ArrayType;
 
-use crate::Array;
+use crate::XlaArray;
 
-/// Maximum number of ready bound-shaped materializations retained by one logical [`Array`].
+/// Maximum number of ready bound-shaped materializations retained by one logical [`XlaArray`].
 ///
 /// Each retained entry pins device buffers of the *bound* shape, so the worst-case device memory retained per logical
 /// array is this many bound-shaped copies on top of the array's own storage. The capacity trades that retention
 /// against re-padding cost when one array flows into executables compiled for several different bounds.
 const BOUNDED_MATERIALIZATION_CACHE_CAPACITY: usize = 4;
 
-/// Maximum logical extent scalars retained by one logical [`Array`].
+/// Maximum logical extent scalars retained by one logical [`XlaArray`].
 pub(crate) const LOGICAL_EXTENT_SCALAR_CACHE_CAPACITY: usize = 16;
 
 /// Version of the physical padding convention encoded by [`BoundedMaterializationKey`].
@@ -45,7 +45,7 @@ struct BoundedMaterializationEntry<'o> {
     key: BoundedMaterializationKey,
 
     /// Ready bound-shaped array owning its device buffers.
-    array: Array<'o>,
+    array: XlaArray<'o>,
 }
 
 /// One generation of single-flight production for a structural materialization key.
@@ -57,7 +57,7 @@ struct BoundedMaterializationFlight<'o> {
     waiter_count: usize,
 
     /// Completed result pinned until every registered waiter has consumed or abandoned it.
-    result: Option<Array<'o>>,
+    result: Option<XlaArray<'o>>,
 }
 
 /// Mutable state protected by [`BoundedMaterializationCache::state`].
@@ -75,7 +75,7 @@ struct BoundedMaterializationCacheState<'o> {
 
 /// Value-local cache of lazily produced bound-shaped device arrays.
 ///
-/// The cache is shared by every clone of a logical [`Array`]. Ready entries are capped at
+/// The cache is shared by every clone of a logical [`XlaArray`]. Ready entries are capped at
 /// [`BOUNDED_MATERIALIZATION_CACHE_CAPACITY`] and evicted in least-recently-used order. An in-flight key elects exactly
 /// one producer; waiters sleep without spinning. Completed flight results remain pinned outside the capacity-bounded
 /// ready LRU until every waiter registered for that generation consumes or abandons the result. Producer failure
@@ -138,7 +138,7 @@ impl<'o> BoundedMaterializationCache<'o> {
     fn take_ready(
         state: &mut BoundedMaterializationCacheState<'o>,
         key: &BoundedMaterializationKey,
-    ) -> Option<Array<'o>> {
+    ) -> Option<XlaArray<'o>> {
         let index = state.ready.iter().position(|entry| &entry.key == key)?;
         let entry = state.ready.remove(index).unwrap();
         let array = entry.array.clone();
@@ -161,7 +161,7 @@ impl<'o> BoundedMaterializationCache<'o> {
     fn insert_ready(
         state: &mut BoundedMaterializationCacheState<'o>,
         key: BoundedMaterializationKey,
-        array: Array<'o>,
+        array: XlaArray<'o>,
     ) {
         if let Some(index) = state.ready.iter().position(|entry| entry.key == key) {
             state.ready.remove(index);
@@ -176,7 +176,7 @@ impl<'o> BoundedMaterializationCache<'o> {
 /// Result of a non-blocking lookup in a [`BoundedMaterializationCache`].
 pub(crate) enum BoundedMaterializationProbe<'o> {
     /// A ready bound-shaped array was found.
-    Hit(Array<'o>),
+    Hit(XlaArray<'o>),
 
     /// This caller owns the missing key's single-flight reservation.
     Produce(BoundedMaterializationProducer<'o>),
@@ -205,7 +205,7 @@ impl<'o> BoundedMaterializationProducer<'o> {
     ///
     /// The caller must establish that every asynchronous operation producing `array` completed successfully before
     /// calling this method. Registered waiters pin this flight result independently of ordinary LRU eviction.
-    pub(crate) fn complete(mut self, array: Array<'o>) -> Array<'o> {
+    pub(crate) fn complete(mut self, array: XlaArray<'o>) -> XlaArray<'o> {
         let returned = array.clone();
         let mut state = self.cache.state.lock().expect("bounded materialization cache mutex poisoned");
         let flight = state
@@ -260,7 +260,7 @@ pub(crate) struct BoundedMaterializationWaiter<'o> {
 
 impl<'o> BoundedMaterializationWaiter<'o> {
     /// Waits for a ready entry, or becomes the retry producer after the previous producer fails.
-    pub(crate) fn resolve(mut self) -> Result<Array<'o>, BoundedMaterializationProducer<'o>> {
+    pub(crate) fn resolve(mut self) -> Result<XlaArray<'o>, BoundedMaterializationProducer<'o>> {
         let mut state = self.cache.state.lock().expect("bounded materialization cache mutex poisoned");
         loop {
             let registered_generation = self.generation.unwrap();

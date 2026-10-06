@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 use crate::experimental::XlaDomainError;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::aot::{KernelAotError, LoadedKernel};
-use crate::{Array, DistributedRuntime, FromPjrt};
+use crate::{DistributedRuntime, FromPjrt, XlaArray};
 
 /// Failure in host-coordinated kernel execution. Submitted device work is drained before returning an error.
 #[derive(Debug, thiserror::Error)]
@@ -361,10 +361,10 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     /// and reports abandonment; dropping only the returned handle does not cancel work retained by the coordinator.
     pub fn call_async(
         &mut self,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<XlaArray<'c>>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<ReferenceExecution<Vec<Array<'c>>, DistributedKernelError>, DistributedKernelError> {
+    ) -> Result<ReferenceExecution<Vec<XlaArray<'c>>, DistributedKernelError>, DistributedKernelError> {
         if let Some(previous) = self.previous.take() {
             previous.r#await().map_err(|message| DistributedKernelError::Completion { message })?;
         }
@@ -401,10 +401,10 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     /// Waits for the existing pending call surface and returns only globally ready functional outputs.
     pub fn call(
         &mut self,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<XlaArray<'c>>,
         sources: &[usize],
         cancelled: Arc<AtomicBool>,
-    ) -> Result<Vec<Array<'c>>, DistributedKernelError> {
+    ) -> Result<Vec<XlaArray<'c>>, DistributedKernelError> {
         self.call_async(inputs, sources, cancelled)?.r#await()
     }
 
@@ -412,11 +412,11 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     fn run(
         &self,
         round: u64,
-        inputs: Vec<Array<'c>>,
+        inputs: Vec<XlaArray<'c>>,
         sources: &[usize],
         cancelled: &AtomicBool,
         deadline: Instant,
-    ) -> Result<Execution<Vec<Array<'c>>>, DistributedKernelError> {
+    ) -> Result<Execution<Vec<XlaArray<'c>>>, DistributedKernelError> {
         self.coordination.check(cancelled, deadline)?;
         let (domain, types, mesh, identity, execution) = self.kernel.distributed_parts();
         if inputs.len() != types.len()
@@ -534,7 +534,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
             let value =
-                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes).map_err(XlaDomainError::from)?;
+                XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes).map_err(XlaDomainError::from)?;
             value.block_until_ready().map_err(XlaDomainError::from)?;
             arguments.push(value);
         }
@@ -740,7 +740,7 @@ mod tests {
     }
 
     /// Downloads one completed scalar result for independent host assertions.
-    fn scalar(array: &Array<'_>) -> i32 {
+    fn scalar(array: &XlaArray<'_>) -> i32 {
         array.block_until_ready().unwrap();
         let bytes = array
             .addressable_shards()
@@ -881,7 +881,7 @@ mod tests {
         let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
         let mut coordinator = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &domain,
             ryft_core::ArrayType::scalar(ryft_core::DataType::I32),
             mesh.clone(),

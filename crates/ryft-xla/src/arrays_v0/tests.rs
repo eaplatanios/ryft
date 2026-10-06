@@ -10,7 +10,7 @@ use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precis
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
-use crate::{Array, Error, FromPjrt, ToMlir, XlaSession};
+use crate::{Error, FromPjrt, ToMlir, XlaArray, XlaSession};
 
 use super::*;
 
@@ -54,7 +54,7 @@ fn test_array_new_requires_sharding_without_single_buffer() {
     let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
     assert!(matches!(
-        Array::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
+        XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
         Err(Error::MissingSharding),
     ));
 }
@@ -81,7 +81,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
         .buffer(values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(), BufferType::F32, [2u64], None, device, None)
         .unwrap();
 
-    let array = Array::from_addressable_buffers(&domain, array_type, mesh, vec![buffer]).unwrap();
+    let array = XlaArray::from_addressable_buffers(&domain, array_type, mesh, vec![buffer]).unwrap();
 
     assert_eq!(array.shape(), StaticShape::new(vec![2]));
     assert_eq!(array.data_type(), DataType::F32);
@@ -109,7 +109,7 @@ fn test_array_new_rejects_dynamic_shape() {
         .unwrap();
 
     assert!(matches!(
-        Array::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
+        XlaArray::from_addressable_buffers(&domain, array_type, mesh, Vec::new()),
         Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
     ));
 }
@@ -133,7 +133,7 @@ fn test_device_put_visualizes_uneven_1d_partitioning() {
         .unwrap();
 
     let array =
-        Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
+        XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
             .unwrap();
 
     assert_eq!(array.addressable_shards().count(), 2);
@@ -171,7 +171,7 @@ fn test_device_put_visualizes_2d_partitioning() {
         .unwrap();
 
     let array =
-        Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
+        XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes::<f32>(values.as_slice()).as_slice())
             .unwrap();
 
     assert_eq!(array.addressable_shards().count(), 4);
@@ -273,7 +273,7 @@ fn test_array_put_reshards_fully_addressable_array() {
     let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
         .with_sharding(source_sharding)
         .unwrap();
-    let source_array = Array::from_host_buffer(
+    let source_array = XlaArray::from_host_buffer(
         &engine,
         source_type,
         source_mesh,
@@ -355,7 +355,8 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        XlaArray::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer])
+            .unwrap();
 
     let copied_array = source_array
         .to_placement(&engine, crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding })
@@ -403,7 +404,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&domain, source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
+        XlaArray::from_addressable_buffers(&domain, source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(remote_device_id, 1), Device::new(local_device_id, client.process_index().unwrap())],
@@ -448,7 +449,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
         .with_sharding(source_sharding)
         .unwrap();
-    let source_array = Array::from_addressable_buffers(&engine, source_array_type, source_mesh, Vec::new()).unwrap();
+    let source_array = XlaArray::from_addressable_buffers(&engine, source_array_type, source_mesh, Vec::new()).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0)],
@@ -482,7 +483,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let first_source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
         .with_sharding(source_sharding.clone())
         .unwrap();
-    let first_source_array = Array::from_host_buffer(
+    let first_source_array = XlaArray::from_host_buffer(
         &engine,
         first_source_type,
         source_mesh.clone(),
@@ -492,7 +493,7 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let second_source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
         .with_sharding(source_sharding)
         .unwrap();
-    let second_source_array = Array::from_host_buffer(
+    let second_source_array = XlaArray::from_host_buffer(
         &engine,
         second_source_type,
         source_mesh,
@@ -589,7 +590,8 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        XlaArray::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer])
+            .unwrap();
 
     let copied_array = device_put(&engine, source_array, DevicePutOptions::defaults()).unwrap();
     let expected_visualization =
@@ -634,7 +636,8 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        XlaArray::from_addressable_buffers(&engine, source_array_type, mesh.clone(), vec![local_source_buffer])
+            .unwrap();
 
     let copied_array = source_array
         .into_placement(&engine, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharding.clone() })
@@ -676,7 +679,7 @@ fn test_device_put_rejects_mismatched_src_for_array_leaf() {
     let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
         .with_sharding(source_sharding.clone())
         .unwrap();
-    let source_array = Array::from_host_buffer(
+    let source_array = XlaArray::from_host_buffer(
         &engine,
         source_type,
         source_mesh.clone(),
@@ -779,8 +782,8 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let rhs_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]))
         .with_sharding(rhs_sharding)
         .unwrap();
-    let lhs_array = Array::from_addressable_buffers(&domain, lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
-    let rhs_array = Array::from_addressable_buffers(&domain, rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
+    let lhs_array = XlaArray::from_addressable_buffers(&domain, lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
+    let rhs_array = XlaArray::from_addressable_buffers(&domain, rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
 
     assert_eq!(lhs_array.data_type(), DataType::F32);
     assert_eq!(rhs_array.data_type(), DataType::F32);
@@ -834,7 +837,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
         .collect::<HashMap<_, _>>();
 
     let execute_arguments =
-        Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+        XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
     let outputs = executable
         .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
         .unwrap()
@@ -879,7 +882,7 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -923,7 +926,7 @@ fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
         .with_memory(Memory::Host { pinned: true })
         .with_sharding(source_sharding)
         .unwrap();
-    let source = Array::from_host_buffer(&engine, source_type, mesh.clone(), []).unwrap();
+    let source = XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), []).unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
     let resharded = source
@@ -952,7 +955,7 @@ fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
         .with_sharding(sharded_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let replicated_target = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -1009,7 +1012,7 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
         .with_sharding(sharded_along_x)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&row_values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&row_values).as_slice())
             .unwrap();
 
     let sharded_along_y = Sharding::new(
@@ -1063,7 +1066,8 @@ fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     // Reshard onto the full 4-device mesh, sharded along "x".
     let target_mesh = four_device_mesh_x(&client);
@@ -1108,7 +1112,7 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     // to_device consumes self and donates the source's input buffers to the compiled SPMD
@@ -1154,7 +1158,7 @@ fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
@@ -1206,7 +1210,7 @@ fn test_compilation_context_preserves_custom_base_options() {
 
     // Reshard once per domain with identical inputs. Each domain compiles its own executable.
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let source_for_default = Array::from_host_buffer(
+    let source_for_default = XlaArray::from_host_buffer(
         &default_engine,
         source_type.clone(),
         mesh.clone(),
@@ -1219,9 +1223,13 @@ fn test_compilation_context_preserves_custom_base_options() {
             crate::arrays_v0::DevicePutTarget::Placement { mesh: mesh.clone(), sharding: sharded_target.clone() },
         )
         .unwrap();
-    let source_for_custom =
-        Array::from_host_buffer(&custom_engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-            .unwrap();
+    let source_for_custom = XlaArray::from_host_buffer(
+        &custom_engine,
+        source_type,
+        mesh.clone(),
+        values_to_bytes::<f32>(&values).as_slice(),
+    )
+    .unwrap();
     let _ = source_for_custom
         .to_placement(&custom_engine, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: sharded_target })
         .unwrap();
@@ -1258,7 +1266,8 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     // Destination mesh contains a device on a remote process (process_index 1) that is not
     // addressable from the current client. The compiled cross-mesh path surfaces this as a typed
@@ -1312,7 +1321,7 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
     let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
         .with_sharding(replicated_sharding)
         .unwrap();
-    let source_array = Array::from_host_buffer(
+    let source_array = XlaArray::from_host_buffer(
         &engine,
         source_type,
         explicit_mesh.clone(),
@@ -1368,12 +1377,16 @@ fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())]))
         .with_sharding(replicated_sharding)
         .unwrap();
-    let source_array =
-        Array::from_host_buffer(&engine, source_type, manual_mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-            .unwrap();
+    let source_array = XlaArray::from_host_buffer(
+        &engine,
+        source_type,
+        manual_mesh.clone(),
+        values_to_bytes::<f32>(&values).as_slice(),
+    )
+    .unwrap();
 
     // Manual mesh axes cannot be planned by the SPMD partitioner — the compiled path declines.
-    // `Array::to` falls through to the host materialization fallback (full source is addressable,
+    // `XlaArray::to` falls through to the host materialization fallback (full source is addressable,
     // destination is on the same single process) and successfully reshapes the data to the
     // requested sharding.
     let sharded_target =
@@ -1432,7 +1445,8 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     // Destination: replicated on the full 4-device mesh. The sharded source first all-gathers on
     // src_mesh, broadcasts onto dst_mesh, and (since the intermediate sharding matches the
@@ -1480,7 +1494,8 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     // Destination: sharded along "x" on the full 4-device mesh. Each destination shard holds
     // exactly one element of the global array.
@@ -1527,7 +1542,8 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     let target_mesh = four_device_mesh_x(&client);
     let target_sharding =
@@ -1566,7 +1582,8 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
         .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice()).unwrap();
+        XlaArray::from_host_buffer(&engine, source_type, source_mesh, values_to_bytes::<f32>(&values).as_slice())
+            .unwrap();
 
     // Target: replicated on the full 4-device mesh. The fast path matches every destination shard
     // to the source's single full-array shard. With the bitcast branch removed, copy_to_device
@@ -1612,7 +1629,7 @@ fn test_compiled_reshard_caches_executable_across_calls() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
 
     let sharded_target = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1664,8 +1681,13 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let make_source = || {
-        Array::from_host_buffer(&engine, source_type.clone(), mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-            .unwrap()
+        XlaArray::from_host_buffer(
+            &engine,
+            source_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap()
     };
     let sharded_along_x = Sharding::new(
         mesh.logical_mesh().clone(),
@@ -1725,7 +1747,7 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
 
     // First context: cold compile, disk cache picks up the serialized executable.
     let engine_one = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
-    let source = Array::from_host_buffer(
+    let source = XlaArray::from_host_buffer(
         &engine_one,
         source_type.clone(),
         mesh.clone(),
@@ -1746,7 +1768,7 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let engine_two = XlaSession::with_disk_cache(&client, cache_dir.path()).unwrap().domain();
     assert_eq!(engine_two.cache_size(), 0, "fresh context starts empty in-memory");
     let source_two =
-        Array::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine_two, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let _ = source_two
         .to_placement(&engine_two, crate::arrays_v0::DevicePutTarget::Placement { mesh, sharding: target_sharding })
@@ -1773,7 +1795,7 @@ fn test_compilation_context_clear_cache() {
         .with_sharding(replicated_sharding)
         .unwrap();
     let source_array =
-        Array::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+        XlaArray::from_host_buffer(&engine, source_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
             .unwrap();
     let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 

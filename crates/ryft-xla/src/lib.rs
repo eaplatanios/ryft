@@ -14,7 +14,7 @@ pub mod telemetry;
 pub mod types;
 pub mod values;
 
-pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
+pub use arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArrayShard, block_until_ready, ready};
 pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;

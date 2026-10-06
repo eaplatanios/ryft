@@ -19,30 +19,29 @@ use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
 
 // TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
 
-/// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information.
-/// An [`Array`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
-/// devices in a [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by
-/// its type and sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
-/// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`] for each device that participates in the
+/// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information. An
+/// [`XlaArray`] represents one logical [`ArrayType`] whose elements may be split or replicated across the multiple
+/// devices in a [`DeviceMesh`], potentially spanning multiple nodes or processes. The global array is described by its
+/// type and sharding metadata, while each physical piece of that global array is represented by an [`XlaArrayShard`].
+/// [`XlaArray::shards`] is a global list: it contains one [`ShardDescriptor`] for each device that participates in the
 /// array placement, and not only for the devices that are visible to the current process. In a single-process setup,
-/// every shard is normally _addressable_ because the local [`Client`] can directly access its storage.
-/// In a multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards
-/// on the current process's devices are addressable and ordinarily carry local [`Buffer`]s; bufferless
-/// [`DataType::Zero`] shards are also addressable because their unique value requires no storage. Shards on remote
-/// devices are non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and
-/// [`ArrayType`].
-/// Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason about the complete
-/// global placement while only transferring, executing with, or materializing buffers that this process can access
-/// directly. This distinction is what allows array movement, execution argument assembly, and cross-host transfers to
-/// preserve the full global sharding contract without requiring every process to own every shard buffer.
+/// every shard is normally _addressable_ because the local [`Client`] can directly access its storage. In a
+/// multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards on the
+/// current process's devices are addressable and ordinarily carry local [`Buffer`]s; bufferless [`DataType::Zero`]
+/// shards are also addressable because their unique value requires no storage. Shards on remote devices are
+/// non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and [`ArrayType`].
+/// Keeping both addressable and non-addressable shards in the same [`XlaArray`] lets local code reason about the
+/// complete global placement while only transferring, executing with, or materializing buffers that this process can
+/// access directly. This distinction is what allows array movement, execution argument assembly, and cross-host
+/// transfers to preserve the full global sharding contract without requiring every process to own every shard buffer.
 ///
 /// The current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays retain
 /// their logical `I1` or `U1` type while using one byte per element in this physical representation. This executable
 /// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
 #[derive(Parameter)]
-pub struct Array<'o> {
-    /// Type, shards, and value-local caches of this [`Array`]. They are immutable once constructed and shared by every
-    /// clone, so cloning an array costs a few reference-count increments rather than a deep copy.
+pub struct XlaArray<'o> {
+    /// Type, shards, and value-local caches of this [`XlaArray`]. They are immutable once constructed and shared by
+    /// every clone, so cloning an array costs a few reference-count increments rather than a deep copy.
     parts: Arc<ArrayParts<'o>>,
 
     /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
@@ -57,13 +56,13 @@ pub struct Array<'o> {
     domain: XlaDomain<'o>,
 }
 
-/// Immutable storage of an [`Array`] that its clones share.
+/// Immutable storage of an [`XlaArray`] that its clones share.
 struct ArrayParts<'o> {
-    /// [`ArrayType`] of the [`Array`], shared with the other outputs of the same compiled program output.
+    /// [`ArrayType`] of the [`XlaArray`], shared with the other outputs of the same compiled program output.
     r#type: Arc<ArrayType>,
 
-    /// [`ArrayShard`]s that make up the [`Array`].
-    shards: Vec<ArrayShard<'o>>,
+    /// [`XlaArrayShard`]s that make up the [`XlaArray`].
+    shards: Vec<XlaArrayShard<'o>>,
 
     /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
     /// It is shared because it depends only on the placement, so arrays produced by one compiled program share it.
@@ -76,14 +75,14 @@ struct ArrayParts<'o> {
     bounded_materializations: OnceLock<Arc<BoundedMaterializationCache<'o>>>,
 
     /// Value-local LRU of device-resident scalar arguments for bounded logical extents.
-    logical_extent_scalars: Mutex<VecDeque<(i32, Array<'o>)>>,
+    logical_extent_scalars: Mutex<VecDeque<(i32, XlaArray<'o>)>>,
 }
 
 impl<'o> ArrayParts<'o> {
     /// Creates new [`ArrayParts`] with empty value-local caches.
     fn new(
         r#type: Arc<ArrayType>,
-        shards: Vec<ArrayShard<'o>>,
+        shards: Vec<XlaArrayShard<'o>>,
         shard_index_by_device: Arc<HashMap<DeviceId, ShardIndex>>,
         mesh: Arc<DeviceMesh>,
     ) -> Self {
@@ -98,13 +97,13 @@ impl<'o> ArrayParts<'o> {
     }
 }
 
-// `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
+// `XlaArray` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
 // have the same type and every materialized shard references the same underlying `Buffer` (by `Arc` pointer identity),
 // while bufferless zero-space shards compare equal because their type admits exactly one value. Arrays holding equal
 // ordinary data in distinct buffers deliberately compare unequal, which is the conservative answer that analyses
 // comparing flowing values need (mirroring `Tracer`'s staging-identity `PartialEq`). Element-wise equality would
 // require device-to-host transfers and is deliberately not what this implements.
-impl PartialEq for Array<'_> {
+impl PartialEq for XlaArray<'_> {
     fn eq(&self, other: &Self) -> bool {
         let (left, right) = (&self.parts, &other.parts);
         Arc::ptr_eq(left, right)
@@ -115,7 +114,7 @@ impl PartialEq for Array<'_> {
 }
 
 // TODO(eaplatanios): Review this.
-impl<'o> Clone for Array<'o> {
+impl<'o> Clone for XlaArray<'o> {
     fn clone(&self) -> Self {
         crate::telemetry::array_constructed();
         Self {
@@ -127,19 +126,20 @@ impl<'o> Clone for Array<'o> {
 }
 
 // TODO(eaplatanios): Review this.
-impl<'o> Drop for Array<'o> {
+impl<'o> Drop for XlaArray<'o> {
     fn drop(&mut self) {
         crate::telemetry::array_dropped();
     }
 }
 
-impl<'o> Array<'o> {
-    /// Creates an [`Array`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
-    /// [`DeviceMesh`] to determine what [`ArrayShard`]s make up the array and which ones correspond to the addressable
-    /// buffers. The provided [`ArrayType`] describes the global logical array. Its [`Shape`](ryft_core::arrays::Shape)
-    /// must be static, and it must normally contain [`Sharding`] metadata whose logical mesh matches `mesh`. As a
-    /// convenience for unsharded arrays, callers may omit the sharding information only when exactly one addressable
-    /// buffer is provided; in that case the array is treated as replicated over the provided `mesh`.
+impl<'o> XlaArray<'o> {
+    /// Creates an [`XlaArray`] of type `r#type` from the provided _addressable_ [`Buffer`]s using the provided concrete
+    /// [`DeviceMesh`] to determine what [`XlaArrayShard`]s make up the array and which ones correspond to the
+    /// addressable buffers. The provided [`ArrayType`] describes the global logical array. Its
+    /// [`Shape`](ryft_core::arrays::Shape) must be static, and it must normally contain [`Sharding`] metadata whose
+    /// logical mesh matches `mesh`. As a convenience for unsharded arrays, callers may omit the sharding information
+    /// only when exactly one addressable buffer is provided; in that case the array is treated as replicated over the
+    /// provided `mesh`.
     ///
     /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. This function will
     /// return an [`Error::MultipleBuffersOnDevice`] if there are multiple buffers provided that are owned by the same
@@ -149,19 +149,19 @@ impl<'o> Array<'o> {
     /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. A buffer whose physical
     /// memory differs from `r#type.memory()` produces [`Error::BufferMemoryMismatch`]. [`Memory::Device`] denotes the
     /// owning device's default memory; host placements require the corresponding pinned or unpinned memory kind.
-    /// Shards without a local/addressable buffer are retained as non-addressable [`ArrayShard`]s. For a logical
+    /// Shards without a local/addressable buffer are retained as non-addressable [`XlaArrayShard`]s. For a logical
     /// [`DataType::Zero`] array, every private predicate carrier must contain only false bits; a noncanonical buffer is
     /// rejected so that its physical payload cannot become observable through the logical zero-space value. Valid
     /// carriers are discarded after validation and the local shards become addressable bufferless zero-space shards.
     ///
     /// # Parameters
     ///
-    ///   - `domain`: [`XlaDomain`] the new [`Array`] belongs to. Its client must own every provided buffer, and it is
-    ///     what eager execution and free transforms recover through [`Value::execution_domain`]. Metadata-only arrays
-    ///     whose shards all live on other processes pass the local domain with no buffers.
-    ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
-    ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
-    ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
+    ///   - `domain`: [`XlaDomain`] the new [`XlaArray`] belongs to. Its client must own every provided buffer, and it
+    ///     is what eager execution and free transforms recover through [`Value::execution_domain`]. Metadata-only
+    ///     arrays whose shards all live on other processes pass the local domain with no buffers.
+    ///   - `r#type`: Global [`ArrayType`] for the new [`XlaArray`].
+    ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`XlaArrayShard`] placement.
+    ///   - `buffers`: [`Buffer`]s for the [`XlaArrayShard`]s that are addressable from the current process.
     pub fn from_addressable_buffers(
         domain: &XlaDomain<'o>,
         r#type: ArrayType,
@@ -171,10 +171,10 @@ impl<'o> Array<'o> {
         Self::from_addressable_buffers_internal(domain, r#type, mesh, buffers, true)
     }
 
-    /// Creates an [`Array`] from backend-produced buffers whose zero-space carriers are known to be canonical. This is
-    /// the trusted internal counterpart of [`Self::from_addressable_buffers`]; it avoids synchronizing device buffers
-    /// back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input boundaries,
-    /// and discards canonical zero-space carriers after extracting their placement metadata.
+    /// Creates an [`XlaArray`] from backend-produced buffers whose zero-space carriers are known to be canonical. This
+    /// is the trusted internal counterpart of [`Self::from_addressable_buffers`]; it avoids synchronizing device
+    /// buffers back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input
+    /// boundaries, and discards canonical zero-space carriers after extracting their placement metadata.
     pub(crate) fn from_canonical_addressable_buffers(
         domain: &XlaDomain<'o>,
         r#type: ArrayType,
@@ -234,9 +234,9 @@ impl<'o> Array<'o> {
             .map(|descriptor| {
                 let buffer = buffers_by_device.remove(&descriptor.device().id());
                 if zero_space && buffer.is_some() {
-                    ArrayShard::new_zero(descriptor)
+                    XlaArrayShard::new_zero(descriptor)
                 } else {
-                    ArrayShard::new(descriptor, buffer)
+                    XlaArrayShard::new(descriptor, buffer)
                 }
             })
             .collect::<Vec<_>>();
@@ -279,9 +279,9 @@ impl<'o> Array<'o> {
                     if !addressable_device_ids.contains(&descriptor.device().id()) {
                         return Err(Error::NonAddressableDevice { device_id: descriptor.device().id(), process_index });
                     }
-                    Ok(ArrayShard::new_zero(descriptor))
+                    Ok(XlaArrayShard::new_zero(descriptor))
                 } else {
-                    Ok(ArrayShard::new(descriptor, None))
+                    Ok(XlaArrayShard::new(descriptor, None))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -294,10 +294,10 @@ impl<'o> Array<'o> {
         })
     }
 
-    /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
+    /// Creates an [`XlaArray`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
     /// and `mesh`, while avoiding redundant allocations external to the PJRT backend of the domain's [`Client`].
     /// This function derives the per-device shard slices from the provided type/mesh pair, transfers only the shards
-    /// addressable by that client, and returns an [`Array`] that belongs to `domain` and whose global shard metadata
+    /// addressable by that client, and returns an [`XlaArray`] that belongs to `domain` and whose global shard metadata
     /// covers the full mesh.
     ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
@@ -477,7 +477,7 @@ impl<'o> Array<'o> {
         Ok(Self::from_canonical_addressable_buffers(domain, r#type, mesh, addressable_buffers)?)
     }
 
-    /// Creates an [`Array`] that belongs to `domain` from the per-device `buffers` that one execution of a compiled
+    /// Creates an [`XlaArray`] that belongs to `domain` from the per-device `buffers` that one execution of a compiled
     /// program returned for one of its outputs, placed according to that output's precomputed `layout`. The buffers
     /// must be ordered like the addressable devices that `layout` was created for, and `fence` is the whole-execution
     /// completion fence of the launch.
@@ -519,12 +519,12 @@ impl<'o> Array<'o> {
             .map(|(descriptor, position)| match position {
                 // Zero-space outputs need no storage: a returned carrier holds only false bits and is discarded like in
                 // the validating constructors, and a program may also return no carrier at all.
-                Some(_) if zero_space => ArrayShard::new_zero(descriptor.clone()),
+                Some(_) if zero_space => XlaArrayShard::new_zero(descriptor.clone()),
                 Some(position) => {
                     let buffer = buffers.get_mut(*position).and_then(Option::take).map(Arc::new);
-                    ArrayShard::new(descriptor.clone(), buffer)
+                    XlaArrayShard::new(descriptor.clone(), buffer)
                 }
-                None => ArrayShard::new(descriptor.clone(), None),
+                None => XlaArrayShard::new(descriptor.clone(), None),
             })
             .collect::<Vec<_>>();
         crate::telemetry::array_constructed();
@@ -540,8 +540,8 @@ impl<'o> Array<'o> {
         }
     }
 
-    /// Associates this [`Array`] with `domain` for future receiver-based dispatch, keeping its storage. This selects a
-    /// different effect scope or set of compilation options (or a different session) on the same PJRT client. It does
+    /// Associates this [`XlaArray`] with `domain` for future receiver-based dispatch, keeping its storage. This selects
+    /// a different effect scope or set of compilation options (or a different session) on the same PJRT client. It does
     /// not merge or retroactively order work that was previously submitted through the array's former scope.
     ///
     /// # Errors
@@ -568,7 +568,7 @@ impl<'o> Array<'o> {
         self
     }
 
-    /// Returns the PJRT [`Client`] that this [`Array`] lives on, which is the client of the session of its domain.
+    /// Returns the PJRT [`Client`] that this [`XlaArray`] lives on, which is the client of the session of its domain.
     ///
     /// Note that the client cannot be recovered from the addressable shard buffers themselves: [`Buffer`]s only store
     /// a raw handle to their owning PJRT client (by design, to avoid carrying the
@@ -581,19 +581,19 @@ impl<'o> Array<'o> {
         self.domain.client()
     }
 
-    /// Returns the [`XlaDomain`] this [`Array`] belongs to.
+    /// Returns the [`XlaDomain`] this [`XlaArray`] belongs to.
     #[inline]
     pub fn domain(&self) -> &XlaDomain<'o> {
         &self.domain
     }
 
-    /// Returns the [`DataType`] of the elements stored in this [`Array`].
+    /// Returns the [`DataType`] of the elements stored in this [`XlaArray`].
     #[inline]
     pub fn data_type(&self) -> DataType {
         self.parts.r#type.data_type()
     }
 
-    /// Returns the global [`StaticShape`] of this [`Array`].
+    /// Returns the global [`StaticShape`] of this [`XlaArray`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
         self.parts
@@ -602,13 +602,13 @@ impl<'o> Array<'o> {
             .expect("runtime arrays should only be constructed from array types with static shapes")
     }
 
-    /// Returns the physical memory/storage [`Layout`] of this [`Array`] if it is known.
+    /// Returns the physical memory/storage [`Layout`] of this [`XlaArray`] if it is known.
     #[inline]
     pub fn layout(&self) -> Option<&Layout> {
         self.parts.r#type.layout()
     }
 
-    /// Returns [`Sharding`] information about this [`Array`].
+    /// Returns [`Sharding`] information about this [`XlaArray`].
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         self.parts
@@ -617,40 +617,40 @@ impl<'o> Array<'o> {
             .expect("runtime arrays should only be constructed from array types with sharding")
     }
 
-    /// Returns the concrete [`DeviceMesh`] implied by this [`Array`]'s global shard placement metadata (i.e., the
+    /// Returns the concrete [`DeviceMesh`] implied by this [`XlaArray`]'s global shard placement metadata (i.e., the
     /// mesh that the array was constructed over).
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
         &self.parts.mesh
     }
 
-    /// Returns the [`ArrayShard`]s that make up this [`Array`].
+    /// Returns the [`XlaArrayShard`]s that make up this [`XlaArray`].
     #[inline]
-    pub fn shards(&self) -> &[ArrayShard<'o>] {
+    pub fn shards(&self) -> &[XlaArrayShard<'o>] {
         self.parts.shards.as_slice()
     }
 
-    /// Returns an [`Iterator`] over the _addressable_ [`ArrayShard`]s of this [`Array`].
+    /// Returns an [`Iterator`] over the _addressable_ [`XlaArrayShard`]s of this [`XlaArray`].
     #[inline]
-    pub fn addressable_shards(&self) -> impl Iterator<Item = &ArrayShard<'o>> {
+    pub fn addressable_shards(&self) -> impl Iterator<Item = &XlaArrayShard<'o>> {
         self.parts.shards.iter().filter(|shard| shard.is_addressable())
     }
 
-    /// Returns the [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
+    /// Returns the [`XlaArrayShard`] of this [`XlaArray`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
     #[inline]
-    pub fn device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+    pub fn device_shard(&self, device_id: DeviceId) -> Option<&XlaArrayShard<'o>> {
         self.parts.shard_index_by_device.get(&device_id).and_then(|index| self.parts.shards.get(*index))
     }
 
-    /// Returns the _addressable_ [`ArrayShard`] of this [`Array`] that is placed on the device with the provided
+    /// Returns the _addressable_ [`XlaArrayShard`] of this [`XlaArray`] that is placed on the device with the provided
     /// [`DeviceId`], if such a shard exists.
     #[inline]
-    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+    pub fn addressable_device_shard(&self, device_id: DeviceId) -> Option<&XlaArrayShard<'o>> {
         self.device_shard(device_id).filter(|shard| shard.is_addressable())
     }
 
-    /// Returns the number of logical payload bytes that this [`Array`] occupies across all devices and processes.
+    /// Returns the number of logical payload bytes that this [`XlaArray`] occupies across all devices and processes.
     /// Bufferless [`DataType::Zero`] arrays occupy zero bytes.
     #[inline]
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
@@ -659,7 +659,7 @@ impl<'o> Array<'o> {
 
     /// Returns whether every global shard has process-local storage and can therefore retain a bounded materialization.
     pub(crate) fn supports_bounded_materialization_cache(&self) -> bool {
-        self.parts.shards.iter().all(ArrayShard::is_addressable)
+        self.parts.shards.iter().all(XlaArrayShard::is_addressable)
     }
 
     /// Probes the clone-shared cache for one structural bound-shaped materialization key.
@@ -675,7 +675,7 @@ impl<'o> Array<'o> {
         &self,
         domain: &XlaDomain<'o>,
         extent: i32,
-    ) -> Result<(Array<'o>, bool), ArrayError> {
+    ) -> Result<(XlaArray<'o>, bool), ArrayError> {
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -688,7 +688,7 @@ impl<'o> Array<'o> {
         let scalar_type = ArrayType::scalar(DataType::I32)
             .with_sharding(Sharding::replicated(self.sharding().mesh().clone(), 0))
             .map_err(Error::from)?;
-        let scalar = Array::from_host_buffer(domain, scalar_type, self.mesh().clone(), extent.to_ne_bytes())?;
+        let scalar = XlaArray::from_host_buffer(domain, scalar_type, self.mesh().clone(), extent.to_ne_bytes())?;
         let mut scalars = self.parts.logical_extent_scalars.lock().expect("logical extent scalar cache mutex poisoned");
         if let Some(index) = scalars.iter().position(|(candidate, _)| *candidate == extent) {
             let entry = scalars.remove(index).unwrap();
@@ -716,7 +716,7 @@ impl<'o> Array<'o> {
         if Arc::strong_count(&self.parts) != 1 {
             return false;
         }
-        for buffer in self.parts.shards.iter().filter_map(ArrayShard::buffer) {
+        for buffer in self.parts.shards.iter().filter_map(XlaArrayShard::buffer) {
             if Arc::strong_count(buffer) != 1 {
                 return false;
             }
@@ -860,39 +860,39 @@ impl<'o> Array<'o> {
     }
 }
 
-/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
-pub async fn ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+/// Waits asynchronously for every [`XlaArray`] leaf in `values` to become ready without copying data to the host.
+pub async fn ready<'o, Values: Parameterized<XlaArray<'o>>>(values: &Values) -> Result<(), Error> {
     for array in values.parameters() {
         array.ready().await?;
     }
     Ok(())
 }
 
-/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
-pub fn block_until_ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+/// Blocks until every [`XlaArray`] leaf in `values` is ready without copying data to the host.
+pub fn block_until_ready<'o, Values: Parameterized<XlaArray<'o>>>(values: &Values) -> Result<(), Error> {
     for array in values.parameters() {
         array.block_until_ready()?;
     }
     Ok(())
 }
 
-impl Debug for Array<'_> {
+impl Debug for XlaArray<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("Array")
+            .debug_struct("XlaArray")
             .field("type", &self.parts.r#type)
             .field("shards", &self.shards())
             .finish()
     }
 }
 
-impl Display for Array<'_> {
+impl Display for XlaArray<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "array(type={})", self.parts.r#type)
     }
 }
 
-impl Typed for Array<'_> {
+impl Typed for XlaArray<'_> {
     type Type = ArrayType;
 
     fn r#type(&self) -> Cow<'_, ArrayType> {
@@ -900,15 +900,15 @@ impl Typed for Array<'_> {
     }
 }
 
-impl<'o> Value for Array<'o> {
-    // A concrete `Array` dispatches AND executes through the rich, PJRT-backed `XlaDomain`: the blanket value
+impl<'o> Value for XlaArray<'o> {
+    // A concrete `XlaArray` dispatches AND executes through the rich, PJRT-backed `XlaDomain`: the blanket value
     // capabilities in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...) bind their
     // operations through `dispatch_domain()`, which is what makes every operation on concrete arrays execute
     // eagerly, op by op, through the domain recovered below, while free transform entry points (e.g.,
     // `ryft_core::batching::batch`) recover the same domain through `execution_domain()`. `ryft-core`'s own
-    // `ryft_core::arrays::Array` instead keeps the constant-only `EagerContext` dispatch domain and provides direct host kernels
-    // for each capability, relying on in-crate coherence between those direct impls and the blankets; a downstream
-    // backend crate cannot take that route because the coherence check cannot rule out future
+    // `ryft_core::arrays::Array` instead keeps the constant-only `EagerContext` dispatch domain and provides direct
+    // host kernels for each capability, relying on in-crate coherence between those direct impls and the blankets; a
+    // downstream backend crate cannot take that route because the coherence check cannot rule out future
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
     // capability surface and only capabilities without operation-binding blankets (`Concretizable<bool>`,
     // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
@@ -919,8 +919,8 @@ impl<'o> Value for Array<'o> {
         self.execution_domain()
     }
 
-    /// Recovers the eager [`XlaDomain`] this [`Array`] belongs to (see [`Array::domain`]), and with it the session,
-    /// compilation cache, effect scope, and compilation options that receiver-based operations execute with.
+    /// Recovers the eager [`XlaDomain`] this [`XlaArray`] belongs to (see [`XlaArray::domain`]), and with it the
+    /// session, compilation cache, effect scope, and compilation options that receiver-based operations execute with.
     /// Association is per value: receiver-based `x + y` and `y + x` may choose different scopes even when their
     /// numerical values match. Fork scopes at task boundaries rather than inside expressions.
     fn execution_domain(&self) -> Self::ExecutionDomain {
@@ -929,8 +929,8 @@ impl<'o> Value for Array<'o> {
 }
 
 /// Placement of one output of a compiled program, computed once per program so that every execution can build that
-/// output's [`Array`] from the returned buffers (refer to [`Array::from_execution_output`]) without re-deriving or
-/// re-validating its placement. Every array built from one layout shares its type, device index, and mesh.
+/// output's [`XlaArray`] from the returned buffers (refer to [`XlaArray::from_execution_output`]) without re-deriving
+/// or re-validating its placement. Every array built from one layout shares its type, device index, and mesh.
 pub(crate) struct ArrayOutputLayout {
     /// [`ArrayType`] of the output, which has a static shape and sharding metadata.
     r#type: Arc<ArrayType>,
@@ -981,13 +981,13 @@ impl ArrayOutputLayout {
     }
 }
 
-/// Shard of an [`Array`]. [`ArrayShard`]s always carry global shard metadata through [`ArrayShard::descriptor`].
-/// They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the current process, a bufferless
-/// marker for the unique value of [`DataType::Zero`], or metadata only when the shard belongs to another process.
-/// This lets an [`Array`] describe its full global layout without allocating meaningless zero-space buffers. Ordinary
-/// addressable buffers remain stored inside [`Arc`]s so cloned arrays can share them.
+/// Shard of an [`XlaArray`]. [`XlaArrayShard`]s always carry global shard metadata through
+/// [`XlaArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
+/// current process, a bufferless marker for the unique value of [`DataType::Zero`], or metadata only when the shard
+/// belongs to another process. This lets an [`XlaArray`] describe its full global layout without allocating meaningless
+/// zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so cloned arrays can share them.
 #[derive(Clone)]
-pub struct ArrayShard<'o> {
+pub struct XlaArrayShard<'o> {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
     descriptor: ShardDescriptor,
 
@@ -995,7 +995,7 @@ pub struct ArrayShard<'o> {
     storage: ArrayShardStorage<'o>,
 }
 
-/// Physical storage state of one [`ArrayShard`].
+/// Physical storage state of one [`XlaArrayShard`].
 #[derive(Clone)]
 enum ArrayShardStorage<'o> {
     /// The shard belongs to another process and has no process-local storage.
@@ -1008,8 +1008,8 @@ enum ArrayShardStorage<'o> {
     Buffer(Arc<Buffer<'o>>),
 }
 
-impl<'o> ArrayShard<'o> {
-    /// Creates a new [`ArrayShard`].
+impl<'o> XlaArrayShard<'o> {
+    /// Creates a new [`XlaArrayShard`].
     #[inline]
     pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
         let storage = buffer.map_or(ArrayShardStorage::Remote, ArrayShardStorage::Buffer);
@@ -1022,14 +1022,14 @@ impl<'o> ArrayShard<'o> {
         Self { descriptor, storage: ArrayShardStorage::Zero }
     }
 
-    /// Returns the [`ShardDescriptor`] of this [`ArrayShard`], which is defined and provided irrespective of whether
+    /// Returns the [`ShardDescriptor`] of this [`XlaArrayShard`], which is defined and provided irrespective of whether
     /// this shard is addressable from the current process or not.
     #[inline]
     pub fn descriptor(&self) -> &ShardDescriptor {
         &self.descriptor
     }
 
-    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
+    /// Returns the [`Buffer`] underlying this [`XlaArrayShard`]. This is `None` if the shard is remote or is an
     /// addressable bufferless [`DataType::Zero`] shard.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
@@ -1039,25 +1039,25 @@ impl<'o> ArrayShard<'o> {
         }
     }
 
-    /// Returns this [`ArrayShard`]'s global index.
+    /// Returns this [`XlaArrayShard`]'s global index.
     #[inline]
     pub fn index(&self) -> ShardIndex {
         self.descriptor.index()
     }
 
-    /// Returns the [`Device`] that owns this [`ArrayShard`].
+    /// Returns the [`Device`] that owns this [`XlaArrayShard`].
     #[inline]
     pub fn device(&self) -> Device {
         self.descriptor.device()
     }
 
-    /// Returns the [`ShardDescriptor::slice`] covered by this [`ArrayShard`].
+    /// Returns the [`ShardDescriptor::slice`] covered by this [`XlaArrayShard`].
     #[inline]
     pub fn slice(&self) -> &[Range<usize>] {
         self.descriptor.slice()
     }
 
-    /// Returns the local [`StaticShape`] of this [`ArrayShard`].
+    /// Returns the local [`StaticShape`] of this [`XlaArrayShard`].
     #[inline]
     pub fn shape(&self) -> StaticShape {
         self.descriptor.shape()
@@ -1080,11 +1080,11 @@ impl<'o> ArrayShard<'o> {
     }
 }
 
-impl Debug for ArrayShard<'_> {
+impl Debug for XlaArrayShard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let device = self.device();
         formatter
-            .debug_struct("ArrayShard")
+            .debug_struct("XlaArrayShard")
             .field("index", &self.index())
             .field("device_id", &device.id())
             .field("process_index", &device.process_index())
@@ -1094,14 +1094,14 @@ impl Debug for ArrayShard<'_> {
     }
 }
 
-/// Row-major ordinal index of an [`ArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
+/// Row-major ordinal index of an [`XlaArrayShard`] within a [`DeviceMesh`]. Shard indices are assigned using the same
 /// row-major ordering as [`DeviceMesh::devices`]. This gives all processes a stable way to refer to the same global
 /// shard without depending on whether that shard is locally addressable or not.
 pub type ShardIndex = usize;
 
-/// Device ownership and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent of any
-/// local [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying [`Array`]
-/// that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
+/// Device ownership and slice metadata for an [`XlaArrayShard`]. A [`ShardDescriptor`] is intentionally independent of
+/// any local [`Buffer`]. It describes which [`Device`] owns the [`XlaArrayShard`] and which slice of the underlying
+/// [`XlaArray`] that shard represents. [`XlaArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// Refer to the documentation of [`Self::index`] for information on this field.
@@ -1111,7 +1111,7 @@ pub struct ShardDescriptor {
     device: Device,
 
     /// Refer to the documentation of [`Self::slice`] for information on this field. It is shared, so cloning a
-    /// descriptor (e.g., into every output [`Array`] of a compiled program) does not allocate.
+    /// descriptor (e.g., into every output [`XlaArray`] of a compiled program) does not allocate.
     slice: Arc<[Range<usize>]>,
 }
 
@@ -1243,7 +1243,7 @@ impl ShardLayout {
     ///
     /// # Parameters
     ///
-    ///   - `shape`: [`StaticShape`] of the [`Array`] being sharded/partitioned.
+    ///   - `shape`: [`StaticShape`] of the [`XlaArray`] being sharded/partitioned.
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
     ///   - `sharding`: Logical [`Sharding`] specification to apply to `shape`.
     pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, Error> {
@@ -1342,7 +1342,7 @@ impl ShardLayout {
     }
 
     /// Returns the lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es. This is used when a
-    /// [`Buffer`] reports a [`DeviceId`] and the [`Array`] constructor needs to find the global shard metadata that
+    /// [`Buffer`] reports a [`DeviceId`] and the [`XlaArray`] constructor needs to find the global shard metadata that
     /// buffer should satisfy.
     #[inline]
     pub fn shard_index_by_device(&self) -> &HashMap<DeviceId, ShardIndex> {
@@ -1358,7 +1358,7 @@ impl ShardLayout {
 
 /// Provides XLA-specific helpers for [`ArrayType`]s.
 pub(crate) trait ArrayTypeExtension {
-    /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
+    /// Returns the number of logical payload bytes required by a dense [`XlaArray`] of this [`ArrayType`].
     /// [`DataType::Zero`] requires no payload bytes even though a backend may use a temporary private carrier.
     fn size_in_bytes(&self) -> Result<usize, Error>;
 }
@@ -1399,14 +1399,14 @@ mod tests {
     use crate::{Error, FromPjrt, ToPjrt, XlaSession};
 
     use super::{
-        Array, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout, block_until_ready,
+        ArrayOutputLayout, ArrayTypeExtension, ShardDescriptor, ShardLayout, XlaArray, XlaArrayShard, block_until_ready,
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn test_array_is_send_and_sync() {
-        assert_send_sync::<Array<'static>>();
+        assert_send_sync::<XlaArray<'static>>();
     }
 
     #[test]
@@ -1418,7 +1418,7 @@ mod tests {
     fn test_array_reference_is_send_and_sync() {
         // Exact reference clones share immutable handle-local type and identity metadata, so the XLA reference family
         // relies on the array value and that metadata being safe for concurrent access.
-        assert_send_sync::<Reference<Array<'static>>>();
+        assert_send_sync::<Reference<XlaArray<'static>>>();
     }
 
     // TODO(eaplatanios): Review this test.
@@ -1450,8 +1450,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Construct via `Array::from_addressable_buffers` and exercise every canonical `Array` accessor.
-        let array = Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
+        // Construct via `XlaArray::from_addressable_buffers` and exercise every canonical `XlaArray` accessor.
+        let array =
+            XlaArray::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
 
         assert_eq!(array.r#type().as_ref(), &array_type);
         assert_eq!(array.data_type(), DataType::F32);
@@ -1478,23 +1479,23 @@ mod tests {
         assert!(array.device_shard(absent_device_id).is_none());
         assert!(array.addressable_device_shard(absent_device_id).is_none());
 
-        // Layout metadata stored on the underlying array type is exposed verbatim by `Array::layout`.
+        // Layout metadata stored on the underlying array type is exposed verbatim by `XlaArray::layout`.
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
         let layout_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_layout(layout.clone())
             .with_sharding(sharding)
             .unwrap();
-        let layout_array = Array::from_addressable_buffers(&domain, layout_type, mesh.clone(), Vec::new()).unwrap();
+        let layout_array = XlaArray::from_addressable_buffers(&domain, layout_type, mesh.clone(), Vec::new()).unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
 
-        // Construct via `Array::from_host_buffer` and verify that it partitions the dense row-major host bytes
+        // Construct via `XlaArray::from_host_buffer` and verify that it partitions the dense row-major host bytes
         // over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
         // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let host_array =
-            Array::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
+            XlaArray::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(values.as_slice()).as_slice())
                 .unwrap();
 
         assert_eq!(host_array.shape(), StaticShape::new(vec![4, 4]));
@@ -1524,7 +1525,8 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let array =
-            Array::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(&[1.0, 2.0]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, array_type, mesh, values_to_bytes::<f32>(&[1.0, 2.0]).as_slice())
+                .unwrap();
 
         // Clones share their storage, so a shared array is never donatable while a uniquely held one is.
         assert!(array.has_unique_shard_buffers());
@@ -1554,7 +1556,7 @@ mod tests {
         let actual = buffer.memory().unwrap().kind().unwrap().to_string();
         assert_ne!(actual, "pinned_host");
         assert_eq!(
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 r#type.with_memory(Memory::Host { pinned: true }),
                 mesh,
@@ -1587,7 +1589,7 @@ mod tests {
             for shape in [Shape::new(vec![]), Shape::new(vec![Dimension::Static(2)])] {
                 let count = if shape.rank() == 0 { 1 } else { 2 };
                 let r#type = ArrayType::new(DataType::I64, shape).with_memory(memory);
-                let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), &values[..count * 8]).unwrap();
+                let array = XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), &values[..count * 8]).unwrap();
                 assert_eq!(array.r#type().memory(), memory);
                 let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
                 let actual = buffer.memory().unwrap();
@@ -1636,17 +1638,18 @@ mod tests {
         // Planned outputs describe the same placement as the validating constructor, and every output built from one
         // layout shares its metadata.
         let expected =
-            Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
-        let output = Array::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
+            XlaArray::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        let output =
+            XlaArray::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
         let other_output =
-            Array::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
+            XlaArray::from_execution_output(&domain, &layout, shard_buffers(), ExecutionFence::new(Vec::new()));
         assert_eq!(output.r#type().as_ref(), &array_type);
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(
-            output.shards().iter().map(ArrayShard::descriptor).collect::<Vec<_>>(),
-            expected.shards().iter().map(ArrayShard::descriptor).collect::<Vec<_>>(),
+            output.shards().iter().map(XlaArrayShard::descriptor).collect::<Vec<_>>(),
+            expected.shards().iter().map(XlaArrayShard::descriptor).collect::<Vec<_>>(),
         );
-        assert!(output.shards().iter().all(ArrayShard::is_addressable));
+        assert!(output.shards().iter().all(XlaArrayShard::is_addressable));
         assert!(Arc::ptr_eq(&output.parts.r#type, &other_output.parts.r#type));
         assert!(Arc::ptr_eq(&output.parts.mesh, &other_output.parts.mesh));
         output.block_until_ready().unwrap();
@@ -1665,7 +1668,7 @@ mod tests {
         let zero_type = array_type.with_data_type(DataType::Zero);
         let zero_layout = ArrayOutputLayout::new(zero_type.clone(), Arc::new(mesh), device_ids.as_slice()).unwrap();
         let zero_output =
-            Array::from_execution_output(&domain, &zero_layout, Vec::new(), ExecutionFence::new(Vec::new()));
+            XlaArray::from_execution_output(&domain, &zero_layout, Vec::new(), ExecutionFence::new(Vec::new()));
         assert_eq!(zero_output.r#type().as_ref(), &zero_type);
         assert!(zero_output.shards().iter().all(|shard| shard.is_addressable() && shard.buffer().is_none()));
     }
@@ -1700,7 +1703,7 @@ mod tests {
                 client.buffer(bytes.as_slice(), BufferType::F32, [2u64], None, device.clone(), None).unwrap()
             })
             .collect::<Vec<_>>();
-        drop(Array::from_execution_output(&domain, &layout, buffers, ExecutionFence::new(Vec::new())));
+        drop(XlaArray::from_execution_output(&domain, &layout, buffers, ExecutionFence::new(Vec::new())));
     }
 
     #[test]
@@ -1715,7 +1718,7 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&domain, r#type, mesh, []).unwrap();
+        let array = XlaArray::from_host_buffer(&domain, r#type, mesh, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
         assert_eq!(array.size_in_bytes(), Ok(0));
         let shard = array.addressable_shards().next().unwrap();
@@ -1724,7 +1727,7 @@ mod tests {
         assert_eq!(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap(), Vec::<u8>::new());
 
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(0)]));
-        let zero_sized = Array::from_host_buffer(&domain, zero_sized_type, array.mesh().clone(), []).unwrap();
+        let zero_sized = XlaArray::from_host_buffer(&domain, zero_sized_type, array.mesh().clone(), []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
         assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
     }
@@ -1743,7 +1746,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let error = Array::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap_err();
+        let error = XlaArray::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap_err();
 
         assert!(matches!(error, Error::NonCanonicalZeroBuffer { .. }));
     }
@@ -1762,7 +1765,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
-        let array = Array::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap();
+        let array = XlaArray::from_addressable_buffers(&domain, r#type, mesh, vec![buffer]).unwrap();
 
         assert_eq!(array.addressable_shards().count(), 1);
         assert!(array.addressable_shards().next().unwrap().buffer().is_none());
@@ -1782,7 +1785,7 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
-        let array = Array::from_host_buffer(&domain, r#type, mesh, []).unwrap();
+        let array = XlaArray::from_host_buffer(&domain, r#type, mesh, []).unwrap();
 
         assert_eq!(array.shards().len(), 2);
         assert!(array.shards()[0].is_addressable());
@@ -1806,7 +1809,7 @@ mod tests {
                 ArrayType::scalar(data_type).with_sharding(Sharding::replicated(logical_mesh.clone(), 0)).unwrap();
             let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
             assert!(matches!(
-                Array::from_addressable_buffers(&domain, array_type, mesh.clone(), vec![buffer]),
+                XlaArray::from_addressable_buffers(&domain, array_type, mesh.clone(), vec![buffer]),
                 Err(Error::BufferTypeMismatch { expected, actual })
                     if expected == ArrayType::scalar(DataType::Boolean) && actual == ArrayType::scalar(data_type),
             ));
@@ -1831,13 +1834,13 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
 
-        // Arrays constructed via `Array::from_host_buffer` belong to the provided domain and live on its client, which
-        // transferred their shard buffers. Cloning an array preserves that association.
+        // Arrays constructed via `XlaArray::from_host_buffer` belong to the provided domain and live on its client,
+        // which transferred their shard buffers. Cloning an array preserves that association.
         let session = XlaSession::new(&client);
         let domain = session.domain();
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
-        let array = Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
+        let array = XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
         let recovered_client = array.client();
         assert!(std::ptr::eq(recovered_client, &client));
         assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
@@ -1845,7 +1848,7 @@ mod tests {
         assert!(std::ptr::eq(array.clone().client(), &client));
         assert!(Arc::ptr_eq(array.clone().domain().session(), &session));
 
-        // Arrays constructed via `Array::from_addressable_buffers` belong to the provided domain, whose client is
+        // Arrays constructed via `XlaArray::from_addressable_buffers` belong to the provided domain, whose client is
         // validated to own every addressable shard buffer.
         let shard_buffers = || {
             client_devices
@@ -1857,7 +1860,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let array =
-            Array::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+            XlaArray::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
         assert!(std::ptr::eq(array.client(), &client));
         assert!(Arc::ptr_eq(array.domain().session(), &session));
 
@@ -1867,14 +1870,15 @@ mod tests {
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .unwrap();
         let other_domain = XlaSession::new(&other_client).domain();
-        let error = Array::from_addressable_buffers(&other_domain, array_type.clone(), mesh.clone(), shard_buffers())
-            .unwrap_err();
+        let error =
+            XlaArray::from_addressable_buffers(&other_domain, array_type.clone(), mesh.clone(), shard_buffers())
+                .unwrap_err();
         assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
         assert!(error.to_string().starts_with("the domain's client does not own the addressable shard buffer"));
 
         // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to (and live
         // on the client of) the provided domain.
-        let array = Array::from_addressable_buffers(&other_domain, array_type, mesh, Vec::new()).unwrap();
+        let array = XlaArray::from_addressable_buffers(&other_domain, array_type, mesh, Vec::new()).unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
         assert!(std::ptr::eq(array.client(), &other_client));
     }
@@ -1943,14 +1947,14 @@ mod tests {
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
         let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
-        let array = Array::from_addressable_buffers(&domain, array_type, device_mesh, Vec::new()).unwrap();
+        let array = XlaArray::from_addressable_buffers(&domain, array_type, device_mesh, Vec::new()).unwrap();
         assert_eq!(
             format!("{array:?}"),
             concat!(
-                "Array { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
+                "XlaArray { type: ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2)] }, layout: None, ",
                 "sharding: Some(Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }], ",
                 "axis_indices: {\"x\": 0} }, dimensions: [Replicated], unreduced_axes: {}, reduced_axes: {}, ",
-                "varying_manual_axes: {} }), memory: Device }, shards: [ArrayShard { index: 0, device_id: 0, ",
+                "varying_manual_axes: {} }), memory: Device }, shards: [XlaArrayShard { index: 0, device_id: 0, ",
                 "process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",
             ),
@@ -1960,7 +1964,7 @@ mod tests {
     #[test]
     fn test_array_shard() {
         let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor.clone(), None);
+        let shard = XlaArrayShard::new(descriptor.clone(), None);
 
         assert_eq!(shard.descriptor(), &descriptor);
         assert!(shard.buffer().is_none());
@@ -1976,12 +1980,12 @@ mod tests {
     #[test]
     fn test_array_shard_debug() {
         let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
-        let shard = ArrayShard::new(descriptor, None);
+        let shard = XlaArrayShard::new(descriptor, None);
 
         assert_eq!(
             format!("{shard:?}"),
             concat!(
-                "ArrayShard { index: 3, device_id: 7, process_index: 2, ",
+                "XlaArrayShard { index: 3, device_id: 7, process_index: 2, ",
                 "shape: StaticShape { dimensions: [3, 4] }, is_addressable: false }",
             ),
         );
@@ -2185,10 +2189,10 @@ mod tests {
 
     #[test]
     fn test_array_physical_buffer_type() {
-        assert_eq!(Array::physical_buffer_type(DataType::I1), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::U1), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::Boolean), BufferType::Predicate);
-        assert_eq!(Array::physical_buffer_type(DataType::I2), BufferType::I2);
+        assert_eq!(XlaArray::physical_buffer_type(DataType::I1), BufferType::Predicate);
+        assert_eq!(XlaArray::physical_buffer_type(DataType::U1), BufferType::Predicate);
+        assert_eq!(XlaArray::physical_buffer_type(DataType::Boolean), BufferType::Predicate);
+        assert_eq!(XlaArray::physical_buffer_type(DataType::I2), BufferType::I2);
         assert_eq!(DataType::I1.to_pjrt(), BufferType::I1);
         assert_eq!(DataType::U1.to_pjrt(), BufferType::U1);
     }

@@ -294,7 +294,7 @@ mod xla_backend {
     use ryft::pjrt::{ClientOptions, CpuClientOptions, Error as PjrtError, Plugin, load_cpu_plugin};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
-    use ryft::xla::{Array, FromPjrt, XlaDomain, XlaSession, XlaValue};
+    use ryft::xla::{FromPjrt, XlaArray, XlaDomain, XlaSession, XlaValue};
     use ryft::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Parameterized,
         ProjectedContext, Shape, Sharding,
@@ -313,15 +313,15 @@ mod xla_backend {
         mesh: &DeviceMesh,
         dimensions: &[usize],
         values: &[f32],
-    ) -> ExampleResult<Array<'c>> {
+    ) -> ExampleResult<XlaArray<'c>> {
         let shape = Shape::new(dimensions.iter().copied().map(Dimension::Static).collect());
         let r#type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
-        Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
+        Ok(XlaArray::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes(values))?)
     }
 
     /// Copies a replicated `f32` XLA array back to the host.
-    fn read_f32s(array: &Array<'_>) -> ExampleResult<Vec<f32>> {
+    fn read_f32s(array: &XlaArray<'_>) -> ExampleResult<Vec<f32>> {
         let shard =
             array.addressable_shards().next().ok_or_else(|| "xla result has no addressable shard".to_string())?;
         let bytes = shard

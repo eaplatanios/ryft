@@ -26,7 +26,7 @@ pub mod transfers;
 #[cfg(test)]
 pub mod tests;
 
-pub use crate::arrays::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+pub use crate::arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArrayShard};
 pub use device_put::{DevicePutLeaf, device_put};
 pub use error::ArrayError;
 pub use execution::ExecuteArguments;

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::Array;
+use crate::XlaArray;
 
 use super::*;
 
@@ -42,7 +42,7 @@ impl<'o> ExecuteArguments<'o> {
     /// shared (for example, by another clone of the array or by a retained materialization cache); callers that need
     /// to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub(crate) fn from_arrays_with_donation(
-        arrays: Vec<Array<'o>>,
+        arrays: Vec<XlaArray<'o>>,
         addressable_device_ids: Arc<[DeviceId]>,
         donation_flags: &[bool],
     ) -> Result<Self, ArrayError> {
@@ -68,7 +68,7 @@ impl<'o> ExecuteArguments<'o> {
             for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
                 let buffer = array
                     .device_shard(device_id)
-                    .and_then(ArrayShard::buffer)
+                    .and_then(XlaArrayShard::buffer)
                     .ok_or(ArrayError::MissingArrayShardForDevice { array_index, device_id })?;
                 device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
             }

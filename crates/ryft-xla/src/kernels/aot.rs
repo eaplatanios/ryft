@@ -22,7 +22,7 @@ use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaCompiledProgram;
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::staging::{XlaKernelCompilerBinding, XlaKernelExecutionFacts, stage_kernel};
-use crate::{Array, XlaCompilationAnalysis, XlaDomain, XlaOptions};
+use crate::{XlaArray, XlaCompilationAnalysis, XlaDomain, XlaOptions};
 
 /// A bundle is malformed, incompatible, or cannot be produced by the selected backend.
 #[derive(Debug, Error)]
@@ -366,7 +366,7 @@ impl<'c> LoadedKernel<'c> {
 
     /// Submits ordinary array inputs and returns the existing completion-bearing execution handle.
     /// Pending uploads, input retention, aliases, and device failures use XLA's canonical invocation path.
-    pub fn call(&self, inputs: Vec<Array<'c>>) -> Result<Execution<Vec<Array<'c>>>, KernelAotError> {
+    pub fn call(&self, inputs: Vec<XlaArray<'c>>) -> Result<Execution<Vec<XlaArray<'c>>>, KernelAotError> {
         Ok(self.domain.execute_compiled_async(&self.program, inputs)?)
     }
 }
@@ -429,7 +429,7 @@ pub(crate) mod tests {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
             vec![crate::XlaValue::Array(
-                Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
+                XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {
             vec![]
@@ -624,7 +624,7 @@ pub(crate) mod tests {
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
         let loaded = decoded.load(&domain, &binding(1), &mesh).unwrap();
         let input =
-            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
+            XlaArray::from_host_buffer(&domain, ArrayType::scalar(DataType::I32), mesh.clone(), 23i32.to_ne_bytes())
                 .unwrap();
         let execution = loaded.call(vec![input]).unwrap();
         execution.fence().block_until_ready().unwrap();

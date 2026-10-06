@@ -12,7 +12,7 @@ use ryft_core::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{
-    Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, XlaValue, jitted,
+    FromPjrt, JittedXlaFunction, XlaArray, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, XlaValue, jitted,
 };
 use serde_json::{Value, json};
 
@@ -161,12 +161,12 @@ fn input_array<'c>(
     mesh: &DeviceMesh,
     r#type: ArrayType,
     size: usize,
-) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
     let mut bytes = Vec::with_capacity(size * size_of::<f32>());
     for index in 0..size {
         bytes.extend_from_slice(&((index % 1024) as f32 / 1024.0).to_ne_bytes());
     }
-    Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
+    Ok(XlaArray::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
 }
 
 fn stage_workload<'c>(
@@ -188,8 +188,8 @@ fn stage_workload<'c>(
 fn call_workload<'c>(
     domain: &XlaDomain<'c>,
     compiled: &BenchmarkCompiledFunction<'c>,
-    input: Array<'c>,
-) -> Result<Array<'c>, Box<dyn std::error::Error>> {
+    input: XlaArray<'c>,
+) -> Result<XlaArray<'c>, Box<dyn std::error::Error>> {
     match ryft_core::compilation::call_function(domain, compiled.executable_function(), XlaValue::Array(input))? {
         XlaValue::Array(output) => Ok(output),
         XlaValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),

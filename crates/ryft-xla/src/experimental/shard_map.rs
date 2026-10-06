@@ -681,7 +681,7 @@ where
 /// placement over auto axes without tracking the result, use [`constrain_sharding`] instead.
 ///
 /// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
-/// [`Array::to_placement`](crate::Array::to_placement) outside the trace.
+/// [`XlaArray::to_placement`](crate::XlaArray::to_placement) outside the trace.
 ///
 /// # Parameters
 ///
@@ -2189,9 +2189,9 @@ mod tests {
         CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll,
     };
     use ryft_core::{
-        Array as CpuArray, BatchAxis, BatchAxisSpecification, DataType, Device, DeviceMesh, Differentiate,
-        DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Mul, Reduce,
-        ReductionKind, RegionRole, Sharding, ShardingDimension, Sin, batch,
+        Array, BatchAxis, BatchAxisSpecification, DataType, Device, DeviceMesh, Differentiate, DimensionBounds,
+        DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Mul, Reduce, ReductionKind, RegionRole,
+        Sharding, ShardingDimension, Sin, batch,
     };
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -2199,7 +2199,7 @@ mod tests {
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
-    use crate::{Array, FromPjrt, ToMlir, XlaSession};
+    use crate::{FromPjrt, ToMlir, XlaArray, XlaSession};
 
     use super::*;
 
@@ -2328,7 +2328,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = Array::from_addressable_buffers(
+        let input = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(data_type, &[4 * shard_size], sharding),
             device_mesh,
@@ -2341,7 +2341,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
         executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -3173,12 +3173,12 @@ mod tests {
                 )
             },
             (
-                CpuArray::matrix(2, 3, vec![1_i32, 2, 2, 3, 4, 0]).unwrap(),
-                CpuArray::matrix(2, 4, vec![0_i32; 8]).unwrap(),
-                CpuArray::matrix(2, 2, vec![0_i32, 1, 0, 1]).unwrap(),
-                CpuArray::matrix(2, 2, vec![1_i32, 2, 1, 1]).unwrap(),
-                CpuArray::matrix(2, 2, vec![0_i32, 0, 1, 2]).unwrap(),
-                CpuArray::matrix(2, 2, vec![1_i32, 1, 2, 1]).unwrap(),
+                Array::matrix(2, 3, vec![1_i32, 2, 2, 3, 4, 0]).unwrap(),
+                Array::matrix(2, 4, vec![0_i32; 8]).unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 1, 0, 1]).unwrap(),
+                Array::matrix(2, 2, vec![1_i32, 2, 1, 1]).unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 0, 1, 2]).unwrap(),
+                Array::matrix(2, 2, vec![1_i32, 1, 2, 1]).unwrap(),
             ),
             (
                 BatchAxis::new(0),
@@ -3835,7 +3835,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -3857,7 +3857,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -3965,14 +3965,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array = Array::from_addressable_buffers(
+        let lhs_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
             device_mesh.clone(),
             lhs_buffers,
         )
         .unwrap();
-        let rhs_array = Array::from_addressable_buffers(
+        let rhs_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding),
             device_mesh,
@@ -3994,7 +3994,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -4163,7 +4163,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -4185,7 +4185,7 @@ mod tests {
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
 
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -4283,7 +4283,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -4297,7 +4297,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 4);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -4471,7 +4471,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = Array::from_addressable_buffers(
+        let input = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -4484,7 +4484,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -4586,7 +4586,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = Array::from_addressable_buffers(
+        let input = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -4599,7 +4599,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -4864,14 +4864,14 @@ mod tests {
                 })
                 .collect();
             let inputs = vec![
-                Array::from_addressable_buffers(
+                XlaArray::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[], replicated),
                     device_mesh.clone(),
                     shared_buffers,
                 )
                 .unwrap(),
-                Array::from_addressable_buffers(
+                XlaArray::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[device_count], sharded),
                     device_mesh,
@@ -4885,7 +4885,7 @@ mod tests {
                 .iter()
                 .map(|device| device.id().unwrap())
                 .collect::<Vec<_>>();
-            let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+            let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
             let outputs = executable
                 .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
                 .unwrap()
@@ -5055,21 +5055,21 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[3], replicated),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[4], sharded),
                 device_mesh,
@@ -5088,7 +5088,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5211,21 +5211,21 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
                 device_mesh.clone(),
                 data_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
                 device_mesh.clone(),
                 index_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], replicated),
                 device_mesh,
@@ -5249,7 +5249,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5368,17 +5368,17 @@ mod tests {
             .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
+            XlaArray::from_host_buffer(
                 &domain,
                 key_type,
                 device_mesh.clone(),
                 &values_to_bytes(&[0.0_f32, 1.0, 0.0, 3.0]),
             )
             .unwrap(),
-            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
+            XlaArray::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
                 .unwrap(),
-            Array::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
+            XlaArray::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -5386,7 +5386,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5506,14 +5506,14 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[], replicated),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[4], global),
                 device_mesh,
@@ -5527,7 +5527,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5645,14 +5645,14 @@ mod tests {
             })
             .collect();
         let inputs = vec![
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2], shared_sharding),
                 device_mesh.clone(),
                 shared_buffers,
             )
             .unwrap(),
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::F32, &[2, 2], global),
                 device_mesh,
@@ -5666,7 +5666,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(inputs, &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5747,7 +5747,7 @@ mod tests {
                                                 None,
                                             )
                                             .unwrap()[0];
-                                        let limit = CpuArray::from_elements(limit_type, &[10f32]).unwrap();
+                                        let limit = Array::from_elements(limit_type, &[10f32]).unwrap();
                                         let limit = builder
                                             .add_instruction(
                                                 ConstantOperation::new(limit),
@@ -5826,7 +5826,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let input = Array::from_addressable_buffers(
+        let input = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharded),
             device_mesh,
@@ -5839,7 +5839,7 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let arguments = Array::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
         let outputs = executable
             .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -5949,7 +5949,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
@@ -5963,7 +5963,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -6419,7 +6419,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::U64, &[4], sharding),
             device_mesh,
@@ -6432,7 +6432,7 @@ mod tests {
         let execution_devices = executable.addressable_devices().unwrap();
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -6644,7 +6644,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding),
             device_mesh,
@@ -6658,7 +6658,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -6747,7 +6747,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], input_sharding),
             device_mesh,
@@ -6764,7 +6764,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -6890,7 +6890,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[16], sharding),
             device_mesh,
@@ -6907,7 +6907,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -7036,7 +7036,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -7050,7 +7050,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -7159,7 +7159,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[6, 2], input_sharding),
             device_mesh,
@@ -7176,7 +7176,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -7269,7 +7269,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[4], sharding.clone()),
             device_mesh.clone(),
@@ -7283,7 +7283,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -7473,7 +7473,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
@@ -7487,7 +7487,7 @@ mod tests {
         assert_eq!(execution_devices.len(), 2);
         let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -7594,7 +7594,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_addressable_buffers(
+        let input_array = XlaArray::from_addressable_buffers(
             &domain,
             static_sharded_array_type(DataType::F32, &[2, 6], input_sharding),
             device_mesh,
@@ -7611,7 +7611,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let execute_arguments =
-            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()

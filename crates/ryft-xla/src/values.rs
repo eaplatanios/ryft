@@ -1,6 +1,6 @@
 //! Session-carrying composite values of the [`XlaDomain`].
 //!
-//! [`XlaValue`] is the [`XlaDomain`] counterpart of [`ArrayIrValue`]: it holds an XLA [`Array`], a first-class runtime
+//! [`XlaValue`] is the [`XlaDomain`] counterpart of [`ArrayIrValue`]: it holds an [`XlaArray`], a first-class runtime
 //! dimension ([`XlaDimension`]), or an array reference ([`XlaReference`]). Unlike [`ArrayIrValue`], whose dimension and
 //! reference members are session-free host values, every member of an [`XlaValue`] (and every projected representation
 //! of a member) owns the [`XlaDomain`] session that it belongs to. This has three consequences:
@@ -32,7 +32,7 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 
-use crate::{Array, XlaDomain};
+use crate::{XlaArray, XlaDomain};
 
 /// First-class runtime dimension bound to the [`XlaDomain`] session in which array results derived from it are
 /// materialized. This is the dimension member of [`XlaValue`] and its projection onto [`DimensionType`].
@@ -119,7 +119,7 @@ impl<'c> Compare<XlaValue<'c>, DimensionType> for XlaDimension<'c> {
 }
 
 impl<'c> Value for XlaDimension<'c> {
-    // Like `Array`, a dimension dispatches and executes through the rich `XlaDomain` that it carries, projected onto
+    // Like `XlaArray`, a dimension dispatches and executes through the rich `XlaDomain` that it carries, projected onto
     // the dimension member family. That domain evaluates dimension operations on the host and materializes array
     // results (e.g., `dimension_to_scalar`) in its session.
     type DispatchDomain = ProjectedContext<XlaDomain<'c>, DimensionType>;
@@ -151,7 +151,7 @@ impl<'c> Value for XlaDimension<'c> {
 #[derive(Clone)]
 pub struct XlaReference<'c> {
     /// Shared reference handle (i.e., the allocation, the view path, and the cached reference type).
-    reference: ArrayReference<Array<'c>>,
+    reference: ArrayReference<XlaArray<'c>>,
 
     /// [`XlaDomain`] that owns the referent of this reference.
     domain: XlaDomain<'c>,
@@ -159,12 +159,12 @@ pub struct XlaReference<'c> {
 
 impl<'c> XlaReference<'c> {
     /// Creates a new [`XlaReference`] that binds `reference` to `domain`.
-    pub fn new(reference: ArrayReference<Array<'c>>, domain: XlaDomain<'c>) -> Self {
+    pub fn new(reference: ArrayReference<XlaArray<'c>>, domain: XlaDomain<'c>) -> Self {
         Self { reference, domain }
     }
 
     /// Returns the shared [`ArrayReference`] handle of this reference.
-    pub fn handle(&self) -> &ArrayReference<Array<'c>> {
+    pub fn handle(&self) -> &ArrayReference<XlaArray<'c>> {
         &self.reference
     }
 
@@ -174,7 +174,7 @@ impl<'c> XlaReference<'c> {
     }
 
     /// Consumes this reference and returns its shared [`ArrayReference`] handle.
-    pub fn into_handle(self) -> ArrayReference<Array<'c>> {
+    pub fn into_handle(self) -> ArrayReference<XlaArray<'c>> {
         self.reference
     }
 }
@@ -228,12 +228,12 @@ impl Typed for XlaReference<'_> {
 ///
 /// # Identity
 ///
-/// [`PartialEq`] ignores sessions: arrays compare by the storage identity of [`Array`], dimensions by their
+/// [`PartialEq`] ignores sessions: arrays compare by the storage identity of [`XlaArray`], dimensions by their
 /// [`DimensionValue`]s, and references by their handles.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum XlaValue<'c> {
-    /// Device-resident XLA [`Array`], which carries its own domain.
-    Array(Array<'c>),
+    /// Device-resident [`XlaArray`], which carries its own domain.
+    Array(XlaArray<'c>),
 
     /// First-class runtime dimension.
     Dimension(XlaDimension<'c>),
@@ -255,7 +255,7 @@ impl<'c> XlaValue<'c> {
     /// Converts this value into the session-free [`ArrayIrValue`] representation over XLA arrays, which drops the
     /// domains of dimension and reference members. Used to delegate host-side semantics (e.g., reference handles and
     /// predicates) to the generic [`ArrayIrValue`] implementations in `ryft-core`.
-    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<Array<'c>> {
+    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<XlaArray<'c>> {
         match self {
             Self::Array(value) => ArrayIrValue::Array(value),
             Self::Dimension(value) => ArrayIrValue::Dimension(value.into_value()),
@@ -265,7 +265,7 @@ impl<'c> XlaValue<'c> {
 
     /// Converts a session-free [`ArrayIrValue`] over XLA arrays into an [`XlaValue`], binding dimension and reference
     /// members to `domain`. Array members keep their own domain.
-    pub(crate) fn from_array_ir_value(value: ArrayIrValue<Array<'c>>, domain: &XlaDomain<'c>) -> Self {
+    pub(crate) fn from_array_ir_value(value: ArrayIrValue<XlaArray<'c>>, domain: &XlaDomain<'c>) -> Self {
         match value {
             ArrayIrValue::Array(value) => Self::Array(value),
             ArrayIrValue::Dimension(value) => Self::Dimension(XlaDimension::new(value, domain.clone())),
@@ -362,17 +362,17 @@ impl<'c> Value for XlaValue<'c> {
 }
 
 impl<'c> ValueProjection<ArrayType> for XlaValue<'c> {
-    type Projected = Array<'c>;
+    type Projected = XlaArray<'c>;
     type ProjectedRef<'v>
-        = &'v Array<'c>
+        = &'v XlaArray<'c>
     where
         Self: 'v;
 
-    fn from_projected(value: Array<'c>) -> Self {
+    fn from_projected(value: XlaArray<'c>) -> Self {
         Self::Array(value)
     }
 
-    fn projected<'v>(&'v self) -> Result<&'v Array<'c>, TypeError>
+    fn projected<'v>(&'v self) -> Result<&'v XlaArray<'c>, TypeError>
     where
         ArrayType: 'v,
     {
@@ -382,7 +382,7 @@ impl<'c> ValueProjection<ArrayType> for XlaValue<'c> {
         }
     }
 
-    fn into_projected(self) -> Result<Array<'c>, TypeError> {
+    fn into_projected(self) -> Result<XlaArray<'c>, TypeError> {
         match self {
             Self::Array(value) => Ok(value),
             other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
@@ -448,8 +448,8 @@ impl<'c> ValueProjection<ReferenceType<ArrayType>> for XlaValue<'c> {
     }
 }
 
-impl<'c> From<Array<'c>> for XlaValue<'c> {
-    fn from(value: Array<'c>) -> Self {
+impl<'c> From<XlaArray<'c>> for XlaValue<'c> {
+    fn from(value: XlaArray<'c>) -> Self {
         Self::Array(value)
     }
 }
@@ -502,7 +502,7 @@ impl AssertionValue for XlaValue<'_> {
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values; these implementations provide the panicking operator sugar that the array operation bundles
-// require by delegating to the fallible `ryft` capabilities, exactly like those of `Array`.
+// require by delegating to the fallible `ryft` capabilities, exactly like those of `XlaArray`.
 
 impl std::ops::Neg for XlaValue<'_> {
     type Output = Self;
@@ -578,11 +578,11 @@ mod tests {
         data_type: DataType,
         values: &[T],
         shape: &[usize],
-    ) -> Array<'c> {
+    ) -> XlaArray<'c> {
         let r#type = ArrayType::new(data_type, Shape::from(shape.to_vec()))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))
             .unwrap();
-        Array::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<T>(values).as_slice()).unwrap()
+        XlaArray::from_host_buffer(domain, r#type, mesh.clone(), values_to_bytes::<T>(values).as_slice()).unwrap()
     }
 
     fn read<T: Copy>(value: &XlaValue<'_>) -> Vec<T> {

@@ -4,7 +4,7 @@ use ryft_core::{ArrayType, Typed};
 use ryft_pjrt::Event;
 
 use crate::arrays::ArrayTypeExtension;
-use crate::{Array, Error as XlaError, ToPjrt};
+use crate::{Error as XlaError, ToPjrt, XlaArray};
 
 use super::*;
 
@@ -132,7 +132,7 @@ impl DenseArrayHostCopy {
 
 /// Starts copies for every addressable shard of `array` without awaiting them. Errors when any global shard is not
 /// addressable from the current process.
-pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<DenseArrayHostCopy, ArrayError> {
+pub(crate) fn begin_materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<DenseArrayHostCopy, ArrayError> {
     if array.data_type().is_zero() {
         return Ok(DenseArrayHostCopy {
             global_shape: array.shape(),
@@ -171,9 +171,9 @@ pub(crate) fn begin_materialize_dense_array_bytes(array: &Array<'_>) -> Result<D
 /// Copies every addressable shard of `array` to host and merges them into one dense row-major byte buffer. Errors when
 /// any global shard is not addressable from the current process.
 ///
-/// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and compiled paths cannot satisfy
-/// the requested placement.
-pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
+/// Used by [`XlaArray::to`](crate::XlaArray::to)'s last-resort host fallback when the fast and compiled paths cannot
+/// satisfy the requested placement.
+pub(crate) fn materialize_dense_array_bytes(array: &XlaArray<'_>) -> Result<Vec<u8>, ArrayError> {
     begin_materialize_dense_array_bytes(array)?.finish()
 }
 

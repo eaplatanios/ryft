@@ -15,7 +15,7 @@ use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::{Array, ExecutableXlaFunction, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
+use crate::{ExecutableXlaFunction, XlaArray, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -464,12 +464,12 @@ where
     }
 
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
-    pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
+    pub fn interpret(&self, inputs: In::To<XlaArray<'c>>) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::To<XlaArray<'c>>:
+            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.inner.statistics.executions.fetch_add(1, Ordering::Relaxed);
         let dispatch = self
@@ -499,13 +499,13 @@ where
     fn profile_baseline(
         &self,
         executable: ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Out::To<Array<'c>>, XlaDomainError>
+        inputs: In::To<XlaArray<'c>>,
+    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        In::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::Family: ParameterizedFamily<XlaArray<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::To<XlaArray<'c>>:
+            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let profiler_options = ProfileOptions {
             version: 1,

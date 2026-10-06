@@ -97,7 +97,9 @@ use ryft_pjrt::Execution;
 use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaCompiledProgram;
 use crate::experimental::ops::{XlaConstant, XlaOperation};
-use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions, XlaValue};
+use crate::{
+    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, XlaArray, XlaDomain, XlaOptions, XlaValue,
+};
 
 /// Composite tracer retained by the experimental stateful XLA program.
 ///
@@ -170,12 +172,13 @@ where
 
 /// Lifts one public runtime array tree into the production composite value family.
 fn lift_arrays<'c, P>(
-    values: P::To<Array<'c>>,
+    values: P::To<XlaArray<'c>>,
 ) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family:
-        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaStatefulValue<'c>>,
+    P::Family: ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<XlaArray<'c>>
+        + ParameterizedFamily<XlaStatefulValue<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values.into_parameters().map(XlaValue::Array);
@@ -187,18 +190,19 @@ where
 /// Projects one production composite output tree back to public runtime arrays.
 fn project_arrays<'c, P>(
     values: XlaProgramParameterValues<P, XlaStatefulValue<'c>>,
-) -> Result<P::To<Array<'c>>, XlaDomainError>
+) -> Result<P::To<XlaArray<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family:
-        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaStatefulValue<'c>> + ParameterizedFamily<Array<'c>>,
+    P::Family: ParameterizedFamily<ArrayIrType>
+        + ParameterizedFamily<XlaStatefulValue<'c>>
+        + ParameterizedFamily<XlaArray<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values
         .into_parameters()
         .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    P::To::<Array<'c>>::from_parameters(structure, parameters)
+    P::To::<XlaArray<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
@@ -248,13 +252,13 @@ where
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<Array<'c>>
+        + ParameterizedFamily<XlaArray<'c>>
         + ParameterizedFamily<XlaStatefulValue<'c>>
         + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<Array<'c>>
+        + ParameterizedFamily<XlaArray<'c>>
         + ParameterizedFamily<XlaStatefulValue<'c>>
         + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
@@ -262,8 +266,8 @@ where
     pub fn call(
         &self,
         static_parameters: Static,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Out::To<Array<'c>>, XlaDomainError>
+        inputs: In::To<XlaArray<'c>>,
+    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
     where
         XlaOptions: Clone,
         F: Fn(
@@ -747,7 +751,7 @@ type XlaSourceProgramOutput<Out> = XlaProgramConstants<Out>;
 /// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
 ///
 /// Holds the traced source [`Program`](ryft_core::programs::Program) of one closure together with its captured
-/// runtime [`Array`]s and input / output type metadata, **without** compiling a PJRT executable. This is the right
+/// runtime [`XlaArray`]s and input / output type metadata, **without** compiling a PJRT executable. This is the right
 /// entry point for functions that are only ever composed into larger programs: [`Self::call`] embeds the staged
 /// program into an active outer trace as a `jit_call` boundary, and [`XlaDomain::compile_staged_function`] produces a
 /// [`CompiledXlaFunction`] when an executable is actually needed. Executable cache identity is derived from the
@@ -911,30 +915,30 @@ impl<'c> XlaDomain<'c> {
         Ok(CompiledXlaFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
     }
 
-    /// Executes an XLA runtime program on concrete [`Array`] inputs.
+    /// Executes an XLA runtime program on concrete [`XlaArray`] inputs.
     #[inline]
     pub fn interpret<In, Out>(
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Out::To<Array<'c>>, XlaDomainError>
+        inputs: In::To<XlaArray<'c>>,
+    ) -> Result<Out::To<XlaArray<'c>>, XlaDomainError>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<XlaArray<'c>>
                             + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<XlaArray<'c>>
                             + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<XlaArray<'c>>:
+            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = lift_arrays::<In>(inputs)?;
         project_arrays::<Out>(call_function(self, &executable.function, inputs)?)
@@ -944,25 +948,25 @@ impl<'c> XlaDomain<'c> {
     pub fn interpret_async<In, Out>(
         &self,
         executable: &ExecutableXlaFunction<'c, In, Out>,
-        inputs: In::To<Array<'c>>,
-    ) -> Result<Execution<Out::To<Array<'c>>>, XlaDomainError>
+        inputs: In::To<XlaArray<'c>>,
+    ) -> Result<Execution<Out::To<XlaArray<'c>>>, XlaDomainError>
     where
         In: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<XlaArray<'c>>
                             + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
-                            + ParameterizedFamily<Array<'c>>
+                            + ParameterizedFamily<XlaArray<'c>>
                             + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
-        Out::To<Array<'c>>:
-            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        Out::To<XlaArray<'c>>:
+            Parameterized<XlaArray<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         if executable.function.compiled_program().requires_stateful_call() {
             return Err(XlaDomainError::UnsupportedReferenceAbi {
@@ -1051,7 +1055,7 @@ impl<'c> XlaDomain<'c> {
 /// [`XlaDomain::compile_staged_function`].
 ///
 /// Holds the cached PJRT-backed [`XlaCompiledProgram`] plus the [`StagedXlaFunction`] it was compiled from, whose
-/// input / output type metadata marshals a [`Parameterized`] tree of [`Array`]s into the executable and reassembles
+/// input / output type metadata marshals a [`Parameterized`] tree of [`XlaArray`]s into the executable and reassembles
 /// the outputs back into the user's expected output tree shape.
 ///
 /// The retained staged function also keeps the **source [`Program`](ryft_core::Program)** that the execution domain
@@ -1546,7 +1550,7 @@ where
 #[track_caller]
 pub fn compile_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<XlaArray<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
@@ -1616,7 +1620,7 @@ where
 #[track_caller]
 fn compile_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<XlaArray<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
@@ -1696,7 +1700,7 @@ where
 #[track_caller]
 pub fn stage_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<XlaArray<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
@@ -1734,7 +1738,7 @@ where
 #[track_caller]
 fn stage_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
-    captures: Vec<Array<'c>>,
+    captures: Vec<XlaArray<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
@@ -1848,19 +1852,18 @@ mod tests {
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::{
-        Add, AddOperation, ArgMax, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayReference,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
-        CaptureReference, Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind,
-        Cumulative, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
-        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh,
-        Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
-        ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
-        ZeroLike, differentiate_at,
+        Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
+        ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative, DataType, Device,
+        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
+        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
+        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis,
+        MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError,
+        ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape,
+        ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh,
+        TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1876,7 +1879,7 @@ mod tests {
     };
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions, XlaReference,
+        AdaptiveProfileGuidedOptions, ArrayError, Error, FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaReference,
         XlaSession, XlaValue,
     };
 
@@ -1973,7 +1976,7 @@ mod tests {
         DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(), devices).unwrap()
     }
 
-    fn read_f32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f32> {
+    fn read_f32_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<f32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -1987,7 +1990,7 @@ mod tests {
         values_from_bytes::<f32>(shard_bytes.as_slice())
     }
 
-    fn read_sharded_f32_array(array: &Array<'_>) -> Vec<f32> {
+    fn read_sharded_f32_array(array: &XlaArray<'_>) -> Vec<f32> {
         let mut values = Vec::new();
         for device in array.mesh().devices() {
             let shard_bytes = array
@@ -2004,7 +2007,7 @@ mod tests {
         values
     }
 
-    fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f64> {
+    fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<f64> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -2089,7 +2092,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -2130,7 +2133,7 @@ mod tests {
         assert_eq!(compiled.source_program().program().input_ids().len(), 1);
         assert_eq!(compiled.source_program().captures().len(), 0);
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -2161,8 +2164,8 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
-        let value =
-            Array::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
+        let value = XlaArray::from_host_buffer(&engine, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice())
+            .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
             vec![value],
@@ -2173,7 +2176,8 @@ mod tests {
         .unwrap();
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
-        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
+        let input =
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4f32; 6]);
     }
@@ -2197,7 +2201,8 @@ mod tests {
             ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
         ] {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values))
+                    .unwrap();
             let output = engine.interpret(&compiled.executable_function(), input.clone()).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
@@ -2224,7 +2229,8 @@ mod tests {
             [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
         {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values))
+                    .unwrap();
             let output = engine.interpret(&gradient.executable_function(), input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
@@ -2277,7 +2283,7 @@ mod tests {
             )
             .unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
@@ -2299,7 +2305,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
+        let input = XlaArray::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
         assert!(read_f32_array(&client, &output)[0].is_nan());
     }
@@ -2324,7 +2330,7 @@ mod tests {
             let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+                XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
             let output = engine.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &output), expected);
         }
@@ -2344,7 +2350,7 @@ mod tests {
             .unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let source = || {
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -2395,13 +2401,14 @@ mod tests {
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
         let input =
-            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+            XlaArray::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled finite-shift guard must retain the undefined weight at an infinite input.
-        let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let input =
+            XlaArray::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         let values = read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
@@ -2422,7 +2429,7 @@ mod tests {
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+            XlaArray::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = engine.interpret(&differentiated.executable_function(), (input.clone(), input)).unwrap();
         assert_eq!(read_f32_array(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
@@ -2440,7 +2447,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source = |values: [f32; 4]| {
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -2508,7 +2515,7 @@ mod tests {
         assert_eq!(executable.output_types(), &[input_type.clone()]);
 
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = domain.interpret(&executable, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
@@ -2559,7 +2566,7 @@ mod tests {
         for (initial, expected_value, expected_state, expected_gradient) in
             [(3.0_f32, 36.0, 6.0, 24.0), (5.0, 100.0, 10.0, 40.0), (3.0, 36.0, 6.0, 24.0)]
         {
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
@@ -2726,9 +2733,13 @@ mod tests {
             // A larger root exercises repeated updates through the same compiled loop and nested call.
             let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
             let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
-            let input =
-                Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                    .unwrap();
+            let input = XlaArray::from_host_buffer(
+                &domain,
+                input_type,
+                mesh.clone(),
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap();
             let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, &outputs), expected);
             assert_eq!(read_f32_array(&client, &frozen), expected);
@@ -2756,13 +2767,13 @@ mod tests {
         )
         .unwrap();
         let initial =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(initial.r#type().sharding().is_some());
         let reference = ArrayReference::new(initial);
         let retained_snapshot = reference.read().unwrap();
         let rejected_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         assert!(matches!(
             ryft_core::call_function(
@@ -2780,7 +2791,7 @@ mod tests {
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
                 .call_statefully(
@@ -2864,7 +2875,8 @@ mod tests {
         // Both references are committed after the call: the primal holder accumulates the update and the tangent
         // holder accumulates the tangent update, and the outputs read the committed states.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                .unwrap()
         };
         let reference = ArrayReference::new(scalar(1.0));
         let tangent_reference = ArrayReference::new(scalar(10.0));
@@ -2929,7 +2941,8 @@ mod tests {
         // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
         // while leaving the destination unchanged, so both end at `5 + 2`.
         let scalar = |value: f32| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                .unwrap()
         };
         let cotangent_reference = ArrayReference::new(scalar(5.0));
         let input_cotangent = compiled
@@ -2965,7 +2978,7 @@ mod tests {
             .unwrap();
         let vector = |values: &[f32]| {
             XlaValue::Array(
-                Array::from_host_buffer(
+                XlaArray::from_host_buffer(
                     &domain,
                     array_type.clone(),
                     mesh.clone(),
@@ -3012,14 +3025,14 @@ mod tests {
         }
         fn value_and_gradient<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
             domain: &XlaDomain<'c>,
-            input: Array<'c>,
+            input: XlaArray<'c>,
             policy: P,
         ) -> (XlaValue<'c>, XlaValue<'c>) {
             let function = rematerialize(sine_of_dot).with_policy(policy);
             domain.differentiate_at(XlaValue::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
         }
         let input = || {
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 mesh.clone(),
@@ -3079,7 +3092,7 @@ mod tests {
             },
         );
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
         };
         let input = XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
@@ -3186,7 +3199,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.call_statefully(&domain, XlaValue::Array(input)).unwrap();
         let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -3217,7 +3230,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.call_statefully_async(&domain, XlaValue::Array(input)).r#await().unwrap();
         let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
@@ -3243,7 +3256,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+            XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
             let output = compiled
@@ -3279,7 +3292,7 @@ mod tests {
         // than enqueueing an execution whose hidden final-state outputs nothing would publish.
         let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             ExecutableXlaFunction { function: compiled.executable_function().clone() };
-        let input = Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = XlaArray::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             domain.interpret_async(&executable, input),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
@@ -3314,7 +3327,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
@@ -3336,7 +3349,7 @@ mod tests {
             let mutate = &mutate;
             scope.spawn(move || {
                 let update =
-                    Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                    XlaArray::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
                 mutation_finished
                     .send(mutate.call_statefully(
                         domain,
@@ -3380,10 +3393,10 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
             .call_statefully_async(
                 &domain,
@@ -3413,20 +3426,20 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let predecessor = ControlledReferenceCompletion::new();
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(predecessor.clone()));
         let first_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let first = compiled.call_statefully_async(
             &domain,
             (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(first_update)),
         );
         let second_update =
-            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.call_statefully_async(
             &domain,
             (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(second_update)),
@@ -3466,12 +3479,12 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let completion = ControlledReferenceCompletion::new();
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(completion.clone()));
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         drop(compiled.call_statefully_async(
             &domain,
             (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
@@ -3503,7 +3516,7 @@ mod tests {
         )
         .unwrap();
         let root = ArrayReference::new(
-            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+            XlaArray::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
         let view = root
@@ -3542,7 +3555,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 alternate_type.clone(),
                 mesh.clone(),
@@ -3570,7 +3583,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let update = Array::from_host_buffer(
+        let update = XlaArray::from_host_buffer(
             &domain,
             replicated_type.clone(),
             mesh,
@@ -3614,7 +3627,7 @@ mod tests {
         )
         .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 mesh.clone(),
@@ -3622,7 +3635,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = Array::from_host_buffer(
+        let update = XlaArray::from_host_buffer(
             &domain,
             array_type.clone(),
             mesh.clone(),
@@ -3646,7 +3659,7 @@ mod tests {
         let reversed_mesh =
             DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
         let reversed_reference = ArrayReference::new(
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 array_type.clone(),
                 reversed_mesh,
@@ -3654,7 +3667,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = Array::from_host_buffer(
+        let update = XlaArray::from_host_buffer(
             &domain,
             array_type,
             mesh,
@@ -3695,7 +3708,7 @@ mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
@@ -3760,7 +3773,8 @@ mod tests {
         )
         .unwrap();
         let array = |r#type: &ArrayType, values: &[f32]| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
+            XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+                .unwrap()
         };
         let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
         let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
@@ -3836,7 +3850,7 @@ mod tests {
         )
         .unwrap();
         let array = |values: &[f32]| {
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
         let destination = ArrayReference::new(array(&[5.0, 7.0]));
@@ -3914,7 +3928,7 @@ mod tests {
         .unwrap();
 
         let reference = ArrayReference::new(
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 sharded_type.clone(),
                 mesh.clone(),
@@ -3922,7 +3936,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = Array::from_host_buffer(
+        let update = XlaArray::from_host_buffer(
             &domain,
             sharded_type,
             mesh,
@@ -4016,7 +4030,7 @@ mod tests {
         .unwrap();
 
         let reference = ArrayReference::new(
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &domain,
                 replicated_type,
                 mesh.clone(),
@@ -4024,7 +4038,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let update = Array::from_host_buffer(
+        let update = XlaArray::from_host_buffer(
             &domain,
             sharded_type,
             mesh,
@@ -4085,7 +4099,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap();
             let reference = ArrayReference::new(
-                Array::from_host_buffer(
+                XlaArray::from_host_buffer(
                     &domain,
                     actual_type,
                     mesh.clone(),
@@ -4124,13 +4138,13 @@ mod tests {
             mesh.clone(),
         );
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
 
         for expected in [3.0f32, 5.0] {
             let update =
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
                 .call_statefully(
@@ -4161,7 +4175,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -4175,7 +4189,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let output = compiled.call_statefully(&domain, XlaValue::Array(update)).unwrap();
         let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![3.0]);
@@ -4195,7 +4209,7 @@ mod tests {
             .unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            XlaArray::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, public_reference| {
@@ -4235,7 +4249,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
@@ -4279,16 +4293,16 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let (higher_output, lower_output) = compiled
             .call_statefully(
@@ -4335,20 +4349,20 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let second = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let (lower_reference, higher_reference) =
             if first.id() < second.id() { (first, second) } else { (second, first) };
         let higher_first_update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         let lower_first_update =
-            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
         // The two calls present the same holders in opposite argument order and start together. Both must finish:
         // internal identity ordering serializes their retained-guard windows without creating a lock cycle.
@@ -4413,7 +4427,7 @@ mod tests {
         .unwrap();
         let reference_new = |value: f32| {
             ArrayReference::new(
-                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap(),
             )
         };
@@ -4426,7 +4440,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let wrong_update =
-            Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice())
+                .unwrap();
         let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
         let expected_error = format!(
             "runtime input type {} does not refine declared type {declared_update_type}",
@@ -4453,7 +4468,7 @@ mod tests {
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
         assert!(matches!(
@@ -4479,7 +4494,7 @@ mod tests {
         let post_handoff_second = reference_new(10.0);
         let post_handoff_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
         assert!(matches!(
@@ -4513,7 +4528,7 @@ mod tests {
         let pre_commit_second = reference_new(10.0);
         let pre_commit_read_only = reference_new(20.0);
         let update =
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
@@ -4545,7 +4560,7 @@ mod tests {
         let committed_first = reference_new(1.0);
         let committed_second = reference_new(10.0);
         let committed_read_only = reference_new(20.0);
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.call_statefully(
@@ -4589,15 +4604,15 @@ mod tests {
         )
         .unwrap();
         let first = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         let frozen = ArrayReference::new(
-            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+            XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
         frozen.freeze().unwrap();
-        let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let update = XlaArray::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
@@ -4702,21 +4717,21 @@ mod tests {
         }));
 
         for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>(&[3.0]).as_slice(),
             )
             .unwrap();
-            let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+            let jacobian: Jacobian<ArrayType, XlaArray<'_>, ArrayType, ArrayType> =
                 domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let hessian: Hessian<ArrayType, XlaArray<'_>, ArrayType, ArrayType> =
             domain.interpret(&second.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
@@ -4756,12 +4771,12 @@ mod tests {
         .unwrap();
 
         let scalar =
-            Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
+            XlaArray::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
                 .unwrap();
         let vector =
-            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+            XlaArray::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
-        let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
+        let jacobian: Jacobian<ArrayType, XlaArray<'_>, (ArrayType, ArrayType), ArrayType> =
             domain.interpret(&forward.executable_function(), (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
@@ -4790,7 +4805,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
+            XlaArray::from_host_buffer(&domain, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
 
         let output = domain.interpret(&executable, input).unwrap();
@@ -4827,7 +4842,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         assert!(matches!(
             other_domain.interpret(&executable, input.clone()),
@@ -4877,7 +4892,7 @@ mod tests {
                 .unwrap()
                 .into_executable_function();
         let input =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let output =
             std::thread::scope(|scope| scope.spawn(move || domain.interpret(&executable, input)).join().unwrap())
@@ -4923,7 +4938,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let source =
-            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
         let sine = function.call(true, source.clone()).unwrap();
         let warm_sine = function.call(true, source.clone()).unwrap();
@@ -4956,7 +4971,7 @@ mod tests {
             compile(|x| x.clone() * x.stop_gradient().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer(
+        let source = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -4996,7 +5011,7 @@ mod tests {
         )
         .unwrap();
         let other_values = [4.0f32, 3.0, 2.0, 1.0];
-        let first = Array::from_host_buffer(
+        let first = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5004,7 +5019,7 @@ mod tests {
         )
         .unwrap();
         let second =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
                 .unwrap();
         let (first, second) = engine.interpret(&variadic.executable_function(), (first, second)).unwrap();
         assert_eq!(read_f32_array(&client, &first), values);
@@ -5037,16 +5052,20 @@ mod tests {
             {
                 assert!(!available);
                 assert!(matches!(
-                    Array::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
+                    XlaArray::from_host_buffer(&engine, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
                     Err(ArrayError::Error(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
                         if actual_device == device_id && actual_memory == memory,
                 ));
                 continue;
             }
             assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
-            let source =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
-                    .unwrap();
+            let source = XlaArray::from_host_buffer(
+                &engine,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes(&values).as_slice(),
+            )
+            .unwrap();
 
             // A compiled host result must occupy the requested host memory, not just carry host metadata on a device buffer.
             let to_host: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -5149,7 +5168,7 @@ mod tests {
         let compiled: CompiledXlaFunction<'_, ArrayType, ()> =
             compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
 
         let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
         assert_eq!(execution.output(), &());
@@ -5206,7 +5225,7 @@ mod tests {
 
         // Execute and compare against the mathematical reference.
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer(
+        let source = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5244,7 +5263,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5264,7 +5283,7 @@ mod tests {
         assert_eq!(compiled.source_program().captures().len(), 1);
         assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
 
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5287,7 +5306,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let capture = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
+        let capture = XlaArray::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), []).unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
             |captures, _| captures[0].clone(),
             vec![capture],
@@ -5296,7 +5315,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
+        let input = XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
 
         let output = engine.interpret(&compiled.executable_function(), input).unwrap();
 
@@ -5317,7 +5336,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5337,7 +5356,7 @@ mod tests {
 
         assert_eq!(outer.source_program().captures().len(), 1);
 
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5363,14 +5382,14 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let left_bias = Array::from_host_buffer(
+        let left_bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
             values_to_bytes::<f32>(&[2.0, 2.0, 2.0, 2.0]).as_slice(),
         )
         .unwrap();
-        let right_bias = Array::from_host_buffer(
+        let right_bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5403,7 +5422,7 @@ mod tests {
 
         assert_eq!(outer.source_program().captures().len(), 2);
 
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -5428,7 +5447,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5448,7 +5467,7 @@ mod tests {
 
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
-        let primal = Array::from_host_buffer(
+        let primal = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5456,7 +5475,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -5476,7 +5495,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5496,7 +5515,7 @@ mod tests {
         assert_eq!(gradient.source_program().captures().len(), 1);
 
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![2.0]);
@@ -5555,7 +5574,7 @@ mod tests {
         }
         expected_gradient *= expected_value.cos();
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
         let output = engine.interpret(&gradient.executable_function(), input).unwrap();
         assert!((read_f32_array(&client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
     }
@@ -5588,7 +5607,7 @@ mod tests {
         // The retained derived function keeps residuals as runtime values: different primals through the shared
         // executable produce different, correct value-dependent gradients (`d(x*x)/dx = 2x`).
         for point in [3.0f32, -5.0f32] {
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -5634,7 +5653,7 @@ mod tests {
         assert_eq!(engine.compilation_context().statistics(), statistics);
 
         // The retained JVP computes `(x * x, 2 * x * t)` for runtime `(x, t)` supplied per call.
-        let primal = Array::from_host_buffer(
+        let primal = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5642,7 +5661,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
+            XlaArray::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&second.executable_function(), (primal, tangent)).unwrap();
         assert_eq!(read_f32_array(&client, &primal_output), vec![9.0]);
@@ -5660,7 +5679,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5705,7 +5724,7 @@ mod tests {
 
         assert_eq!(jvp_compiled.source_program().captures().len(), 1);
 
-        let primal = Array::from_host_buffer(
+        let primal = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -5713,7 +5732,7 @@ mod tests {
         )
         .unwrap();
         let tangent =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
@@ -5759,14 +5778,14 @@ mod tests {
         assert_eq!(inlined_sin_count, 0, "jvp(jit(f)) should not inline the callee body");
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
-            let primal_array = Array::from_host_buffer(
+            let primal_array = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
-            let tangent_array = Array::from_host_buffer(
+            let tangent_array = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -5831,8 +5850,8 @@ mod tests {
         let zero_identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let primal_input = Array::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
-        let tangent_input = Array::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
+        let primal_input = XlaArray::from_host_buffer(&engine, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
+        let tangent_input = XlaArray::from_host_buffer(&engine, tangent_type.clone(), mesh, []).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp.executable_function(), (primal_input, tangent_input)).unwrap();
 
@@ -5978,14 +5997,14 @@ mod tests {
         .unwrap();
 
         for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
-            let primal_array = Array::from_host_buffer(
+            let primal_array = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
                 values_to_bytes::<f32>([primal].as_slice()).as_slice(),
             )
             .unwrap();
-            let tangent_array = Array::from_host_buffer(
+            let tangent_array = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6053,7 +6072,7 @@ mod tests {
 
         let a_values = [10.0f32, 20.0, 30.0];
         let b_values = [1.0f32, 2.0, 3.0];
-        let a = Array::from_host_buffer(
+        let a = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -6061,7 +6080,7 @@ mod tests {
         )
         .unwrap();
         let b =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), (a, b)).unwrap();
 
@@ -6138,13 +6157,13 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         // The output remains independently readable after the donating call returns. Donation
         // is opaque from the host side — PJRT may reuse the input's device buffer for the
-        // output, but the public API only observes the resulting `Array`.
+        // output, but the public API only observes the resulting `XlaArray`.
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
             .device_shard(device_id)
@@ -6242,7 +6261,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape).with_sharding(sharded).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6299,7 +6318,7 @@ mod tests {
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         // Override the output sharding to the same 2-way shard along "x" so the partitioner
-        // emits a fully-sharded output and `Array`'s sharding metadata matches.
+        // emits a fully-sharded output and `XlaArray`'s sharding metadata matches.
         let xla_options = XlaOptions::new(mesh.clone()).with_out_shardings(vec![sharded.clone()]);
         let options = xla_options;
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
@@ -6310,7 +6329,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -6354,7 +6373,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let replicated_input_type = ArrayType::new(DataType::F32, shape).with_sharding(replicated).unwrap();
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source = Array::from_host_buffer(
+        let source = XlaArray::from_host_buffer(
             &engine,
             replicated_input_type,
             mesh.clone(),
@@ -6456,7 +6475,7 @@ mod tests {
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
@@ -6532,7 +6551,7 @@ mod tests {
 
         let values = [0.1f32, 0.2, 0.3, 0.4];
         let source =
-            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
@@ -6580,7 +6599,7 @@ mod tests {
 
         let input_value = 0.5f32;
         let make_input = || {
-            Array::from_host_buffer(
+            XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6609,7 +6628,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let bias = Array::from_host_buffer(
+        let bias = XlaArray::from_host_buffer(
             &engine,
             input_type.clone(),
             mesh.clone(),
@@ -6632,7 +6651,7 @@ mod tests {
         assert_eq!(outer.source_program().captures().len(), 1);
 
         let input_value = 0.5f32;
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &engine,
             input_type,
             mesh.clone(),
@@ -6694,7 +6713,7 @@ mod tests {
         .unwrap();
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &engine,
                 input_type.clone(),
                 mesh.clone(),
@@ -6846,7 +6865,7 @@ mod tests {
         domain.compilation_context().clear_statistics();
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
         for index in 0..BASELINE_REPETITIONS {
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &domain,
                 input_type.clone(),
                 mesh.clone(),
@@ -7143,7 +7162,7 @@ mod tests {
 
     /// One decode step of the tiny gated-attention language model shared by the compiled decode-loop demo and its
     /// eager reference loop. The step is written once against `ryft`'s value-level capability traits, so the same
-    /// function executes eagerly over reference [`CpuArray`]s and stages symbolically over [`XlaCompileTracer`]s
+    /// function executes eagerly over reference [`Array`]s and stages symbolically over [`XlaCompileTracer`]s
     /// inside the compiled `While` body.
     ///
     /// The decode state is a thirteen-value vector: the current position and token (`i32` scalars), the `[steps,
@@ -7338,14 +7357,14 @@ mod tests {
         vec![outputs[4].clone(), outputs[2].clone(), outputs[3].clone()]
     }
 
-    /// Runs the decode-loop demo's eager reference: the same [`decode_step`] executed over reference [`CpuArray`]
+    /// Runs the decode-loop demo's eager reference: the same [`decode_step`] executed over reference [`Array`]
     /// values in a plain Rust loop, with no `While` staging, compilation, or XLA involvement.
     fn reference_decode_loop(
-        initial_state: Vec<CpuArray>,
+        initial_state: Vec<Array>,
         configuration: &DecodeConfiguration,
         sampling: DecodeSampling,
-    ) -> Vec<CpuArray> {
-        let context = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+    ) -> Vec<Array> {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let mut state = initial_state;
         for _ in 0..configuration.steps {
             state = decode_step(&context, &state, configuration, sampling, DecodeAttention::Composed).unwrap();
@@ -7486,7 +7505,7 @@ mod tests {
     }
 
     /// Reads a replicated `i32` array back from the single test device.
-    fn read_i32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<i32> {
+    fn read_i32_array(client: &ryft_pjrt::Client<'_>, array: &XlaArray<'_>) -> Vec<i32> {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
             .device_shard(device_id)
@@ -7556,7 +7575,7 @@ mod tests {
         .unwrap();
 
         let device_input = |index: usize, bytes: Vec<u8>| {
-            Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
+            XlaArray::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
         };
         let mut device_inputs = vec![
             device_input(0, values_to_bytes::<i32>(&[0])),
@@ -7575,23 +7594,23 @@ mod tests {
         let device_cache_values = read_f32_array(&client, &outputs[2]);
 
         let mut reference_state = vec![
-            CpuArray::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap(),
-            CpuArray::from_elements(ArrayType::new_static(DataType::I32, []), &[3_i32]).unwrap(),
-            CpuArray::from_elements(
+            Array::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap(),
+            Array::from_elements(ArrayType::new_static(DataType::I32, []), &[3_i32]).unwrap(),
+            Array::from_elements(
                 ArrayType::new_static(DataType::F32, [steps, dimension]),
                 &vec![0.0_f32; steps * dimension],
             )
             .unwrap(),
-            CpuArray::from_elements(
+            Array::from_elements(
                 ArrayType::new_static(DataType::F32, [steps, dimension]),
                 &vec![0.0_f32; steps * dimension],
             )
             .unwrap(),
-            CpuArray::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0_i32; steps]).unwrap(),
-            CpuArray::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42_u64, 0]).unwrap(),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0_i32; steps]).unwrap(),
+            Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42_u64, 0]).unwrap(),
         ];
         reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
-            CpuArray::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
+            Array::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
         }));
         let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
         let reference_tokens = reference_state[4].elements::<i32>().unwrap();

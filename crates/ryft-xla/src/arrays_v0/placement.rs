@@ -73,10 +73,10 @@ pub struct DevicePutOptions<
     MayAlias = Option<bool>,
 > {
     /// Destination placement tree prefix. When absent, host leaves are committed to the default
-    /// local device and [`Array`] leaves preserve their current placement.
+    /// local device and [`XlaArray`] leaves preserve their current placement.
     device: Option<DeviceTarget>,
 
-    /// Source placement tree prefix. This is validated for [`Array`] leaves and ignored for host
+    /// Source placement tree prefix. This is validated for [`XlaArray`] leaves and ignored for host
     /// leaves, which do not carry runtime placement metadata before upload.
     src: Option<SourceTarget>,
 
