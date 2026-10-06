@@ -2014,7 +2014,7 @@ mod tests {
                 let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
                     forward={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
-                        let %2:f32[extent] =
+                        let %2:f32[extent] = \
                                 parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
                         in (%2)
                     },
