@@ -6,7 +6,7 @@ use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
     Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
 };
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -885,18 +885,19 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// # Parameters
     ///
     ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `split_axis`: Input axis split into one slice per receiver.
+    ///   - `split_axis`: Input axis split into one slice per receiver. Negative axes count from the end.
     ///   - `concatenation_axis`: Output position at which sender slices are stacked after removing `split_axis`.
+    ///     Negative positions count from the end of the output, whose rank equals the rank of this value.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelAllToAll::parallel_all_to_all_with_options`].
     #[inline]
-    fn parallel_all_to_all(
+    fn parallel_all_to_all<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
     ) -> Result<Self, ProgramError> {
         self.parallel_all_to_all_with_options(axis_name, split_axis, concatenation_axis, CollectiveOptions::default())
     }
@@ -908,18 +909,19 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// # Parameters
     ///
     ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `split_axis`: Input axis split into one chunk per receiver.
-    ///   - `concatenation_axis`: Array axis along which received chunks are concatenated in sender order.
+    ///   - `split_axis`: Input axis split into one chunk per receiver. Negative axes count from the end.
+    ///   - `concatenation_axis`: Array axis along which received chunks are concatenated in sender order. Negative axes
+    ///     count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelAllToAll::parallel_all_to_all_with_options`].
     #[inline]
-    fn parallel_all_to_all_tiled(
+    fn parallel_all_to_all_tiled<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
     ) -> Result<Self, ProgramError> {
         self.parallel_all_to_all_with_options(
             axis_name,
@@ -935,21 +937,23 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// # Parameters
     ///
     ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `split_axis`: Input axis split into one slice or chunk per receiver.
-    ///   - `concatenation_axis`: Output axis holding the received slices or chunks, as selected by `options`.
+    ///   - `split_axis`: Input axis split into one slice or chunk per receiver. Negative axes count from the end.
+    ///   - `concatenation_axis`: Output axis holding the received slices or chunks, as selected by `options`. Negative
+    ///     axes count from the end of the output, whose rank equals the rank of this value in both modes.
     ///   - `options`: Tiling mode and optional ordered participant groups.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`](crate::AxisError::UnboundAxisName)
-    /// when no binder binds `axis_name`, and a [`ProgramError`] for invalid axes, groups, or split geometry, pending
+    /// when no binder binds `axis_name` or [`AxisError::OutOfBounds`](crate::AxisError::OutOfBounds) when an axis is
+    /// out of bounds, and a [`ProgramError`] for invalid groups or split geometry, pending
     /// cross-device sums, or an overflowing concatenation extent. A batch level that binds the collective axis rejects
     /// participant groups and bounded ragged inputs.
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
 
@@ -960,13 +964,18 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// # Parameters
     ///
     ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `axis`: Ranked axis to exchange with the named axis.
+    ///   - `axis`: Ranked axis to exchange with the named axis. Negative axes count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::parallel_all_to_all_with_options`].
     #[inline]
-    fn parallel_swap_axes(&self, axis_name: &str, axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_swap_axes<SwappedAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        axis: SwappedAxis,
+    ) -> Result<Self, ProgramError> {
+        let axis = axis.into();
         self.parallel_all_to_all(axis_name, axis, axis)
     }
 
@@ -976,19 +985,20 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     /// # Parameters
     ///
     ///   - `axis_name`: Name bound by an enclosing batch level or manual region.
-    ///   - `axis`: Ranked axis to exchange with the named axis.
+    ///   - `axis`: Ranked axis to exchange with the named axis. Negative axes count from the end.
     ///   - `axis_index_groups`: Ordered equal-sized partition of the named-axis participant coordinates.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::parallel_all_to_all_with_options`].
     #[inline]
-    fn parallel_swap_axes_with_axis_index_groups(
+    fn parallel_swap_axes_with_axis_index_groups<SwappedAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        axis: usize,
+        axis: SwappedAxis,
         axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, ProgramError> {
+        let axis = axis.into();
         self.parallel_all_to_all_with_options(
             axis_name,
             axis,
@@ -1000,11 +1010,11 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
 
 impl ParallelAllToAll<ArrayType> for Array {
     #[inline]
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        _split_axis: usize,
-        _concatenation_axis: usize,
+        _split_axis: SplitAxis,
+        _concatenation_axis: ConcatenationAxis,
         _options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // A concrete `Array` never executes inside an axis binder, because the values under a `batch` level or inside
@@ -1014,11 +1024,11 @@ impl ParallelAllToAll<ArrayType> for Array {
 }
 
 impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // A concrete composite value performs the collective through its array member.
@@ -1044,11 +1054,11 @@ where
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Mul + Div + Rem + Compare<V>>
         + ValueProjection<ArrayType, Projected: ParallelVary>,
 {
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Composite values stage the array followed by one result extent per axis. Only a manual mesh binder records
@@ -1057,6 +1067,10 @@ where
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
+        let self_type = self.r#type();
+        let rank = <&ArrayType>::try_from(self_type.as_ref())?.rank();
+        let split_axis = split_axis.into().normalize(rank)?;
+        let concatenation_axis = concatenation_axis.into().normalize(rank)?;
         let mut input = self.clone();
         let mut operation = ParallelAllToAllOperation::new(
             axis_name.to_string(),
@@ -1082,14 +1096,6 @@ where
 
         let input_type = input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-        let rank = input_type.rank();
-        if split_axis >= rank || concatenation_axis >= rank {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` split axis {split_axis} or concatenation axis \
-                 {concatenation_axis} is out of bounds for rank {rank}",
-            ))
-            .into());
-        }
 
         // Untiled exchange replaces the split axis. Its static extent needs no instruction. A dynamic one still
         // needs an equality assertion before it is discarded. Operation type inference checks static geometry.
@@ -1162,11 +1168,11 @@ impl<V: ParallelAllToAll<ArrayIrType> + ValueProjection<ArrayType, Projected = P
     ParallelAllToAll<ArrayType> for ProjectedValue<ArrayType, V>
 {
     #[inline]
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         self.value()
@@ -1182,17 +1188,20 @@ impl<
         > + ParallelVary,
 > ParallelAllToAll<ArrayType> for V
 {
-    fn parallel_all_to_all_with_options(
+    fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        split_axis: usize,
-        concatenation_axis: usize,
+        split_axis: SplitAxis,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
+        let rank = self.r#type().rank();
+        let split_axis = split_axis.into().normalize(rank)?;
+        let concatenation_axis = concatenation_axis.into().normalize(rank)?;
         let mut input = self.clone();
         let mut operation =
             ParallelAllToAllOperation::new(axis_name.to_string(), axis_size, split_axis, concatenation_axis, options);
@@ -1213,8 +1222,6 @@ impl<
         Ok(outputs.remove(0))
     }
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -3359,6 +3366,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_to_all_parallel_all_to_all_negative_axes() {
+        // Negative split and concatenation axes count from the end. An exchange preserves the rank, so both axes are
+        // normalized against the rank of the input in both modes. Homogeneous and composite values normalize the axes
+        // alike.
+        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
+        let homogeneous =
+            |input_type: ArrayType, split_axis: i32, concatenation_axis: i32, options: CollectiveOptions| {
+                TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                    move |input| input.parallel_all_to_all_with_options("x", split_axis, concatenation_axis, options),
+                    input_type,
+                    named_axes(),
+                )
+                .map(|(_, program)| program.to_string())
+            };
+        let composite =
+            |input_type: ArrayType, split_axis: i32, concatenation_axis: i32, options: CollectiveOptions| {
+                TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                    move |input| input.parallel_all_to_all_with_options("x", split_axis, concatenation_axis, options),
+                    ArrayIrType::Array(input_type),
+                    named_axes(),
+                )
+                .map(|(_, program)| program.to_string())
+            };
+        let untiled_type = || ArrayType::new_static(DataType::F32, [3, 4, 2]);
+        let tiled_type = || ArrayType::new_static(DataType::F32, [4, 6]);
+        let untiled = CollectiveOptions::default;
+        let tiled = CollectiveOptions::tiled;
+        assert_eq!(homogeneous(untiled_type(), -1, -3, untiled()), homogeneous(untiled_type(), 2, 0, untiled()));
+        assert_eq!(homogeneous(tiled_type(), -2, -1, tiled()), homogeneous(tiled_type(), 0, 1, tiled()));
+        assert_eq!(composite(untiled_type(), -1, -3, untiled()), composite(untiled_type(), 2, 0, untiled()));
+        assert_eq!(composite(tiled_type(), -2, -1, tiled()), composite(tiled_type(), 0, 1, tiled()));
+        assert_eq!(
+            homogeneous(untiled_type(), -4, 0, untiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
+        );
+        assert_eq!(
+            composite(tiled_type(), 0, -3, tiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
+    }
+
+    #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_tiled() {
         // Homogeneous array values stage the static-shape operation without explicit result extents. Over a manual
         // mesh axis, a varying input is exchanged directly and the staged operation records the mesh.
@@ -3514,7 +3563,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_with_options_array_ir_extents() {
-        // The composite capability validates both axes before it stages any result extent.
+        // The composite capability normalizes both axes before it stages any result extent.
         assert_eq!(
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| input.parallel_all_to_all_with_options("x", 2, 0, CollectiveOptions::default()),
@@ -3522,9 +3571,7 @@ mod tests {
                 vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })],
             )
             .map(|(output_type, _)| output_type),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`parallel_all_to_all` split axis 2 or concatenation axis 0 is out of bounds for rank 2",
-            ))),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
         );
 
         // Static group-local requirements are rejected while staging, while dynamic ones remain runtime assertions,
@@ -3818,6 +3865,20 @@ mod tests {
             batch(
                 |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                     item.parallel_swap_axes("x", 0)
+                },
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0]).unwrap()),
+        );
+
+        // Negative axes count from the end, so `-1` swaps the trailing axis, which is the only axis of each item here.
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    item.parallel_swap_axes("x", -1)
                 },
                 Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
                 BatchAxis::new(0),

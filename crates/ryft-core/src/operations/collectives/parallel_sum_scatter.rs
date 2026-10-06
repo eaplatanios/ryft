@@ -7,7 +7,7 @@ use crate::arrays::{
     DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape,
     Sharding,
 };
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -784,13 +784,17 @@ pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + S
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `scatter_axis`: Axis of this value along which the sum is scattered.
+    ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelSumScatter::parallel_sum_scatter_with_options`].
     #[inline]
-    fn parallel_sum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_sum_scatter<ScatterAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        scatter_axis: ScatterAxis,
+    ) -> Result<Self, ProgramError> {
         self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::default())
     }
 
@@ -801,13 +805,17 @@ pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + S
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `scatter_axis`: Axis of this value along which the sum is scattered.
+    ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelSumScatter::parallel_sum_scatter_with_options`].
     #[inline]
-    fn parallel_sum_scatter_tiled(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_sum_scatter_tiled<ScatterAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        scatter_axis: ScatterAxis,
+    ) -> Result<Self, ProgramError> {
         self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
     }
 
@@ -817,19 +825,19 @@ pub trait ParallelSumScatter<T = <Self as Capability>::Universe>: Capability + S
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `scatter_axis`: Axis of this value along which the sum is scattered.
+    ///   - `scatter_axis`: Axis of this value along which the sum is scattered. Negative axes count from the end.
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
-    /// `axis_name`, and a [`ProgramError`] if `scatter_axis` is out of bounds, if its extent does not fit the tiling
-    /// mode, if the participant groups are invalid, if this value is not numeric, or if its manual mesh state does
-    /// not satisfy the input variation or pending-sum contract.
-    fn parallel_sum_scatter_with_options(
+    /// `axis_name` or [`AxisError::OutOfBounds`] when `scatter_axis` is out of bounds, and a [`ProgramError`] if the
+    /// extent of `scatter_axis` does not fit the tiling mode, if the participant groups are invalid, if this value is
+    /// not numeric, or if its manual mesh state does not satisfy the input variation or pending-sum contract.
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        scatter_axis: usize,
+        scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError>;
 }
@@ -839,10 +847,10 @@ impl ParallelSumScatter<ArrayType> for Array {
     // a manual region are tracers, so every axis name is unbound for it.
 
     #[inline]
-    fn parallel_sum_scatter_with_options(
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        _scatter_axis: usize,
+        _scatter_axis: ScatterAxis,
         _options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         Err(AxisError::UnboundAxisName { name: axis_name.to_string() }.into())
@@ -855,16 +863,17 @@ impl<
         > + ParallelVary,
 > ParallelSumScatter<ArrayType> for V
 {
-    fn parallel_sum_scatter_with_options(
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        scatter_axis: usize,
+        scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let scatter_axis = scatter_axis.into().normalize(self.r#type().rank())?;
         let mut input = self.clone();
         let mut operation = ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options);
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
@@ -882,10 +891,10 @@ impl<
 }
 
 impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScatter<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_sum_scatter_with_options(
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        scatter_axis: usize,
+        scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // A concrete composite value performs the collective through its array member.
@@ -910,10 +919,10 @@ impl<
         + ValueProjection<ArrayType, Projected: ParallelVary>,
 > ParallelSumScatter<ArrayIrType> for V
 {
-    fn parallel_sum_scatter_with_options(
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        scatter_axis: usize,
+        scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // A composite value binds a `ParallelSumScatterOperation` through its own context, followed by one explicit
@@ -923,6 +932,8 @@ impl<
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let self_type = self.r#type();
+        let scatter_axis = scatter_axis.into().normalize(<&ArrayType>::try_from(self_type.as_ref())?.rank())?;
         let mut input = self.clone();
         let mut operation =
             ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
@@ -938,12 +949,6 @@ impl<
         let input_type = input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let rank = input_type.rank();
-        if scatter_axis >= rank {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` scatter axis {scatter_axis} is out of bounds for rank {rank}",
-            ))
-            .into());
-        }
 
         // Untiled scatter consumes its selected axis. Only a dynamic extent needs to be observed and checked;
         // operation type inference checks the static input geometry when the collective is bound below.
@@ -994,10 +999,10 @@ impl<V: ParallelSumScatter<ArrayIrType> + ValueProjection<ArrayType, Projected =
     ParallelSumScatter<ArrayType> for ProjectedValue<ArrayType, V>
 {
     #[inline]
-    fn parallel_sum_scatter_with_options(
+    fn parallel_sum_scatter_with_options<ScatterAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        scatter_axis: usize,
+        scatter_axis: ScatterAxis,
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         self.value()
@@ -2498,6 +2503,45 @@ mod tests {
                 BatchAxisSpecification::named("x"),
             ),
             Ok(ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_parallel_sum_scatter_negative_axes() {
+        // Negative scatter axes count from the end of the input in both modes. Homogeneous and composite values
+        // normalize the axis alike.
+        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
+        let homogeneous = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
+                input_type,
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let composite = |input_type: ArrayType, scatter_axis: i32, options: CollectiveOptions| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                move |input| input.parallel_sum_scatter_with_options("x", scatter_axis, options),
+                ArrayIrType::Array(input_type),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let untiled_type = || ArrayType::new_static(DataType::F32, [3, 2]);
+        let tiled_type = || ArrayType::new_static(DataType::F32, [3, 4]);
+        let untiled = CollectiveOptions::default;
+        let tiled = CollectiveOptions::tiled;
+        assert_eq!(homogeneous(untiled_type(), -1, untiled()), homogeneous(untiled_type(), 1, untiled()));
+        assert_eq!(homogeneous(tiled_type(), -1, tiled()), homogeneous(tiled_type(), 1, tiled()));
+        assert_eq!(composite(untiled_type(), -1, untiled()), composite(untiled_type(), 1, untiled()));
+        assert_eq!(composite(tiled_type(), -1, tiled()), composite(tiled_type(), 1, tiled()));
+        assert_eq!(
+            homogeneous(untiled_type(), -3, untiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
+        assert_eq!(
+            composite(tiled_type(), 2, tiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
         );
     }
 

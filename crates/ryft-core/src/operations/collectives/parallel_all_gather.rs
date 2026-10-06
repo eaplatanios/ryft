@@ -10,7 +10,7 @@ use crate::arrays::{
     ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
     DimensionVariable, LinearResiduals, LogicalMesh, RaggedAxis, Shape, Sharding,
 };
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -1083,13 +1083,18 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `concatenation_axis`: Position of the inserted axis, which ranges from zero through the rank of this value.
+    ///   - `concatenation_axis`: Position of the inserted axis in the result, whose rank is one more than the rank of
+    ///     this value. Negative positions count from the end, so `-1` appends a new trailing axis.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather(&self, axis_name: &str, concatenation_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_all_gather<ConcatenationAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        concatenation_axis: ConcatenationAxis,
+    ) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
             axis_name,
             concatenation_axis,
@@ -1105,13 +1110,18 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `concatenation_axis`: Axis of this value along which the values are concatenated.
+    ///   - `concatenation_axis`: Axis of this value along which the values are concatenated. Negative axes count from
+    ///     the end.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather_tiled(&self, axis_name: &str, concatenation_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_all_gather_tiled<ConcatenationAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        concatenation_axis: ConcatenationAxis,
+    ) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
             axis_name,
             concatenation_axis,
@@ -1127,8 +1137,10 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Parameters
     ///
     ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
-    ///   - `concatenation_axis`: Position of the inserted axis in untiled mode, or axis of this value along which the
-    ///     values are concatenated in tiled mode.
+    ///   - `concatenation_axis`: Position of the inserted axis in the result in untiled mode, or axis of this value
+    ///     along which the values are concatenated in tiled mode. Negative axes count from the end of the result in
+    ///     untiled mode, whose rank is one more than the rank of this value, and from the end of this value in tiled
+    ///     mode.
     ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective.
     ///   - `output_variance`: Manual variation of the result over a manual mesh axis. An ordinary all-gather
     ///     preserves the mesh state of this value.
@@ -1136,13 +1148,14 @@ pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Si
     /// # Errors
     ///
     /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
-    /// `axis_name`, and a [`ProgramError`] if `concatenation_axis` is out of bounds, if the participant groups are
+    /// `axis_name` or [`AxisError::OutOfBounds`] when `concatenation_axis` is out of bounds, and a [`ProgramError`] if
+    /// the participant groups are
     /// invalid or combined with invariant or reduced output variance, if reduced output variance is requested for an
     /// axis that is not a manual mesh axis, or if this value is unreduced over the gathered manual mesh axis.
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        concatenation_axis: usize,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError>;
@@ -1153,10 +1166,10 @@ impl ParallelAllGather<ArrayType> for Array {
     // a manual region are tracers, so every axis name is unbound for it.
 
     #[inline]
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        _concatenation_axis: usize,
+        _concatenation_axis: ConcatenationAxis,
         _options: CollectiveOptions,
         _output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
@@ -1169,18 +1182,22 @@ where
     V: ShapeChangingCollectiveValue + ParallelVary,
     V::DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
 {
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        concatenation_axis: usize,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain composite extent delegation. Over a
         // manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
         // copy is gathered, while a pending sum over the axis is rejected before that transition can obscure it.
+        // An untiled gather inserts an axis, so its concatenation axis is a position in the result, whose rank is one
+        // more than the rank of the input.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let result_rank = self.r#type().rank() + usize::from(options.mode == CollectiveMode::Untiled);
+        let concatenation_axis = concatenation_axis.into().normalize(result_rank)?;
         let mut operation = ParallelAllGatherOperation::new(
             axis_name.to_string(),
             axis_size,
@@ -1209,10 +1226,10 @@ where
 }
 
 impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        concatenation_axis: usize,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
@@ -1239,10 +1256,10 @@ where
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
     <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
 {
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        concatenation_axis: usize,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
@@ -1250,8 +1267,15 @@ where
         // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that does
         // not vary over the axis is first made varying through its array view, so that every device's copy is
         // gathered, while a pending sum over the axis is rejected before that transition can obscure it.
+        // An untiled gather inserts an axis, so its concatenation axis is a position in the result, whose rank is one
+        // more than the rank of the input. The axis is normalized before the explicit result extents are derived from
+        // the input extents.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let input_type = self.r#type();
+        let rank = <&ArrayType>::try_from(input_type.as_ref())?.rank();
+        let concatenation_axis =
+            concatenation_axis.into().normalize(rank + usize::from(options.mode == CollectiveMode::Untiled))?;
         let mut operation = ParallelAllGatherOperation::new(
             axis_name.to_string(),
             axis_size,
@@ -1275,16 +1299,6 @@ where
             operation = operation.with_mesh(mesh);
         }
 
-        // The concatenation axis must be validated before the explicit result extents are derived from the input
-        // extents.
-        let input_type = input.r#type();
-        let rank = <&ArrayType>::try_from(input_type.as_ref())?.rank();
-        if concatenation_axis > rank || (options.mode == CollectiveMode::Tiled && concatenation_axis == rank) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {concatenation_axis} is out of bounds for rank {rank}",
-            ))
-            .into());
-        }
         let mut output_extents = (0..rank).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
         let participants = context.dimension_constant(effective_axis_size)?;
         match options.mode {
@@ -1309,10 +1323,10 @@ where
     V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
 {
     #[inline]
-    fn parallel_all_gather_with_options(
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,
-        concatenation_axis: usize,
+        concatenation_axis: ConcatenationAxis,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
@@ -3950,6 +3964,60 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_gather_parallel_all_gather_negative_axes() {
+        // Negative concatenation axes count from the end of the result. An untiled gather inserts an axis, so its
+        // result has one more axis than the input and `-1` appends a new trailing axis, while a tiled gather
+        // concatenates along an existing axis. Homogeneous and composite values normalize the axis alike.
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let named_axes = || vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })];
+        let homogeneous = |concatenation_axis: i32, options: CollectiveOptions| {
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                move |input| {
+                    input.parallel_all_gather_with_options(
+                        "x",
+                        concatenation_axis,
+                        options,
+                        ParallelAllGatherOutputVariance::Varying,
+                    )
+                },
+                input_type.clone(),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let composite = |concatenation_axis: i32, options: CollectiveOptions| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                move |input| {
+                    input.parallel_all_gather_with_options(
+                        "x",
+                        concatenation_axis,
+                        options,
+                        ParallelAllGatherOutputVariance::Varying,
+                    )
+                },
+                ArrayIrType::Array(input_type.clone()),
+                named_axes(),
+            )
+            .map(|(_, program)| program.to_string())
+        };
+        let untiled = CollectiveOptions::default;
+        let tiled = CollectiveOptions::tiled;
+        assert_eq!(homogeneous(-1, untiled()), homogeneous(2, untiled()));
+        assert_eq!(homogeneous(-3, untiled()), homogeneous(0, untiled()));
+        assert_eq!(homogeneous(-1, tiled()), homogeneous(1, tiled()));
+        assert_eq!(composite(-1, untiled()), composite(2, untiled()));
+        assert_eq!(composite(-2, tiled()), composite(0, tiled()));
+        assert_eq!(
+            homogeneous(-4, untiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 })),
+        );
+        assert_eq!(
+            composite(-3, tiled()),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
+    }
+
+    #[test]
     fn test_parallel_all_gather_parallel_all_gather_tiled() {
         // Inside a manual region, homogeneous array values stage the static-shape operation without explicit result
         // extents, and an invariant input is made varying first so that every copy is gathered.
@@ -4125,7 +4193,8 @@ mod tests {
                 if message == "`parallel_all_gather` does not support unreduced inputs",
         ));
 
-        // Composite values validate the concatenation axis before they derive the explicit result extents.
+        // Composite values normalize the concatenation axis before they derive the explicit result extents, and a tiled
+        // gather concatenates along an existing axis, so its axis must be smaller than the rank of the input.
         assert!(matches!(
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -4139,8 +4208,7 @@ mod tests {
                 ArrayIrType::Array(varying_type),
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
             ),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`parallel_all_gather` concatenation axis 1 is out of bounds for rank 1",
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis, rank: 1 })) if axis == Axis::from(1),
         ));
     }
 

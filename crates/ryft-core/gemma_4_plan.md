@@ -185,7 +185,7 @@ in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, 
 | `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `ParallelReduceOperation` with any `ReductionKind` (incl. `Min`) |
 | `lax.all_gather` | tensor-parallel gathers | ✅ | `ParallelAllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
 | reduce-scatter | ZeRO-style gradient sharding | ✅ | `ParallelSumScatterOperation` |
-| `lax.ppermute` | pipeline parallelism | ✅ | `ParallelPermuteOperation` (+ `ParallelPermute::parallel_shuffle`, `ParallelSwapAxes` conveniences) |
+| `lax.ppermute` | pipeline parallelism | ✅ | `ParallelPermuteOperation` (+ `ParallelPermute::parallel_shuffle`, `ParallelAllToAll::parallel_swap_axes` conveniences) |
 | `lax.all_to_all` | MoE expert exchange | ✅ | `ParallelAllToAllOperation` |
 
 ### 1.9 Autodiff & training transforms
