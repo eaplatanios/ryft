@@ -122,12 +122,16 @@ update this file so that they do not need to remind you again in the future.
   `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`,
   `DifferentiationContext`, and `TranspositionContext`. Keep shared blanket implementations and substantial helper
   submodules shared rather than duplicating them to reproduce this ordering at each call site.
+- In non-trivial batching rules, explain logical and physical axis roles, replicated-input handling, reshape/transpose
+  stages, and sharding restoration with code comments beside the corresponding steps.
 - Keep domain-specific construction and transform-specific execution policy out of the central `Operation` trait.
   Prefer existing operation providers and the owning transform's validated execution path; add a core hook only when
   a general operation contract requires it, rather than to simplify one domain's dispatch.
 - Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
   diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
   differentiation.
+- Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when
+  constructing or updating operation output types, and propagate validation errors through existing conversions.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -219,6 +223,9 @@ update this file so that they do not need to remind you again in the future.
   final argument.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
+- Name functions that enforce a precondition by returning an error (e.g., `Result<(), Error>`, or a validated input)
+  `validate_*`, not `check_*`. Reserve `check_*` for assertion-style macros and test oracles (e.g., `check_count!`,
+  `check_gradient!`, and `check_operation_*!`).
 - Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
   shorthand.
 - When writing indentation into `std::fmt::Formatter`, prefer inline width-based formatting like

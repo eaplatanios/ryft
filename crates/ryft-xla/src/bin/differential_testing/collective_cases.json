@@ -1,0 +1,752 @@
+[
+  {
+    "id": "collective_gather_1_untiled",
+    "operation": "all_gather",
+    "participants": 1,
+    "local_shape": [
+      2,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": false
+  },
+  {
+    "id": "collective_gather_2_untiled",
+    "operation": "all_gather",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": false
+  },
+  {
+    "id": "collective_gather_4_untiled",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": false
+  },
+  {
+    "id": "collective_gather_8_untiled",
+    "operation": "all_gather",
+    "participants": 8,
+    "local_shape": [
+      2,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": false
+  },
+  {
+    "id": "collective_gather_tiled_axis_1",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_gather_ordered_groups",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ]
+  },
+  {
+    "id": "collective_gather_replicated",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": false,
+    "replicated_input": true
+  },
+  {
+    "id": "collective_gather_mesh_x",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "mesh_shape": [
+      2,
+      2
+    ],
+    "axis_name": "x"
+  },
+  {
+    "id": "collective_gather_mesh_y",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "mesh_shape": [
+      2,
+      2
+    ],
+    "axis_name": "y"
+  },
+  {
+    "id": "collective_scatter_1_tiled",
+    "operation": "sum_scatter",
+    "participants": 1,
+    "local_shape": [
+      2,
+      2
+    ],
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_scatter_2_tiled",
+    "operation": "sum_scatter",
+    "participants": 2,
+    "local_shape": [
+      2,
+      4
+    ],
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_scatter_4_tiled",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      2,
+      8
+    ],
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_scatter_8_tiled",
+    "operation": "sum_scatter",
+    "participants": 8,
+    "local_shape": [
+      2,
+      16
+    ],
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_scatter_untiled",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      3
+    ],
+    "tensor_axis": 1,
+    "tiled": false
+  },
+  {
+    "id": "collective_scatter_ordered_groups",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ]
+  },
+  {
+    "id": "collective_all_to_all_cross_axes",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      8,
+      2
+    ],
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_to_all_untiled",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      3
+    ],
+    "split_axis": 1,
+    "concatenation_axis": 0,
+    "tiled": false
+  },
+  {
+    "id": "collective_all_to_all_ordered_groups",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ]
+  },
+  {
+    "id": "collective_reduce_sum",
+    "operation": "reduce",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "reduction": "sum"
+  },
+  {
+    "id": "collective_reduce_min",
+    "operation": "reduce",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "reduction": "min"
+  },
+  {
+    "id": "collective_reduce_max",
+    "operation": "reduce",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "reduction": "max"
+  },
+  {
+    "id": "collective_reduce_mean",
+    "operation": "reduce",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "reduction": "mean"
+  },
+  {
+    "id": "collective_reduce_product",
+    "operation": "reduce",
+    "participants": 2,
+    "local_shape": [
+      2,
+      3
+    ],
+    "reduction": "product"
+  },
+  {
+    "id": "collective_reduce_sum_groups",
+    "operation": "reduce",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "reduction": "sum",
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ]
+  },
+  {
+    "id": "collective_reduce_sum_mesh_y",
+    "operation": "reduce",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "reduction": "sum",
+    "mesh_shape": [
+      2,
+      2
+    ],
+    "axis_name": "y"
+  },
+  {
+    "id": "collective_permute_partial",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      2,
+      3
+    ],
+    "pairs": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ]
+  },
+  {
+    "id": "collective_permute_cycle",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "id": "collective_shuffle",
+    "operation": "shuffle",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "permutation": [
+      2,
+      0,
+      3,
+      1
+    ]
+  },
+  {
+    "id": "collective_swap_axes",
+    "operation": "swap_axes",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      3
+    ],
+    "tensor_axis": 1
+  },
+  {
+    "id": "collective_axis_index_mesh_x",
+    "operation": "axis_index",
+    "participants": 4,
+    "local_shape": [
+      1
+    ],
+    "mesh_shape": [
+      2,
+      2
+    ],
+    "axis_name": "x",
+    "replicated_input": true
+  },
+  {
+    "id": "collective_axis_index_mesh_y",
+    "operation": "axis_index",
+    "participants": 4,
+    "local_shape": [
+      1
+    ],
+    "mesh_shape": [
+      2,
+      2
+    ],
+    "axis_name": "y",
+    "replicated_input": true
+  },
+  {
+    "id": "collective_vary_replicated",
+    "operation": "vary",
+    "participants": 4,
+    "local_shape": [
+      2,
+      3
+    ],
+    "replicated_input": true
+  },
+  {
+    "id": "collective_all_gather_jvp",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "jvp",
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_gather_vjp",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "vjp",
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_gather_batch",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      2
+    ],
+    "transform": "batch",
+    "tensor_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_sum_scatter_jvp",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "jvp",
+    "tensor_axis": 0,
+    "tiled": true
+  },
+  {
+    "id": "collective_sum_scatter_vjp",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "vjp",
+    "tensor_axis": 0,
+    "tiled": true
+  },
+  {
+    "id": "collective_sum_scatter_batch",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      2
+    ],
+    "transform": "batch",
+    "tensor_axis": 0,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_to_all_jvp",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "jvp",
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_to_all_vjp",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "vjp",
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_all_to_all_batch",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      2
+    ],
+    "transform": "batch",
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true
+  },
+  {
+    "id": "collective_permute_jvp",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "jvp",
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "id": "collective_permute_vjp",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "vjp",
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "id": "collective_permute_batch",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      2
+    ],
+    "transform": "batch",
+    "pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "id": "collective_reduce_jvp",
+    "operation": "reduce",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "jvp",
+    "reduction": "sum"
+  },
+  {
+    "id": "collective_reduce_vjp",
+    "operation": "reduce",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "transform": "vjp",
+    "reduction": "sum"
+  },
+  {
+    "id": "collective_reduce_batch",
+    "operation": "reduce",
+    "participants": 4,
+    "local_shape": [
+      2,
+      4,
+      2
+    ],
+    "transform": "batch",
+    "reduction": "sum"
+  },
+  {
+    "id": "collective_gather_ordered_groups_vjp",
+    "operation": "all_gather",
+    "participants": 4,
+    "local_shape": [
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ],
+    "transform": "vjp"
+  },
+  {
+    "id": "collective_scatter_ordered_groups_vjp",
+    "operation": "sum_scatter",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "tensor_axis": 0,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ],
+    "transform": "vjp"
+  },
+  {
+    "id": "collective_all_to_all_ordered_groups_vjp",
+    "operation": "all_to_all",
+    "participants": 4,
+    "local_shape": [
+      4,
+      2
+    ],
+    "split_axis": 0,
+    "concatenation_axis": 1,
+    "tiled": true,
+    "groups": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ],
+    "transform": "vjp"
+  },
+  {
+    "id": "collective_permute_partial_vjp",
+    "operation": "permute",
+    "participants": 4,
+    "local_shape": [
+      2,
+      3
+    ],
+    "pairs": [
+      [
+        0,
+        2
+      ],
+      [
+        3,
+        1
+      ]
+    ],
+    "transform": "vjp"
+  }
+]

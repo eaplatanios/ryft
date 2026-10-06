@@ -292,7 +292,7 @@ impl CompiledKernel {
             || parsed.block != [1, 1, 1]
             || parsed.shared_memory_bytes != 0
             || parsed.size_bytes != cubin.len()
-            || parsed.sha256 != format!("{:x}", Sha256::digest(&cubin))
+            || parsed.sha256 != hex::encode(Sha256::digest(&cubin))
             || parsed.grid != grid
             || parsed.target != target.architecture()
             || configuration.schema != COMPILER_SCHEMA_VERSION
@@ -300,7 +300,7 @@ impl CompiledKernel {
             || configuration.tileiras != TILEIRAS_VERSION
             || configuration.nvcc != NVCC_VERSION
             || configuration.nvvm != NVVM_VERSION
-            || configuration.worker_sha256 != format!("{:x}", Sha256::digest(include_bytes!("export.py")))
+            || configuration.worker_sha256 != hex::encode(Sha256::digest(include_bytes!("export.py")))
         {
             return Err(Error::Artifact {
                 message: "manifest does not match the kernel, ABI, toolchain, or bytes".into(),
@@ -615,7 +615,7 @@ mod tests {
             pipeline_stages: None,
             buffering_depth: None,
             maximum_scratch_bytes: None,
-            worker_sha256: format!("{:x}", Sha256::digest(include_bytes!("export.py"))),
+            worker_sha256: hex::encode(Sha256::digest(include_bytes!("export.py"))),
         };
         Manifest {
             schema: 1,
@@ -637,7 +637,7 @@ mod tests {
             block: [1, 1, 1],
             shared_memory_bytes: 0,
             size_bytes: bytes.len(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: hex::encode(Sha256::digest(bytes)),
         }
     }
 

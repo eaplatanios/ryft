@@ -154,7 +154,7 @@ impl KernelAotBundle {
         let semantic_digest = Self::semantic_digest(definition)?;
         let report = KernelCompilationReport {
             semantic_digest: semantic_digest.clone(),
-            configuration_digest: format!("{:x}", Sha256::digest(&configuration)),
+            configuration_digest: hex::encode(Sha256::digest(&configuration)),
             provenance: definition
                 .body()
                 .regions()
@@ -317,10 +317,9 @@ impl KernelAotBundle {
 
     /// Computes the canonical source identity independently of its transport encoding and diagnostic provenance.
     fn semantic_digest(definition: &KernelDefinition) -> Result<String, KernelAotError> {
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(definition.semantic_key().map_err(|error| Self::invalid(error.to_string()))?)
-        ))
+        Ok(hex::encode(Sha256::digest(
+            definition.semantic_key().map_err(|error| Self::invalid(error.to_string()))?,
+        )))
     }
 
     /// Constructs an exact bundle-owned diagnostic.

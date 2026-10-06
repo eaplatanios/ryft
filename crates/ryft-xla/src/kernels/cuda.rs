@@ -120,7 +120,7 @@ impl CudaKernelEmbedding {
         };
         let payload = attribute("ryft.cuda.payload")?;
         let digest = attribute("ryft.cuda.sha256")?;
-        if format!("{:x}", Sha256::digest(payload.as_bytes())) != digest {
+        if hex::encode(Sha256::digest(payload.as_bytes())) != digest {
             return Err(KernelEmbeddingError::Invalid { message: "cuda payload digest mismatch".to_owned() });
         }
         let envelope: CudaEnvelope = serde_json::from_str(payload)?;
@@ -346,7 +346,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
                 .map(|parameter| parameter.r#type().into_owned())
                 .collect(),
         )
-        .with_attribute("ryft.cuda.sha256", format!("{:x}", Sha256::digest(payload.as_bytes())))
+        .with_attribute("ryft.cuda.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
         .with_attribute("ryft.cuda.payload", payload);
         if self.row_major_layouts {
             operation = operation.with_attribute("ryft.cuda.row_major", true);
@@ -557,7 +557,7 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         }
     }
     let payload = payload.ok_or_else(|| FfiError::invalid_argument("missing cuda payload"))?;
-    if digest != Some(format!("{:x}", Sha256::digest(payload.as_bytes())).as_str()) {
+    if digest != Some(hex::encode(Sha256::digest(payload.as_bytes())).as_str()) {
         return Err(FfiError::invalid_argument("cuda payload digest mismatch"));
     }
     let envelope: CudaEnvelope =
@@ -984,7 +984,7 @@ mod tests {
         let changed = CustomCallOperation::new(original.target_name(), original.output_types().to_vec())
             .with_input_output_alias(0, 0)
             .unwrap()
-            .with_attribute("ryft.cuda.sha256", format!("{:x}", Sha256::digest(payload.as_bytes())))
+            .with_attribute("ryft.cuda.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
             .with_attribute("ryft.cuda.payload", payload);
         assert!(matches!(
             CudaKernelEmbedding::from_custom_call(&verified, &changed),

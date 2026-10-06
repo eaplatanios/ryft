@@ -1897,6 +1897,7 @@ dependencies = [
 name = "ryft-cuda"
 version = "0.0.3"
 dependencies = [
+ "hex",
  "indoc",
  "libloading 0.9.0",
  "pretty_assertions",
@@ -1912,6 +1913,7 @@ dependencies = [
 name = "ryft-experimental"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "indoc",
  "pretty_assertions",
  "ryft-core",
@@ -2022,6 +2024,7 @@ name = "ryft-xla"
 version = "0.0.3"
 dependencies = [
  "half",
+ "hex",
  "indoc",
  "ndarray",
  "num-complex",

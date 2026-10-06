@@ -65,7 +65,7 @@ impl RocmKernelEmbedding {
         };
         let payload = attribute("ryft.rocm.payload")?;
         if payload.len() > RocmEnvelope::MAXIMUM_PAYLOAD_BYTES
-            || format!("{:x}", Sha256::digest(payload.as_bytes())) != attribute("ryft.rocm.sha256")?
+            || hex::encode(Sha256::digest(payload.as_bytes())) != attribute("ryft.rocm.sha256")?
         {
             return Err(KernelEmbeddingError::Invalid {
                 message: "rocm payload exceeds its size limit or has an invalid digest".into(),
@@ -190,7 +190,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKernelA
             return Err(KernelEmbeddingError::Invalid { message: "rocm payload exceeds its size limit".into() });
         }
         Ok(CustomCallOperation::new(self.target_name.clone(), outputs)
-            .with_attribute("ryft.rocm.sha256", format!("{:x}", Sha256::digest(payload.as_bytes())))
+            .with_attribute("ryft.rocm.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
             .with_attribute("ryft.rocm.payload", payload)
             .with_attribute("ryft.rocm.row_major", true))
     }
@@ -346,7 +346,7 @@ fn launch_rocm_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     }
     let payload = payload.ok_or_else(|| FfiError::invalid_argument("missing rocm payload"))?;
     if payload.len() > RocmEnvelope::MAXIMUM_PAYLOAD_BYTES
-        || digest != Some(format!("{:x}", Sha256::digest(payload.as_bytes())).as_str())
+        || digest != Some(hex::encode(Sha256::digest(payload.as_bytes())).as_str())
     {
         return Err(FfiError::invalid_argument("rocm payload exceeds its size limit or has an invalid digest"));
     }

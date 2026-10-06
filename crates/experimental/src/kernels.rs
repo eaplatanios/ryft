@@ -469,7 +469,7 @@ fn execute_aot_case<'c>(
             }
             executable_digest.update(&buffer[..count]);
         }
-        let executable_digest = format!("{:x}", executable_digest.finalize());
+        let executable_digest = hex::encode(executable_digest.finalize());
         let source = std::env::var("RYFT_KERNEL_SOURCE_SHA256").unwrap();
         let environment = std::env::var("RYFT_KERNEL_PROFILE_ENVIRONMENT").unwrap();
         assert!(!environment.trim().is_empty());
@@ -487,7 +487,7 @@ fn execute_aot_case<'c>(
             "identity": {
                 "semantic_digest": report["semantic_digest"],
                 "configuration_digest": report["configuration_digest"],
-                "execution_digest": format!("{:x}", Sha256::digest(facts.configuration_key().unwrap())),
+                "execution_digest": hex::encode(Sha256::digest(facts.configuration_key().unwrap())),
                 "environment": format!("{backend}; {environment}; host={}/{}; fixed-f32-add-64; ordinary-cache; iterations={iterations}",
                     std::env::consts::OS, std::env::consts::ARCH),
                 "methodology": concat!(
@@ -632,7 +632,11 @@ mod gpu {
         case: KernelCase,
         options: Options,
     ) -> Result<Vec<f32>, XlaDomainError> {
-        eprintln!("Mosaic {}: semantic={:x}", case.name, Sha256::digest(case.definition.semantic_key().unwrap()));
+        eprintln!(
+            "Mosaic {}: semantic={}",
+            case.name,
+            hex::encode(Sha256::digest(case.definition.semantic_key().unwrap()))
+        );
         let bytes = case
             .inputs
             .into_iter()
@@ -1354,7 +1358,11 @@ mod cutile {
         let compiler = Compiler::new(python).with_cancellation(Arc::clone(&cancellation));
         let schedule = KernelSchedule::default();
         let options = Options::default();
-        eprintln!("cuTile {}: semantic={:x}", case.name, Sha256::digest(case.definition.semantic_key().unwrap()));
+        eprintln!(
+            "cuTile {}: semantic={}",
+            case.name,
+            hex::encode(Sha256::digest(case.definition.semantic_key().unwrap()))
+        );
         let verified = VerifiedKernel::new(&case.definition, 1024).unwrap();
         let output = verified.compile(&compiler, &target, &options, &schedule).unwrap();
         let binding =
@@ -1431,11 +1439,11 @@ mod cutile {
             .collect::<Vec<_>>();
         assert_eq!(original_values, case.inputs[0], "live input for {}", case.name);
         eprintln!(
-            "cuTile {}: cubin={:x}; manifest={:x}; executable={:x}; Python disabled before reload",
+            "cuTile {}: cubin={}; manifest={}; executable={}; Python disabled before reload",
             case.name,
-            Sha256::digest(output.artifact().bytes()),
-            Sha256::digest(output.manifest()),
-            Sha256::digest(&executable_bytes)
+            hex::encode(Sha256::digest(output.artifact().bytes())),
+            hex::encode(Sha256::digest(output.manifest())),
+            hex::encode(Sha256::digest(&executable_bytes)),
         );
         if let Some(directory) = env::var_os("RYFT_CUTILE_ARTIFACT_DIRECTORY") {
             let directory = PathBuf::from(directory);

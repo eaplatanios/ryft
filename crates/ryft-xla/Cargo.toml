@@ -38,6 +38,7 @@ ryft-triton = { workspace = true, optional = true }
 ryft-rocm = { workspace = true, optional = true }
 ryft-xla-sys.workspace = true
 half.workspace = true
+hex.workspace = true
 ndarray = { workspace = true, optional = true }
 prost.workspace = true
 serde.workspace = true

@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
 
+from ryft.jax import differential_testing
 from ryft.jax.differential_testing import (
     SCHEMA,
     CaseComparison,
@@ -12,6 +20,7 @@ from ryft.jax.differential_testing import (
     StagingObservation,
     compare_case,
     differential_cases,
+    main,
     observation_payload,
     parse_observation,
     project_collective_stablehlo,
@@ -63,10 +72,11 @@ class DifferentialTestingTest(unittest.TestCase):
     maxDiff = None
 
     def test_registry(self) -> None:
+        cases = differential_cases()
         self.assertEqual(
             [
                 (case.case_id, case.relationship, bool(case.collectives), bool(case.stablehlo_patterns))
-                for case in differential_cases()
+                for case in cases[:7]
             ],
             [
                 ("grouped_shape_changing_collectives", "parity", True, False),
@@ -75,8 +85,14 @@ class DifferentialTestingTest(unittest.TestCase):
                 ("data_dependent_prefix_take", "ryft_exceeds_jax", False, False),
                 ("scaled_dot_and_matmul", "parity", False, True),
                 ("dot_product_attention", "parity", False, True),
+                ("negative_dynamic_slice", "parity", False, True),
             ],
         )
+        self.assertEqual(len({case.case_id for case in cases}), len(cases))
+        self.assertTrue(cases[7:])
+        self.assertTrue(all(
+            case.reference is not None and case.suite in ("collectives", "cuda-collectives") for case in cases[7:]
+        ))
 
     def test_observation_schema(self) -> None:
         observation = parse_observation(
@@ -111,11 +127,25 @@ class DifferentialTestingTest(unittest.TestCase):
                     "staging": {"status": "unknown"},
                 }
             )
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaisesRegex(ValueError, "observations.output.*must be finite"):
+                parse_observation(
+                    {"schema": SCHEMA, "case_id": "case", "observations": {"output": [[value]]}}
+                )
 
     def test_collective_stablehlo_projection(self) -> None:
         self.assertEqual(project_collective_stablehlo(GROUPED_STABLEHLO), GROUPED_COLLECTIVES)
         with self.assertRaisesRegex(ValueError, "stablehlo.all_gather is missing replica/source-target groups"):
             project_collective_stablehlo('"stablehlo.all_gather"(%0) <{all_gather_dim = 0 : i64}>')
+
+    def test_collective_stablehlo_projection_reductions_and_singleton_groups(self) -> None:
+        self.assertEqual(
+            project_collective_stablehlo(
+                '"stablehlo.all_reduce"(%arg0) <{replica_groups = dense<0> : tensor<1x1xi64>}> ({\n'
+                '  stablehlo.add %left, %right : tensor<f32>\n})'
+            ),
+            (StableHloCollective("all_reduce", ((0,),), ()),),
+        )
 
     def test_exact_parity_comparison(self) -> None:
         observation = grouped_observation()
@@ -143,6 +173,36 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(len(comparison.differences), 1)
         self.assertTrue(comparison.differences[0].startswith("StableHLO collectives: jax "))
         self.assertIn("!= expected", comparison.differences[0])
+
+    def test_exact_parity_comparison_rejects_shared_numerical_error(self) -> None:
+        observation = grouped_observation()
+        reference = {"all_gather": ((9.0, 1.0), (2.0, 3.0))}
+        comparison = compare_case("parity", GROUPED_COLLECTIVES, observation, observation, reference=reference)
+        self.assertEqual(
+            comparison.differences,
+            (
+                f"reference observations: ryft {observation.observations!r} != expected {reference!r}",
+                f"reference observations: jax {observation.observations!r} != expected {reference!r}",
+            ),
+        )
+        self.assertTrue(
+            compare_case(
+                "parity", GROUPED_COLLECTIVES, observation, observation, reference=observation.observations,
+            ).passed()
+        )
+
+    def test_exact_parity_comparison_reference_checks_participant_count_and_output_names(self) -> None:
+        observation = grouped_observation()
+        for reference in (
+            {"all_gather": ((0.0, 1.0),)},
+            {"all_gather": ((0.0,), (2.0,))},
+            {"different_output": observation.observations["all_gather"]},
+        ):
+            comparison = compare_case("parity", GROUPED_COLLECTIVES, observation, observation, reference=reference)
+            self.assertEqual(len(comparison.differences), 2)
+            self.assertTrue(all(
+                difference.startswith("reference observations:") for difference in comparison.differences
+            ))
 
     def test_exact_parity_comparison_rejects_empty_projection(self) -> None:
         # A printer or lowering regression that stops emitting recognizable collectives empties both projections
@@ -209,6 +269,80 @@ class DifferentialTestingTest(unittest.TestCase):
         comparisons = run_comparison(repo_root(), ("data_dependent_prefix_take",))
 
         self.assertEqual(comparisons, (CaseComparison(case_id="data_dependent_prefix_take", differences=()),))
+
+    def test_main_collective_suite_selection(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(("--suite", "collectives", "--list")), 0)
+        expected = [case.case_id for case in differential_cases() if case.suite == "collectives"]
+        self.assertEqual(output.getvalue().splitlines(), expected)
+        self.assertNotIn("data_dependent_prefix_take", expected)
+        self.assertIn("grouped_shape_changing_collectives", expected)
+
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(("--suite", "collectives", "--case", "scaled_dot_and_matmul", "--list")), 2)
+        self.assertEqual(errors.getvalue(), "case 'scaled_dot_and_matmul' is not in suite 'collectives'\n")
+
+    def test_main_cuda_suite_selection(self) -> None:
+        cuda_ids = [case.case_id for case in differential_cases() if case.suite == "cuda-collectives"]
+        self.assertTrue(cuda_ids)
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(("--suite", "cuda-collectives", "--list")), 0)
+        self.assertEqual(output.getvalue().splitlines(), cuda_ids)
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(("--list",)), 0)
+        self.assertTrue(set(cuda_ids).isdisjoint(output.getvalue().splitlines()))
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(("--case", cuda_ids[0], "--case", "pshuffle", "--list")), 2)
+        self.assertEqual(errors.getvalue(), "CPU and CUDA cases must run in separate invocations\n")
+
+    def test_collect_ryft_observations_cuda_feature(self) -> None:
+        case_id = next(case.case_id for case in differential_cases() if case.suite == "cuda-collectives")
+        with patch("ryft.jax.differential_testing._run_emitter", return_value="[]") as emitter:
+            self.assertEqual(differential_testing.collect_ryft_observations(repo_root(), (case_id,)), ())
+        self.assertEqual(emitter.call_args.args[0], [
+            "cargo", "run", "--quiet", "-p", "ryft-xla", "--features", "differential-testing,cuda-13",
+            "--bin", "differential_testing", "--", "--case", case_id,
+        ])
+
+    def test_main_subprocess_configuration(self) -> None:
+        with patch("ryft.jax.differential_testing.run_comparison", return_value=()) as comparison:
+            self.assertEqual(
+                main(("--case", "pshuffle", "--timeout", "60", "--ryft-binary", "/tmp/ryft-emitter")), 0,
+            )
+        comparison.assert_called_once_with(
+            repo_root(), ("pshuffle",), timeout=60, binary=Path("/tmp/ryft-emitter"),
+        )
+
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(("--timeout", "0", "--list")), 2)
+        self.assertEqual(errors.getvalue(), "--timeout must be positive\n")
+
+    def test_main_subprocess_failure(self) -> None:
+        errors = StringIO()
+        with (
+            patch("ryft.jax.differential_testing.run_comparison", side_effect=RuntimeError("execution timed out")),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(main(("--case", "pshuffle")), 1)
+        self.assertEqual(errors.getvalue(), "execution timed out\n")
+
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation requires POSIX")
+    def test_emitter_timeout_terminates_child_processes(self) -> None:
+        # The child inherits the output pipe and blocks. After cancellation, communicate() can finish only when
+        # the child has also exited; killing just the launcher would leave this test blocked on that pipe.
+        program = (
+            "import subprocess, sys, threading; "
+            "subprocess.Popen([sys.executable, '-c', 'import threading; threading.Event().wait()']); "
+            "threading.Event().wait()"
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            differential_testing._run_emitter((sys.executable, "-c", program), repo_root(), timeout=1)
 
 
 if __name__ == "__main__":

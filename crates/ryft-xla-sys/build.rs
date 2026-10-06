@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -144,9 +144,17 @@ impl UrlWithChecksum {
 
     /// Verifies that the file at `path` matches the current [`UrlWithChecksum::checksum`].
     fn verify_checksum(&self, path: &Path) -> Result<()> {
+        // Hashers no longer implement `std::io::Write` as of `sha2` 0.11, so the file is streamed into them in chunks.
         let mut file = File::open(path)?;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)?;
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
         let hash_bytes = hasher.finalize();
         let hash = hex::encode(hash_bytes);
         if hash != self.checksum {

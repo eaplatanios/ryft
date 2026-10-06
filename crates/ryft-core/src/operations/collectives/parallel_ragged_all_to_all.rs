@@ -4038,17 +4038,91 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_ragged_all_to_all_transposition_grouped_named_batch_axis_adjoint_identity() {
+        // Reversed noncontiguous groups exchange unequal width-two segments, including empty transfers and repeated
+        // source rows. The pullback must accumulate repeated reads and preserve cotangents of untouched seed rows.
+        let data_type = ArrayType::new_static(DataType::F64, [4, 4, 2]);
+        let operand = Array::from_elements(data_type.clone(), &(1..=32).map(f64::from).collect::<Vec<_>>()).unwrap();
+        let output = Array::from_elements(data_type.clone(), &(101..=132).map(f64::from).collect::<Vec<_>>()).unwrap();
+        let cotangent = operand.clone();
+        let (value, gradient) = differentiate_at((operand.clone(), output.clone()))
+            .value_and_gradient(|(operand, output)| {
+                let context = operand.dispatch_domain();
+                let input_offsets = context.lift(Array::matrix(4, 2, vec![0i32, 0, 1, 4, 4, 1, 0, 0]).unwrap())?;
+                let send_sizes = context.lift(Array::matrix(4, 2, vec![2i32, 1, 1, 0, 0, 1, 1, 2]).unwrap())?;
+                let output_offsets = context.lift(Array::matrix(4, 2, vec![0i32, 2, 2, 4, 4, 0, 0, 0]).unwrap())?;
+                let receive_sizes = context.lift(Array::matrix(4, 2, vec![1i32, 1, 2, 0, 0, 2, 1, 1]).unwrap())?;
+                let cotangent = context.lift(cotangent.clone())?;
+                let exchanged = batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.parallel_ragged_all_to_all_with_axis_index_groups(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                            vec![vec![3, 1], vec![2, 0]],
+                        )
+                    },
+                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
+                    (
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                    ),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                Ok(exchanged.mul(&cotangent)?.reduce(&[0, 1, 2], ReductionKind::Sum)?)
+            })
+            .unwrap();
+        assert_eq!(
+            gradient.0,
+            Array::from_elements(
+                data_type.clone(),
+                &[
+                    22.0f64, 24.0, 19.0, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 29.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 34.0, 36.0, 11.0, 12.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            gradient.1,
+            Array::from_elements(
+                data_type,
+                &[
+                    0.0f64, 0.0, 3.0, 4.0, 0.0, 0.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 13.0, 14.0, 15.0, 16.0, 0.0, 0.0,
+                    0.0, 0.0, 21.0, 22.0, 23.0, 24.0, 0.0, 0.0, 27.0, 28.0, 0.0, 0.0, 31.0, 32.0,
+                ],
+            )
+            .unwrap(),
+        );
+
+        // The weighted primal equals the inner product with the pullback over both independent linear data inputs.
+        // All values are exactly representable, so this adjoint identity needs no numerical tolerance.
+        assert_eq!(value, Array::scalar(38_676.0f64).unwrap());
+        let operand_inner_product = operand.mul(&gradient.0).unwrap().reduce(&[0, 1, 2], ReductionKind::Sum).unwrap();
+        let output_inner_product = output.mul(&gradient.1).unwrap().reduce(&[0, 1, 2], ReductionKind::Sum).unwrap();
+        assert_eq!(operand_inner_product.add(&output_inner_product), Ok(value));
+    }
+
+    #[test]
     fn test_parallel_ragged_all_to_all_transposition_inside_named_batch_axis() {
         // Reverse-mode differentiation inside a matching `batch` level transposes the logical exchange, whose offset
         // metadata are transposed by dense exchanges over the same named axis. The gradients equal those of the
-        // transposed physical exchange, which finite differences check in the test above.
+        // transposed physical exchange, which finite differences check in the outer differentiation test.
         let (values, gradients) = batch(
             |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                 differentiate_at((operand, output))
                     .with_captures((input_offsets, send_sizes, output_offsets, receive_sizes))
                     .value_and_gradient(
                         |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                            Ok(operand
+                            operand
                                 .parallel_ragged_all_to_all(
                                     "x",
                                     &output,
@@ -4057,7 +4131,7 @@ mod tests {
                                     &output_offsets,
                                     &receive_sizes,
                                 )?
-                                .reduce(&[0], ReductionKind::Sum)?)
+                                .reduce(&[0], ReductionKind::Sum)
                         },
                     )
                     .map_err(ProgramError::from)

@@ -10,23 +10,6 @@ error: ryft parameters must be owned; references are not allowed
 18 |     Variant1 { field0: u32, field1: (u64, (i8, P, &'static P), u64) },
    |                                                   ^^^^^^^^^^
 
-error[E0425]: cannot find type `P` in this scope
-  --> tests/parameters/error_enums.rs:10:34
-   |
-10 | enum EnumWithUnusedParameterType<P: Parameter> {
-   |                                  ^ not found in this scope
-
-error[E0425]: cannot find type `P` in this scope
-  --> tests/parameters/error_enums.rs:10:34
-   |
-10 | enum EnumWithUnusedParameterType<P: Parameter> {
-   |                                  ^ not found in this scope
-   |
-help: you might be missing a type parameter
-   |
-10 | enum EnumWithUnusedParameterType<P><P: Parameter> {
-   |                                 +++
-
 error[E0392]: type parameter `P` is never used
   --> tests/parameters/error_enums.rs:10:34
    |
@@ -36,18 +19,17 @@ error[E0392]: type parameter `P` is never used
    = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
 
 error[E0277]: the trait bound `EnumWithUnusedParameterType<Placeholder>: Clone` is not satisfied
- --> tests/parameters/error_enums.rs:9:10
-  |
-9 | #[derive(Parameterized)]
-  |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `EnumWithUnusedParameterType<Placeholder>`
-  |
-  = help: see issue #48214
-  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+  --> tests/parameters/error_enums.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `EnumWithUnusedParameterType<Placeholder>`
+   |
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: consider annotating `EnumWithUnusedParameterType<Placeholder>` with `#[derive(Clone)]`
-  |
-10+ #[derive(Clone)]
-11| enum EnumWithUnusedParameterType<P: Parameter> {
-  |
+   |
+10 + #[derive(Clone)]
+11 | enum EnumWithUnusedParameterType<P: Parameter> {
+   |
 
 error[E0310]: the parameter type `P` may not live long enough
   --> tests/parameters/error_enums.rs:18:37
@@ -71,7 +53,7 @@ error[E0282]: type annotations needed
 11 | |     Variant0(usize),
    | |____________^ cannot infer type of the type parameter `P` declared on the enum `EnumWithUnusedParameterType`
    |
-help: consider specifying the generic argument
+help: consider specifying a concrete type for the type parameter `P`
    |
-10 | enum EnumWithUnusedParameterType::<_><P: Parameter> {
-   |                                 +++++
+10 | enum EnumWithUnusedParameterType::</* Type */><P: Parameter> {
+   |                                 ++++++++++++++

@@ -1,8 +1,9 @@
 """Executable behavioral and StableHLO differential testing between Ryft and pinned JAX.
 
 The Rust side is emitted by `cargo run -p ryft-xla --features differential-testing --bin differential_testing`.
-The JAX side runs in a fresh Python process so that four host devices are configured before JAX is imported. Exact
-parity cases compare named values and declared semantic StableHLO contracts. The bounded data-dependent case instead
+The JAX side runs in a fresh process so that its selected backend is configured before JAX is imported. Exact
+parity cases compare named values and declared semantic StableHLO contracts. Collective cases additionally compare
+each backend against an independent host reference. The bounded data-dependent case instead
 encodes an explicit capability relation: eager values agree, Ryft stages the bounded result, and pinned JAX rejects
 staging because the result extent depends on traced data.
 
@@ -13,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
+import signal
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -28,7 +32,7 @@ if TYPE_CHECKING:
 SCHEMA = "ryft-jax-differential-v1"
 PINNED_JAX_VERSION = "0.10.0"
 BUILD_HINT = "cargo build -p ryft-xla --features differential-testing --bin differential_testing"
-SUBPROCESS_TIMEOUT_SECONDS = 1800
+SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,10 @@ def _parse_observations(value: Any) -> dict[str, tuple[tuple[float, ...], ...]]:
                     raise ValueError(
                         f"field 'observations.{name}[{execution_index}][{value_index}]' must be numeric"
                     )
+                if not math.isfinite(element):
+                    raise ValueError(
+                        f"field 'observations.{name}[{execution_index}][{value_index}]' must be finite"
+                    )
                 values.append(float(element))
             parsed_executions.append(tuple(values))
         parsed[name] = tuple(parsed_executions)
@@ -168,9 +176,11 @@ def observation_payload(observation: DifferentialObservation) -> dict[str, Any]:
 
 
 _COLLECTIVE_PATTERN = re.compile(
-    r'"stablehlo\.(all_gather|reduce_scatter|all_to_all|collective_permute)"[^\n]*'
+    r'"stablehlo\.(all_reduce|all_gather|reduce_scatter|all_to_all|collective_permute)"[^\n]*'
 )
-_DENSE_GROUPS_PATTERN = re.compile(r"(?:replica_groups|source_target_pairs) = dense<(\[\[.*?\]\])>")
+_DENSE_GROUPS_PATTERN = re.compile(
+    r"(?:replica_groups|source_target_pairs) = dense<(\[\[.*?\]\]|-?\d+)> : tensor<(\d+)x(\d+)xi64>"
+)
 _AXIS_PATTERNS = {
     "all_gather_dim": re.compile(r"all_gather_dim = (\d+) : i64"),
     "scatter_dimension": re.compile(r"scatter_dimension = (\d+) : i64"),
@@ -185,7 +195,7 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
 
     The projection intentionally ignores SSA names, channel handles, tensor spellings, wrapper functions, and Shardy
     metadata. It retains the collective family, ordered replica/source-target groups, and operation-defining axis
-    attributes. Those are the cross-framework contracts Phase 7 needs to compare.
+    attributes. Independent numerical references also check reduction combiners and tensor layouts.
 
     # Parameters
 
@@ -200,7 +210,12 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
         if groups_match is None:
             raise ValueError(f"stablehlo.{operation} is missing replica/source-target groups")
         groups_payload = json.loads(groups_match.group(1))
-        groups = tuple(tuple(int(member) for member in group) for group in groups_payload)
+        if isinstance(groups_payload, int):
+            groups = tuple(
+                (groups_payload,) * int(groups_match.group(3)) for _ in range(int(groups_match.group(2)))
+            )
+        else:
+            groups = tuple(tuple(int(member) for member in group) for group in groups_payload)
         axis_attributes = tuple(
             (name, int(axis_match.group(1)))
             for name, pattern in _AXIS_PATTERNS.items()
@@ -256,6 +271,7 @@ def compare_case(
     ryft: DifferentialObservation,
     jax: DifferentialObservation,
     stablehlo_patterns: tuple[str, ...] = (),
+    reference: Mapping[str, tuple[tuple[float, ...], ...]] | None = None,
 ) -> CaseComparison:
     """Compares one Ryft/JAX record pair according to its declared capability relationship.
 
@@ -266,6 +282,7 @@ def compare_case(
       - `ryft`: Ryft-side observation.
       - `jax`: JAX-side observation.
       - `stablehlo_patterns`: Semantic operation or attribute spellings that both StableHLO modules must contain.
+      - `reference`: Independent host-computed outputs checked separately against each framework.
     """
 
     differences = []
@@ -273,10 +290,16 @@ def compare_case(
         differences.append(f"case ID: ryft '{ryft.case_id}' != jax '{jax.case_id}'")
     if ryft.observations != jax.observations:
         differences.append(f"observations: ryft {ryft.observations!r} != jax {jax.observations!r}")
+    if reference is not None:
+        for side, observation in (("ryft", ryft), ("jax", jax)):
+            if observation.observations != reference:
+                differences.append(
+                    f"reference observations: {side} {observation.observations!r} != expected {reference!r}"
+                )
     if relationship == "parity":
         if ryft.staging != jax.staging:
             differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
-        if not collectives and not stablehlo_patterns:
+        if not collectives and not stablehlo_patterns and reference is None:
             differences.append("StableHLO: exact-parity case must declare a semantic contract")
         if ryft.stablehlo is None or jax.stablehlo is None:
             differences.append("StableHLO: exact-parity case requires modules from both frameworks")
@@ -306,30 +329,80 @@ def compare_case(
     return CaseComparison(case_id=ryft.case_id, differences=tuple(differences))
 
 
-def _selected_cases(case_ids: Sequence[str]) -> tuple[DifferentialCase, ...]:
-    """Returns registry entries selected by exact case ID, preserving registry order."""
+def _selected_cases(case_ids: Sequence[str], suite: str | None = None) -> tuple[DifferentialCase, ...]:
+    """Returns registry entries selected by suite and exact case ID, preserving registry order."""
 
     cases = differential_cases()
-    if not case_ids:
-        return cases
     unknown = [case_id for case_id in case_ids if all(case.case_id != case_id for case in cases)]
     if unknown:
         raise ValueError(f"unknown differential-testing case '{unknown[0]}'")
+    if suite is not None:
+        cases = tuple(case for case in cases if case.suite == suite)
+    if not case_ids:
+        return tuple(case for case in cases if suite is not None or case.suite != "cuda-collectives")
     selected = set(case_ids)
-    return tuple(case for case in cases if case.case_id in selected)
+    outside_suite = selected.difference(case.case_id for case in cases)
+    if outside_suite:
+        raise ValueError(f"case '{sorted(outside_suite)[0]}' is not in suite '{suite}'")
+    cases = tuple(case for case in cases if case.case_id in selected)
+    if any(case.suite == "cuda-collectives" for case in cases) and any(
+        case.suite != "cuda-collectives" for case in cases
+    ):
+        raise ValueError("CPU and CUDA cases must run in separate invocations")
+    return cases
 
 
-def collect_ryft_observations(root: Path, case_ids: Sequence[str]) -> tuple[DifferentialObservation, ...]:
+def _run_emitter(command: Sequence[str], directory: Path, timeout: int) -> str:
+    """Captures one emitter, terminating its process group if compilation or execution exceeds its deadline.
+
+    A `cargo run` invocation can own a compiler or an executing test child. Killing the launcher alone would leave
+    that child running after a timeout, so POSIX launches receive their own process group.
+    """
+
+    with subprocess.Popen(
+        command, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=os.name == "posix",
+    ) as process:
+        try:
+            output, errors = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # The process group can exit between the timeout and cancellation.
+                    pass
+            else:
+                process.kill()
+            process.communicate()
+            raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
+        return output
+
+
+def collect_ryft_observations(
+    root: Path,
+    case_ids: Sequence[str],
+    *,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
+    binary: Path | None = None,
+) -> tuple[DifferentialObservation, ...]:
     """Runs the Rust emitter and parses its selected records."""
 
-    command = [
+    cases = _selected_cases(case_ids)
+    features = (
+        "differential-testing,cuda-13" if any(case.suite == "cuda-collectives" for case in cases)
+        else "differential-testing"
+    )
+    command = [str(binary.resolve())] if binary is not None else [
         "cargo",
         "run",
         "--quiet",
         "-p",
         "ryft-xla",
         "--features",
-        "differential-testing",
+        features,
         "--bin",
         "differential_testing",
         "--",
@@ -337,49 +410,41 @@ def collect_ryft_observations(root: Path, case_ids: Sequence[str]) -> tuple[Diff
     for case_id in case_ids:
         command.extend(("--case", case_id))
     try:
-        result = subprocess.run(
-            command,
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
+        output = _run_emitter(command, root, timeout)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"Ryft differential emitter failed:\n{error.stderr.strip()}") from None
     except subprocess.TimeoutExpired:
+        build_hint = BUILD_HINT.replace("--features differential-testing", f"--features {features}")
         raise RuntimeError(
-            f"Ryft differential emitter timed out after {SUBPROCESS_TIMEOUT_SECONDS} seconds. A cold compile of the "
-            f"emitter can exceed that budget; pre-build it with '{BUILD_HINT}' and rerun."
+            f"Ryft differential emitter timed out after {timeout} seconds. A cold compile of the "
+            f"emitter can exceed that budget; pre-build it with '{build_hint}' and rerun."
         ) from None
-    payload = json.loads(result.stdout)
+    payload = json.loads(output)
     if not isinstance(payload, list):
         raise ValueError("Ryft differential emitter must return a JSON array")
     return tuple(parse_observation(record) for record in payload)
 
 
-def collect_jax_observations(root: Path, case_ids: Sequence[str]) -> tuple[DifferentialObservation, ...]:
+def collect_jax_observations(
+    root: Path,
+    case_ids: Sequence[str],
+    *,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
+) -> tuple[DifferentialObservation, ...]:
     """Runs the JAX emitters in a fresh process and parses their selected records."""
 
     command = [sys.executable, "-m", "ryft.jax.differential_testing", "--emit-jax"]
     for case_id in case_ids:
         command.extend(("--case", case_id))
     try:
-        result = subprocess.run(
-            command,
-            cwd=root / "python",
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
+        output = _run_emitter(command, root / "python", timeout)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"JAX differential emitter failed:\n{error.stderr.strip()}") from None
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"JAX differential emitter timed out after {SUBPROCESS_TIMEOUT_SECONDS} seconds"
+            f"JAX differential emitter timed out after {timeout} seconds"
         ) from None
-    payload = json.loads(result.stdout)
+    payload = json.loads(output)
     if not isinstance(payload, list):
         raise ValueError("JAX differential emitter must return a JSON array")
     return tuple(parse_observation(record) for record in payload)
@@ -396,27 +461,39 @@ def _record_map(records: Sequence[DifferentialObservation], side: str) -> dict[s
     return indexed
 
 
-def run_comparison(root: Path, case_ids: Sequence[str]) -> tuple[CaseComparison, ...]:
+def run_comparison(
+    root: Path,
+    case_ids: Sequence[str],
+    *,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
+    binary: Path | None = None,
+) -> tuple[CaseComparison, ...]:
     """Runs both frameworks and returns comparisons for the selected registry entries."""
 
     cases = _selected_cases(case_ids)
     selected_ids = tuple(case.case_id for case in cases)
-    ryft = _record_map(collect_ryft_observations(root, selected_ids), "Ryft")
-    jax = _record_map(collect_jax_observations(root, selected_ids), "JAX")
+    ryft = _record_map(collect_ryft_observations(root, selected_ids, timeout=timeout, binary=binary), "Ryft")
+    jax = _record_map(collect_jax_observations(root, selected_ids, timeout=timeout), "JAX")
     if set(ryft) != set(selected_ids):
         raise ValueError(f"Ryft case set {sorted(ryft)} does not match selected cases {sorted(selected_ids)}")
     if set(jax) != set(selected_ids):
         raise ValueError(f"JAX case set {sorted(jax)} does not match selected cases {sorted(selected_ids)}")
-    return tuple(
-        compare_case(
+    comparisons = []
+    for case in cases:
+        comparison = compare_case(
             case.relationship,
             case.collectives,
             ryft[case.case_id],
             jax[case.case_id],
             case.stablehlo_patterns,
+            None if case.reference is None else case.reference(),
         )
-        for case in cases
-    )
+        differences = list(comparison.differences)
+        if case.validate is not None:
+            for side, observation in (("ryft", ryft[case.case_id]), ("jax", jax[case.case_id])):
+                differences.extend(f"{side} {difference}" for difference in case.validate(observation))
+        comparisons.append(CaseComparison(case_id=case.case_id, differences=tuple(differences)))
+    return tuple(comparisons)
 
 
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
@@ -424,6 +501,12 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
 
     parser = argparse.ArgumentParser(description="Differentially test Ryft behavior and StableHLO against pinned JAX.")
     parser.add_argument("--case", action="append", default=[], help="select one case ID; may be repeated")
+    parser.add_argument("--suite", choices=("collectives", "cuda-collectives"), help="select a correctness suite")
+    parser.add_argument(
+        "--timeout", type=int, default=SUBPROCESS_TIMEOUT_SECONDS,
+        help="maximum seconds for each framework subprocess (default: 300)",
+    )
+    parser.add_argument("--ryft-binary", type=Path, help="run a prebuilt Rust emitter instead of cargo run")
     parser.add_argument("--list", action="store_true", help="list case IDs without executing them")
     parser.add_argument("--emit-jax", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(arguments)
@@ -434,7 +517,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     parsed = parse_arguments(arguments)
     try:
-        cases = _selected_cases(parsed.case)
+        if parsed.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        cases = _selected_cases(parsed.case, parsed.suite)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 2
@@ -450,7 +535,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         records = build_jax_observations(tuple(case.case_id for case in cases))
         print(json.dumps([observation_payload(record) for record in records], indent=2))
         return 0
-    comparisons = run_comparison(repo_root(), tuple(case.case_id for case in cases))
+    try:
+        comparisons = run_comparison(
+            repo_root(), tuple(case.case_id for case in cases), timeout=parsed.timeout, binary=parsed.ryft_binary,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        print(error, file=sys.stderr)
+        return 1
     for comparison in comparisons:
         if comparison.passed():
             print(f"PASS {comparison.case_id}")

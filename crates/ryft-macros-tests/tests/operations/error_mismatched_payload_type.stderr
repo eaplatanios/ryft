@@ -4,5 +4,4 @@ error[E0271]: type mismatch resolving `<StopGradientOperation<ArrayType> as Oper
 3 | #[derive(Clone, ryft::Operation)]
   |                 ^^^^^^^^^^^^^^^ expected `DataType`, found `ArrayType`
   |
-  = help: see issue #48214
   = note: this error originates in the derive macro `ryft::Operation` (in Nightly builds, run with -Z macro-backtrace for more info)

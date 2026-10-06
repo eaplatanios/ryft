@@ -90,9 +90,15 @@ error[E0425]: cannot find type `P` in this scope
   --> tests/parameters/error_self.rs:10:52
    |
 10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
-   |                                   -                ^^^^ help: a type parameter with a similar name exists: `T`
+   |                                   -                ^^^^
    |                                   |
    |                                   similarly named type parameter `T` defined here
+   |
+help: a type parameter with a similar name exists
+   |
+10 - pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+10 + pub struct Generics<P: Parameter, T: Trait<Assoc = T>>
+   |
 
 error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
   --> tests/parameters/error_self.rs:9:10
@@ -118,7 +124,9 @@ note: required for `Generics<Placeholder, T>` to implement `ParameterizedFamily<
    |          ^^^^^^^^^^^^^
 ...
 13 |     <Self as Trait>::Assoc: Sized,
-   |                             ----- unsatisfied trait bound introduced in this `derive` macro
+   |                             ----- unsatisfied trait bound
+   = help: consider manually implementing `ParameterizedFamily<Placeholder>` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
@@ -161,7 +169,6 @@ help: the trait `Clone` is not implemented for `Struct<Placeholder>`
    |
 24 | pub struct Struct<P: Parameter> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: generic `Self` types are currently not permitted in anonymous constants
@@ -187,7 +194,6 @@ help: the trait `Clone` is not implemented for `Tuple<Placeholder>`
    |
 44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: generic `Self` types are currently not permitted in anonymous constants
@@ -225,7 +231,6 @@ help: the trait `Clone` is not implemented for `Enum<Placeholder>`
    |
 58 | pub enum Enum<P: Parameter> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
    = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0308]: mismatched types

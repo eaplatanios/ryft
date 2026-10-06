@@ -45,6 +45,7 @@ cutile-compiler = ["cutile", "dep:tempfile"]
 
 [dependencies]
 ryft-core = { workspace = true, optional = true }
+hex.workspace = true
 libloading.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

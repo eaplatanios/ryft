@@ -278,9 +278,9 @@ where
             .with_attribute("ryft.kernel.schema", i64::from(KERNEL_SCHEMA_VERSION))
             .with_attribute(
                 "ryft.kernel.semantic",
-                format!("{:x}", Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
+                hex::encode(Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
             )
-            .with_attribute("ryft.kernel.configuration", format!("{:x}", configuration_hash.finalize()));
+            .with_attribute("ryft.kernel.configuration", hex::encode(configuration_hash.finalize()));
         let provenance = kernel
             .definition()
             .body()
@@ -712,7 +712,7 @@ pub(crate) mod tests {
         .unwrap();
         let (module, _signature, requires_assertion_handler) = lowered.into_parts();
         assert!(!requires_assertion_handler);
-        let semantic = format!("{:x}", Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
+        let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
         let configuration = "6dea220b6278c1cf02bdf72bf1a7969892b830605f8a1a1baea5af53bfcad12e";
         assert_eq!(
             module,

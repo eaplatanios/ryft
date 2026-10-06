@@ -964,11 +964,10 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`](crate::AxisError::UnboundAxisName)
-    /// when no binder binds `axis_name` or [`AxisError::OutOfBounds`](crate::AxisError::OutOfBounds) when an axis is
-    /// out of bounds, and a [`ProgramError`] for invalid groups or split geometry, pending cross-device sums, or an
-    /// overflowing concatenation extent. A batch level that binds the collective axis rejects participant groups and
-    /// bounded ragged inputs.
+    /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`] when no binder binds `axis_name` or
+    /// [`AxisError::OutOfBounds`] when an axis is out of bounds, and a [`ProgramError`] for invalid groups or split
+    /// geometry, pending cross-device sums, or an overflowing concatenation extent. A batch level that binds the
+    /// collective axis rejects participant groups and bounded ragged inputs.
     fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
         axis_name: &str,

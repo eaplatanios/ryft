@@ -44,6 +44,104 @@ their StableHLO (collective family, ordered groups, and axis attributes). It als
 differences: the bounded data-dependent prefix case must execute eagerly in both frameworks, stage in Ryft, and fail
 JAX staging with concretization. Use `--list` to show the case registry and repeat `--case CASE_ID` to run a subset.
 
+### Collective correctness on one host
+
+The collective suite runs real compiled XLA programs across logical CPU PJRT devices in a single process. It works
+without multiple GPUs or nodes, including on DGX Spark. Each participating CPU device receives its own local buffers;
+the test waits for execution and host transfers before checking results. JAX runs in a fresh subprocess and the harness
+explicitly selects its CPU backend, regardless of the host's available accelerators.
+
+From the repository root, build the Rust emitter once, then switch to the Python utilities and run the suite:
+
+```bash
+# From the repository root:
+timeout 300 cargo build -p ryft-xla --features differential-testing --bin differential_testing
+
+# From python/:
+cd python
+uv sync
+uv run python scripts/compare_behavior_with_jax.py --suite collectives --list
+timeout 300 uv run python scripts/compare_behavior_with_jax.py \
+  --suite collectives --ryft-binary ../target/debug/differential_testing
+```
+
+Without `--ryft-binary`, the harness uses `cargo run`. Each framework subprocess has a 300-second timeout; `--timeout`
+sets a different budget explicitly. A cold build may need a separate build invocation before running the comparisons.
+The Rust binary also accepts `--suite collectives`, `--list`, and repeated `--case` arguments for direct investigation.
+
+The suite contains the three original collective workloads and 51 additional experiments described by the shared
+[`collective_cases.json`](../crates/ryft-xla/src/bin/differential_testing/collective_cases.json) manifest. Both framework
+emitters consume that manifest. Each backend is checked separately against independent NumPy reference semantics, so
+matching wrong results cannot pass. The references assemble participant-local arrays directly; reverse-mode references
+compute the transpose of the host linear map on basis vectors, rather than copying either backend's derivative rule.
+
+| Coverage | Executed cases |
+| --- | --- |
+| Participants | 1, 2, 4, and 8 CPU devices; one-dimensional and 2-by-2 meshes |
+| Group ordering | Noncontiguous groups, reversed participant order, and both mesh axes |
+| Shape-changing collectives | Tiled/untiled all-gather, sum-scatter, and all-to-all; distinct split/concatenation axes |
+| Other operations | Sum, mean, min, max, and product reductions; partial/cyclic permutations; shuffle; swap axes; axis index; replicated input variation |
+| Transforms | Actual batching, JVP, and VJP execution for supported linear collectives, including grouped VJPs |
+| Derivative checks | Participant-dependent tangent/cotangent seeds, exact host transpose references, and the adjoint inner-product identity |
+
+Actual output shapes are checked before participant-local values are flattened. Primal cases with a common direct
+lowering also compare ordered collective groups and axis attributes in StableHLO. Product reduction uses a gather plus
+local product in JAX, so its cross-framework contract is numerical rather than identical primitive lowering.
+
+These additional experiments use small static `f32` arrays. They supplement core operation tests for data types,
+validation, dynamic geometry, and all-gather's invariant/reduced variation semantics; they do not establish exhaustive
+coverage of those dimensions. Add cases to the shared manifest to extend the finite execution matrix.
+
+Run the harness's own tests, including the live JAX matrix, with:
+
+```bash
+timeout 300 uv run python -m unittest tests.test_collective_testing tests.test_differential_testing
+```
+
+`parallel_ragged_all_to_all` cannot execute on XLA's CPU backend. This is also a JAX limitation: its CPU compilation
+fails with `HLO opcode 'ragged-all-to-all' is not supported by XLA:CPU ThunkEmitter`. See
+[JAX's ragged lowering](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/parallel.py) and
+[XLA's CPU opcode dispatcher](https://github.com/openxla/xla/blob/main/xla/service/cpu/thunk_emitter.cc).
+Ryft's target validation reports that restriction before compilation. Core eager/named-batching tests exercise ragged
+transfer semantics and adjoints, including empty transfers, repeated source reads, grouped routing, and untouched
+output-seed regions; lowering tests cover its accelerator custom-call contract and explicit CPU rejection.
+
+CPU execution does not test CUDA/NCCL communication, hardware topology, network failures, or performance. Native
+cross-process kernel execution also remains outside this suite. Those require separate integration coverage. A
+single-participant ragged exchange can still perform native GPU copies, but it does not establish multi-GPU routing
+correctness.
+
+The explicitly selected CUDA suite runs eight ragged all-to-all workloads on one real GPU, including a DGX Spark.
+It checks seeded output holes, empty transfers, repeated source reads, trailing row dimensions, unrelated batching,
+JVPs, and VJPs of both the operand and output seed with `i32` and `u64` metadata. All transfer metadata are runtime
+arguments. Ryft and JAX outputs are checked against independent NumPy copies and basis-vector adjoints, including
+actual array shapes and `f32` element types. VJP cases also check the adjoint inner-product identity.
+
+Build with CUDA 13 from the repository root, then run from `python/`:
+
+```bash
+timeout 300 cargo build -p ryft-xla --features differential-testing,cuda-13 --bin differential_testing
+cd python
+CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.10.0' python -m ryft.jax.differential_testing \
+    --suite cuda-collectives --ryft-binary ../target/debug/differential_testing
+```
+
+Omit `--ryft-binary` to let the harness build with the CUDA feature automatically. CUDA cases are excluded from default
+and CPU-suite execution; missing CUDA support fails explicitly. Select individual cases with `--case`, or inspect them
+with `--suite cuda-collectives --list`. CPU and CUDA workloads run in separate invocations. Each emitter has a
+300-second timeout that also terminates its child processes.
+
+Ryft's CUDA plugin also needs compatible shared libraries on its loader path. If system CUDA is older than the
+plugin's build toolkit, set `LD_LIBRARY_PATH` to compatible library directories; installing JAX's CUDA extra alone
+does not expose those libraries to the separate Rust process. On the Spark, the plugin required NVRTC 13.2 builtins
+and NVJitLink 13.2 or newer. The eight cases passed on its GB10 with driver 580.173.02 on 2026-10-06, using isolated
+CUDA libraries. Native compilation dumps contained `kRaggedAllToAll` GPU thunks.
+
+Repeated source reads are covered in primal and JVP execution. Pinned JAX's ragged transpose overwrites overlapping
+operand cotangents, so CUDA VJP parity cases use disjoint source intervals; Ryft's additive transpose has separate core
+regression coverage. These single-GPU tests execute the accelerator backend and verify local transfer geometry, but
+multi-GPU routing and NCCL communication still require multiple devices.
+
 To investigate local reference state inside custom JVP rules, run:
 
 ```bash

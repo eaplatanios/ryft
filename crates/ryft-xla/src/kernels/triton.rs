@@ -55,7 +55,7 @@ impl KernelOutputEmbedding<CompiledKernel> for TritonEmbedding {
         };
         Ok(operation
             .with_attribute("ryft.triton.schema", i64::from(COMPILER_SCHEMA_VERSION))
-            .with_attribute("ryft.triton.configuration", format!("{:x}", Sha256::digest(output.configuration_key()))))
+            .with_attribute("ryft.triton.configuration", hex::encode(Sha256::digest(output.configuration_key()))))
     }
 }
 

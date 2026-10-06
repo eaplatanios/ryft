@@ -1,22 +1,38 @@
 """Shared case registry and pinned-JAX emitters for differential testing.
 
-JAX is imported only after `build_jax_observations` configures four host devices. Keep this module free of module-level
-JAX imports so the parent comparison process can safely spawn it after running the Ryft emitter.
+JAX is imported only after `build_jax_observations` configures logical CPU devices. Keep this module free of
+module-level JAX imports so the parent comparison process can safely spawn it after running the Ryft emitter.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any
 
+from ryft.jax.collective_testing import (
+    build_collective_jax,
+    collective_contract,
+    collective_descriptors,
+    collective_reference,
+    legacy_collective_reference,
+    validate_collective_arrays,
+    validate_collective_observation,
+)
 from ryft.jax.differential_testing import (
     PINNED_JAX_VERSION,
     SCHEMA,
     DifferentialObservation,
     StableHloCollective,
     StagingObservation,
+)
+from ryft.jax.ragged_collective_testing import (
+    build_ragged_jax,
+    ragged_descriptors,
+    ragged_reference,
+    validate_ragged_observation,
 )
 
 
@@ -26,8 +42,9 @@ class DifferentialCase:
 
     `collectives` is the collective projection both frameworks must produce, in module order. `stablehlo_patterns`
     lists semantic operation or attribute spellings that must occur in both modules. An exact-parity case must declare
-    at least one of these contracts, because comparing two unconstrained modules would pass vacuously. Capability
-    cases that compare no module declare neither contract.
+    at least one of these contracts or an independent reference. `reference` provides host semantics checked separately
+    against each backend. `validate` checks identities against actual outputs, and `suite` selects related workloads.
+    Capability cases that compare no module declare neither module contract.
     """
 
     case_id: str
@@ -35,12 +52,17 @@ class DifferentialCase:
     build_jax: Callable[[Any, Any, Any], DifferentialObservation]
     collectives: tuple[StableHloCollective, ...] = ()
     stablehlo_patterns: tuple[str, ...] = ()
+    reference: Callable[[], dict[str, tuple[tuple[float, ...], ...]]] | None = None
+    suite: str = "general"
+    validate: Callable[[DifferentialObservation], tuple[str, ...]] | None = None
 
 
-def _configure_jax_devices() -> None:
-    """Configures four host devices before the process imports JAX."""
+def _configure_jax_devices(device_count: int = 4) -> None:
+    """Configures the requested logical CPU devices before the process imports JAX."""
 
-    flag = "--xla_force_host_platform_device_count=4"
+    flag = f"--xla_force_host_platform_device_count={device_count}"
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["JAX_NUM_CPU_DEVICES"] = str(device_count)
     existing = [
         value
         for value in os.environ.get("XLA_FLAGS", "").split()
@@ -86,6 +108,11 @@ def _build_grouped_collectives(jax: Any, jax_numpy: Any, numpy: Any) -> Differen
     function = jax.pmap(grouped, axis_name="x")
     inputs = jax_numpy.arange(16.0, dtype=jax_numpy.float32).reshape(4, 4)
     all_gather, psum_scatter, all_to_all = function(inputs)
+    validate_collective_arrays(
+        "grouped_shape_changing_collectives",
+        {"all_gather": all_gather, "psum_scatter": psum_scatter, "all_to_all": all_to_all},
+        {"all_gather": (4, 8), "psum_scatter": (4, 2), "all_to_all": (4, 4)},
+    )
     return DifferentialObservation(
         schema=SCHEMA,
         case_id="grouped_shape_changing_collectives",
@@ -104,6 +131,7 @@ def _build_pshuffle(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObserva
     function = jax.pmap(lambda input_value: jax.lax.pshuffle(input_value, "x", [2, 0, 3, 1]), axis_name="x")
     inputs = jax_numpy.arange(8.0, dtype=jax_numpy.float32).reshape(4, 2)
     output = function(inputs)
+    validate_collective_arrays("pshuffle", {"output": output}, {"output": (4, 2)})
     return DifferentialObservation(
         schema=SCHEMA,
         case_id="pshuffle",
@@ -118,6 +146,7 @@ def _build_pswapaxes(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObserv
     function = jax.pmap(lambda input_value: jax.lax.pswapaxes(input_value, "x", 0), axis_name="x")
     inputs = jax_numpy.arange(32.0, dtype=jax_numpy.float32).reshape(4, 4, 2)
     output = function(inputs)
+    validate_collective_arrays("pswapaxes", {"output": output}, {"output": (4, 4, 2)})
     return DifferentialObservation(
         schema=SCHEMA,
         case_id="pswapaxes",
@@ -399,6 +428,49 @@ DIFFERENTIAL_CASES = (
 )
 
 
+def _collective_cases() -> tuple[DifferentialCase, ...]:
+    """Registers manifest workloads with both JAX execution and independent host references."""
+
+    return tuple(
+        DifferentialCase(
+            descriptor["id"],
+            "parity",
+            partial(build_collective_jax, descriptor),
+            collective_contract(descriptor),
+            reference=partial(collective_reference, descriptor),
+            suite="collectives",
+            validate=(
+                partial(validate_collective_observation, descriptor) if descriptor.get("transform") == "vjp" else None
+            ),
+        )
+        for descriptor in collective_descriptors()
+    )
+
+
+def _ragged_cases() -> tuple[DifferentialCase, ...]:
+    """Registers optional native CUDA ragged execution separately from the CPU matrix."""
+
+    return tuple(
+        DifferentialCase(
+            descriptor["id"],
+            "parity",
+            partial(build_ragged_jax, descriptor),
+            stablehlo_patterns=("ragged_all_to_all",),
+            reference=partial(ragged_reference, descriptor),
+            suite="cuda-collectives",
+            validate=partial(validate_ragged_observation, descriptor) if descriptor["transform"] == "vjp" else None,
+        )
+        for descriptor in ragged_descriptors()
+    )
+
+
+DIFFERENTIAL_CASES = tuple(
+    replace(case, suite="collectives", reference=partial(legacy_collective_reference, case.case_id))
+    if index < 3 else case
+    for index, case in enumerate(DIFFERENTIAL_CASES)
+) + _collective_cases() + _ragged_cases()
+
+
 def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObservation, ...]:
     """Builds selected observations against the exact repository-pinned JAX version.
 
@@ -407,18 +479,37 @@ def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObserva
       - `case_ids`: Exact registry IDs to execute, in desired output order.
     """
 
-    _configure_jax_devices()
+    by_id = {case.case_id: case for case in DIFFERENTIAL_CASES}
+    selected = tuple(by_id[case_id] for case_id in case_ids)
+    cuda = any(case.suite == "cuda-collectives" for case in selected)
+    if cuda and any(case.suite != "cuda-collectives" for case in selected):
+        raise ValueError("CPU and CUDA cases must run in separate invocations")
+    participant_counts = {descriptor["id"]: descriptor["participants"] for descriptor in collective_descriptors()}
+    device_count = max((participant_counts.get(case_id, 4) for case_id in case_ids), default=4)
+    if cuda:
+        os.environ["JAX_PLATFORMS"] = "cuda"
+        os.environ["JAX_ENABLE_X64"] = "true"
+        # GPU tests use one real device; remove inherited CPU simulation flags.
+        os.environ.pop("JAX_NUM_CPU_DEVICES", None)
+        os.environ["XLA_FLAGS"] = " ".join(
+            value for value in os.environ.get("XLA_FLAGS", "").split()
+            if not value.startswith("--xla_force_host_platform_device_count=")
+        )
+    else:
+        _configure_jax_devices(device_count)
     import jax
     import jax.numpy as jax_numpy
     import numpy
 
     if jax.__version__ != PINNED_JAX_VERSION:
         raise RuntimeError(f"differential harness requires jax=={PINNED_JAX_VERSION} but found {jax.__version__}")
-    if len(jax.devices()) != 4:
+    if cuda:
+        if not jax.devices("cuda"):
+            raise RuntimeError("CUDA collective suite requires a JAX CUDA device")
+    elif len(jax.devices("cpu")) != device_count:
         raise RuntimeError(
-            f"differential harness requires exactly four JAX host devices but found {len(jax.devices())}"
+            f"differential harness requires {device_count} JAX CPU devices but found {len(jax.devices('cpu'))}"
         )
-    by_id = {case.case_id: case for case in DIFFERENTIAL_CASES}
     return tuple(by_id[case_id].build_jax(jax, jax_numpy, numpy) for case_id in case_ids)
 
 

@@ -112,7 +112,7 @@ impl Compiler {
             pipeline_stages: schedule.pipeline_stages().map(|value| value.get()),
             buffering_depth: schedule.buffering_depth().map(|value| value.get()),
             maximum_scratch_bytes: schedule.maximum_scratch_bytes(),
-            worker_sha256: format!("{:x}", Sha256::digest(include_bytes!("export.py"))),
+            worker_sha256: hex::encode(Sha256::digest(include_bytes!("export.py"))),
         })?)
     }
 

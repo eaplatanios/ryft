@@ -89,7 +89,7 @@ fn parse_cutile_artifact(metadata_json: &str, cubin_path: &Path, cubin: Vec<u8>)
             cubin.len(),
         ));
     }
-    let actual_sha256 = format!("{:x}", Sha256::digest(cubin.as_slice()));
+    let actual_sha256 = hex::encode(Sha256::digest(cubin.as_slice()));
     if metadata.artifact.sha256 != actual_sha256 {
         return Err(format!(
             "cuTile cubin SHA-256 mismatch: metadata records `{}`, but the artifact hashes to `{actual_sha256}`",
@@ -383,7 +383,7 @@ fn test_cutile_metadata_contract() {
         "artifact": {
             "format": "cubin",
             "path": cubin_path,
-            "sha256": format!("{:x}", Sha256::digest(cubin.as_slice())),
+            "sha256": hex::encode(Sha256::digest(cubin.as_slice())),
             "size_bytes": cubin.len(),
             "target_sm": "sm_100",
         },

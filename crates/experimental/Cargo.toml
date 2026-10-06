@@ -16,6 +16,7 @@ ryft-triton = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 indoc.workspace = true
 pretty_assertions.workspace = true
 ryft-core.workspace = true

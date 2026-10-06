@@ -65,7 +65,7 @@ impl KernelOutputEmbedding<CompiledKernel> for CuTileEmbedding {
         Ok(embedding
             .custom_call(kernel, output.artifact())?
             .with_attribute("ryft.cutile.schema", i64::from(COMPILER_SCHEMA_VERSION))
-            .with_attribute("ryft.cutile.configuration", format!("{:x}", Sha256::digest(output.configuration_key()))))
+            .with_attribute("ryft.cutile.configuration", hex::encode(Sha256::digest(output.configuration_key()))))
     }
 }
 
