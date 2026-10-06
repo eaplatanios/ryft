@@ -315,6 +315,105 @@ impl ParallelRaggedAllToAllOperation {
     fn participant_groups(&self) -> Vec<Vec<usize>> {
         self.axis_index_groups().map_or_else(|| vec![(0..self.axis_size).collect()], <[Vec<usize>]>::to_vec)
     }
+
+    /// Binds this [`ParallelRaggedAllToAllOperation`] to `inputs`, given in their canonical order, through the dispatch
+    /// domain of the first input. Over a manual mesh axis, the operation records the mesh of that axis, and a first
+    /// input that does not vary over the axis is made varying first. All inputs are then aligned to the manual axes
+    /// that any of them varies over, so that the output type records every manual axis over which the result can
+    /// differ.
+    fn stage<
+        V: Value<
+                Type = ArrayType,
+                DispatchDomain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes,
+            > + ParallelVary,
+    >(
+        mut self,
+        inputs: [&V; 6],
+    ) -> Result<V, ProgramError> {
+        let context = inputs[0].dispatch_domain();
+        let mut inputs = inputs.map(Clone::clone);
+        let axis_name = self.axis_name.clone();
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(&axis_name) {
+            if inputs.iter().any(|input| input.r#type().unreduced_axes().contains(axis_name.as_str())) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
+            }
+            if !inputs[0]
+                .r#type()
+                .sharding()
+                .is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis_name))
+            {
+                inputs[0] = inputs[0].parallel_vary(&axis_name)?;
+            }
+            self = self.with_mesh(mesh);
+        }
+        let inputs = V::align_manual_variation(&inputs)?;
+        let mut outputs = context.bind(self, Vec::new(), &inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+
+    /// Transposes sender-owned offset metadata of this [`ParallelRaggedAllToAllOperation`] in its current logical or
+    /// physical representation, staging the transposition in `context`. The result gives every receiver the offsets
+    /// that each sender in its participant group addressed to it, so that the adjoint exchange can route cotangents
+    /// back along the forward routes.
+    fn transpose_offsets<
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ParallelAllToAllOperation>
+            + From<ConcatenateOperation<ArrayType>>
+            + From<SliceOperation>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
+    >(
+        &self,
+        context: &mut TracingContext<V, O>,
+        offsets: &Tracer<TracingContext<V, O>>,
+    ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError> {
+        if self.is_physical() {
+            // Physical batching has already materialized every participant, so no named-axis binder remains in
+            // which a dense collective could run. Row `p` of the result instead concatenates, for every sender in the
+            // participant group of `p`, the block of that sender's offsets addressed to the position of `p` in that
+            // group, using only static slices and concatenations.
+            let offset_type = offsets.r#type();
+            let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
+            let group_size = self.effective_axis_size()?;
+            let slices_per_peer = metadata_length / group_size;
+            let groups = self.participant_groups();
+            let mut rows = Vec::with_capacity(self.axis_size);
+            for participant in 0..self.axis_size {
+                let (group, participant_position) = groups
+                    .iter()
+                    .find_map(|group| {
+                        group.iter().position(|candidate| *candidate == participant).map(|position| (group, position))
+                    })
+                    .unwrap();
+                let start = participant_position * slices_per_peer;
+                let mut blocks = Vec::with_capacity(group_size);
+                for &sender in group {
+                    blocks.push(offsets.slice(&[sender, start], &[sender + 1, start + slices_per_peer], &[1, 1])?);
+                }
+                rows.push(Tracer::concatenate(blocks.iter(), 1)?);
+            }
+            return Ok(Tracer::concatenate(rows.iter(), 0)?);
+        }
+
+        // The logical representation exchanges the offsets through a tiled all-to-all over the same participant groups
+        // and, for an exchange over a manual mesh axis, over the same mesh, whose variation contract the offsets
+        // already satisfy as inputs of this operation.
+        let options = self.axis_index_groups().map_or_else(CollectiveOptions::tiled, |groups| {
+            CollectiveOptions::tiled().with_axis_index_groups(groups.to_vec())
+        });
+        let mut exchange = ParallelAllToAllOperation::new(self.axis_name.clone(), self.axis_size, 0, 0, options);
+        if let Some(mesh) = &self.mesh {
+            exchange = exchange.with_mesh(mesh.clone());
+        }
+        let mut outputs = context.bind(exchange, Vec::new(), std::slice::from_ref(offsets))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
 }
 
 impl Display for ParallelRaggedAllToAllOperation {
@@ -801,8 +900,28 @@ impl<
                                 )?;
                                 check_count!("output", iota, 1, ProgramError);
 
+                                // The scale takes part only in the offset arithmetic of each shard, so it is created
+                                // in the memory space and with the manual variation of the metadata that it rebases
+                                // instead of going through a `parallel_vary` transition. Skipping that transition is
+                                // sound only because the scale is a non-differentiable constant: the transpose of the
+                                // transition is a cross-device sum, which a value that can carry a tangent would need.
+                                let leading_extent =
+                                    u64::try_from(leading_extent).map_err(|_| ProgramError::InvalidArgument {
+                                        message: format!(
+                                            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {leading_extent} \
+                                             does not fit in `u64`",
+                                        ),
+                                    })?;
+                                let mut scale_type =
+                                    ArrayType::scalar(DataType::U64).with_memory(metadata_type.memory());
+                                if let Some(sharding) = metadata_type.sharding() {
+                                    let scale_sharding = Sharding::replicated(sharding.mesh().clone(), 0)
+                                        .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
+                                        .map_err(TypeError::from)?;
+                                    scale_type = scale_type.with_sharding(scale_sharding).map_err(TypeError::from)?;
+                                }
                                 let mut scale = context.parent().bind(
-                                    ConstantOperation::new(metadata_extent_scalar(&metadata_type, leading_extent)?),
+                                    ConstantOperation::new(Array::from_elements(scale_type, &[leading_extent])?),
                                     Vec::new(),
                                     &[],
                                 )?;
@@ -1005,15 +1124,24 @@ impl_differentiable_operation! {
                                 return Ok(());
                             }
 
-                            let input_offsets = known_transpose_input(input_offsets, "input_offsets")?;
-                            let send_sizes = known_transpose_input(send_sizes, "send_sizes")?;
-                            let output_offsets = known_transpose_input(output_offsets, "output_offsets")?;
-                            let receive_sizes = known_transpose_input(receive_sizes, "receive_sizes")?;
+                            // The metadata route the cotangents, so they must be known primal residuals.
+                            let known_input = |input: &PartialValue<Tracer<TracingContext<V, O>>>, name: &str| {
+                                input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
+                                    message: format!(
+                                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` \
+                                         to be a known primal residual",
+                                    ),
+                                })
+                            };
+                            let input_offsets = known_input(input_offsets, "input_offsets")?;
+                            let send_sizes = known_input(send_sizes, "send_sizes")?;
+                            let output_offsets = known_input(output_offsets, "output_offsets")?;
+                            let receive_sizes = known_input(receive_sizes, "receive_sizes")?;
                             let (operand_cotangent, permuted_output_offsets) = if !accumulators[0].is_needed() {
                                 (MaybeZero::Zero(operand.r#type().cotangent()?), None)
                             } else {
-                                let permuted_output_offsets = transpose_offsets(operation, context, &output_offsets)?;
-                                let permuted_input_offsets = transpose_offsets(operation, context, &input_offsets)?;
+                                let permuted_output_offsets = operation.transpose_offsets(context, &output_offsets)?;
+                                let permuted_input_offsets = operation.transpose_offsets(context, &input_offsets)?;
                                 let zero = context.zero(&operand.r#type().cotangent()?)?;
                                 let adjoint_inputs = [
                                     cotangent.clone(),
@@ -1035,15 +1163,142 @@ impl_differentiable_operation! {
                             } else {
                                 let permuted_output_offsets = match permuted_output_offsets {
                                     Some(permuted_output_offsets) => permuted_output_offsets,
-                                    None => transpose_offsets(operation, context, &output_offsets)?,
+                                    None => operation.transpose_offsets(context, &output_offsets)?,
                                 };
-                                MaybeZero::Value(mask_output_cotangent(
-                                    context,
-                                    cotangent,
-                                    &permuted_output_offsets,
-                                    &receive_sizes,
-                                    operation.is_physical(),
-                                )?)
+
+                                // Preserve the output seed's cotangent outside the received regions with an interval
+                                // mask. Each received region `[o, o + n)` contributes `+1` at `o` and `-1` at `o + n`
+                                // to a marker array of extent `M + 1`, whose prefix sums are then nonzero exactly at
+                                // received rows.
+                                let output_type = cotangent.r#type().into_owned();
+                                let leading_axis = usize::from(operation.is_physical());
+                                let output_extent =
+                                    output_type.shape().dimensions()[leading_axis].value().ok_or_else(|| {
+                                        ProgramError::UnsupportedOperation {
+                                            message: format!(
+                                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a \
+                                                 static output leading dimension",
+                                            ),
+                                        }
+                                    })?;
+                                let marker_extent =
+                                    output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
+                                        message: format!(
+                                            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent \
+                                             does not fit in `usize`",
+                                        ),
+                                    })?;
+                                let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
+                                marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
+
+                                // Marker constants participate in the metadata computation on each shard. Give them the
+                                // metadata's placement and variation from creation instead of staging a `parallel_vary`
+                                // transition. This is sound only because they are non-differentiable constants: the
+                                // transpose of that transition is a cross-device sum, which any value that can carry
+                                // a tangent would need. The marker's segment dimension has extent `M + 1`, which is
+                                // unrelated to the metadata length, so it is replicated, while the participant axis of
+                                // the physical form keeps the offsets' sharding so that it lines up with the batching
+                                // dimensions of the scatters below.
+                                let marker_sharding = permuted_output_offsets
+                                    .r#type()
+                                    .sharding()
+                                    .map(|sharding| {
+                                        let mut dimensions = sharding.dimensions().to_vec();
+                                        dimensions[leading_axis] = ShardingDimension::Replicated;
+                                        sharding.with_dimensions(dimensions)
+                                    })
+                                    .transpose()
+                                    .map_err(TypeError::from)?;
+                                let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions))
+                                    .with_memory(output_type.memory())
+                                    .with_sharding(marker_sharding)
+                                    .map_err(TypeError::from)?;
+
+                                // Metadata may use any integer width and memory placement. Widen index arithmetic to
+                                // `u64` before adding and move it beside the cotangent so scatter's three inputs share
+                                // one memory space.
+                                let normalize_metadata =
+                                    |value: &Tracer<TracingContext<V, O>>| -> Result<_, ProgramError> {
+                                        let value = if value.r#type().memory() == output_type.memory() {
+                                            value.clone()
+                                        } else {
+                                            value.transfer_to_memory(output_type.memory())?
+                                        };
+                                        if value.r#type().data_type() == DataType::U64 {
+                                            Ok(value)
+                                        } else {
+                                            Ok(value.convert_element_type(DataType::U64)?)
+                                        }
+                                    };
+                                let output_offsets = normalize_metadata(&permuted_output_offsets)?;
+                                let receive_sizes = normalize_metadata(&receive_sizes)?;
+                                let update_type = output_offsets.r#type().into_owned().with_data_type(DataType::I64);
+                                let marker = context.zero(&marker_type)?;
+                                let ones = context.one(&update_type)?;
+                                let negative_ones = ones.neg()?;
+                                let end_offsets = output_offsets.add(&receive_sizes)?;
+                                let mut index_dimensions = output_offsets.r#type().shape().dimensions().to_vec();
+                                index_dimensions.push(Dimension::Static(1));
+                                let start_indices = output_offsets.reshape(Shape::new(index_dimensions.clone()))?;
+                                let end_indices = end_offsets.reshape(Shape::new(index_dimensions))?;
+                                let scatter_dimensions = if operation.is_physical() {
+                                    ScatterDimensionNumbers::new(Vec::new(), vec![1], vec![1])
+                                        .with_batching_dimensions(vec![0], vec![0])
+                                } else {
+                                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0])
+                                };
+
+                                // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the
+                                // same position, while adjacent regions combine deterministically at their shared
+                                // boundary.
+                                let options = ScatterOptions::new();
+                                let markers = marker
+                                    .scatter(
+                                        &start_indices,
+                                        &ones,
+                                        &scatter_dimensions,
+                                        ScatterReductionKind::Add,
+                                        &options,
+                                    )?
+                                    .scatter(
+                                        &end_indices,
+                                        &negative_ones,
+                                        &scatter_dimensions,
+                                        ScatterReductionKind::Add,
+                                        &options,
+                                    )?;
+                                let markers = markers.cumulative_sum(leading_axis)?;
+                                let start_indices = vec![0; markers.r#type().rank()];
+                                let mut limit_indices = markers
+                                    .r#type()
+                                    .shape()
+                                    .dimensions()
+                                    .iter()
+                                    .map(|dimension| dimension.value().unwrap())
+                                    .collect::<Vec<_>>();
+                                limit_indices[leading_axis] = output_extent;
+                                let strides = vec![1; markers.r#type().rank()];
+                                let markers = markers.slice(
+                                    start_indices.as_slice(),
+                                    limit_indices.as_slice(),
+                                    strides.as_slice(),
+                                )?;
+                                let marker_zero = context.zero(markers.r#type().as_ref())?;
+                                let received = markers.not_equal(&marker_zero)?;
+
+                                // The receive mask varies with its offset metadata. Expanding it over payload
+                                // dimensions changes only geometry; retain those variation facts instead of
+                                // replacing them with an unsharded Boolean type.
+                                let mut condition_type = received.r#type().into_owned();
+                                for (axis, dimension) in
+                                    output_type.shape().dimensions().iter().enumerate().skip(leading_axis + 1)
+                                {
+                                    condition_type = condition_type.with_inserted_dimension(axis, dimension.clone())?;
+                                }
+                                let received =
+                                    received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
+                                let zero = context.zero(&output_type)?;
+                                MaybeZero::Value(Tracer::select(&received, &zero, cotangent)?)
                             };
                             accumulators[0].accumulate(context, operand_cotangent)?;
                             accumulators[1].accumulate(context, output_cotangent)
@@ -1326,10 +1581,14 @@ impl<
         receive_sizes: &Self,
     ) -> Result<Self, ProgramError> {
         let axis_size = resolve_named_axis_size(&self.dispatch_domain(), axis_name)?;
-        bind_parallel_ragged_all_to_all(
-            ParallelRaggedAllToAllOperation::new(axis_name.to_string(), axis_size),
-            [self, output, input_offsets, send_sizes, output_offsets, receive_sizes],
-        )
+        ParallelRaggedAllToAllOperation::new(axis_name.to_string(), axis_size).stage([
+            self,
+            output,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            receive_sizes,
+        ])
     }
 
     #[inline]
@@ -1344,51 +1603,18 @@ impl<
         axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, ProgramError> {
         let axis_size = resolve_named_axis_size(&self.dispatch_domain(), axis_name)?;
-        bind_parallel_ragged_all_to_all(
-            ParallelRaggedAllToAllOperation::grouped(axis_name.to_string(), axis_size, axis_index_groups)?,
-            [self, output, input_offsets, send_sizes, output_offsets, receive_sizes],
-        )
+        ParallelRaggedAllToAllOperation::grouped(axis_name.to_string(), axis_size, axis_index_groups)?.stage([
+            self,
+            output,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            receive_sizes,
+        ])
     }
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Binds `operation` to `inputs`, given in their canonical order, through the context of the first input. Over a
-/// manual mesh axis, the operation records the mesh of that axis, and a first input that does not vary over the axis is
-/// made varying first. All inputs are then aligned to the manual axes that any of them varies over, so that the output
-/// type records every manual axis over which the result can differ.
-fn bind_parallel_ragged_all_to_all<V>(
-    mut operation: ParallelRaggedAllToAllOperation,
-    inputs: [&V; 6],
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
-        + ParallelVary,
-{
-    let context = inputs[0].dispatch_domain();
-    let mut inputs = inputs.map(Clone::clone);
-    let axis_name = operation.axis_name().to_string();
-    if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(&axis_name) {
-        if inputs.iter().any(|input| input.r#type().unreduced_axes().contains(axis_name.as_str())) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` does not support unreduced inputs",
-            ))
-            .into());
-        }
-        if !inputs[0]
-            .r#type()
-            .sharding()
-            .is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis_name))
-        {
-            inputs[0] = inputs[0].parallel_vary(&axis_name)?;
-        }
-        operation = operation.with_mesh(mesh);
-    }
-    let inputs = V::align_manual_variation(&inputs)?;
-    let mut outputs = context.bind(operation, Vec::new(), &inputs)?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
 
 /// Reference-value capability used by eager interpretation of [`ParallelRaggedAllToAllOperation`].
 ///
@@ -1575,264 +1801,6 @@ impl ParallelRaggedAllToAllEvaluation for Array {
         }
         Array::from_logical_bytes(output.r#type().into_owned(), result_bytes.as_slice())
     }
-}
-
-/// Returns `input` as the known primal residual required by the transpose rule.
-fn known_transpose_input<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>>(
-    input: &PartialValue<Tracer<TracingContext<V, O>>>,
-    name: &str,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError> {
-    input.as_known().cloned().ok_or_else(|| {
-        ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` to be a known primal \
-                 residual",
-            ),
-        }
-        .into()
-    })
-}
-
-/// Stages the logical named-axis exchange that transposes sender-owned offset metadata. The exchange runs over the
-/// same participant groups as `operation` and, for an exchange over a manual mesh axis, over the same mesh, whose
-/// variation contract the offsets already satisfy as inputs of `operation`.
-fn transpose_logical_offsets<V, O>(
-    operation: &ParallelRaggedAllToAllOperation,
-    context: &mut TracingContext<V, O>,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ParallelAllToAllOperation>,
-{
-    let options = operation.axis_index_groups().map_or_else(CollectiveOptions::tiled, |groups| {
-        CollectiveOptions::tiled().with_axis_index_groups(groups.to_vec())
-    });
-    let mut exchange =
-        ParallelAllToAllOperation::new(operation.axis_name().to_string(), operation.axis_size(), 0, 0, options);
-    if let Some(mesh) = operation.mesh() {
-        exchange = exchange.with_mesh(mesh.clone());
-    }
-    let mut outputs = context.bind(exchange, Vec::new(), std::slice::from_ref(offsets))?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
-/// Transposes physical sender/receiver offset blocks within each participant group using only static slices and
-/// concatenations. Physical batching has already materialized every participant, so no named-axis binder remains in
-/// which a dense collective could run.
-fn transpose_physical_offsets<V, O>(
-    operation: &ParallelRaggedAllToAllOperation,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>
-        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
-        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
-{
-    let offset_type = offsets.r#type();
-    let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
-    let group_size = operation.effective_axis_size()?;
-    let slices_per_peer = metadata_length / group_size;
-    let groups = operation.participant_groups();
-    let mut rows = Vec::with_capacity(operation.axis_size());
-    for participant in 0..operation.axis_size() {
-        let (group, participant_position) = groups
-            .iter()
-            .find_map(|group| {
-                group.iter().position(|candidate| *candidate == participant).map(|position| (group, position))
-            })
-            .unwrap();
-        let start = participant_position * slices_per_peer;
-        let mut blocks = Vec::with_capacity(group_size);
-        for &sender in group {
-            blocks.push(offsets.slice(&[sender, start], &[sender + 1, start + slices_per_peer], &[1, 1])?);
-        }
-        rows.push(Tracer::concatenate(blocks.iter(), 1)?);
-    }
-    Ok(Tracer::concatenate(rows.iter(), 0)?)
-}
-
-/// Transposes sender-owned offset metadata in the operation's current logical or physical representation.
-fn transpose_offsets<V, O>(
-    operation: &ParallelRaggedAllToAllOperation,
-    context: &mut TracingContext<V, O>,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<ParallelAllToAllOperation>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>
-        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
-        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
-{
-    if operation.is_physical() {
-        transpose_physical_offsets(operation, offsets)
-    } else {
-        transpose_logical_offsets(operation, context, offsets)
-    }
-}
-
-/// Stages the interval mask that preserves the output seed's cotangent outside received regions.
-///
-/// # Parameters
-///
-///   - `context`: Tracing context in which the mask is staged.
-///   - `cotangent`: Output seed cotangent to mask, whose leading segment axis has a static extent.
-///   - `output_offsets`: Receiver-frame offsets of the received regions, already exchanged to the receivers.
-///   - `receive_sizes`: Lengths of the received regions, indexed by sending participant.
-///   - `physical`: Whether the inputs use the physical representation, in which every input has a leading
-///     participant axis.
-fn mask_output_cotangent<V, O>(
-    context: &mut TracingContext<V, O>,
-    cotangent: &Tracer<TracingContext<V, O>>,
-    output_offsets: &Tracer<TracingContext<V, O>>,
-    receive_sizes: &Tracer<TracingContext<V, O>>,
-    physical: bool,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<BroadcastOperation>
-        + From<CompareOperation<ArrayType>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<CumulativeOperation>
-        + From<NegOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<ReshapeOperation>
-        + From<ScatterOperation>
-        + From<SelectOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<TransferToMemoryOperation>
-        + From<ZeroOperation<ArrayType>>
-        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
-        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
-{
-    let output_type = cotangent.r#type().into_owned();
-    let leading_axis = usize::from(physical);
-    let output_extent = output_type.shape().dimensions()[leading_axis].value().ok_or_else(|| {
-        ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a static output leading dimension",
-            ),
-        }
-    })?;
-    let marker_extent = output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
-        message: format!(
-            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`",
-        ),
-    })?;
-    let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
-    marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
-
-    // Marker constants participate in the metadata computation on each shard. Give them the metadata's placement
-    // and variation from creation instead of staging a `parallel_vary` transition. This is sound only because they
-    // are non-differentiable constants: the transpose of that transition is a cross-device sum, which any value that
-    // can carry a tangent would need. The marker's segment dimension has extent `M + 1`, which is unrelated to the
-    // metadata length, so it is replicated, while the participant axis of the physical form keeps the offsets'
-    // sharding so that it lines up with the batching dimensions of the scatters below.
-    let marker_sharding = output_offsets
-        .r#type()
-        .sharding()
-        .map(|sharding| {
-            let mut dimensions = sharding.dimensions().to_vec();
-            dimensions[leading_axis] = ShardingDimension::Replicated;
-            sharding.with_dimensions(dimensions)
-        })
-        .transpose()
-        .map_err(TypeError::from)?;
-    let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions))
-        .with_memory(output_type.memory())
-        .with_sharding(marker_sharding)
-        .map_err(TypeError::from)?;
-
-    // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and move
-    // it beside the cotangent so scatter's three inputs share one memory space.
-    let normalize_metadata = |value: &Tracer<TracingContext<V, O>>| -> Result<_, ProgramError> {
-        let value = if value.r#type().memory() == output_type.memory() {
-            value.clone()
-        } else {
-            value.transfer_to_memory(output_type.memory())?
-        };
-        if value.r#type().data_type() == DataType::U64 {
-            Ok(value)
-        } else {
-            Ok(value.convert_element_type(DataType::U64)?)
-        }
-    };
-    let output_offsets = normalize_metadata(output_offsets)?;
-    let receive_sizes = normalize_metadata(receive_sizes)?;
-    let update_type = output_offsets.r#type().into_owned().with_data_type(DataType::I64);
-    let marker = context.zero(&marker_type)?;
-    let ones = context.one(&update_type)?;
-    let negative_ones = ones.neg()?;
-    let end_offsets = output_offsets.add(&receive_sizes)?;
-    let mut index_dimensions = output_offsets.r#type().shape().dimensions().to_vec();
-    index_dimensions.push(Dimension::Static(1));
-    let start_indices = output_offsets.reshape(Shape::new(index_dimensions.clone()))?;
-    let end_indices = end_offsets.reshape(Shape::new(index_dimensions))?;
-    let scatter_dimensions = if physical {
-        ScatterDimensionNumbers::new(Vec::new(), vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0])
-    } else {
-        ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0])
-    };
-
-    // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the same position, while
-    // adjacent regions combine deterministically at their shared boundary.
-    let options = ScatterOptions::new();
-    let markers = marker
-        .scatter(&start_indices, &ones, &scatter_dimensions, ScatterReductionKind::Add, &options)?
-        .scatter(&end_indices, &negative_ones, &scatter_dimensions, ScatterReductionKind::Add, &options)?;
-    let markers = markers.cumulative_sum(leading_axis)?;
-    let start_indices = vec![0; markers.r#type().rank()];
-    let mut limit_indices = markers
-        .r#type()
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| dimension.value().unwrap())
-        .collect::<Vec<_>>();
-    limit_indices[leading_axis] = output_extent;
-    let strides = vec![1; markers.r#type().rank()];
-    let markers = markers.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?;
-    let marker_zero = context.zero(markers.r#type().as_ref())?;
-    let received = markers.not_equal(&marker_zero)?;
-
-    // The receive mask varies with its offset metadata. Expanding it over payload dimensions changes only
-    // geometry; retain those variation facts instead of replacing them with an unsharded Boolean type.
-    let mut condition_type = received.r#type().into_owned();
-    for (axis, dimension) in output_type.shape().dimensions().iter().enumerate().skip(leading_axis + 1) {
-        condition_type = condition_type.with_inserted_dimension(axis, dimension.clone())?;
-    }
-    let received = received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
-    let zero = context.zero(&output_type)?;
-    Ok(Tracer::select(&received, &zero, cotangent)?)
-}
-
-/// Constructs a `u64` scalar array containing `extent` in the memory space of `metadata_type` that varies over the same
-/// manual mesh axes as `metadata_type`. The scalar takes part only in the offset arithmetic of each shard, so it is
-/// created with the variation of the metadata that it rebases instead of going through a [`ParallelVaryOperation`]
-/// transition. Skipping that transition is sound only because the scalar is a non-differentiable constant: the
-/// transpose of the transition is a cross-device sum, which a value that can carry a tangent would need, so such a
-/// value must be aligned with [`align_manual_variation`](ManualVariationAlignment::align_manual_variation) instead.
-fn metadata_extent_scalar(metadata_type: &ArrayType, extent: usize) -> Result<Array, ProgramError> {
-    let extent = u64::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
-        message: format!("`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {extent} does not fit in `u64`"),
-    })?;
-    let mut scalar_type = ArrayType::scalar(DataType::U64).with_memory(metadata_type.memory());
-    if let Some(sharding) = metadata_type.sharding() {
-        let scalar_sharding = Sharding::replicated(sharding.mesh().clone(), 0)
-            .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
-            .map_err(TypeError::from)?;
-        scalar_type = scalar_type.with_sharding(scalar_sharding).map_err(TypeError::from)?;
-    }
-    Array::from_elements(scalar_type, &[extent])
 }
 
 #[cfg(test)]
