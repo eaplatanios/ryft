@@ -187,6 +187,13 @@ pub use trigonometric::{
 /// `Typed<Type = T>` alongside a universe-parameterized capability bound at `T`, because the resulting
 /// equality makes bounds on `V::Type` unusable.
 ///
+/// Provided functions that inspect the type of their receiver therefore do not pin the universe
+/// of their capability. Instead, they bound a view of that type, such as [`AsArrayType`](crate::AsArrayType) or
+/// [`AsDimensionType`](crate::AsDimensionType) (e.g., `Self: Typed<Type: AsArrayType>`), so that every universe whose
+/// types offer that view inherits them. Implementations name their universe explicitly (e.g., `Add<ArrayType>`), and a
+/// blanket implementation over values of several universes introduces that universe as its own type parameter (e.g.,
+/// the staging implementation of [`ReferenceAddUpdate`], which serves every universe that has reference members).
+///
 /// # The `capability` Attribute
 ///
 /// Capability traits are declared with the [`capability`](macro@capability) attribute, which checks their

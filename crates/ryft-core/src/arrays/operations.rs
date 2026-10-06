@@ -259,33 +259,34 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 /// capabilities alongside the dedicated [`DimensionMin`], [`DimensionMax`], [`DimensionSaturatingSub`], and
 /// [`DimensionPow`]. It is implemented automatically for every value that implements all of its members, and so it
 /// must never be implemented manually.
-pub trait DimensionOperations:
-    Value<Type = DimensionType>
-    + DimensionMax
-    + DimensionMin
-    + Add
-    + Sub
+pub trait DimensionOperations<T = <Self as Capability>::Universe>:
+    Value
+    + DimensionMax<T>
+    + DimensionMin<T>
+    + Add<T>
+    + Sub<T>
     // TODO(eaplatanios): Do we need a more general `SaturatingSub` operation type and capability trait as well?
-    + DimensionSaturatingSub
-    + Mul
-    + Div
-    + Rem
-    + DimensionPow
+    + DimensionSaturatingSub<T>
+    + Mul<T>
+    + Div<T>
+    + Rem<T>
+    + DimensionPow<T>
 {
 }
 
 impl<
-    V: Value<Type = DimensionType>
-        + DimensionMin
-        + DimensionMax
-        + Add
-        + Sub
-        + DimensionSaturatingSub
-        + Mul
-        + Div
-        + Rem
-        + DimensionPow,
-> DimensionOperations for V
+    T,
+    V: Value
+        + DimensionMin<T>
+        + DimensionMax<T>
+        + Add<T>
+        + Sub<T>
+        + DimensionSaturatingSub<T>
+        + Mul<T>
+        + Div<T>
+        + Rem<T>
+        + DimensionPow<T>,
+> DimensionOperations<T> for V
 {
 }
 
@@ -540,11 +541,11 @@ pub trait ArrayIrOperations:
     Value<Type = ArrayIrType>
     + ArrayOperations<ArrayIrType>
     + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
-    + ValueProjection<DimensionType, Projected: DimensionOperations>
+    + ValueProjection<DimensionType, Projected: DimensionOperations<DimensionType>>
     + DimensionSize
     + DimensionFromScalar
     + DimensionToScalar
-    + ReferenceOperations<ArrayReferenceTransform>
+    + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
     + DynamicManipulationOperations<ArrayIrType>
     + DynamicRngBitGenerator<ArrayIrType>
 {
@@ -554,11 +555,11 @@ impl<
     V: Value<Type = ArrayIrType>
         + ArrayOperations<ArrayIrType>
         + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
-        + ValueProjection<DimensionType, Projected: DimensionOperations>
+        + ValueProjection<DimensionType, Projected: DimensionOperations<DimensionType>>
         + DimensionSize
         + DimensionFromScalar
         + DimensionToScalar
-        + ReferenceOperations<ArrayReferenceTransform>
+        + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
         + DynamicManipulationOperations<ArrayIrType>
         + DynamicRngBitGenerator<ArrayIrType>,
 > ArrayIrOperations for V

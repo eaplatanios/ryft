@@ -1380,8 +1380,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
 
 /// Group of the value-level collective capabilities [`ParallelReduce`], [`ParallelVary`], [`ParallelAllGather`],
 /// [`ParallelSumScatter`], [`ParallelPermute`], [`ParallelAllToAll`], and [`ParallelRaggedAllToAll`]. It is implemented
-/// automatically for every type that implements all of its members. The group is parameterized by the [`Capability`]
-/// universe `T` of its values because several of its members are. The context-side [`AxisIndex`] is implemented by
+/// automatically for every type that implements all of its members. The context-side [`AxisIndex`] is implemented by
 /// contexts rather than values and is therefore not a member.
 pub trait CollectiveOperations<T = <Self as Capability>::Universe>:
     Capability

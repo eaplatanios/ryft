@@ -596,8 +596,9 @@ macro_rules! define_dimension_arithmetic_operation {
 
 /// Defines a value-level capability for a binary dimension arithmetic operation.
 ///
-/// The generated trait exposes one semantic binary method. Its blanket implementation constructs and binds the
-/// corresponding operation through the value's dispatch domain. Concrete eager values provide backend-owned
+/// The generated trait is a universe-parameterized [`Capability`](crate::Capability) that exposes one semantic binary
+/// method. Its blanket implementation for values of the [`DimensionType`](crate::DimensionType) universe constructs and
+/// binds the corresponding operation through the value's dispatch domain. Concrete eager values provide backend-owned
 /// implementations.
 ///
 /// # Examples
