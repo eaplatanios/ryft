@@ -28,6 +28,12 @@ from ryft.jax.differential_testing import (
     StableHloCollective,
     StagingObservation,
 )
+from ryft.jax.distributed_collective_testing import (
+    build_distributed_case_jax,
+    distributed_contract,
+    distributed_descriptors,
+    distributed_reference,
+)
 from ryft.jax.ragged_collective_testing import (
     build_ragged_jax,
     ragged_descriptors,
@@ -464,14 +470,33 @@ def _ragged_cases() -> tuple[DifferentialCase, ...]:
     )
 
 
+def _distributed_cases() -> tuple[DifferentialCase, ...]:
+    """Registers actual two-process CUDA communication separately from every single-process suite."""
+
+    return tuple(
+        DifferentialCase(
+            descriptor["id"],
+            "parity",
+            partial(build_distributed_case_jax, descriptor),
+            distributed_contract(descriptor),
+            stablehlo_patterns=("ragged_all_to_all",) if descriptor["operation"] == "ragged_all_to_all" else (),
+            reference=partial(distributed_reference, descriptor),
+            suite="cuda-distributed-collectives",
+        )
+        for descriptor in distributed_descriptors()
+    )
+
+
 DIFFERENTIAL_CASES = tuple(
     replace(case, suite="collectives", reference=partial(legacy_collective_reference, case.case_id))
     if index < 3 else case
     for index, case in enumerate(DIFFERENTIAL_CASES)
-) + _collective_cases() + _ragged_cases()
+) + _collective_cases() + _ragged_cases() + _distributed_cases()
 
 
-def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObservation, ...]:
+def build_jax_observations(
+    case_ids: Sequence[str], *, rank: int | None = None, coordinator: str | None = None,
+) -> tuple[DifferentialObservation, ...]:
     """Builds selected observations against the exact repository-pinned JAX version.
 
     # Parameters
@@ -481,9 +506,16 @@ def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObserva
 
     by_id = {case.case_id: case for case in DIFFERENTIAL_CASES}
     selected = tuple(by_id[case_id] for case_id in case_ids)
-    cuda = any(case.suite == "cuda-collectives" for case in selected)
-    if cuda and any(case.suite != "cuda-collectives" for case in selected):
+    cuda = any(case.suite.startswith("cuda-") for case in selected)
+    distributed = any(case.suite == "cuda-distributed-collectives" for case in selected)
+    if cuda and any(not case.suite.startswith("cuda-") for case in selected):
         raise ValueError("CPU and CUDA cases must run in separate invocations")
+    if distributed and (rank not in (0, 1) or coordinator is None):
+        raise ValueError("CUDA distributed cases require the two-process worker launcher")
+    if not distributed and (rank is not None or coordinator is not None):
+        raise ValueError("distributed coordinates require CUDA distributed cases")
+    if distributed and any(case.suite != "cuda-distributed-collectives" for case in selected):
+        raise ValueError("single-process and distributed CUDA cases must run in separate invocations")
     participant_counts = {descriptor["id"]: descriptor["participants"] for descriptor in collective_descriptors()}
     device_count = max((participant_counts.get(case_id, 4) for case_id in case_ids), default=4)
     if cuda:
@@ -503,14 +535,24 @@ def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObserva
 
     if jax.__version__ != PINNED_JAX_VERSION:
         raise RuntimeError(f"differential harness requires jax=={PINNED_JAX_VERSION} but found {jax.__version__}")
-    if cuda:
-        if not jax.devices("cuda"):
-            raise RuntimeError("CUDA collective suite requires a JAX CUDA device")
-    elif len(jax.devices("cpu")) != device_count:
-        raise RuntimeError(
-            f"differential harness requires {device_count} JAX CPU devices but found {len(jax.devices('cpu'))}"
+    if distributed:
+        # Initialize before any backend query; both processes own GPU 0 and discover two global PJRT participants.
+        jax.distributed.initialize(
+            coordinator_address=coordinator, num_processes=2, process_id=rank, local_device_ids=[0],
+            initialization_timeout=30, heartbeat_timeout_seconds=30, shutdown_timeout_seconds=30,
         )
-    return tuple(by_id[case_id].build_jax(jax, jax_numpy, numpy) for case_id in case_ids)
+    try:
+        if cuda:
+            if not jax.devices("cuda"):
+                raise RuntimeError("CUDA collective suite requires a JAX CUDA device")
+        elif len(jax.devices("cpu")) != device_count:
+            raise RuntimeError(
+                f"differential harness requires {device_count} JAX CPU devices but found {len(jax.devices('cpu'))}"
+            )
+        return tuple(by_id[case_id].build_jax(jax, jax_numpy, numpy) for case_id in case_ids)
+    finally:
+        if distributed:
+            jax.distributed.shutdown()
 
 
 __all__ = ["DIFFERENTIAL_CASES", "DifferentialCase", "build_jax_observations"]

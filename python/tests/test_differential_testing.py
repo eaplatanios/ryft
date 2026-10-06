@@ -91,7 +91,8 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
         self.assertTrue(cases[7:])
         self.assertTrue(all(
-            case.reference is not None and case.suite in ("collectives", "cuda-collectives") for case in cases[7:]
+            case.reference is not None and case.suite in ("collectives", *differential_testing.CUDA_SUITES)
+            for case in cases[7:]
         ))
 
     def test_observation_schema(self) -> None:
@@ -315,7 +316,7 @@ class DifferentialTestingTest(unittest.TestCase):
                 main(("--case", "pshuffle", "--timeout", "60", "--ryft-binary", "/tmp/ryft-emitter")), 0,
             )
         comparison.assert_called_once_with(
-            repo_root(), ("pshuffle",), timeout=60, binary=Path("/tmp/ryft-emitter"),
+            repo_root(), ("pshuffle",), timeout=60, binary=Path("/tmp/ryft-emitter"), log_directory=None,
         )
 
         errors = StringIO()

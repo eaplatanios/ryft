@@ -18,8 +18,13 @@ import math
 import os
 import re
 import signal
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -33,6 +38,7 @@ SCHEMA = "ryft-jax-differential-v1"
 PINNED_JAX_VERSION = "0.10.0"
 BUILD_HINT = "cargo build -p ryft-xla --features differential-testing --bin differential_testing"
 SUBPROCESS_TIMEOUT_SECONDS = 300
+CUDA_SUITES = ("cuda-collectives", "cuda-distributed-collectives")
 
 
 @dataclass(frozen=True)
@@ -339,17 +345,168 @@ def _selected_cases(case_ids: Sequence[str], suite: str | None = None) -> tuple[
     if suite is not None:
         cases = tuple(case for case in cases if case.suite == suite)
     if not case_ids:
-        return tuple(case for case in cases if suite is not None or case.suite != "cuda-collectives")
+        return tuple(case for case in cases if suite is not None or case.suite not in CUDA_SUITES)
     selected = set(case_ids)
     outside_suite = selected.difference(case.case_id for case in cases)
     if outside_suite:
         raise ValueError(f"case '{sorted(outside_suite)[0]}' is not in suite '{suite}'")
     cases = tuple(case for case in cases if case.case_id in selected)
-    if any(case.suite == "cuda-collectives" for case in cases) and any(
-        case.suite != "cuda-collectives" for case in cases
-    ):
+    if any(case.suite in CUDA_SUITES for case in cases) and any(case.suite not in CUDA_SUITES for case in cases):
         raise ValueError("CPU and CUDA cases must run in separate invocations")
+    if any(case.suite == "cuda-distributed-collectives" for case in cases) and any(
+        case.suite != "cuda-distributed-collectives" for case in cases
+    ):
+        raise ValueError("single-process and distributed CUDA cases must run in separate invocations")
     return cases
+
+
+@contextmanager
+def _shared_gpu_environment():
+    """Owns a private MPS daemon unless the caller supplies an existing MPS pipe directory.
+
+    Both ranks need concurrent progress on the same GPU. Restrict each to one NCCL CTA and less than half the GPU's
+    active threads, and avoid allocator preallocation. Only a daemon started here is shut down here.
+    """
+
+    environment = os.environ.copy()
+    environment.update({
+        "NCCL_MULTI_RANK_GPU_ENABLE": "1", "NCCL_NVLS_ENABLE": "0", "NCCL_MAX_CTAS": "1",
+        "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "45", "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    })
+    environment.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    environment.setdefault("NCCL_DEBUG", "INFO")
+    if environment.get("CUDA_MPS_PIPE_DIRECTORY"):
+        yield environment
+        return
+    control = shutil.which("nvidia-cuda-mps-control")
+    if control is None:
+        raise RuntimeError("distributed CUDA suite requires `nvidia-cuda-mps-control` or an existing MPS pipe directory")
+    with tempfile.TemporaryDirectory(prefix="ryft-cuda-mps-", delete=False) as directory:
+        pipes, logs = Path(directory) / "pipes", Path(directory) / "logs"
+        pipes.mkdir()
+        logs.mkdir()
+        environment.update({"CUDA_MPS_PIPE_DIRECTORY": str(pipes), "CUDA_MPS_LOG_DIRECTORY": str(logs)})
+        failure = None
+        try:
+            try:
+                subprocess.run([control, "-d"], env=environment, capture_output=True, text=True, check=True, timeout=10)
+            except subprocess.SubprocessError as error:
+                raise RuntimeError(f"private CUDA MPS startup failed: {error}") from error
+            yield environment
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            # Even a timed-out `-d` invocation may have forked a daemon. Attempt private shutdown after startup
+            # failures too; retain its directories when shutdown fails so the daemon remains addressable.
+            try:
+                subprocess.run(
+                    [control], input="quit\n", env=environment, capture_output=True, text=True, check=True, timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                message = f"private CUDA MPS shutdown failed: {error}; retained control directory: {directory}"
+                if failure is None:
+                    raise RuntimeError(message) from error
+                raise RuntimeError(f"{failure}; {message}") from failure
+            else:
+                shutil.rmtree(directory)
+
+
+def _run_distributed_emitters(
+    command: Sequence[str], directory: Path, timeout: int, side: str, log_directory: Path | None = None,
+) -> tuple[str, str]:
+    """Runs both ranks concurrently, cancelling their process groups on any failure or timeout.
+
+    File-backed output prevents a verbose worker from blocking on a full pipe while the other waits in a collective.
+    The timeout covers the whole launch. An optional directory retains each rank's stdout/stderr on success as well.
+    """
+
+    with socket.socket() as endpoint:
+        endpoint.bind(("127.0.0.1", 0))
+        coordinator = f"127.0.0.1:{endpoint.getsockname()[1]}"
+    with tempfile.TemporaryDirectory(prefix="ryft-distributed-") as temporary, ExitStack() as stack:
+        logs = Path(temporary) if log_directory is None else log_directory.resolve()
+        logs.mkdir(parents=True, exist_ok=True)
+        outputs, errors, processes = [], [], []
+        with _shared_gpu_environment() as environment:
+            try:
+                for rank in range(2):
+                    output = stack.enter_context((logs / f"{side}-rank-{rank}.stdout.log").open("w+"))
+                    error = stack.enter_context((logs / f"{side}-rank-{rank}.stderr.log").open("w+"))
+                    outputs.append(output)
+                    errors.append(error)
+                    worker_command = [*command, "--distributed-worker", str(rank), "--coordinator", coordinator]
+                    # NCCL's default INFO destination is stdout, which must remain a strict JSON channel.
+                    worker_environment = {**environment, "NCCL_DEBUG_FILE": str(logs / f"{side}-rank-{rank}.nccl.log")}
+                    processes.append(subprocess.Popen(
+                        worker_command, cwd=directory, env=worker_environment, stdout=output, stderr=error,
+                        text=True, start_new_session=os.name == "posix",
+                    ))
+                deadline = time.monotonic() + timeout
+                while any(process.poll() is None for process in processes):
+                    if any(process.poll() not in (None, 0) for process in processes):
+                        raise RuntimeError("a worker exited unsuccessfully")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"workers timed out after {timeout} seconds")
+                    time.sleep(0.02)
+                if any(process.returncode != 0 for process in processes):
+                    raise RuntimeError("a worker exited unsuccessfully")
+            except (OSError, RuntimeError) as failure:
+                diagnostics = []
+                for rank, error in enumerate(errors):
+                    error.seek(0)
+                    diagnostics.append(f"rank {rank}:\n{error.read()[-65536:]}")
+                retained = "" if log_directory is None else f"\nworker logs: {logs}"
+                raise RuntimeError(f"{side} distributed emitter failed: {failure}\n" + "\n".join(diagnostics) + retained) from failure
+            finally:
+                for process in processes:
+                    if os.name == "posix":
+                        # A failed worker can leave live children even after its own exit.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    elif process.poll() is None:
+                        process.kill()
+                    process.wait()
+            records = []
+            for output in outputs:
+                output.seek(0)
+                records.append(output.read())
+            return records[0], records[1]
+
+
+def _merge_distributed_observations(
+    payloads: Sequence[str], case_ids: Sequence[str], side: str,
+) -> tuple[DifferentialObservation, ...]:
+    """Combines one validated local observation per rank in deterministic global rank order."""
+
+    if len(payloads) != 2:
+        raise ValueError(f"{side} distributed emitter must produce exactly two rank payloads")
+    ranks = []
+    for payload in payloads:
+        records = json.loads(payload)
+        if not isinstance(records, list):
+            raise ValueError(f"{side} distributed worker must return a JSON array")
+        indexed = _record_map(tuple(parse_observation(record) for record in records), side)
+        if set(indexed) != set(case_ids):
+            raise ValueError(f"{side} distributed rank case set does not match the selected cases")
+        ranks.append(indexed)
+    merged = []
+    for case_id in case_ids:
+        first, second = (rank[case_id] for rank in ranks)
+        if first.staging is not None or second.staging is not None or first.stablehlo != second.stablehlo:
+            raise ValueError(f"{side} distributed ranks disagree on the module contract for `{case_id}`")
+        if set(first.observations) != set(second.observations) or any(
+            len(record.observations[name]) != 1 for record in (first, second) for name in record.observations
+        ):
+            raise ValueError(f"{side} distributed ranks must emit matching names and one local output each")
+        merged.append(DifferentialObservation(
+            SCHEMA, case_id,
+            {name: first.observations[name] + second.observations[name] for name in first.observations},
+            stablehlo=first.stablehlo,
+        ))
+    return tuple(merged)
 
 
 def _run_emitter(command: Sequence[str], directory: Path, timeout: int) -> str:
@@ -387,12 +544,13 @@ def collect_ryft_observations(
     *,
     timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
     binary: Path | None = None,
+    log_directory: Path | None = None,
 ) -> tuple[DifferentialObservation, ...]:
     """Runs the Rust emitter and parses its selected records."""
 
     cases = _selected_cases(case_ids)
     features = (
-        "differential-testing,cuda-13" if any(case.suite == "cuda-collectives" for case in cases)
+        "differential-testing,cuda-13" if any(case.suite in CUDA_SUITES for case in cases)
         else "differential-testing"
     )
     command = [str(binary.resolve())] if binary is not None else [
@@ -407,8 +565,26 @@ def collect_ryft_observations(
         "differential_testing",
         "--",
     ]
+    distributed = any(case.suite == "cuda-distributed-collectives" for case in cases)
+    if distributed and binary is None:
+        # Build once before rendezvous; concurrent `cargo run` workers can serialize on Cargo's build lock.
+        build = ["cargo", "build", "--quiet", "-p", "ryft-xla", "--features", features,
+                 "--bin", "differential_testing", "--message-format=json"]
+        try:
+            artifacts = [json.loads(line) for line in _run_emitter(build, root, timeout).splitlines() if line.strip()]
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"Ryft distributed emitter build failed:\n{error.stderr.strip()}") from None
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Ryft distributed emitter build timed out after {timeout} seconds; pre-build with CUDA") from None
+        executables = [artifact["executable"] for artifact in artifacts if artifact.get("executable")]
+        if len(executables) != 1:
+            raise RuntimeError("Ryft distributed emitter build must produce exactly one executable")
+        command = [executables[0]]
     for case_id in case_ids:
         command.extend(("--case", case_id))
+    if distributed:
+        payloads = _run_distributed_emitters(command, root, timeout, "ryft", log_directory)
+        return _merge_distributed_observations(payloads, case_ids, "Ryft")
     try:
         output = _run_emitter(command, root, timeout)
     except subprocess.CalledProcessError as error:
@@ -430,12 +606,16 @@ def collect_jax_observations(
     case_ids: Sequence[str],
     *,
     timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
+    log_directory: Path | None = None,
 ) -> tuple[DifferentialObservation, ...]:
     """Runs the JAX emitters in a fresh process and parses their selected records."""
 
     command = [sys.executable, "-m", "ryft.jax.differential_testing", "--emit-jax"]
     for case_id in case_ids:
         command.extend(("--case", case_id))
+    if any(case.suite == "cuda-distributed-collectives" for case in _selected_cases(case_ids)):
+        payloads = _run_distributed_emitters(command, root / "python", timeout, "jax", log_directory)
+        return _merge_distributed_observations(payloads, case_ids, "JAX")
     try:
         output = _run_emitter(command, root / "python", timeout)
     except subprocess.CalledProcessError as error:
@@ -467,13 +647,16 @@ def run_comparison(
     *,
     timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
     binary: Path | None = None,
+    log_directory: Path | None = None,
 ) -> tuple[CaseComparison, ...]:
     """Runs both frameworks and returns comparisons for the selected registry entries."""
 
     cases = _selected_cases(case_ids)
     selected_ids = tuple(case.case_id for case in cases)
-    ryft = _record_map(collect_ryft_observations(root, selected_ids, timeout=timeout, binary=binary), "Ryft")
-    jax = _record_map(collect_jax_observations(root, selected_ids, timeout=timeout), "JAX")
+    ryft = _record_map(collect_ryft_observations(
+        root, selected_ids, timeout=timeout, binary=binary, log_directory=log_directory,
+    ), "Ryft")
+    jax = _record_map(collect_jax_observations(root, selected_ids, timeout=timeout, log_directory=log_directory), "JAX")
     if set(ryft) != set(selected_ids):
         raise ValueError(f"Ryft case set {sorted(ryft)} does not match selected cases {sorted(selected_ids)}")
     if set(jax) != set(selected_ids):
@@ -501,12 +684,15 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
 
     parser = argparse.ArgumentParser(description="Differentially test Ryft behavior and StableHLO against pinned JAX.")
     parser.add_argument("--case", action="append", default=[], help="select one case ID; may be repeated")
-    parser.add_argument("--suite", choices=("collectives", "cuda-collectives"), help="select a correctness suite")
+    parser.add_argument("--suite", choices=("collectives", *CUDA_SUITES), help="select a correctness suite")
     parser.add_argument(
         "--timeout", type=int, default=SUBPROCESS_TIMEOUT_SECONDS,
         help="maximum seconds for each framework subprocess (default: 300)",
     )
     parser.add_argument("--ryft-binary", type=Path, help="run a prebuilt Rust emitter instead of cargo run")
+    parser.add_argument("--worker-log-directory", type=Path, help="retain distributed stdout/stderr separately per rank")
+    parser.add_argument("--distributed-worker", type=int, choices=(0, 1), help=argparse.SUPPRESS)
+    parser.add_argument("--coordinator", help=argparse.SUPPRESS)
     parser.add_argument("--list", action="store_true", help="list case IDs without executing them")
     parser.add_argument("--emit-jax", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(arguments)
@@ -520,6 +706,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if parsed.timeout <= 0:
             raise ValueError("--timeout must be positive")
         cases = _selected_cases(parsed.case, parsed.suite)
+        if (parsed.distributed_worker is None) != (parsed.coordinator is None):
+            raise ValueError("distributed worker and coordinator must be specified together")
+        if parsed.distributed_worker is not None and (
+            not parsed.emit_jax or not cases or any(case.suite != "cuda-distributed-collectives" for case in cases)
+        ):
+            raise ValueError("distributed worker mode requires CUDA distributed JAX cases")
     except ValueError as error:
         print(error, file=sys.stderr)
         return 2
@@ -532,12 +724,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if parsed.emit_jax:
         from ryft.jax.differential_testing_cases import build_jax_observations
 
-        records = build_jax_observations(tuple(case.case_id for case in cases))
+        records = build_jax_observations(
+            tuple(case.case_id for case in cases), rank=parsed.distributed_worker, coordinator=parsed.coordinator,
+        )
         print(json.dumps([observation_payload(record) for record in records], indent=2))
         return 0
     try:
         comparisons = run_comparison(
             repo_root(), tuple(case.case_id for case in cases), timeout=parsed.timeout, binary=parsed.ryft_binary,
+            log_directory=parsed.worker_log_directory,
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(error, file=sys.stderr)
@@ -553,7 +748,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Registry callbacks import this module by its canonical name. Use that same instance for comparisons so
+    # dataclass contracts do not compare unequal merely because `python -m` defined a second copy in `__main__`.
+    from ryft.jax.differential_testing import main as entry_point
+
+    raise SystemExit(entry_point())
 
 
 __all__ = [

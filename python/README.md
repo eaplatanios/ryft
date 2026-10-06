@@ -140,7 +140,49 @@ CUDA libraries. Native compilation dumps contained `kRaggedAllToAll` GPU thunks.
 Repeated source reads are covered in primal and JVP execution. Pinned JAX's ragged transpose overwrites overlapping
 operand cotangents, so CUDA VJP parity cases use disjoint source intervals; Ryft's additive transpose has separate core
 regression coverage. These single-GPU tests execute the accelerator backend and verify local transfer geometry, but
-multi-GPU routing and NCCL communication still require multiple devices.
+the separate distributed suite below exercises cross-process routing and NCCL communication on the same GPU.
+
+The `cuda-distributed-collectives` suite launches two independent PJRT processes sharing CUDA device 0. It uses
+[NCCL's experimental multiple-ranks-per-GPU support](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable),
+available since NCCL 2.30, and CUDA MPS for concurrent progress. The loaded NCCL library must support that option;
+an older system library can take precedence over the version installed with JAX. Include the compatible NCCL directory
+in `LD_LIBRARY_PATH` alongside the CUDA libraries needed by Ryft. The verified Spark configuration used NCCL 2.32.3
+from `site-packages/nvidia/nccl/lib`, plus compatible NVRTC and NVJitLink libraries from `nvidia/cu13/lib`.
+
+After the CUDA build above, run from `python/`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --with 'jax[cuda13]==0.10.0' python -m ryft.jax.differential_testing \
+    --suite cuda-distributed-collectives --ryft-binary ../target/debug/differential_testing \
+    --worker-log-directory /tmp/ryft-distributed-logs
+```
+
+The launcher starts a private `nvidia-cuda-mps-control` daemon for each framework and shuts it down afterward. If
+`CUDA_MPS_PIPE_DIRECTORY` is supplied, it uses that caller-owned daemon without stopping it. It enables
+`NCCL_MULTI_RANK_GPU_ENABLE=1`, disables NVLS, limits NCCL to one CTA per rank, sets each MPS client to 45% active
+threads, and disables allocator preallocation. Each framework's worker pair has a 300-second deadline, configurable
+with `--timeout`; PJRT/JAX coordination has 30-second deadlines. Worker failure or timeout cancels both process groups,
+including descendants. The optional log directory retains each rank's stdout, stderr, and NCCL diagnostics.
+
+Seven cases check sum all-reduce, tiled all-gather, shape-changing all-to-all, and four ragged exchanges: asymmetric
+`i32` routing, trailing rows with `u64` metadata, zero transfers, and repeated source reads. Inputs differ by rank;
+ragged metadata remain runtime arguments and seeded output holes are checked. Both frameworks must agree with an
+independent host reference after execution and host transfer complete. Actual local output shapes and element types
+are validated, and semantic StableHLO contracts are checked. These cases share
+[`distributed_collective_cases.json`](../crates/ryft-xla/src/bin/differential_testing/distributed_collective_cases.json).
+Use `--suite cuda-distributed-collectives --list` or repeated `--case` options to inspect or narrow the suite. It is
+excluded from default execution and runs separately from CPU and single-process CUDA cases.
+
+All seven cases passed on the DGX Spark's GB10 with driver 580.173.02 and NCCL 2.32.3 on 2026-10-06, including a full
+run with automatic MPS startup and cleanup. Native logs showed two communicator ranks on the same physical GPU,
+P2P/CUMEM transport, and `kRaggedAllToAll` GPU thunks. This covers real cross-process communication and routing;
+separate GPUs/nodes are still needed to validate physical interconnects, remote failures, and bandwidth.
+
+Run the orchestration and independent-reference regressions without CUDA with:
+
+```bash
+timeout 300 uv run python -m unittest tests.test_distributed_testing tests.test_distributed_collective_testing
+```
 
 To investigate local reference state inside custom JVP rules, run:
 

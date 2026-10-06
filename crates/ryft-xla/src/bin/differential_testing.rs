@@ -33,6 +33,9 @@ mod collectives;
 #[path = "differential_testing/ragged.rs"]
 mod ragged;
 
+#[path = "differential_testing/distributed_collectives.rs"]
+mod distributed_collectives;
+
 /// Schema version emitted by this binary and accepted by the Python comparison harness.
 const SCHEMA: &str = "ryft-jax-differential-v1";
 
@@ -716,6 +719,8 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut requested = Vec::new();
     let mut list = false;
     let mut suite = None;
+    let mut worker_rank = None;
+    let mut coordinator = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -725,9 +730,20 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
             "--suite"
                 if index + 1 < arguments.len()
-                    && matches!(arguments[index + 1].as_str(), "collectives" | "cuda-collectives") =>
+                    && matches!(
+                        arguments[index + 1].as_str(),
+                        "collectives" | "cuda-collectives" | "cuda-distributed-collectives"
+                    ) =>
             {
                 suite = Some(arguments[index + 1].as_str());
+                index += 2;
+            }
+            "--distributed-worker" if index + 1 < arguments.len() => {
+                worker_rank = Some(arguments[index + 1].parse::<usize>()?);
+                index += 2;
+            }
+            "--coordinator" if index + 1 < arguments.len() => {
+                coordinator = Some(arguments[index + 1].as_str());
                 index += 2;
             }
             "--case" if index + 1 < arguments.len() => {
@@ -736,20 +752,20 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
             argument => {
                 return Err(format!(
-                    "expected `--list`, `--case CASE_ID`, or `--suite collectives|cuda-collectives` but got `{argument}`"
+                    "expected `--list`, `--case CASE_ID`, or `--suite SUITE`, `--distributed-worker RANK`, or `--coordinator ADDRESS` but got `{argument}`"
                 )
                 .into());
             }
         }
     }
     if list {
-        if !requested.is_empty() {
-            return Err("`--list` cannot be combined with `--case`".into());
+        if !requested.is_empty() || worker_rank.is_some() || coordinator.is_some() {
+            return Err("`--list` cannot be combined with `--case` or distributed worker options".into());
         }
         for case in cases.iter().filter(|case| suite.is_none() || (suite == Some("collectives") && case.collective)) {
             println!("{}", case.case_id);
         }
-        if suite != Some("cuda-collectives") {
+        if suite.is_none() || suite == Some("collectives") {
             for case in collectives::registry()? {
                 println!("{}", case.id);
             }
@@ -759,7 +775,31 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 println!("{}", case.id);
             }
         }
+        if suite == Some("cuda-distributed-collectives") {
+            for case in distributed_collectives::registry()? {
+                println!("{}", case.id);
+            }
+        }
         return Ok(());
+    }
+    if let Some(rank) = worker_rank {
+        if suite.is_some_and(|suite| suite != "cuda-distributed-collectives") {
+            return Err("distributed workers require suite `cuda-distributed-collectives`".into());
+        }
+        let coordinator = coordinator.ok_or("distributed workers require `--coordinator ADDRESS`")?;
+        let mut records = distributed_collectives::run_worker(rank, coordinator, &requested)?;
+        records.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(());
+    }
+    if coordinator.is_some() {
+        return Err("`--coordinator` requires `--distributed-worker RANK`".into());
+    }
+    let distributed_cases = distributed_collectives::registry()?;
+    if suite == Some("cuda-distributed-collectives")
+        || requested.iter().any(|id| distributed_cases.iter().any(|case| case.id == *id))
+    {
+        return Err("suite `cuda-distributed-collectives` requires the two-process launcher or `--distributed-worker RANK --coordinator ADDRESS`".into());
     }
     let collective_cases = collectives::registry()?;
     let ragged_cases = ragged::registry()?;
@@ -865,6 +905,32 @@ mod tests {
         assert_eq!(
             run(&["--suite".into(), "cuda-collectives".into()]).unwrap_err().to_string(),
             "CUDA collective case `cuda_ragged_seed_holes_i32` failed: suite `cuda-collectives` requires the `cuda-13` Cargo feature",
+        );
+    }
+
+    #[test]
+    fn test_run_requires_distributed_worker() {
+        assert_eq!(
+            run(&["--suite".into(), "cuda-distributed-collectives".into()]).unwrap_err().to_string(),
+            "suite `cuda-distributed-collectives` requires the two-process launcher or `--distributed-worker RANK --coordinator ADDRESS`",
+        );
+    }
+
+    #[test]
+    fn test_run_requires_distributed_coordinator() {
+        assert_eq!(
+            run(&["--distributed-worker".into(), "0".into()]).unwrap_err().to_string(),
+            "distributed workers require `--coordinator ADDRESS`",
+        );
+    }
+
+    #[test]
+    fn test_run_rejects_distributed_options_with_cpu_suite() {
+        assert_eq!(
+            run(&["--suite".into(), "collectives".into(), "--distributed-worker".into(), "0".into()])
+                .unwrap_err()
+                .to_string(),
+            "distributed workers require suite `cuda-distributed-collectives`",
         );
     }
 

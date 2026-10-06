@@ -549,7 +549,7 @@ impl GpuClientOptions {
             values.push(NamedValue::new("node_id", node_id as i64));
         }
         if let Some(node_count) = self.node_count {
-            values.push(NamedValue::new("node_count", node_count as i64));
+            values.push(NamedValue::new("num_nodes", node_count as i64));
         }
         if let Some(partition_index) = self.partition_index {
             values.push(NamedValue::new("partition_index", partition_index as i64));
@@ -1530,8 +1530,8 @@ mod tests {
                 NamedValue::new("enable_mock_nccl", true),
                 NamedValue::new("memory_fraction", 0.5),
                 NamedValue::new("mock_gpu_topology", "2x3x4"),
-                NamedValue::new("node_count", 4),
                 NamedValue::new("node_id", 2),
+                NamedValue::new("num_nodes", 4),
                 NamedValue::new("partition_index", 1),
                 NamedValue::new("platform_name", "cuda"),
                 NamedValue::new("preallocate", true),
