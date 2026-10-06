@@ -3855,9 +3855,9 @@ mod tests {
                     %2:i32[1] = const [1]
                     %3:i32[1] = const [0]
                     %4:i32[1] = const [1]
-                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %3
-                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %1
                     %7:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}] = zero \
                         [type=f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{'data'}, {}]}]]
@@ -3925,9 +3925,9 @@ mod tests {
                     %2:i32[1] = const [1]
                     %3:i32[1] = const [0]
                     %4:i32[1] = const [1]
-                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                    %5:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %3
-                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concat_axis=0, \
+                    %6:i32[1] = parallel_all_to_all [axis_name=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                         options=Tiled] %1
                     %7:f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}] = zero \
                         [type=f32[3, 2][sharding={mesh<['data'=2:explicit]>, [{}, {'data'}]}]]
@@ -4006,7 +4006,7 @@ mod tests {
                     axis_name=\"x\",
                     axis_size=2,
                     split_axis=0,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     mesh=['x'=2:manual, 'y'=2:manual],
                 ] %3
@@ -4015,7 +4015,7 @@ mod tests {
                         axis_name=\"x\",
                         axis_size=2,
                         split_axis=0,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         mesh=['x'=2:manual, 'y'=2:manual],
                     ] %1
@@ -4108,14 +4108,14 @@ mod tests {
                         axis_name=\"x\",
                         axis_size=4,
                         split_axis=0,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
                     ] %3 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %6:i32[4] = parallel_all_to_all [
                         axis_name=\"x\",
                         axis_size=4,
                         split_axis=0,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=CollectiveOptions { mode: Tiled, axis_index_groups: [[0, 2], [3, 1]] },
                     ] %1 ; provenance=ryft::differentiation::parallel_ragged_all_to_all_transpose
                     %7:f32[3] = zero [type=f32[3]] ; \

@@ -438,9 +438,9 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
         let mut dimensions = input_type.shape().dimensions().to_vec();
         dimensions[self.scatter_axis] = Dimension::Static(0);
         let sharding = input_type.resized_sharding(dimensions.as_slice(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
-        let mut base_output_type =
-            ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
-        base_output_type.sharding = sharding;
+        let base_output_type = ArrayType::new(input_type.data_type(), Shape::new(dimensions))
+            .with_memory(input_type.memory())
+            .with_sharding(sharding)?;
         let mut output_types = infer_array_ir_shape_changing_collective_output_type(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
             input_types,
@@ -479,8 +479,9 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
         let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
 
         // Check the actual result geometry: the placeholder zero above cannot establish explicit-sharding divisibility.
-        output_type.sharding =
+        let sharding =
             input_type.resized_sharding(output_type.shape().dimensions(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
+        output_type = output_type.with_sharding(sharding)?;
         if output_type.shape() == input_type.shape() {
             output_type = output_type.with_layout(input_type.layout().cloned());
         }
@@ -2013,8 +2014,8 @@ mod tests {
                 let %2:f32[extent] = linear_call [residual_count=1] %1 %0 [
                     forward={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
-                        let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
-                            options=Tiled] %1 %0
+                        let %2:f32[extent] =
+                                parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
                         in (%2)
                     },
                     transpose={
@@ -2022,7 +2023,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Varying,
                         ] %1 %0
@@ -2042,7 +2043,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Varying,
                         ] %1 %0
@@ -2050,8 +2051,8 @@ mod tests {
                     },
                     transpose={
                         lambda %0:dimension<extent ∈ [1, 9)>, %1:f32[extent] .
-                        let %2:f32[extent] = parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, \
-                            options=Tiled] %1 %0
+                        let %2:f32[extent] = \
+                                parallel_sum_scatter [axis_name=\"x\", axis_size=1, scatter_axis=0, options=Tiled] %1 %0
                         in (%2)
                     },
                 ]
@@ -2193,7 +2194,7 @@ mod tests {
                 let %1:f32[8] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0
@@ -2215,7 +2216,7 @@ mod tests {
                 let %1:f32[3, 2, 4] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=1,
+                    concatenation_axis=1,
                     options=Untiled,
                     output_variance=Varying,
                 ] %0
@@ -2266,7 +2267,7 @@ mod tests {
                 let %1:f32[3] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0
@@ -2292,7 +2293,7 @@ mod tests {
                     parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2308,7 +2309,7 @@ mod tests {
                     parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Reduced,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2325,7 +2326,7 @@ mod tests {
                     parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Reduced,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2342,7 +2343,7 @@ mod tests {
                     = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Reduced,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2359,7 +2360,7 @@ mod tests {
                     varying_manual={'x'}}] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2408,7 +2409,7 @@ mod tests {
                     varying_manual={'x'}}] = parallel_all_gather [
                     axis_name=\"y\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Reduced,
                     mesh=['x'=2:manual, 'y'=2:manual],
@@ -2417,7 +2418,7 @@ mod tests {
                         parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Reduced,
                         mesh=['x'=2:manual, 'y'=2:manual],
@@ -2449,7 +2450,7 @@ mod tests {
                         varying_manual={'x'}}] = parallel_all_gather [
                         axis_name=\"y\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Reduced,
                         mesh=['x'=2:manual, 'y'=2:manual],
@@ -2459,7 +2460,7 @@ mod tests {
                         parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Reduced,
                         mesh=['x'=2:manual, 'y'=2:manual],

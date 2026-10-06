@@ -1,7 +1,3 @@
-//! Contains the named-axis [`ParallelAllGatherOperation`], which stacks or concatenates participants' inputs across a
-//! named axis, together with its interpretation, partial-evaluation, batching, forward-mode differentiation, and
-//! transposition rules. [`ParallelAllGather`] exposes the value-level capability for both array type families.
-
 // TODO(eaplatanios): Review this module.
 
 use std::fmt::Display;
@@ -11,8 +7,8 @@ use ryft_macros::capability;
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType,
-    ArrayIrValue, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
-    LinearResiduals, LogicalMesh, RaggedAxis, Shape, Sharding,
+    ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
+    DimensionVariable, LinearResiduals, LogicalMesh, RaggedAxis, Shape, Sharding,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
@@ -43,13 +39,14 @@ use crate::operations::collectives::{
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
+use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
-use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
+use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -59,11 +56,12 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-/// Named-axis variance carried by an all-gather result.
+/// Named-axis variance carried by an all-gather result, which corresponds to the `to` argument of JAX's
+/// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) (i.e., `'varying'`,
+/// `'invarying'`, and `'reduced'`).
 ///
 /// This is an operation option rather than parallel type metadata. Type inference maps it onto the canonical
-/// [`Sharding::varying_manual_axes`](crate::arrays::Sharding::varying_manual_axes) and
-/// [`Sharding::reduced_axes`](crate::arrays::Sharding::reduced_axes) sets.
+/// [`Sharding::varying_manual_axes`] and [`Sharding::reduced_axes`] sets of a result over a manual mesh axis.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ParallelAllGatherOutputVariance {
     /// The result continues to vary across the gathered manual mesh axis.
@@ -80,40 +78,44 @@ pub enum ParallelAllGatherOutputVariance {
 /// Canonical operation name for [`ParallelAllGatherOperation`].
 pub const PARALLEL_ALL_GATHER_OPERATION_NAME: &str = "parallel_all_gather";
 
-/// [`Operation`] that gathers every participant's input across the named axis, so each participant receives all inputs
-/// in participant order. This corresponds to [JAX's `all_gather`][jax] and
-/// [StableHLO's `all_gather`][stablehlo]. The [`CollectiveMode`] of its options selects the output shape over a group
-/// of `n` participants:
+/// [`Operation`] that gathers every participant's input across the named axis, so that every participant receives all
+/// inputs in participant order. This is the analogue of JAX's
+/// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) and of StableHLO's
+/// [`all_gather`](https://openxla.org/stablehlo/spec#all_gather). The [`CollectiveMode`] of its options selects the
+/// output shape over a group of `n` participants:
 ///
-///   - [`CollectiveMode::Untiled`] inserts a new axis of extent `n` at `concat_axis`.
-///   - [`CollectiveMode::Tiled`] multiplies the existing `concat_axis` extent by `n`.
+///   - [`CollectiveMode::Untiled`] inserts a new axis of extent `n` at `concatenation_axis`, so that participant `i`'s
+///     input becomes row `i` of that axis.
+///   - [`CollectiveMode::Tiled`] multiplies the extent of the existing `concatenation_axis` by `n`, so that participant
+///     `i`'s input becomes the `i`-th contiguous chunk of that axis.
 ///
-/// All other dimensions are unchanged. [`CollectiveOptions`] can restrict gathering to participant groups, whose
-/// listed order determines the chunk order. The collective is linear: varying results transpose to
-/// [`ParallelSumScatterOperation`], and reduced results use sum-scatter while consuming the cotangent's unreduced-axis
-/// state. Invariant results require linearization in [`ArrayIrType`], whose pullback selects the current participant's
-/// chunk locally. Homogeneous [`ArrayType`] reverse mode and direct transposition reject invariant results. A matching
-/// `batch` level consumes the mapped batch axis by moving it to `concat_axis` and, in tiled mode, merging it with the
-/// existing axis in participant order. The gathered output is replicated across the batch items.
-///
-/// Untiled batching co-moves bounded ragged metadata with the gathered value: the named participant axis becomes
-/// an ordinary output axis and is added to each participant-varying extent array's `extent_axes` mapping. Tiled
-/// gathering of a ragged carrier is rejected because fusing the participant and concatenation axes can make live
-/// chunks non-prefix-shaped, which one [`RaggedAxis`] cannot represent faithfully.
+/// All other dimensions are unchanged. Participant groups (refer to [`CollectiveOptions`]) restrict the gather to each
+/// group, whose listed order determines the chunk order, and are supported only with varying output variance. The
+/// collective is linear. A varying result transposes to a [`ParallelSumScatterOperation`] with the same mode, axis,
+/// participant groups, and mesh, and so does a reduced result, whose unreduced cotangent carries the pending sum that
+/// the sum-scatter completes. An invariant result instead transposes by selecting the current participant's chunk of
+/// the output cotangent at its [`AxisIndexOperation`] index, which needs no communication.
 ///
 /// An all-gather over a manual mesh axis is created by [`with_mesh`](Self::with_mesh), and
-/// [`ParallelAllGather::parallel_all_gather_with_options`] supplies the mesh automatically from the enclosing
-/// manual region. Its input must vary over the axis (refer to [`ParallelVary`]), and its output variance selects
-/// the manual variation of the result. An ordinary all-gather carries no mesh and preserves the input's mesh state,
-/// even when its input carries a manual mesh axis with the same name, because a `batch` level whose axis name
-/// shadows that mesh axis may bind it instead. A matching `batch` level rejects all-gathers over a manual mesh
-/// axis, and only manual mesh axes support reduced output variance. Interpretation of a manual mesh all-gather requires
-/// its enclosing binder, even for a single participant; an ordinary single-participant all-gather can be interpreted
-/// locally. Participant groups are supported only with varying output variance and are rejected by a matching `batch`
-/// level.
+/// [`ParallelAllGather::parallel_all_gather_with_options`] supplies the mesh automatically from the enclosing manual
+/// region. Its input must vary over the axis (refer to [`ParallelVary`]) and must not be unreduced over it, and its
+/// [`ParallelAllGatherOutputVariance`] selects the manual variation of the result. Pending sums over unrelated mesh
+/// axes are preserved. The transpose of an invariant result first makes its invariant output cotangent varying over
+/// the axis, because every participant selects a different chunk of it. An ordinary all-gather carries no mesh and
+/// preserves the input's mesh state, even when its input carries a manual mesh axis with the same name, because a
+/// `batch` level whose axis name shadows that mesh axis may bind it instead, and only a manual mesh axis supports
+/// reduced output variance. Outside any binder, the single participant of a degenerate ordinary all-gather keeps its
+/// value, with a size-one axis inserted in untiled mode, while a manual mesh all-gather always requires its binder,
+/// because a local reshape cannot perform its variance transition.
 ///
-/// [jax]: https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html
-/// [stablehlo]: https://openxla.org/stablehlo/spec#all_gather
+/// A matching `batch` level consumes the mapped batch axis of an ordinary all-gather by moving it to
+/// `concatenation_axis` and, in tiled mode, merging it into the existing axis in batch item order, so that every batch
+/// item receives the same gathered value and the output is replicated. Untiled gathering co-moves bounded ragged
+/// metadata with the gathered value: the participant axis becomes an ordinary output axis that is added to the
+/// `extent_axes` of each [`RaggedAxis`] whose extents vary across the batch items. Tiled gathering of a bounded ragged
+/// input is rejected, because fusing the participant and concatenation axes can make the live elements of a chunk
+/// non-prefix-shaped, which one [`RaggedAxis`] cannot represent. A matching level also rejects participant groups and
+/// all-gathers over a manual mesh axis, and every other `batch` level rejects bounded ragged inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelAllGatherOperation {
     /// Axis name referenced by this collective.
@@ -124,7 +126,7 @@ pub struct ParallelAllGatherOperation {
     axis_size: usize,
 
     /// Axis at which participants are stacked in untiled mode, or along which inputs are concatenated in tiled mode.
-    concat_axis: usize,
+    concatenation_axis: usize,
 
     /// Shared rank and participant-group semantics.
     options: CollectiveOptions,
@@ -143,11 +145,11 @@ impl ParallelAllGatherOperation {
     pub fn new(
         axis_name: String,
         axis_size: usize,
-        concat_axis: usize,
+        concatenation_axis: usize,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Self {
-        Self { axis_name, axis_size, concat_axis, options, output_variance, mesh: None }
+        Self { axis_name, axis_size, concatenation_axis, options, output_variance, mesh: None }
     }
 
     /// Returns this [`ParallelAllGatherOperation`] configured to gather over a manual axis of `mesh`. The input must
@@ -174,8 +176,8 @@ impl ParallelAllGatherOperation {
 
     /// Returns the stacking position in untiled mode or the existing concatenation axis in tiled mode.
     #[inline]
-    pub fn concat_axis(&self) -> usize {
-        self.concat_axis
+    pub fn concatenation_axis(&self) -> usize {
+        self.concatenation_axis
     }
 
     /// Returns the shared rank and participant-group semantics.
@@ -219,7 +221,7 @@ impl ParallelAllGatherOperation {
     /// because a `batch` level whose axis name shadows that mesh axis may bind it instead. Over a manual mesh axis, the
     /// input must vary over the axis, and the output variance selects whether the result keeps varying over it,
     /// becomes invariant over it, or records it as reduced.
-    fn finalize_output_type(&self, input_type: &ArrayType, mut output_type: ArrayType) -> Result<ArrayType, TypeError> {
+    fn finalize_output_type(&self, input_type: &ArrayType, output_type: ArrayType) -> Result<ArrayType, TypeError> {
         let axis_name = self.axis_name();
         let Some(mesh) = &self.mesh else {
             if self.output_variance == ParallelAllGatherOutputVariance::Reduced {
@@ -270,14 +272,13 @@ impl ParallelAllGatherOperation {
         }
 
         // The shape-only output type preserves the input sharding, which exists here.
-        let output_sharding = output_type.sharding().unwrap().clone();
-        output_type.sharding = Some(
-            output_sharding
-                .with_varying_manual_axes(varying_axes)
-                .and_then(|sharding| sharding.with_reduced_axes(reduced_axes))
-                .map_err(TypeError::from)?,
-        );
-        Ok(output_type)
+        let output_sharding = output_type
+            .sharding()
+            .unwrap()
+            .clone()
+            .with_varying_manual_axes(varying_axes)?
+            .with_reduced_axes(reduced_axes)?;
+        Ok(output_type.with_sharding(output_sharding)?)
     }
 }
 
@@ -314,14 +315,14 @@ impl Operation for ParallelAllGatherOperation {
         let effective_axis_size = self.effective_axis_size()?;
         let output_type = match self.options.mode {
             CollectiveMode::Untiled => {
-                input_type.with_inserted_dimension(self.concat_axis, Dimension::Static(effective_axis_size))?
+                input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
             }
             CollectiveMode::Tiled => {
                 let mut output_dimensions = shape.dimensions().to_vec();
-                let Some(dimension) = output_dimensions.get_mut(self.concat_axis) else {
+                let Some(dimension) = output_dimensions.get_mut(self.concatenation_axis) else {
                     return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concat axis {} is out of bounds for rank {}",
-                        self.concat_axis,
+                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {} is out of bounds for rank {}",
+                        self.concatenation_axis,
                         output_dimensions.len(),
                     )));
                 };
@@ -344,7 +345,7 @@ impl Operation for ParallelAllGatherOperation {
         OperationFormatter::new(formatter, indentation, PARALLEL_ALL_GATHER_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
             operation.field("axis_size", self.axis_size)?;
-            operation.field("concat_axis", format_args!("{:?}", &self.concat_axis))?;
+            operation.field("concatenation_axis", format_args!("{:?}", &self.concatenation_axis))?;
             operation.field("options", format_args!("{:?}", &self.options))?;
             operation.field("output_variance", format_args!("{:?}", &self.output_variance))?;
             if let Some(mesh) = &self.mesh {
@@ -386,21 +387,21 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
 
     fn adjoint(&self, _input_type: &ArrayType) -> Result<ParallelSumScatterOperation, ProgramError> {
         // A varying all-gather is the adjoint of a sum-scatter with the same mode, axis, participant groups, and mesh,
-        // and so is a reduced one, whose unreduced cotangent the sum-scatter consumes. An invariant all-gather instead
-        // needs the residual-aware composite adjoint, because its pullback depends on participant-indexed geometry.
+        // and so is a reduced one, whose unreduced cotangent the sum-scatter consumes. An invariant all-gather has no
+        // adjoint collective, because its transpose selects a participant-indexed chunk locally, so its transposition
+        // rules never request one.
         if self.output_variance == ParallelAllGatherOutputVariance::Invariant {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "direct transposition of invariant `{PARALLEL_ALL_GATHER_OPERATION_NAME}` cannot represent the \
-                     participant-indexed slice; linearize in composite array IR so that the current participant can \
-                     select its gathered chunk",
+                    "invariant `{PARALLEL_ALL_GATHER_OPERATION_NAME}` has no adjoint collective because its transpose \
+                     selects the current participant's chunk",
                 ),
             });
         }
         let adjoint = ParallelSumScatterOperation::new(
             self.axis_name.clone(),
             self.axis_size,
-            self.concat_axis,
+            self.concatenation_axis,
             self.options.clone(),
         );
         Ok(match &self.mesh {
@@ -411,9 +412,9 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
 
     #[inline]
     fn adapt_to_batch_axis(&self, input_batch_axis: usize) -> (Self, usize) {
-        let (concat_axis, output_batch_axis) =
-            self.options.mode.forwarded_concatenation_axes(self.concat_axis, input_batch_axis);
-        (Self { concat_axis, ..self.clone() }, output_batch_axis)
+        let (concatenation_axis, output_batch_axis) =
+            self.options.mode.forwarded_concatenation_axes(self.concatenation_axis, input_batch_axis);
+        (Self { concatenation_axis, ..self.clone() }, output_batch_axis)
     }
 }
 
@@ -433,46 +434,45 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
         let input_type = <&ArrayType>::try_from(input_type)?;
         let base_output_type = match self.options.mode {
             CollectiveMode::Untiled => {
-                input_type.with_inserted_dimension(self.concat_axis, Dimension::Static(effective_axis_size))?
+                input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
             }
             CollectiveMode::Tiled => {
-                if self.concat_axis >= input_type.rank() {
+                if self.concatenation_axis >= input_type.rank() {
                     return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concat axis {} is out of bounds for rank {}",
-                        self.concat_axis,
+                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {} is out of bounds for rank {}",
+                        self.concatenation_axis,
                         input_type.rank(),
                     )));
                 }
                 let mut dimensions = input_type.shape().dimensions().to_vec();
-                dimensions[self.concat_axis] = Dimension::Static(0);
+                dimensions[self.concatenation_axis] = Dimension::Static(0);
                 let sharding =
                     input_type.resized_sharding(dimensions.as_slice(), PARALLEL_ALL_GATHER_OPERATION_NAME)?;
-                let mut output_type =
-                    ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
-                output_type.sharding = sharding;
-                output_type
+                ArrayType::new(input_type.data_type(), Shape::new(dimensions))
+                    .with_memory(input_type.memory())
+                    .with_sharding(sharding)?
             }
         };
         let mut output_types = infer_array_ir_shape_changing_collective_output_type(
             PARALLEL_ALL_GATHER_OPERATION_NAME,
             input_types,
             base_output_type,
-            &[self.concat_axis],
+            &[self.concatenation_axis],
             |output_extents| {
                 match self.options.mode {
                     CollectiveMode::Untiled => {
-                        let output_extent = &output_extents[self.concat_axis];
+                        let output_extent = &output_extents[self.concatenation_axis];
                         if output_extent != &Dimension::Static(effective_axis_size) {
                             return Err(TypeError::invalid(format!(
                                 "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` inserted output axis {} extent must equal axis \
                                  group size {effective_axis_size} but got {output_extent}",
-                                self.concat_axis,
+                                self.concatenation_axis,
                             )));
                         }
                     }
                     CollectiveMode::Tiled => {
-                        let input_extent = &input_type.shape().dimensions()[self.concat_axis];
-                        let output_extent = &output_extents[self.concat_axis];
+                        let input_extent = &input_type.shape().dimensions()[self.concatenation_axis];
+                        let output_extent = &output_extents[self.concatenation_axis];
                         if let (Dimension::Static(input_extent), Dimension::Static(output_extent)) =
                             (input_extent, output_extent)
                         {
@@ -486,7 +486,7 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
                                     "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` result extent must equal input axis {} \
                                      extent {input_extent} multiplied by axis group size {effective_axis_size}; \
                                      expected {expected} but got {output_extent}",
-                                    self.concat_axis,
+                                    self.concatenation_axis,
                                 )));
                             }
                         }
@@ -498,8 +498,9 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
         let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
         if self.options.mode == CollectiveMode::Tiled {
             // The placeholder zero cannot prove divisibility of the actual result by its explicit mesh placement.
-            output_type.sharding =
+            let sharding =
                 input_type.resized_sharding(output_type.shape().dimensions(), PARALLEL_ALL_GATHER_OPERATION_NAME)?;
+            output_type = output_type.with_sharding(sharding)?;
             if output_type.shape() == input_type.shape() {
                 output_type = output_type.with_layout(input_type.layout().cloned());
             }
@@ -516,7 +517,8 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
         output_extents: Vec<P::ShapeExtent>,
         output_sharding: Option<Sharding>,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
-        let logical_input_rank = input.unbatched_type().rank();
+        // The batching rules reject all-gathers over a manual mesh axis, which reduced output variance requires, and
+        // infer the output type first, so the concatenation axis is known to be within bounds for the input rank.
         if self.options.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -525,43 +527,21 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> ShapeChangingCollectiveBatc
                 ),
             });
         }
-        if self.output_variance == ParallelAllGatherOutputVariance::Reduced {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` with reduced output variance is not supported when a batch \
-                     transform binds the collective axis",
-                ),
-            });
-        }
+
         let axis_extent =
             P::collective_axis_extent(context, PARALLEL_ALL_GATHER_OPERATION_NAME, &self.axis_name, self.axis_size)?;
-
-        let axis_is_out_of_bounds = match self.options.mode {
-            CollectiveMode::Untiled => self.concat_axis > logical_input_rank,
-            CollectiveMode::Tiled => self.concat_axis >= logical_input_rank,
-        };
-        if axis_is_out_of_bounds {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concat axis {} is out of bounds for rank \
-                     {logical_input_rank}",
-                    self.concat_axis,
-                ),
-            });
-        }
-
         let mut input_extents = output_extents.clone();
         match self.options.mode {
             CollectiveMode::Untiled => {
-                input_extents.remove(self.concat_axis);
+                input_extents.remove(self.concatenation_axis);
             }
             CollectiveMode::Tiled => {
-                input_extents[self.concat_axis] =
-                    P::divide_extents_exactly(context, &output_extents[self.concat_axis], &axis_extent)?;
+                input_extents[self.concatenation_axis] =
+                    P::divide_extents_exactly(context, &output_extents[self.concatenation_axis], &axis_extent)?;
             }
         }
         let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
-        let moved = input.into_value().move_axis(0, self.concat_axis)?;
+        let moved = input.into_value().move_axis(0, self.concatenation_axis)?;
         let gathered = P::reshape_collective(context, moved, output_extents.as_slice(), output_sharding)?;
         Ok(ArrayBatch::replicated(gathered))
     }
@@ -599,12 +579,6 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> 
 {
 }
 
-// Batching rule for [`ParallelAllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
-// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
-// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled StableHLO
-// `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A non-matching
-// level forwards the collective to the parent context, unchanged for a replicated input (through
-// `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
 impl<
     C: Context<Type = ArrayType, Value: Transpose, Operation: From<ParallelAllGatherOperation>>,
     P: CollectiveArrayExtentBatchingPolicy<C>,
@@ -616,6 +590,13 @@ impl<
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A matching `batch` level consumes the mapped batch axis by materializing the gather: the batch axis moves to
+        // the per-item `concatenation_axis` and, in tiled mode, merges into it item-major (i.e., item 0's chunk first),
+        // which matches the StableHLO `all_gather` chunk order. Every batch item sees the same gathered value, so the
+        // output is replicated, and an untiled gather also relocates the bounded ragged metadata of its input. A
+        // non-matching level forwards the collective to the parent context, unchanged for a replicated input and with
+        // its array axes shifted past the batch axis for a mapped one. This rule cannot reuse the shared
+        // `shape_changing_collective_batch` rule, which rejects every bounded ragged input.
         if context.axis_name() != Some(self.axis_name.as_str()) {
             ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return context.forward_collective(self, inputs);
@@ -666,10 +647,16 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> 
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelSumScatterOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<AxisIndexOperation>
+        + From<DynamicSliceOperation>
+        + From<ParallelSumScatterOperation>
+        + From<ParallelVaryOperation>
+        + From<ReshapeOperation>
+        + From<ZeroOperation<ArrayType>>,
 > TransposableOperation<V, O> for ParallelAllGatherOperation
 {
-    #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -678,7 +665,88 @@ impl<
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        self.linear_collective_transpose(context, inputs, outputs, accumulators)
+        // A varying or reduced result transposes to its adjoint sum-scatter. An invariant result has no adjoint
+        // collective: every participant holds the complete output cotangent, so the input cotangent of participant `i`
+        // is chunk `i` of that cotangent, which this rule selects locally, as JAX's `all_gather_invariant` transpose
+        // does. A known input and a structural-zero output cotangent contribute nothing.
+        if self.output_variance != ParallelAllGatherOutputVariance::Invariant {
+            return self.linear_collective_transpose(context, inputs, outputs, accumulators);
+        }
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return Ok(());
+        };
+        if inputs[0].is_known() {
+            return Ok(());
+        }
+
+        // The homogeneous family has no dimension values, so the selected chunk needs static extents. A dynamically
+        // shaped input can only occur in a mixed program, whose linearization stages the composite rule instead.
+        let input_cotangent_type = inputs[0].r#type().cotangent()?;
+        let participants_type =
+            input_cotangent_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(self.axis_size))?;
+        let Some(participants_shape) = participants_type.static_shape() else {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` transpose requires a statically shaped input but got \
+                 `{input_cotangent_type}`",
+            ))
+            .into());
+        };
+        let mut sizes = participants_shape.dimensions().to_vec();
+        sizes[self.concatenation_axis] = 1;
+
+        // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while every participant
+        // selects a different chunk of it, so the selected chunk varies over that axis. The cotangent can carry a
+        // tangent itself (e.g., under nested differentiation), and so it is made varying with a real `parallel_vary`
+        // transition, whose transpose is the cross-device sum, rather than by retyping the selected chunk.
+        let mut cotangent = cotangent.clone();
+        if self.mesh.is_some()
+            && !cotangent
+                .r#type()
+                .sharding()
+                .is_some_and(|sharding| sharding.varying_manual_axes().contains(self.axis_name()))
+        {
+            let operation = ParallelVaryOperation::new(self.axis_name.clone());
+            cotangent = context.bind(O::from(operation), Vec::new(), &[cotangent])?.remove(0);
+        }
+
+        // A tiled gather concatenates the participants' chunks along `concatenation_axis`, so splitting that axis into
+        // a participant axis followed by the chunk axis yields the untiled view, whose participant axis is then sliced
+        // at the current participant's index and removed. A degenerate axis selects row zero instead, so that the
+        // pullback of a degenerate ordinary all-gather remains interpretable without an enclosing binder.
+        if self.options.mode == CollectiveMode::Tiled {
+            let operation = ReshapeOperation::new(participants_type.shape().clone())
+                .with_output_sharding(participants_type.sharding().cloned());
+            cotangent = context.bind(O::from(operation), Vec::new(), &[cotangent])?.remove(0);
+        }
+        let start = if self.axis_size == 1 {
+            let operation = ZeroOperation::new(ArrayType::scalar(DataType::U64));
+            context.bind(O::from(operation), Vec::new(), &[])?.remove(0)
+        } else {
+            let mut operation = AxisIndexOperation::new(self.axis_name.clone());
+            if let Some(mesh) = &self.mesh {
+                operation = operation.with_mesh(mesh.clone());
+            }
+            context.bind(O::from(operation), Vec::new(), &[])?.remove(0)
+        };
+
+        // The remaining start indices are non-differentiable constants, so they are created directly with the
+        // placement and manual variation of the participant index.
+        let zero = ZeroOperation::new(start.r#type().into_owned());
+        let zero = context.bind(O::from(zero), Vec::new(), &[])?.remove(0);
+        let mut slice_inputs = vec![zero; 1 + sizes.len()];
+        slice_inputs[0] = cotangent;
+        slice_inputs[1 + self.concatenation_axis] = start;
+        let selected = context
+            .bind(O::from(DynamicSliceOperation::new(sizes)), Vec::new(), slice_inputs.as_slice())?
+            .remove(0);
+        let operation = ReshapeOperation::new(input_cotangent_type.shape().clone())
+            .with_output_sharding(input_cotangent_type.sharding().cloned());
+        let contribution = context.bind(O::from(operation), Vec::new(), &[selected])?.remove(0);
+        accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
+        Ok(())
     }
 }
 
@@ -731,9 +799,6 @@ impl<
     }
 }
 
-// Batching rule for array IR [`ParallelAllGatherOperation`]. The logical result extents remain ordinary
-// replicated dimension SSA inputs; matching-axis batching delegates its array mechanics to the homogeneous collective
-// kernel.
 impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllGatherOperation
 where
     C: Context<
@@ -760,6 +825,11 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // The explicit result extents remain ordinary replicated dimension inputs, except that the extent of an axis
+        // that carries a mapped bounded ragged dimension carries that dimension's per-item extents. A matching level
+        // delegates its array mechanics to the homogeneous `batch_matching_axis` kernel over the array projection of
+        // its parent and relocates the bounded ragged metadata like the homogeneous rule. This rule cannot reuse the
+        // shared `shape_changing_collective_batch_in_parent` rule, which rejects every bounded ragged input.
         let Some((array, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -795,7 +865,7 @@ where
             .map(|ragged_axis| {
                 let logical_axis =
                     ragged_axis.axis() - usize::from(input_batch_axis.is_some_and(|axis| axis < ragged_axis.axis()));
-                let output_axis = logical_axis + usize::from(logical_axis >= self.concat_axis());
+                let output_axis = logical_axis + usize::from(logical_axis >= self.concatenation_axis());
                 let output_extent = &output_extents[output_axis];
                 let output_extent_type = output_extent.unbatched_type();
                 let output_extent_type = <&DimensionType>::try_from(&output_extent_type)?;
@@ -933,8 +1003,6 @@ where
     }
 }
 
-// Mixed array IR JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
-// invariant result uses participant-indexed slicing in its transposed linear region.
 impl<C> MemberDifferentiableOperation<C> for ParallelAllGatherOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -956,6 +1024,9 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The explicit output extents are retained as ordinary residuals. A varying or reduced result transposes to
+        // its adjoint sum-scatter, while an invariant result selects the current participant's chunk of the output
+        // cotangent in its transposed linear region.
         if self.output_variance() == ParallelAllGatherOutputVariance::Invariant {
             return jvp_invariant_parallel_all_gather(self, context, inputs);
         }
@@ -963,69 +1034,115 @@ where
     }
 }
 
-/// Gathers participants' arrays across an enclosing named batch axis or manual mesh axis.
+/// Represents the ability to gather values across the participants of a named axis, so that every participant
+/// receives all of them in participant order, by staging a [`ParallelAllGatherOperation`]. This is the analogue of
+/// JAX's [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html), whose default
+/// `tiled = False` corresponds to [`ParallelAllGather::parallel_all_gather`], whose `tiled = True` corresponds to
+/// [`ParallelAllGather::parallel_all_gather_tiled`], and whose `to` argument corresponds to the
+/// [`ParallelAllGatherOutputVariance`] of [`ParallelAllGather::parallel_all_gather_with_options`]. Refer to
+/// [`ParallelAllGatherOperation`] for the semantics and transformation rules.
 ///
-/// [`Self::parallel_all_gather`] stacks inputs along a new axis, and [`Self::parallel_all_gather_tiled`] concatenates
-/// them along an existing axis. Every participant receives the complete gathered value. Homogeneous arrays require
-/// static extents; composite array IR values carry one first-class extent per output axis and support dynamic extents.
-/// Refer to [`ParallelAllGatherOperation`] for batching, ragged-axis, and differentiation semantics.
+/// Over a manual mesh axis, an input that does not vary over the axis is first made varying through [`ParallelVary`],
+/// so that every device's copy is gathered. Homogeneous array values require static extents, while composite array IR
+/// values stage one explicit extent value per output axis and so also support dynamic extents.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// Gather two rows, so that every batch item receives both of them:
+///
+/// ```
+/// # use ryft_core::operations::collectives::ParallelAllGather;
+/// # use ryft_core::{
+/// #     Array, ArrayBatchingPolicy, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchingTracer, EagerContext,
+/// #     batch,
+/// # };
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let rows = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])?;
+/// let gathered = batch(
+///     |row: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+///         row.parallel_all_gather_tiled("rows", 0)
+///     },
+///     rows,
+///     BatchAxis::new(0),
+///     BatchAxis::replicated(),
+///     BatchAxisSpecification::named("rows"),
+/// )?;
+/// assert_eq!(gathered, Array::vector(vec![1.0, 2.0, 3.0, 4.0])?);
+/// # Ok(())
+/// # }
+/// ```
 #[capability]
 pub trait ParallelAllGather<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Stacks participants along a new axis at `concat_axis`, which may range from zero through the input rank.
-    /// Over a manual mesh axis, the result retains variation across `axis_name`.
+    /// Returns the values of the participants of the named axis `axis_name`, stacked along a new axis that is inserted
+    /// at `concatenation_axis`, so that participant `i`'s value becomes row `i` of that axis. Over a manual mesh axis,
+    /// the result keeps varying over `axis_name`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `concatenation_axis`: Position of the inserted axis, which ranges from zero through the rank of this value.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if the axis is unbound or the input violates the collective's type contract.
+    /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_all_gather(&self, axis_name: &str, concatenation_axis: usize) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
             axis_name,
-            concat_axis,
+            concatenation_axis,
             CollectiveOptions::default(),
             ParallelAllGatherOutputVariance::Varying,
         )
     }
 
-    /// Concatenates participants into the existing `concat_axis`, which must be smaller than the input rank.
-    /// Over a manual mesh axis, the result retains variation across `axis_name`.
+    /// Returns the values of the participants of the named axis `axis_name`, concatenated along the existing
+    /// `concatenation_axis`, so that participant `i`'s value becomes chunk `i` of that axis. Over a manual mesh axis,
+    /// the result keeps varying over `axis_name`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `concatenation_axis`: Axis of this value along which the values are concatenated.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if the axis is unbound or the input violates the collective's type contract.
+    /// Returns the errors of [`ParallelAllGather::parallel_all_gather_with_options`].
     #[inline]
-    fn parallel_all_gather_tiled(&self, axis_name: &str, concat_axis: usize) -> Result<Self, ProgramError> {
+    fn parallel_all_gather_tiled(&self, axis_name: &str, concatenation_axis: usize) -> Result<Self, ProgramError> {
         self.parallel_all_gather_with_options(
             axis_name,
-            concat_axis,
+            concatenation_axis,
             CollectiveOptions::new(CollectiveMode::Tiled),
             ParallelAllGatherOutputVariance::Varying,
         )
     }
 
-    /// Gathers participants using explicit shape, grouping, and output-variance semantics.
-    /// An invariant input to a manual mesh gather is first made varying so that every participant's copy is included.
-    /// Pending sums over unrelated mesh axes are preserved.
+    /// Returns the values of the participants of the named axis `axis_name`, gathered along `concatenation_axis` with
+    /// the tiling mode and participant groups of `options` and with the manual variation that `output_variance`
+    /// selects.
     ///
     /// # Parameters
     ///
-    ///   - `axis_name`: Name of an enclosing batch axis or manual mesh axis.
-    ///   - `concat_axis`: Insertion position in untiled mode, or existing concatenation axis in tiled mode.
-    ///   - `options`: Rank-changing or tiled shape semantics and optional ordered participant groups.
-    ///   - `output_variance`: Result variance across a manual mesh axis. Ordinary gathers preserve input mesh metadata.
+    ///   - `axis_name`: Name of an axis bound by an enclosing `batch` level or manual region.
+    ///   - `concatenation_axis`: Position of the inserted axis in untiled mode, or axis of this value along which the
+    ///     values are concatenated in tiled mode.
+    ///   - `options`: [`CollectiveMode`] and optional participant groups of the collective.
+    ///   - `output_variance`: Manual variation of the result over a manual mesh axis. An ordinary all-gather
+    ///     preserves the mesh state of this value.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] for an unbound axis, invalid geometry or groups, or an input unreduced over the
-    /// gathered manual mesh axis. Reduced output variance requires a manual mesh axis. Invariant and reduced output
-    /// variance reject participant groups, and gathering over a named batch axis rejects participant groups.
+    /// Returns a [`ProgramError::Axis`] error wrapping [`AxisError::UnboundAxisName`] when no enclosing binder binds
+    /// `axis_name`, and a [`ProgramError`] if `concatenation_axis` is out of bounds, if the participant groups are
+    /// invalid or combined with invariant or reduced output variance, if reduced output variance is requested for an
+    /// axis that is not a manual mesh axis, or if this value is unreduced over the gathered manual mesh axis.
     fn parallel_all_gather_with_options(
         &self,
         axis_name: &str,
-        concat_axis: usize,
+        concatenation_axis: usize,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError>;
@@ -1039,7 +1156,7 @@ impl ParallelAllGather<ArrayType> for Array {
     fn parallel_all_gather_with_options(
         &self,
         axis_name: &str,
-        _concat_axis: usize,
+        _concatenation_axis: usize,
         _options: CollectiveOptions,
         _output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
@@ -1047,123 +1164,6 @@ impl ParallelAllGather<ArrayType> for Array {
     }
 }
 
-// A concrete composite value performs the collective through its array member.
-impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_all_gather_with_options(
-        &self,
-        axis_name: &str,
-        concat_axis: usize,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
-            axis_name,
-            concat_axis,
-            options,
-            output_variance,
-        )?))
-    }
-}
-
-impl<V> ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
-where
-    V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-{
-    fn parallel_all_gather_with_options(
-        &self,
-        axis_name: &str,
-        concat_axis: usize,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        self.value()
-            .parallel_all_gather_with_options(axis_name, concat_axis, options, output_variance)?
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-// A composite value binds a `ParallelAllGatherOperation` through its own context, followed by one explicit extent
-// value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that does not vary over
-// the axis is first made varying through its array view so that every participant's copy is gathered.
-impl<V> ParallelAllGather<ArrayIrType> for V
-where
-    V: Value<Type = ArrayIrType>
-        + Assert
-        + DimensionSize<V>
-        + ValueProjection<DimensionType>
-        + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelAllGatherOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
-    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
-{
-    fn parallel_all_gather_with_options(
-        &self,
-        axis_name: &str,
-        concat_axis: usize,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let effective_axis_size = options.effective_axis_size(PARALLEL_ALL_GATHER_OPERATION_NAME, axis_size)?;
-        if output_variance != ParallelAllGatherOutputVariance::Varying && options.axis_index_groups.is_some() {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` axis index groups are not supported with invariant or \
-                 reduced output variance",
-            ))
-            .into());
-        }
-        let mut input = self.clone();
-        let mut operation = ParallelAllGatherOperation::new(
-            axis_name.to_string(),
-            axis_size,
-            concat_axis,
-            options.clone(),
-            output_variance,
-        );
-        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
-            let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-            if array.r#type().unreduced_axes().contains(axis_name) {
-                return Err(TypeError::invalid(format!(
-                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
-                ))
-                .into());
-            }
-            if !array.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
-                input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
-            }
-            operation = operation.with_mesh(mesh);
-        }
-        let input_type = input.r#type();
-        let rank = <&ArrayType>::try_from(input_type.as_ref())?.rank();
-        if concat_axis > rank || (options.mode == CollectiveMode::Tiled && concat_axis == rank) {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concat axis {concat_axis} is out of bounds for rank {rank}",
-            ))
-            .into());
-        }
-        let mut output_extents = (0..rank).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-        let participants = context.dimension_constant(effective_axis_size)?;
-        match options.mode {
-            CollectiveMode::Untiled => output_extents.insert(concat_axis, participants),
-            CollectiveMode::Tiled => {
-                let extent = ValueProjection::<DimensionType>::into_projected(output_extents[concat_axis].clone())?;
-                let participants = ValueProjection::<DimensionType>::into_projected(participants)?;
-                output_extents[concat_axis] =
-                    ValueProjection::<DimensionType>::from_projected(extent.mul(&participants)?);
-            }
-        }
-        let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
-        let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
-// Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
 impl<V> ParallelAllGather<ArrayType> for V
 where
     V: ShapeChangingCollectiveValue + ParallelVary,
@@ -1172,23 +1172,24 @@ where
     fn parallel_all_gather_with_options(
         &self,
         axis_name: &str,
-        concat_axis: usize,
+        concatenation_axis: usize,
         options: CollectiveOptions,
         output_variance: ParallelAllGatherOutputVariance,
     ) -> Result<Self, ProgramError> {
+        // Homogeneous values opt into direct staging, while projected values retain composite extent delegation. Over a
+        // manual mesh axis, an input that does not vary over the axis is first made varying, so that every device's
+        // copy is gathered, while a pending sum over the axis is rejected before that transition can obscure it.
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        options.effective_axis_size(PARALLEL_ALL_GATHER_OPERATION_NAME, axis_size)?;
-        if output_variance != ParallelAllGatherOutputVariance::Varying && options.axis_index_groups.is_some() {
-            return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` axis index groups are not supported with invariant or \
-                 reduced output variance",
-            ))
-            .into());
-        }
+        let mut operation = ParallelAllGatherOperation::new(
+            axis_name.to_string(),
+            axis_size,
+            concatenation_axis,
+            options,
+            output_variance,
+        );
+        operation.effective_axis_size()?;
         let mut input = self.clone();
-        let mut operation =
-            ParallelAllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options, output_variance);
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
             if input.r#type().unreduced_axes().contains(axis_name) {
                 return Err(TypeError::invalid(format!(
@@ -1204,6 +1205,121 @@ where
         let mut outputs = context.bind(operation, Vec::new(), &[input])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concatenation_axis: usize,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        // A concrete composite value performs the collective through its array member.
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
+            axis_name,
+            concatenation_axis,
+            options,
+            output_variance,
+        )?))
+    }
+}
+
+impl<V> ParallelAllGather<ArrayIrType> for V
+where
+    V: Value<Type = ArrayIrType>
+        + Assert
+        + DimensionSize<V>
+        + ValueProjection<DimensionType>
+        + ValueProjection<ArrayType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + NamedAxes,
+    <V::DispatchDomain as Domain>::Operation: From<ParallelAllGatherOperation>,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul,
+    <V as ValueProjection<ArrayType>>::Projected: ParallelVary,
+{
+    fn parallel_all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concatenation_axis: usize,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        // A composite value binds a `ParallelAllGatherOperation` through its own context, followed by one explicit
+        // extent value per output axis. Over a manual mesh axis, the operation records the mesh, and an input that does
+        // not vary over the axis is first made varying through its array view, so that every device's copy is
+        // gathered, while a pending sum over the axis is rejected before that transition can obscure it.
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let mut operation = ParallelAllGatherOperation::new(
+            axis_name.to_string(),
+            axis_size,
+            concatenation_axis,
+            options.clone(),
+            output_variance,
+        );
+        let effective_axis_size = operation.effective_axis_size()?;
+        let mut input = self.clone();
+        if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(axis_name) {
+            let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+            if array.r#type().unreduced_axes().contains(axis_name) {
+                return Err(TypeError::invalid(format!(
+                    "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support unreduced inputs",
+                ))
+                .into());
+            }
+            if !array.r#type().sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name)) {
+                input = <V as ValueProjection<ArrayType>>::from_projected(array.parallel_vary(axis_name)?);
+            }
+            operation = operation.with_mesh(mesh);
+        }
+
+        // The concatenation axis must be validated before the explicit result extents are derived from the input
+        // extents.
+        let input_type = input.r#type();
+        let rank = <&ArrayType>::try_from(input_type.as_ref())?.rank();
+        if concatenation_axis > rank || (options.mode == CollectiveMode::Tiled && concatenation_axis == rank) {
+            return Err(TypeError::invalid(format!(
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {concatenation_axis} is out of bounds for rank {rank}",
+            ))
+            .into());
+        }
+        let mut output_extents = (0..rank).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+        let participants = context.dimension_constant(effective_axis_size)?;
+        match options.mode {
+            CollectiveMode::Untiled => output_extents.insert(concatenation_axis, participants),
+            CollectiveMode::Tiled => {
+                let extent =
+                    ValueProjection::<DimensionType>::into_projected(output_extents[concatenation_axis].clone())?;
+                let participants = ValueProjection::<DimensionType>::into_projected(participants)?;
+                output_extents[concatenation_axis] =
+                    ValueProjection::<DimensionType>::from_projected(extent.mul(&participants)?);
+            }
+        }
+        let inputs = std::iter::once(input).chain(output_extents).collect::<Vec<_>>();
+        let mut outputs = context.bind(operation, Vec::new(), inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<V> ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
+where
+    V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    #[inline]
+    fn parallel_all_gather_with_options(
+        &self,
+        axis_name: &str,
+        concatenation_axis: usize,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .parallel_all_gather_with_options(axis_name, concatenation_axis, options, output_variance)?
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -1271,7 +1387,7 @@ where
                         )?
                         .remove(0);
                     let chunk_extent = match transpose_operation.options().mode() {
-                        CollectiveMode::Tiled => input_dimensions[transpose_operation.concat_axis()].clone(),
+                        CollectiveMode::Tiled => input_dimensions[transpose_operation.concatenation_axis()].clone(),
                         CollectiveMode::Untiled => transpose_context
                             .bind(
                                 DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
@@ -1291,7 +1407,7 @@ where
                         let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
                         let axis_index_variable = DimensionVariable::new(
                             format!("{}_index", transpose_operation.axis_name()),
-                            crate::arrays::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
+                            DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
                         );
                         let axis_index = transpose_context
                             .bind(
@@ -1314,10 +1430,10 @@ where
                             .remove(0)
                     };
                     let mut starts = vec![zero; output_rank];
-                    starts[transpose_operation.concat_axis()] = start;
+                    starts[transpose_operation.concatenation_axis()] = start;
                     let mut slice_sizes = input_dimensions.clone();
                     if transpose_operation.options().mode() == CollectiveMode::Untiled {
-                        slice_sizes.insert(transpose_operation.concat_axis(), chunk_extent);
+                        slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
                     }
                     // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
                     // every participant selects a different chunk of it, so the selected chunk varies over that axis.
@@ -1365,7 +1481,9 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Relocates bounded-ragged metadata through a matching untiled all-gather.
+/// Relocates the bounded ragged metadata of the input of an untiled all-gather whose named axis the `batch` level of
+/// `context` binds. A mapped input's per-item extents follow its batch axis to the inserted participant axis, while a
+/// replicated input's scalar extents are broadcast along that axis, which becomes their only extent axis.
 fn gathered_ragged_axes<C, P>(
     operation: &ParallelAllGatherOperation,
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
@@ -1380,7 +1498,7 @@ where
     if let Some(input_batch_axis) = input_batch_axis {
         return Ok(ragged_axes
             .into_iter()
-            .map(|ragged_axis| ragged_axis.moved(input_batch_axis, 0).moved(0, operation.concat_axis))
+            .map(|ragged_axis| ragged_axis.moved(input_batch_axis, 0).moved(0, operation.concatenation_axis))
             .collect());
     }
 
@@ -1398,12 +1516,12 @@ where
             }
             let extents =
                 P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?.into_value();
-            let ragged_axis = ragged_axis.broadcasted(output_axes.as_slice()).moved(0, operation.concat_axis);
+            let ragged_axis = ragged_axis.broadcasted(output_axes.as_slice()).moved(0, operation.concatenation_axis);
             Ok(RaggedAxis::new(
                 ragged_axis.axis(),
                 extents,
                 ragged_axis.dimension().clone(),
-                vec![operation.concat_axis],
+                vec![operation.concatenation_axis],
             ))
         })
         .collect()
@@ -1415,13 +1533,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DataType, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType,
-        ShardingDimension, StridedLayout,
+        ArrayIrOperation, ArrayOperation, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::differentiation::differentiate_at;
+    use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::collectives::tests::{batch_collective, collective_program};
+    use crate::operations::manipulation::slicing::Slice;
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -1447,7 +1567,7 @@ mod tests {
         assert_eq!(operation.name(), PARALLEL_ALL_GATHER_OPERATION_NAME);
         assert_eq!(operation.axis_name(), "x");
         assert_eq!(operation.axis_size(), 4);
-        assert_eq!(operation.concat_axis(), 0);
+        assert_eq!(operation.concatenation_axis(), 0);
         assert_eq!(operation.options(), &CollectiveOptions::tiled());
         assert_eq!(operation.output_variance(), ParallelAllGatherOutputVariance::Varying);
         assert_eq!(operation.mesh(), None);
@@ -1458,7 +1578,7 @@ mod tests {
                 parallel_all_gather [
                     axis_name="x",
                     axis_size=4,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ]
@@ -1521,7 +1641,7 @@ mod tests {
                 parallel_all_gather [
                     axis_name="x",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                     mesh=['x'=2:manual],
@@ -1534,8 +1654,9 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_type_inference() {
-        // A tiled all-gather multiplies its concat axis by the axis size, while an untiled one inserts a new axis of
-        // that size at its concat axis. Static result-shape arithmetic requires statically shaped inputs.
+        // A tiled all-gather multiplies its concatenation axis by the axis size, while an untiled one inserts a new
+        // axis of that size at its concatenation axis. Static result-shape arithmetic requires statically shaped
+        // inputs.
         check_operation_type_inference!(
             operation = ParallelAllGatherOperation::new(
                 "x".to_string(),
@@ -1551,7 +1672,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::scalar(DataType::F32)],
-                    error = "`parallel_all_gather` concat axis 0 is out of bounds for rank 0",
+                    error = "`parallel_all_gather` concatenation axis 0 is out of bounds for rank 0",
                 },
                 {
                     input_types = [ArrayType::new(
@@ -1830,7 +1951,7 @@ mod tests {
             ParallelAllGatherOutputVariance::Varying,
         );
         let input_axis = DimensionVariable::new("input", DimensionBounds::new(1, Some(17)).unwrap());
-        let concat_result = DimensionVariable::new("concat", DimensionBounds::new(2, Some(33)).unwrap());
+        let concatenation_result = DimensionVariable::new("concatenation", DimensionBounds::new(2, Some(33)).unwrap());
         let input_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(input_axis.clone()), Dimension::Static(3)]),
@@ -1838,13 +1959,13 @@ mod tests {
         assert_eq!(
             operation.infer_array_ir_output_types(&[
                 input_type.clone().into(),
-                ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
+                ArrayIrType::Dimension(DimensionType::from(concatenation_result.clone())),
                 DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
             ]),
             Ok(vec![
                 ArrayType::new(
                     DataType::F32,
-                    Shape::new(vec![Dimension::Dynamic(concat_result.clone()), Dimension::Static(3)]),
+                    Shape::new(vec![Dimension::Dynamic(concatenation_result.clone()), Dimension::Static(3)]),
                 )
                 .into()
             ]),
@@ -1882,7 +2003,7 @@ mod tests {
                 ArrayType::new_static(DataType::F32, [3]).into(),
                 DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
             ]),
-            Err(TypeError::invalid("`parallel_all_gather` concat axis 1 is out of bounds for rank 1")),
+            Err(TypeError::invalid("`parallel_all_gather` concatenation axis 1 is out of bounds for rank 1")),
         );
     }
 
@@ -1960,7 +2081,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_type_inference_array_ir_group_size() {
-        // A grouped gather multiplies the concat extent by the size of one participant group rather than the axis size.
+        // A grouped gather multiplies the concatenation extent by the size of one participant group rather than the
+        // axis size.
         let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
         let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
@@ -2058,7 +2180,7 @@ mod tests {
                 parallel_all_gather [
                         axis_name=\"devices\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                         mesh=['devices'=2:manual],
@@ -2098,7 +2220,7 @@ mod tests {
                 parallel_all_gather [
                         axis_name=\"devices\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                         mesh=['devices'=2:manual],
@@ -2335,7 +2457,7 @@ mod tests {
                 let %1:f32[2][sharding={mesh<['x'=1:manual]>, [{}]}] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Invariant,
                     mesh=['x'=1:manual],
@@ -2382,7 +2504,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_batching() {
         // The batch binds the axis `"x"` that the `parallel_all_gather` names, so the matching batching rule consumes
-        // the mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
+        // the mapped axis: every item receives the item-major concatenation of all items along `concatenation_axis`,
         // replicated across the batch, so the input of item `i` occupies the `i`-th chunk of that axis. With items
         // `[1, 2]` and `[3, 4]`, every item receives `[1, 2, 3, 4]`.
         assert_eq!(
@@ -2401,7 +2523,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_batching_untiled() {
-        // An untiled gather stacks the batch items along a new axis at `concat_axis`, here after each item's only axis.
+        // An untiled gather stacks the batch items along a new axis at `concatenation_axis`, here after each item's
+        // only axis.
         let input =
             ArrayBatch::new(Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
@@ -2590,8 +2713,8 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_batching_forwards_unbound_axis() {
-        // A level that binds another axis forwards the gather to its parent, shifting the concat axis past the mapped
-        // axis, which keeps its position in the tiled result.
+        // A level that binds another axis forwards the gather to its parent, shifting the concatenation axis past the
+        // mapped axis, which keeps its position in the tiled result.
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input =
             ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [3, 2])), BatchAxis::new(0)).unwrap();
@@ -2626,7 +2749,7 @@ mod tests {
                 let %1:f32[3, 4] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=1,
+                    concatenation_axis=1,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0
@@ -2638,7 +2761,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_batching_shadows_manual_axis() {
         // An inner named batch binds `x` independently of a manual mesh axis with the same name. The ordinary gather
-        // merges the batch items into its concat axis and preserves the mesh invariance of its input.
+        // merges the batch items into its concatenation axis and preserves the mesh invariance of its input.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2, 3])
             .with_sharding(Sharding::replicated(mesh.clone(), 2))
@@ -2834,7 +2957,7 @@ mod tests {
                 let %4:f32[result, batch, 3] = parallel_all_gather [
                     axis_name=\"inner\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %1 %2 %0 %3
@@ -2976,19 +3099,113 @@ mod tests {
                 let %2:f32[4] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0
                     %3:f32[4] = parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                     ] %1
                 in (%2, %3)"
             },
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_weighted_gradient() {
+        // Distinct weights on the gathered chunks verify that the pullback routes the cotangent of every chunk back to
+        // the batch item that contributed it, including when the physical batch axis follows the concatenation axis.
+        check_gradient!(
+            |inputs| {
+                let gathered = batch(
+                    |item| item.parallel_all_gather_tiled("x", 0),
+                    inputs,
+                    BatchAxis::new(1),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                let first = gathered.slice(&[0], &[2], &[1])?;
+                let second = gathered.slice(&[2], &[4], &[1])?;
+                let weighted = first + second.clone() + second;
+                weighted.reduce(&[0], ReductionKind::Sum)
+            },
+            at = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+        check_gradient!(
+            |inputs| {
+                let gathered = batch(
+                    |item| item.parallel_all_gather("x", 1),
+                    inputs,
+                    BatchAxis::new(1),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                let first = gathered.slice(&[0, 0], &[2, 1], &[1, 1])?;
+                let second = gathered.slice(&[0, 1], &[2, 2], &[1, 1])?;
+                let weighted = first + second.clone() + second;
+                weighted.reduce(&[0, 1], ReductionKind::Sum)
+            },
+            at = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_invariant() {
+        // Inside a level that binds the axis, every item gathers the same complete value, and the pullback of the
+        // invariant gather selects each item's own chunk of the cotangent, so the gradient of `sum(g * g)` is `2 * x`
+        // in both modes.
+        let inputs = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    differentiate_at(item)
+                        .gradient(|item| {
+                            let gathered = item.parallel_all_gather_with_options(
+                                "x",
+                                0,
+                                CollectiveOptions::tiled(),
+                                ParallelAllGatherOutputVariance::Invariant,
+                            )?;
+                            gathered.mul(&gathered)?.reduce(&[0], ReductionKind::Sum)
+                        })
+                        .map_err(ProgramError::from)
+                },
+                inputs.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![2.0, 4.0, 6.0, 8.0]).unwrap()),
+        );
+        assert_eq!(
+            batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+                    differentiate_at(item)
+                        .gradient(|item| {
+                            let gathered = item.parallel_all_gather_with_options(
+                                "x",
+                                1,
+                                CollectiveOptions::default(),
+                                ParallelAllGatherOutputVariance::Invariant,
+                            )?;
+                            gathered.mul(&gathered)?.reduce(&[0, 1], ReductionKind::Sum)
+                        })
+                        .map_err(ProgramError::from)
+                },
+                inputs,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            ),
+            Ok(Array::matrix(2, 2, vec![2.0, 4.0, 6.0, 8.0]).unwrap()),
         );
     }
 
@@ -3081,7 +3298,7 @@ mod tests {
                 let %3:f32[items] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0 %2
@@ -3091,7 +3308,7 @@ mod tests {
                             let %2:f32[items] = parallel_all_gather [
                                 axis_name=\"x\",
                                 axis_size=1,
-                                concat_axis=0,
+                                concatenation_axis=0,
                                 options=Tiled,
                                 output_variance=Varying,
                             ] %1 %0
@@ -3150,7 +3367,7 @@ mod tests {
                 let %2:f32[extent] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0 %1
@@ -3164,7 +3381,7 @@ mod tests {
                 let %2:f32[extent] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Varying,
                 ] %0 %1
@@ -3181,7 +3398,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Varying,
                         ] %1 %0
@@ -3213,7 +3430,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Varying,
                         ] %1 %0
@@ -3286,7 +3503,7 @@ mod tests {
                 let %2:f32[extent] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Invariant,
                 ] %0 %1
@@ -3300,7 +3517,7 @@ mod tests {
                 let %2:f32[extent] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=1,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Invariant,
                 ] %0 %1
@@ -3317,7 +3534,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Invariant,
                         ] %1 %0
@@ -3353,7 +3570,7 @@ mod tests {
                         let %2:f32[extent] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=1,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Invariant,
                         ] %1 %0
@@ -3375,8 +3592,8 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap())]),
         );
 
-        // A nondegenerate untiled invariant gather cannot be transposed directly, but its linearized pullback selects
-        // the current participant's size-one slice and reshapes away the ranked participant axis.
+        // The linearized pullback of a nondegenerate untiled invariant gather selects the current participant's
+        // size-one slice and reshapes away the participant axis.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
         let participant_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
@@ -3402,15 +3619,21 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
-        // guard that rule owns is what rejects direct transposition here.
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0], &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of invariant `parallel_all_gather` cannot represent the \
-                    participant-indexed slice; linearize in composite array IR so that the current participant can \
-                    select its gathered chunk",
-        ));
+        // The mixed boundary delegates its static array contribution to the homogeneous all-gather rule, which selects
+        // the same participant's row of the output cotangent.
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:dimension<2> = const 2
+                    %2:dimension<3> = const 3
+                    %3:u64[] = axis_index [axis_name=\"x\"]
+                    %4:u64[] = zero [type=u64[]]
+                    %5:f32[1, 3] = dynamic_slice [sizes=[1, 3]] %0 %3 %4
+                    %6:f32[3] = reshape [shape=[3]] %5
+                in (%6)"
+            },
+        );
         assert_eq!(
             program.linearize().unwrap().pullback().unwrap().to_string(),
             indoc! {"
@@ -3435,7 +3658,7 @@ mod tests {
                             let %3:f32[2, 3] = parallel_all_gather [
                                 axis_name=\"x\",
                                 axis_size=2,
-                                concat_axis=0,
+                                concatenation_axis=0,
                                 options=Untiled,
                                 output_variance=Invariant,
                             ] %2 %0 %1
@@ -3497,7 +3720,7 @@ mod tests {
                         let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
                             axis_name=\"x\",
                             axis_size=2,
-                            concat_axis=0,
+                            concatenation_axis=0,
                             options=Tiled,
                             output_variance=Invariant,
                             mesh=['x'=2:manual],
@@ -3514,7 +3737,7 @@ mod tests {
     #[test]
     fn test_parallel_all_gather_transposition() {
         // A tiled all-gather is the adjoint of a sum-scatter over the same axis and dimension, so the pullback stages
-        // a `parallel_sum_scatter` on the output cotangent with the gather's concat axis as its scatter axis.
+        // a `parallel_sum_scatter` on the output cotangent with the gather's concatenation axis as its scatter axis.
         let program = collective_program(
             ParallelAllGatherOperation::new(
                 "x".to_string(),
@@ -3576,7 +3799,7 @@ mod tests {
                 CollectiveOptions::tiled(),
                 ParallelAllGatherOutputVariance::Reduced,
             )
-            .with_mesh(mesh),
+            .with_mesh(mesh.clone()),
             input_type.clone(),
         );
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
@@ -3591,8 +3814,8 @@ mod tests {
         );
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
 
-        // Invariant output variance has no direct adjoint, because its pullback must select the current participant's
-        // chunk of the gathered cotangent, which only composite array IR linearization can stage.
+        // An invariant result transposes without communication: a tiled gather splits the participant axis off its
+        // output cotangent, which is then sliced at the current participant's index and reshaped back to the input.
         let program = collective_program(
             ParallelAllGatherOperation::new(
                 "x".to_string(),
@@ -3603,20 +3826,55 @@ mod tests {
             ),
             ArrayType::new_static(DataType::F32, [2]),
         );
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0], &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of invariant `parallel_all_gather` cannot represent the \
-                    participant-indexed slice; linearize in composite array IR so that the current participant can \
-                    select its gathered chunk",
-        ));
-        assert!(matches!(
-            program.linearize().unwrap().pullback(),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of invariant `parallel_all_gather` cannot represent the \
-                    participant-indexed slice; linearize in composite array IR so that the current participant can \
-                    select its gathered chunk",
-        ));
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[2, 2] = reshape [shape=[2, 2]] %0
+                    %2:u64[] = axis_index [axis_name=\"x\"]
+                    %3:u64[] = zero [type=u64[]]
+                    %4:f32[1, 2] = dynamic_slice [sizes=[1, 2]] %1 %2 %3
+                    %5:f32[2] = reshape [shape=[2]] %4
+                in (%5)"
+            },
+        );
+
+        // Over a manual mesh axis, the invariant output cotangent is first made varying, because every participant
+        // selects a different chunk of it, and the selected chunk has the varying input cotangent type.
+        let program = collective_program(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                0,
+                CollectiveOptions::tiled(),
+                ParallelAllGatherOutputVariance::Invariant,
+            )
+            .with_mesh(mesh),
+            input_type.clone(),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                let %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    parallel_vary [axis_name=\"x\"] %0
+                    %2:f32[2, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = reshape [
+                        shape=[2, 2],
+                        output_sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}},
+                    ] %1
+                    %3:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                    %4:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    zero [type=u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
+                    %5:f32[1, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                    dynamic_slice [sizes=[1, 2]] %2 %3 %4
+                    %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    reshape [shape=[2], output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %5
+                in (%6)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
     }
 
     #[test]
@@ -3714,7 +3972,7 @@ mod tests {
                     %2:f32[6][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                         mesh=['x'=2:manual],
@@ -3761,7 +4019,7 @@ mod tests {
                 varying_manual={'x'}}] = parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                         mesh=['x'=2:manual, 'y'=2:manual],
@@ -3819,7 +4077,7 @@ mod tests {
                 let %1:f32[6][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
                     axis_name=\"x\",
                     axis_size=2,
-                    concat_axis=0,
+                    concatenation_axis=0,
                     options=Tiled,
                     output_variance=Invariant,
                     mesh=['x'=2:manual],
@@ -3867,7 +4125,7 @@ mod tests {
                 if message == "`parallel_all_gather` does not support unreduced inputs",
         ));
 
-        // Composite values validate the concat axis before they derive the explicit result extents.
+        // Composite values validate the concatenation axis before they derive the explicit result extents.
         assert!(matches!(
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
@@ -3882,7 +4140,7 @@ mod tests {
                 vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`parallel_all_gather` concat axis 1 is out of bounds for rank 1",
+                if message == "`parallel_all_gather` concatenation axis 1 is out of bounds for rank 1",
         ));
     }
 
@@ -3916,7 +4174,7 @@ mod tests {
                     %4:f32[8] = parallel_all_gather [
                         axis_name=\"x\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Tiled,
                         output_variance=Varying,
                     ] %0 %3

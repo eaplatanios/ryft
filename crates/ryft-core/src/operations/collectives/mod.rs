@@ -2562,7 +2562,7 @@ mod tests {
                     let %5:f32[2, 2, 3] = parallel_all_gather [
                         axis_name=\"inner\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Untiled,
                         output_variance=Varying,
                     ] %1 %2 %3 %4
@@ -2585,7 +2585,7 @@ mod tests {
                     let %5:f32[2, 2, 5, 3] = parallel_all_gather [
                         axis_name=\"inner\",
                         axis_size=2,
-                        concat_axis=0,
+                        concatenation_axis=0,
                         options=Untiled,
                         output_variance=Varying,
                     ] %1 %2 %3 %0 %4
@@ -2648,7 +2648,7 @@ mod tests {
                             axis_name=\"inner\", \
                             axis_size=2, \
                             split_axis=0, \
-                            concat_axis=1, \
+                            concatenation_axis=1, \
                             options=Untiled\
                         ] %1 %2 %3
                     in (%4)"
@@ -2670,7 +2670,7 @@ mod tests {
                             axis_name=\"inner\", \
                             axis_size=2, \
                             split_axis=0, \
-                            concat_axis=2, \
+                            concatenation_axis=2, \
                             options=Untiled\
                         ] %1 %0 %2 %3
                     in (%4)"
