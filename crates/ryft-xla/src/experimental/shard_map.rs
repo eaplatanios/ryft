@@ -2182,6 +2182,8 @@ fn escape_shardy_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    #[cfg(feature = "cuda-13")]
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2196,7 +2198,9 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{
+        ExecutionDeviceInputs, ExecutionInput, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin,
+    };
 
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{FromPjrt, ToMlir, XlaArray, XlaSession};
@@ -3465,7 +3469,7 @@ mod tests {
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                Array::from_addressable_buffers(
+                XlaArray::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::I32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
@@ -3483,7 +3487,8 @@ mod tests {
             .iter()
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
-        let execute_arguments = Array::into_execute_arguments(input_arrays, execution_device_ids.as_slice()).unwrap();
+        let execute_arguments =
+            XlaArray::into_execute_arguments(input_arrays, execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -3576,7 +3581,7 @@ mod tests {
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                Array::from_addressable_buffers(
+                XlaArray::from_addressable_buffers(
                     &domain,
                     static_sharded_array_type(DataType::F32, &[global_extent], sharding.clone()),
                     device_mesh.clone(),
@@ -3608,7 +3613,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
-            Array::from_addressable_buffers(
+            XlaArray::from_addressable_buffers(
                 &domain,
                 static_sharded_array_type(DataType::I32, &[4], sharding.clone()),
                 device_mesh.clone(),
@@ -3626,7 +3631,7 @@ mod tests {
             .map(|device| device.id().unwrap())
             .collect::<Vec<_>>();
         let gradient_arguments =
-            Array::into_execute_arguments(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
+            XlaArray::into_execute_arguments(gradient_inputs, gradient_device_ids.as_slice()).unwrap();
         let gradients = gradient_executable
             .execute(gradient_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
             .unwrap()
@@ -3636,6 +3641,200 @@ mod tests {
             let bytes = gradient.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(bytes.as_slice()), vec![2.0, 0.0, 0.0]);
         }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_parallel_ragged_all_to_all_u64_metadata_executes_on_cuda() {
+        // XLA's GPU `ragged_all_to_all` receives `u64` metadata from three sources: inputs that are already `u64`, the
+        // widened metadata of an exchange merged with an unrelated batch axis, and the rebased metadata of the additive
+        // transpose. A single-participant axis exercises all three on one device.
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
+        let execute = |program: String, inputs: Vec<(Vec<u8>, BufferType, Vec<u64>)>| {
+            let inputs = inputs
+                .into_iter()
+                .map(|(bytes, buffer_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(bytes.as_slice(), buffer_type, shape, None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+            let executable = client
+                .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(1))
+                .unwrap();
+            let mut outputs = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap();
+            let bytes = outputs.remove(0).outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            values_from_bytes::<f32>(bytes.as_slice())
+        };
+        // Direct `u64` metadata: copy `operand` rows `1..3` into `output` rows `0..2`.
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
+            |inputs: Vec<ShardMapTracer>| {
+                inputs[0]
+                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [3]),
+                ArrayType::new_static(DataType::F32, [4]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+            ],
+            mesh.clone(),
+            vec![sharding.clone(); 6],
+            sharding.clone(),
+        )
+        .unwrap();
+        let metadata = |value: u64| (values_to_bytes::<u64>(&[value]), BufferType::U64, vec![1]);
+        assert_eq!(
+            execute(
+                traced.to_mlir_module("main").unwrap(),
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0]), BufferType::F32, vec![3]),
+                    (values_to_bytes::<f32>(&[100.0, 101.0, 102.0, 103.0]), BufferType::F32, vec![4]),
+                    metadata(1),
+                    metadata(2),
+                    metadata(0),
+                    metadata(2),
+                ],
+            ),
+            vec![11.0, 12.0, 102.0, 103.0],
+        );
+
+        // Merged batching over `y` widens the `i32` metadata to `u64` and rebases the offsets of the second item.
+        let batched_sharding =
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
+        let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
+            |inputs: Vec<ShardMapTracer>| {
+                batch(
+                    |inputs: Vec<_>| {
+                        inputs[0]
+                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    },
+                    inputs,
+                    vec![BatchAxis::new(0); 6],
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("y"),
+                )
+                .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                ArrayType::new_static(DataType::F32, [2, 4]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+            ],
+            mesh.clone(),
+            vec![batched_sharding.clone(); 6],
+            batched_sharding,
+        )
+        .unwrap();
+        let program = traced.to_mlir_module("main").unwrap();
+        assert!(program.contains("tensor<2xui64>"));
+        let metadata = |values: [i32; 2]| (values_to_bytes::<i32>(&values), BufferType::I32, vec![2, 1]);
+        assert_eq!(
+            execute(
+                program,
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0, 20.0, 21.0, 22.0]), BufferType::F32, vec![2, 3]),
+                    (
+                        values_to_bytes::<f32>(&[100.0, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
+                        BufferType::F32,
+                        vec![2, 4],
+                    ),
+                    metadata([1, 0]),
+                    metadata([2, 1]),
+                    metadata([0, 3]),
+                    metadata([2, 1]),
+                ],
+            ),
+            vec![11.0, 12.0, 102.0, 103.0, 200.0, 201.0, 202.0, 20.0],
+        );
+
+        // The gradient of the summed exchange with respect to `operand` lowers through the additive transpose, whose
+        // rebased metadata are `u64`. Only the sent rows `1..3` reach the sum.
+        let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
+            |inputs: Vec<ShardMapTracer>| {
+                inputs[0]
+                    .dispatch_domain()
+                    .differentiate_at(inputs[0].clone())
+                    .with_captures((
+                        inputs[1].clone(),
+                        inputs[2].clone(),
+                        inputs[3].clone(),
+                        inputs[4].clone(),
+                        inputs[5].clone(),
+                    ))
+                    .gradient(|operand, (output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand
+                            .parallel_ragged_all_to_all(
+                                "x",
+                                &output,
+                                &input_offsets,
+                                &send_sizes,
+                                &output_offsets,
+                                &receive_sizes,
+                            )
+                            .map(|result| result.reduce(&[0], ReductionKind::Sum).unwrap())
+                    })
+                    .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [3]),
+                ArrayType::new_static(DataType::F32, [4]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+            ],
+            mesh,
+            vec![sharding.clone(); 6],
+            sharding,
+        )
+        .unwrap();
+        let program = traced.to_mlir_module("main").unwrap();
+        assert!(program.contains("tensor<1xui64>"));
+        let metadata = |value: i32| (values_to_bytes::<i32>(&[value]), BufferType::I32, vec![1]);
+        assert_eq!(
+            execute(
+                program,
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0]), BufferType::F32, vec![3]),
+                    (values_to_bytes::<f32>(&[0.0; 4]), BufferType::F32, vec![4]),
+                    metadata(1),
+                    metadata(2),
+                    metadata(0),
+                    metadata(2),
+                ],
+            ),
+            vec![0.0, 1.0, 1.0],
+        );
     }
 
     #[test]

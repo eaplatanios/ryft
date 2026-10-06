@@ -1039,7 +1039,7 @@ mod tests {
         // spans several levels of the parallel scan.
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
-        let input = Array::from_host_buffer(
+        let input = XlaArray::from_host_buffer(
             &domain,
             replicated_type(&mesh, DataType::F32, &[rows, columns]),
             mesh.clone(),
@@ -1056,14 +1056,14 @@ mod tests {
             }
             expected
         };
-        let read = |array: Array<'_>| {
+        let read = |array: XlaArray<'_>| {
             values_from_bytes::<f32>(&shard_host_bytes(array.addressable_shards().next().unwrap()).unwrap())
         };
         assert_eq!(read(input.cumulative_sum(1).unwrap()), scan(false));
         assert_eq!(read(input.reverse_cumulative_sum(1).unwrap()), scan(true));
 
         // Integer sums take the same `chlo.scan` path, here along the leading axis.
-        let integers = Array::from_host_buffer(
+        let integers = XlaArray::from_host_buffer(
             &domain,
             replicated_type(&mesh, DataType::I32, &[4, 2]),
             mesh.clone(),

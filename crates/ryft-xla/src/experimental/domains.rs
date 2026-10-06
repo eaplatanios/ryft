@@ -10061,7 +10061,7 @@ mod tests {
         for size in [4usize, 7] {
             let input_type = replicated_vector_type(&mesh, size);
             let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
-            let input = Array::from_host_buffer(
+            let input = XlaArray::from_host_buffer(
                 &domain,
                 input_type,
                 mesh.clone(),
@@ -10101,10 +10101,10 @@ mod tests {
             );
         let call = |size: i64| {
             let size =
-                Array::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let value =
-                Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
             function.call((), vec![XlaValue::Array(size), XlaValue::Array(value)])
         };
@@ -11665,7 +11665,7 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let execute = |size: i64| {
             let input =
-                Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                XlaArray::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             domain.execute_xla_program(&compiled, vec![input]).unwrap()
         };
@@ -11742,7 +11742,7 @@ mod tests {
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let execute = |size: i64| {
                 let input =
-                    Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    XlaArray::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                         .unwrap();
                 domain.execute_xla_program(&compiled, vec![input]).unwrap()
             };
@@ -11784,7 +11784,7 @@ mod tests {
             });
 
             let zero =
-                Array::from_host_buffer(&domain, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
+                XlaArray::from_host_buffer(&domain, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(
@@ -11851,7 +11851,7 @@ mod tests {
         let one = 0x3f80_u16.to_ne_bytes();
         let mut bytes = vec![0_u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
         bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
-        let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
+        let input = XlaArray::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
         input.block_until_ready().unwrap();
         let execute = || {
             let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
