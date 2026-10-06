@@ -6,8 +6,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType, Dimension,
-    DimensionType, DimensionValue, Layout, LinearResiduals, MeshAxisType, RaggedAxis, Shape, Sharding,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType, AsDimensionType,
+    Dimension, DimensionType, DimensionValue, Layout, LinearResiduals, MeshAxisType, RaggedAxis, Shape, Sharding,
     ShardingDimension, StridedLayout, TiledLayout,
 };
 use crate::axes::Axis;
@@ -1401,7 +1401,8 @@ impl_differentiable_operation! {
 /// # Ok(())
 /// # }
 /// ```
-pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
+#[capability]
+pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Replicates or reorders `self` into the shape supplied by dimension values. Each mapped input extent must equal
     /// its output extent or be statically one; new axes may have static or dynamic extents. Sharding follows the axis
     /// mapping and new axes are replicated. Invalid value kinds, axis mappings, or incompatible extents yield a
@@ -1453,7 +1454,10 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///   - `output_dimensions`: Dimension values describing the complete desired shape, including unchanged trailing
     ///     axes. Use [`DynamicBroadcast::dynamic_broadcast_to_sizes`] when every desired size is a host integer.
     #[inline]
-    fn dynamic_broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
+    fn dynamic_broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError>
+    where
+        Self: Typed<Type: AsArrayType>,
+    {
         self.dynamic_broadcast_to_with_output_sharding(output_dimensions, None)
     }
 
@@ -1469,9 +1473,12 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
         &self,
         output_dimensions: &[Self],
         output_sharding: Option<Sharding>,
-    ) -> Result<Self, ProgramError> {
+    ) -> Result<Self, ProgramError>
+    where
+        Self: Typed<Type: AsArrayType>,
+    {
         let r#type = self.r#type();
-        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let input_type = r#type.as_array_type()?;
         let offset = output_dimensions.len().checked_sub(input_type.rank()).ok_or_else(|| {
             TypeError::invalid(format!(
                 "cannot broadcast rank-{} input to {} output dimensions",
@@ -1496,8 +1503,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     #[inline]
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
     {
         self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
     }
@@ -1516,11 +1522,10 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
     {
         let r#type = self.r#type();
-        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let input_type = r#type.as_array_type()?;
         if leading_dimensions.is_empty() && output_sharding.is_none() {
             return Ok(self.clone());
         }
@@ -1529,7 +1534,9 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
         // so that a rejected request leaves no dead instructions behind and a request that provably changes nothing
         // stages nothing at all.
         let mut output_shape = Vec::with_capacity(leading_dimensions.len() + input_type.rank());
-        output_shape.extend(ArrayIrType::extents(leading_dimensions.iter().map(|dimension| dimension.r#type()))?);
+        for dimension in leading_dimensions {
+            output_shape.push(dimension.r#type().as_dimension_type()?.to_dimension());
+        }
         output_shape.extend(input_type.shape().dimensions().iter().cloned());
         let output_axes = (0..input_type.rank()).map(|axis| axis + leading_dimensions.len()).collect::<Vec<_>>();
         let operation =
@@ -1567,7 +1574,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>,
     {
         let output_dimensions = output_sizes
             .iter()
@@ -1588,8 +1595,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     #[inline]
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
     {
         let context = self.dispatch_domain();
         let leading_dimensions = leading_sizes
@@ -1629,15 +1635,14 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///     identities; distinct unknown dimensions are not assumed to have equal runtime values.
     fn dynamic_broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant> + DimensionSize,
     {
         let Some(first) = inputs.first() else {
             return Ok(Vec::new());
         };
         let shapes = inputs
             .iter()
-            .map(|input| Ok(<&ArrayType>::try_from(input.r#type().as_ref())?.shape().clone()))
+            .map(|input| Ok(input.r#type().as_array_type()?.shape().clone()))
             .collect::<Result<Vec<_>, TypeError>>()?;
         let output_shape: Shape = crate::arrays::Broadcastable::broadcasted(&shapes)
             .map_err(|error| TypeError::invalid(error.to_string()))?;
@@ -1668,7 +1673,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1694,7 +1699,7 @@ impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast for ArrayIrValue<A
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicBroadcast for V
+impl<V: Value<Type = ArrayIrType>> DynamicBroadcast<ArrayIrType> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {

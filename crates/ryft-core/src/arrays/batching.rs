@@ -4203,7 +4203,7 @@ fn normalized_batch_axis_type(
 ///   - `position`: Normalized position of the inserted mapped axis in the broadcast output.
 ///   - `axis_extent`: First-class extent of the transform's mapped axis.
 ///   - `axis_sharding`: Sharding placement of the transform's mapped axis.
-fn broadcast_replicated_array<V: DimensionSize + DynamicBroadcast>(
+fn broadcast_replicated_array<V: Clone + DimensionSize + DynamicBroadcast>(
     value: V,
     r#type: &ArrayType,
     position: usize,
