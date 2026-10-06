@@ -73,8 +73,6 @@ pub enum ParallelAllGatherOutputVariance {
     Reduced,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ParallelAllGatherOperation`].
 pub const PARALLEL_ALL_GATHER_OPERATION_NAME: &str = "parallel_all_gather";
 
@@ -201,31 +199,44 @@ impl ParallelAllGatherOperation {
         self.mesh.as_ref()
     }
 
-    /// Rejects local interpretation of a manual mesh all-gather, whose binder owns execution and output variance.
-    /// A local reshape cannot change manual variance or reduction state, even for a single participant.
-    fn check_local_interpretation(&self) -> Result<(), ProgramError> {
-        if self.mesh.is_some() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "cannot interpret `{PARALLEL_ALL_GATHER_OPERATION_NAME}` over manual mesh axis `{}` without an \
-                     enclosing binder",
-                    self.axis_name,
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    /// Rejects an input that carries reduction state (i.e., a pending or completed sum) over the gathered manual mesh
+    /// Rejects an input that carries reduction state (i.e., pending or completed sum) over the gathered manual mesh
     /// axis, because gathering across that sum would change its reduction semantics. Independent sums over other mesh
     /// axes commute with the gather and are preserved.
     fn check_input_reduction_state(&self, input_type: &ArrayType) -> Result<(), TypeError> {
         let axis_name = &self.axis_name;
         if input_type.unreduced_axes().contains(axis_name) || input_type.reduced_axes().contains(axis_name) {
             return Err(TypeError::invalid(format!(
-                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must not carry reduction state over manual axis \
-                 `{axis_name}`",
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` input must not carry reduction state \
+                 over manual axis `{axis_name}`",
             )));
+        }
+        Ok(())
+    }
+
+    /// Rejects a concatenation axis that is out of bounds for the output of an input with rank `input_rank`. An untiled
+    /// gather inserts its participant axis, so its concatenation axis is a position in an output whose rank is one more
+    /// than `input_rank`, while a tiled gather concatenates along an existing axis.
+    fn check_concatenation_axis(&self, input_rank: usize) -> Result<(), TypeError> {
+        let output_rank = input_rank + usize::from(self.options.mode == CollectiveMode::Untiled);
+        if self.concatenation_axis >= output_rank {
+            return Err(TypeError::invalid(format!(
+                "`{}` concatenation axis {} is out of bounds for output rank {}",
+                PARALLEL_ALL_GATHER_OPERATION_NAME, self.concatenation_axis, output_rank,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rejects local interpretation of a manual mesh all-gather, whose binder owns execution and output variance.
+    /// A local reshape cannot change manual variance or reduction state, even for a single participant.
+    fn check_local_interpretation(&self) -> Result<(), ProgramError> {
+        if self.mesh.is_some() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot interpret `{}` over manual mesh axis `{}` without an enclosing binder",
+                    PARALLEL_ALL_GATHER_OPERATION_NAME, self.axis_name,
+                ),
+            });
         }
         Ok(())
     }
@@ -233,8 +244,8 @@ impl ParallelAllGatherOperation {
     /// Applies an all-gather's named-axis variance transition to the canonical sharding metadata of the shape-only
     /// `output_type` shared by the static and array IR inference paths. An ordinary all-gather carries no mesh and
     /// preserves the mesh state of its input, even when its input carries a manual mesh axis with the same name,
-    /// because a `batch` level whose axis name shadows that mesh axis may bind it instead. Over a manual mesh axis, the
-    /// input must vary over the axis, and the output variance selects whether the result keeps varying over it,
+    /// because a `batch` level whose axis name shadows that mesh axis may bind it instead. Over a manual mesh axis,
+    /// the input must vary over the axis, and the output variance selects whether the result keeps varying over it,
     /// becomes invariant over it, or records it as reduced.
     fn finalize_output_type(&self, input_type: &ArrayType, output_type: ArrayType) -> Result<ArrayType, TypeError> {
         let axis_name = self.axis_name.as_str();
@@ -342,6 +353,8 @@ impl Display for ParallelAllGatherOperation {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl Operation for ParallelAllGatherOperation {
     type Type = ArrayType;
 
@@ -366,19 +379,14 @@ impl Operation for ParallelAllGatherOperation {
             )));
         };
 
+        self.check_concatenation_axis(input_type.rank())?;
         let output_type = match self.options.mode {
             CollectiveMode::Untiled => {
                 input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
             }
             CollectiveMode::Tiled => {
                 let mut output_dimensions = shape.dimensions().to_vec();
-                let Some(dimension) = output_dimensions.get_mut(self.concatenation_axis) else {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {} is out of bounds for rank {}",
-                        self.concatenation_axis,
-                        output_dimensions.len(),
-                    )));
-                };
+                let dimension = &mut output_dimensions[self.concatenation_axis];
                 *dimension = dimension.checked_mul(effective_axis_size).ok_or_else(|| {
                     TypeError::invalid(format!(
                         "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` result extent does not fit in `usize`",
@@ -398,12 +406,12 @@ impl Operation for ParallelAllGatherOperation {
         OperationFormatter::new(formatter, indentation, PARALLEL_ALL_GATHER_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
             operation.field("axis_size", self.axis_size)?;
-            operation.field("concatenation_axis", format_args!("{:?}", &self.concatenation_axis))?;
+            operation.field("concatenation_axis", self.concatenation_axis)?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
             if let Some(axis_index_groups) = self.options.axis_index_groups() {
                 operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;
             }
-            operation.field("output_variance", format_args!("{:?}", &self.output_variance))?;
+            operation.field("output_variance", format_args!("{:?}", self.output_variance))?;
             if let Some(mesh) = &self.mesh {
                 operation.field("mesh", mesh)?;
             }
@@ -488,18 +496,12 @@ impl ShapeChangingCollectiveOperation for ParallelAllGatherOperation {
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
+        self.check_concatenation_axis(input_type.rank())?;
         let base_output_type = match self.options.mode {
             CollectiveMode::Untiled => {
                 input_type.with_inserted_dimension(self.concatenation_axis, Dimension::Static(effective_axis_size))?
             }
             CollectiveMode::Tiled => {
-                if self.concatenation_axis >= input_type.rank() {
-                    return Err(TypeError::invalid(format!(
-                        "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` concatenation axis {} is out of bounds for rank {}",
-                        self.concatenation_axis,
-                        input_type.rank(),
-                    )));
-                }
                 let mut dimensions = input_type.shape().dimensions().to_vec();
                 dimensions[self.concatenation_axis] = Dimension::Static(0);
                 let sharding =
@@ -1085,14 +1087,14 @@ where
 impl<C> MemberDifferentiableOperation<C> for ParallelAllGatherOperation
 where
     C: Context<Type = ArrayIrType>,
-    C::Operation: From<ParallelAllGatherOperation>
+    C::Operation: From<ConstantOperation<DimensionValue>>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
+        + From<DynamicReshapeOperation>
         + From<DynamicSliceOperation<ArrayIrType>>
         + From<LinearCallOperation<ArrayIrType>>
+        + From<ParallelAllGatherOperation>
         + From<ParallelSumScatterOperation>
-        + From<DynamicReshapeOperation>
-        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
@@ -1104,12 +1106,152 @@ where
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The explicit output extents are retained as ordinary residuals. A varying or reduced result transposes to
-        // its adjoint sum-scatter, while an invariant result selects the current participant's chunk of the output
-        // cotangent in its transposed linear region.
-        if self.output_variance == ParallelAllGatherOutputVariance::Invariant {
-            return jvp_invariant_parallel_all_gather(self, context, inputs);
+        // its adjoint sum-scatter. An invariant result has no adjoint collective, so its tangent is one linear call
+        // whose transpose selects the current participant's chunk of the output cotangent using the retained input
+        // geometry and reshapes an untiled size-one participant axis away, like the homogeneous transposition rule.
+        if self.output_variance != ParallelAllGatherOutputVariance::Invariant {
+            return self.shape_changing_collective_jvp_in_parent(context, inputs);
         }
-        self.shape_changing_collective_jvp_in_parent(context, inputs)
+
+        let Some((array, _)) = inputs.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let tangent = match array.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+            MaybeZero::Value(array_tangent) => {
+                let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
+                let (array, output_extents) = tangent_inputs.split_first().unwrap();
+                let context = context.tangent();
+                let mut residuals = LinearResiduals::new();
+                let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                let input_shape = residuals.retain_shape(context, array.primal())?;
+                let forward_operation = self.clone();
+                let forward_output_extents = output_extents.clone();
+                let transpose_operation = self.clone();
+                let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
+                let tangent = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    vec![array_tangent.clone()],
+                    move |residuals, linear_inputs| {
+                        let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                        collective_inputs.push(linear_inputs[0].clone());
+                        collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                        linear_inputs[0].dispatch_domain().bind(
+                            forward_operation,
+                            Vec::new(),
+                            collective_inputs.as_slice(),
+                        )
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
+                        let output_cotangent_type = output_cotangents[0].r#type();
+                        let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
+                        let output_rank = output_cotangent_type.rank();
+                        let zero = transpose_context
+                            .bind(
+                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
+                                Vec::new(),
+                                &[],
+                            )?
+                            .remove(0);
+                        let chunk_extent = match transpose_operation.options().mode() {
+                            CollectiveMode::Tiled => input_dimensions[transpose_operation.concatenation_axis()].clone(),
+                            CollectiveMode::Untiled => transpose_context
+                                .bind(
+                                    DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
+                                    Vec::new(),
+                                    &[],
+                                )?
+                                .remove(0),
+                        };
+                        let start = if transpose_operation.axis_size() == 1 {
+                            zero.clone()
+                        } else {
+                            let mut axis_index_operation =
+                                AxisIndexOperation::new(transpose_operation.axis_name().to_string());
+                            if let Some(mesh) = transpose_operation.mesh() {
+                                axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
+                            }
+                            let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
+                            let axis_index_variable = DimensionVariable::new(
+                                format!("{}_index", transpose_operation.axis_name()),
+                                DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
+                            );
+                            let axis_index = transpose_context
+                                .bind(
+                                    DimensionFromScalarOperation::new(axis_index_variable),
+                                    Vec::new(),
+                                    std::slice::from_ref(&axis_index),
+                                )?
+                                .remove(0);
+                            let axis_index_type = <&DimensionType>::try_from(axis_index.r#type().as_ref())?.clone();
+                            let chunk_extent_type = <&DimensionType>::try_from(chunk_extent.r#type().as_ref())?.clone();
+                            transpose_context
+                                .bind(
+                                    DimensionOperation::Mul(DimensionMulOperation::new(
+                                        &axis_index_type,
+                                        &chunk_extent_type,
+                                    )?),
+                                    Vec::new(),
+                                    &[axis_index, chunk_extent.clone()],
+                                )?
+                                .remove(0)
+                        };
+                        let mut starts = vec![zero; output_rank];
+                        starts[transpose_operation.concatenation_axis()] = start;
+                        let mut slice_sizes = input_dimensions.clone();
+                        if transpose_operation.options().mode() == CollectiveMode::Untiled {
+                            slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
+                        }
+                        // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
+                        // every participant selects a different chunk of it, so the selected chunk varies over that
+                        // axis. The cotangent can carry a tangent itself (e.g., under nested differentiation), and so
+                        // it is made varying with a real `parallel_vary` transition, whose transpose is the
+                        // cross-device sum, rather than by retyping the selected chunk.
+                        let output_cotangent = match transpose_operation.mesh() {
+                            Some(_)
+                                if !output_cotangent_type.sharding().is_some_and(|sharding| {
+                                    sharding.varying_manual_axes().contains(transpose_operation.axis_name())
+                                }) =>
+                            {
+                                transpose_context.bind_array(
+                                    ParallelVaryOperation::new(transpose_operation.axis_name().to_string()),
+                                    std::slice::from_ref(&output_cotangents[0]),
+                                )?
+                            }
+                            _ => output_cotangents[0].clone(),
+                        };
+                        let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
+                        slice_inputs.push(output_cotangent);
+                        slice_inputs.extend(starts);
+                        slice_inputs.extend(slice_sizes);
+                        let selected = transpose_context
+                            .bind(
+                                DynamicSliceOperation::<ArrayIrType>::from_rank(output_rank),
+                                Vec::new(),
+                                slice_inputs.as_slice(),
+                            )?
+                            .remove(0);
+                        let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
+                        reshape_inputs.push(selected);
+                        reshape_inputs.extend(input_dimensions);
+                        transpose_context.bind(
+                            DynamicReshapeOperation::new()
+                                .with_output_sharding(transpose_target_type.sharding().cloned()),
+                            Vec::new(),
+                            reshape_inputs.as_slice(),
+                        )
+                    },
+                )?
+                .remove(0);
+                MaybeZero::Value(tangent)
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -1256,6 +1398,44 @@ impl ParallelAllGather<ArrayType> for Array {
     }
 }
 
+impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        concatenation_axis: ConcatenationAxis,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        // A concrete composite value performs the collective through its array member.
+        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
+            axis_name,
+            concatenation_axis,
+            options,
+            output_variance,
+        )?))
+    }
+}
+
+impl<V> ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
+where
+    V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    #[inline]
+    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
+        &self,
+        axis_name: &str,
+        concatenation_axis: ConcatenationAxis,
+        options: CollectiveOptions,
+        output_variance: ParallelAllGatherOutputVariance,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .parallel_all_gather_with_options(axis_name, concatenation_axis, options, output_variance)?
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
 impl<V> ParallelAllGather<ArrayType> for V
 where
     V: ShapeChangingCollectiveValue + ParallelVary,
@@ -1299,25 +1479,6 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType> + ParallelAllGather<ArrayType>> ParallelAllGather<ArrayIrType> for ArrayIrValue<A> {
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
-        &self,
-        axis_name: &str,
-        concatenation_axis: ConcatenationAxis,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        // A concrete composite value performs the collective through its array member.
-        let array = ValueProjection::<ArrayType>::into_projected(self.clone())?;
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(array.parallel_all_gather_with_options(
-            axis_name,
-            concatenation_axis,
-            options,
-            output_variance,
-        )?))
-    }
-}
-
 impl<V> ParallelAllGather<ArrayIrType> for V
 where
     V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType> + ValueProjection<ArrayType>,
@@ -1351,7 +1512,7 @@ where
             axis_name.to_string(),
             axis_size,
             concatenation_axis,
-            options.clone(),
+            options,
             output_variance,
         );
         let effective_axis_size = operation.effective_axis_size()?;
@@ -1367,7 +1528,7 @@ where
 
         let mut output_extents = (0..rank).map(|axis| input.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
         let participants = context.dimension_constant(effective_axis_size)?;
-        match options.mode {
+        match operation.options.mode {
             CollectiveMode::Untiled => output_extents.insert(concatenation_axis, participants),
             CollectiveMode::Tiled => {
                 let extent =
@@ -1382,183 +1543,6 @@ where
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
-}
-
-impl<V> ParallelAllGather<ArrayType> for ProjectedValue<ArrayType, V>
-where
-    V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-{
-    #[inline]
-    fn parallel_all_gather_with_options<ConcatenationAxis: Into<Axis>>(
-        &self,
-        axis_name: &str,
-        concatenation_axis: ConcatenationAxis,
-        options: CollectiveOptions,
-        output_variance: ParallelAllGatherOutputVariance,
-    ) -> Result<Self, ProgramError> {
-        self.value()
-            .parallel_all_gather_with_options(axis_name, concatenation_axis, options, output_variance)?
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-/// Applies the mixed array IR JVP for invariant all-gather. Its transpose selects the current participant's
-/// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away. Over a
-/// manual mesh axis, the invariant output cotangent is first made varying over that axis, because every participant
-/// selects a different chunk of it.
-fn jvp_invariant_parallel_all_gather<C, P: DifferentiationPolicy<C>>(
-    operation: &ParallelAllGatherOperation,
-    context: &DifferentiationContext<C, P>,
-    inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<ParallelAllGatherOperation>
-        + From<DimensionFromScalarOperation>
-        + From<DimensionSizeOperation>
-        + From<DynamicSliceOperation<ArrayIrType>>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<DynamicReshapeOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
-{
-    let Some((array, _)) = inputs.split_first() else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-    };
-    let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let primal = context.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-    let tangent = match array.tangent() {
-        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-        MaybeZero::Value(array_tangent) => {
-            let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
-            let (array, output_extents) = tangent_inputs.split_first().unwrap();
-            let context = context.tangent();
-            let mut residuals = LinearResiduals::new();
-            let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-            let input_shape = residuals.retain_shape(context, array.primal())?;
-            let forward_operation = operation.clone();
-            let forward_output_extents = output_extents.clone();
-            let transpose_operation = operation.clone();
-            let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
-            let tangent = LinearCallOperation::stage(
-                context,
-                residuals.into_values(),
-                vec![array_tangent.clone()],
-                move |residuals, linear_inputs| {
-                    let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
-                    collective_inputs.push(linear_inputs[0].clone());
-                    collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                    linear_inputs[0].dispatch_domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
-                },
-                move |residuals, output_cotangents| {
-                    let transpose_context = output_cotangents[0].dispatch_domain();
-                    let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
-                    let output_cotangent_type = output_cotangents[0].r#type();
-                    let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
-                    let output_rank = output_cotangent_type.rank();
-                    let zero = transpose_context
-                        .bind(
-                            DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
-                            Vec::new(),
-                            &[],
-                        )?
-                        .remove(0);
-                    let chunk_extent = match transpose_operation.options().mode() {
-                        CollectiveMode::Tiled => input_dimensions[transpose_operation.concatenation_axis()].clone(),
-                        CollectiveMode::Untiled => transpose_context
-                            .bind(
-                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
-                                Vec::new(),
-                                &[],
-                            )?
-                            .remove(0),
-                    };
-                    let start = if transpose_operation.axis_size() == 1 {
-                        zero.clone()
-                    } else {
-                        let mut axis_index_operation =
-                            AxisIndexOperation::new(transpose_operation.axis_name().to_string());
-                        if let Some(mesh) = transpose_operation.mesh() {
-                            axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
-                        }
-                        let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
-                        let axis_index_variable = DimensionVariable::new(
-                            format!("{}_index", transpose_operation.axis_name()),
-                            DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
-                        );
-                        let axis_index = transpose_context
-                            .bind(
-                                DimensionFromScalarOperation::new(axis_index_variable),
-                                Vec::new(),
-                                std::slice::from_ref(&axis_index),
-                            )?
-                            .remove(0);
-                        let axis_index_type = <&DimensionType>::try_from(axis_index.r#type().as_ref())?.clone();
-                        let chunk_extent_type = <&DimensionType>::try_from(chunk_extent.r#type().as_ref())?.clone();
-                        transpose_context
-                            .bind(
-                                DimensionOperation::Mul(DimensionMulOperation::new(
-                                    &axis_index_type,
-                                    &chunk_extent_type,
-                                )?),
-                                Vec::new(),
-                                &[axis_index, chunk_extent.clone()],
-                            )?
-                            .remove(0)
-                    };
-                    let mut starts = vec![zero; output_rank];
-                    starts[transpose_operation.concatenation_axis()] = start;
-                    let mut slice_sizes = input_dimensions.clone();
-                    if transpose_operation.options().mode() == CollectiveMode::Untiled {
-                        slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
-                    }
-                    // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
-                    // every participant selects a different chunk of it, so the selected chunk varies over that axis.
-                    // The cotangent can carry a tangent itself (e.g., under nested differentiation), and so it is
-                    // made varying with a real `parallel_vary` transition, whose transpose is the cross-device sum,
-                    // rather than by retyping the selected chunk.
-                    let output_cotangent = match transpose_operation.mesh() {
-                        Some(_)
-                            if !output_cotangent_type.sharding().is_some_and(|sharding| {
-                                sharding.varying_manual_axes().contains(transpose_operation.axis_name())
-                            }) =>
-                        {
-                            transpose_context.bind_array(
-                                ParallelVaryOperation::new(transpose_operation.axis_name().to_string()),
-                                std::slice::from_ref(&output_cotangents[0]),
-                            )?
-                        }
-                        _ => output_cotangents[0].clone(),
-                    };
-                    let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
-                    slice_inputs.push(output_cotangent);
-                    slice_inputs.extend(starts);
-                    slice_inputs.extend(slice_sizes);
-                    let selected = transpose_context
-                        .bind(
-                            DynamicSliceOperation::<ArrayIrType>::from_rank(output_rank),
-                            Vec::new(),
-                            slice_inputs.as_slice(),
-                        )?
-                        .remove(0);
-                    let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
-                    reshape_inputs.push(selected);
-                    reshape_inputs.extend(input_dimensions);
-                    transpose_context.bind(
-                        DynamicReshapeOperation::new().with_output_sharding(transpose_target_type.sharding().cloned()),
-                        Vec::new(),
-                        reshape_inputs.as_slice(),
-                    )
-                },
-            )?
-            .remove(0);
-            MaybeZero::Value(tangent)
-        }
-    };
-    Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
 #[cfg(test)]
@@ -1709,7 +1693,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::scalar(DataType::F32)],
-                    error = "`parallel_all_gather` concatenation axis 0 is out of bounds for rank 0",
+                    error = "`parallel_all_gather` concatenation axis 0 is out of bounds for output rank 0",
                 },
                 {
                     input_types = [ArrayType::new(
@@ -1730,13 +1714,19 @@ mod tests {
                 CollectiveOptions::default(),
                 ParallelAllGatherOutputVariance::Varying,
             ),
-            cases = [{
-                input_types = [ArrayType::new_static(DataType::F32, [2, 3])],
-                output_types = [ArrayType::new_static(DataType::F32, [2, 4, 3])],
-            }],
+            cases = [
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [2, 3])],
+                    output_types = [ArrayType::new_static(DataType::F32, [2, 4, 3])],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32)],
+                    error = "`parallel_all_gather` concatenation axis 1 is out of bounds for output rank 1",
+                },
+            ],
         );
 
-        // Invalid participant groups are reported before the input shape is examined.
+        // Participant groups combined with invariant output variance are rejected before the input shape is examined.
         check_operation_type_inference!(
             operation = ParallelAllGatherOperation::new(
                 "x".to_string(),
@@ -2069,92 +2059,65 @@ mod tests {
                 ArrayType::new_static(DataType::F32, [3]).into(),
                 DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
             ]),
-            Err(TypeError::invalid("`parallel_all_gather` concatenation axis 1 is out of bounds for rank 1")),
+            Err(TypeError::invalid("`parallel_all_gather` concatenation axis 1 is out of bounds for output rank 1")),
         );
-    }
 
-    #[test]
-    fn test_parallel_all_gather_type_inference_array_ir_untiled() {
-        // An untiled gather inserts a participant axis whose explicit extent must equal the axis group size.
-        let operation = ParallelAllGatherOperation::new(
+        // An untiled gather inserts a participant axis whose explicit extent must equal the axis group size, while the
+        // extents on either side of it must equal the unchanged input extents.
+        let untiled = ParallelAllGatherOperation::new(
             "x".to_string(),
             4,
             1,
             CollectiveOptions::default(),
             ParallelAllGatherOutputVariance::Varying,
         );
+        let extent =
+            |value: usize| -> ArrayIrType { DimensionValue::constant(value).unwrap().r#type().into_owned().into() };
         assert_eq!(
-            operation.infer_array_ir_output_types(&[
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])).into(),
-                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+            untiled.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [2, 3]).into(),
+                extent(2),
+                extent(4),
+                extent(3),
             ]),
-            Ok(vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]),
-                )
-                .into()
-            ]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2, 4, 3]).into()]),
         );
         assert_eq!(
-            operation.infer_array_ir_output_types(&[
+            untiled.infer_array_ir_output_types(&[
                 ArrayType::new_static(DataType::F32, [2, 3]).into(),
-                DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
-                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                extent(2),
+                extent(3),
+                extent(3),
             ]),
             Err(TypeError::invalid(
                 "`parallel_all_gather` inserted output axis 1 extent must equal axis group size 4 but got 3",
             )),
         );
-    }
-
-    #[test]
-    fn test_parallel_all_gather_type_inference_array_ir_untiled_unchanged_extents() {
-        let exact_two = DimensionValue::constant(2).unwrap().r#type().into_owned();
-        let exact_three = DimensionValue::constant(3).unwrap().r#type().into_owned();
-        let exact_four = DimensionValue::constant(4).unwrap().r#type().into_owned();
-        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
-
-        // Inserting an axis preserves the extents already projected into the base output type on either side.
-        let gather = ParallelAllGatherOperation::new(
-            "x".to_string(),
-            2,
-            1,
-            CollectiveOptions::default(),
-            ParallelAllGatherOutputVariance::Varying,
+        assert_eq!(
+            untiled.infer_array_ir_output_types(&[
+                ArrayType::new_static(DataType::F32, [2, 3]).into(),
+                extent(2),
+                extent(4),
+                extent(5),
+            ]),
+            Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 3")),
         );
         assert_eq!(
-            gather.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                exact_three.clone().into(),
-                exact_two.clone().into(),
-                exact_four.clone().into(),
-            ]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [3, 2, 4]).into()]),
+            untiled.infer_array_ir_output_types(&[ArrayType::scalar(DataType::F32).into(), extent(4)]),
+            Err(TypeError::invalid("`parallel_all_gather` concatenation axis 1 is out of bounds for output rank 1")),
         );
-        assert_eq!(
-            gather.infer_array_ir_output_types(&[
-                ArrayType::new_static(DataType::F32, [3, 4]).into(),
-                exact_three.clone().into(),
-                exact_two.clone().into(),
-                exact_five.into(),
-            ]),
-            Err(TypeError::invalid("`parallel_all_gather` output axis 2 extent 5 must equal unchanged extent 4")),
-        );
-    }
 
-    #[test]
-    fn test_parallel_all_gather_type_inference_array_ir_group_size() {
         // A grouped gather multiplies the concatenation extent by the size of one participant group rather than the
         // axis size.
-        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
-            ParallelAllGatherOperation::new("x".to_string(), 4, 0, grouped, ParallelAllGatherOutputVariance::Varying)
-                .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), result_extent.into()]),
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .infer_array_ir_output_types(&[ArrayType::new_static(DataType::F32, [3]).into(), extent(6)]),
             Ok(vec![ArrayType::new_static(DataType::F32, [6]).into()]),
         );
     }
@@ -3953,6 +3916,31 @@ mod tests {
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], unreduced={'x'}}] .
                 let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter \
                 [axis_name=\"x\", axis_size=2, scatter_axis=0, options=Tiled, mesh=['x'=2:manual]] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+
+        // A varying result over a manual mesh axis transposes to the sum-scatter over the same mesh, which keeps the
+        // untiled mode and scatter axis of the gather and returns the varying input cotangent.
+        let program = collective_program(
+            ParallelAllGatherOperation::new(
+                "x".to_string(),
+                2,
+                1,
+                CollectiveOptions::default(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+            .with_mesh(mesh.clone()),
+            input_type.clone(),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] .
+                let %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_sum_scatter \
+                [axis_name=\"x\", axis_size=2, scatter_axis=1, options=Untiled, mesh=['x'=2:manual]] %0
                 in (%1)"
             },
         );
