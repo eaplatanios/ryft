@@ -70,7 +70,7 @@ quote = "1.0.44"
 reqwest = { version = "0.13.2", features = ["blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 # During development/debugging of our macros it may be useful to add the `extra-traits` feature to aid with debugging.
 # However, it should generally be disabled for releases in order to speed up compile times. Currently though, we have
 # to keep it enabled because our macro library relies on the implementation of [PartialEq] for [syn::Path]s.
@@ -90,3 +90,13 @@ zip = "8.1.0"
 
 [profile.test]
 debug = 0
+
+# On macOS, a main executable must fit in the 2 GiB between its load address (`0x100000000`) and the dyld shared cache
+# (`0x180000000`). Otherwise, the cache fails to map and `dyld` aborts with missing system libraries (e.g., `libiconv`).
+# The unit test binary of `ryft-core` exceeds that once its symbol table holds the `v0`-mangled names that recent
+# toolchains use by default (e.g., 1.99.0), which spell out every generic argument. Stripping its local symbols (which
+# `strip = "symbols"` does on macOS, keeping the global ones) shrinks it from 2.2 GB to well within the limit at the
+# of writing of this comment. Panic messages keep their locations, but the frames of `RUST_BACKTRACE` backtraces in
+# this binary are unnamed.
+[profile.test.package.ryft-core]
+strip = "symbols"
