@@ -10263,8 +10263,7 @@ mod tests {
 
     #[test]
     fn test_compiled_dynamic_slice_runtime_input_pullback() {
-        use ryft_core::operations::DimensionConstant;
-        use ryft_core::{Add, Div};
+        use ryft_core::{Add, DimensionConstant, Div};
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);

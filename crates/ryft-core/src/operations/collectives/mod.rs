@@ -208,7 +208,25 @@ impl CollectiveOptions {
         Self::new(CollectiveMode::Tiled)
     }
 
-    /// Returns this [`CollectiveOptions`] instance with the provided ordered participant groups.
+    /// Returns this [`CollectiveOptions`] instance with the provided ordered participant groups. A grouped
+    /// collective exchanges data only among the members of each group, and every count `n` in the shape rules of
+    /// [`CollectiveMode`] becomes the common group size. The order within a group defines the position of each member,
+    /// and positions rather than axis indices route the data:
+    ///
+    ///   - An all-gather places the input of the member at position `p` at index or chunk `p` of the gathered axis.
+    ///   - A sum-scatter sums the inputs of the group members and gives chunk `p` of that sum to the member at
+    ///     position `p`.
+    ///   - An all-to-all sends chunk `p` of the split axis of every member to the member at position `p`, which
+    ///     stacks or concatenates the chunks that it receives in the order of their senders' positions.
+    ///
+    /// For example, with groups `[[0, 2], [3, 1]]`, the tiled all-gather result of participants `3` and `1` holds the
+    /// input of participant `3` followed by that of participant `1`. The groups are validated when the collective is
+    /// staged rather than here.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_index_groups`: Participant groups, each listing axis indices of the named axis, that together
+    ///     partition all of its indices into groups of equal size.
     #[inline]
     pub fn with_axis_index_groups(mut self, axis_index_groups: Vec<Vec<usize>>) -> Self {
         self.axis_index_groups = Some(axis_index_groups);

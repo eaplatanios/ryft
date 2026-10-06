@@ -13,15 +13,13 @@ use serde::Serialize;
 use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
 };
-use ryft_core::operations::collectives::{
-    CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelSumScatter,
-};
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
-    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelPermute, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape,
+    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, ConvertElementTypeOperation, DataType, Device,
+    DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
+    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
+    MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute,
+    ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape,
     Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};

@@ -1,10 +1,9 @@
 use ryft_core::macros::check_count;
-use ryft_core::operations::collectives::ShapeChangingCollectiveValue;
 use ryft_core::{
     Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Concretizable, Context,
     DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
     DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
-    Select, Sub, Typed, Value, WhilePredicate, XorOperation,
+    Select, ShapeChangingCollectiveValue, Sub, Typed, Value, WhilePredicate, XorOperation,
 };
 
 use crate::arrays_v0::host::materialize_dense_array_bytes;

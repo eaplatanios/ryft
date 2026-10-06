@@ -2187,13 +2187,11 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::collectives::{
-        CollectiveOptions, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll,
-    };
     use ryft_core::{
-        Array, BatchAxis, BatchAxisSpecification, DataType, Device, DeviceMesh, Differentiate, DimensionBounds,
-        DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Mul, Reduce, ReductionKind, RegionRole,
-        Sharding, ShardingDimension, Sin, batch,
+        Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, DataType, Device, DeviceMesh, Differentiate,
+        DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis, MeshAxisType, Mul, ParallelAllGather,
+        ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, Reduce, ReductionKind, RegionRole, Sharding,
+        ShardingDimension, Sin, batch,
     };
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -7020,7 +7018,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_shape_changing_collectives_execute_on_cpu() {
-        use ryft_core::operations::collectives::{ParallelAllToAll, ParallelSumScatter};
+        use ryft_core::{ParallelAllToAll, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7149,7 +7147,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_parallel_sum_scatter_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{CollectiveOptions, ParallelSumScatter};
+        use ryft_core::{CollectiveOptions, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7270,7 +7268,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_untiled_parallel_sum_scatter_lowers_rank_removal() {
-        use ryft_core::operations::collectives::{CollectiveOptions, ParallelSumScatter};
+        use ryft_core::{CollectiveOptions, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7593,7 +7591,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_parallel_all_to_all_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{CollectiveOptions, ParallelAllToAll};
+        use ryft_core::{CollectiveOptions, ParallelAllToAll};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7707,7 +7705,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_untiled_parallel_all_to_all_lowers_rank_exchange() {
-        use ryft_core::operations::collectives::ParallelAllToAll;
+        use ryft_core::ParallelAllToAll;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

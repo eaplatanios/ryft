@@ -10,10 +10,6 @@ use ryft_core::operations::attention::{
     AttentionInputs, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
-use ryft_core::operations::collectives::{
-    CollectiveMode, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
-    ParallelRaggedAllToAllOperation, ParallelSumScatterOperation,
-};
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
@@ -21,22 +17,23 @@ use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
     CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
-    CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ComplexOperation, ConjugateOperation,
-    ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME,
-    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
-    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
+    CaptureReference, CeilOperation, ClampOperation, CollectiveMode, ComparisonDirection, ComplexOperation,
+    ConjugateOperation, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
+    DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation,
+    DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, ImaginaryOperation, Instruction,
     IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
     LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, ParallelReduceOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
-    Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
-    RandomAlgorithm, RealOperation, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
-    RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RngBitGeneratorOperation, RoundOperation,
-    RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
-    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
-    SinOperation, SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation,
-    TanOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
-    WhileOperation,
+    PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
+    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, Parameterized, PowOperation,
+    Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME,
+    RaggedDotMode, RaggedDotOperation, RandomAlgorithm, RealOperation, ReducePrecisionOperation, ReductionKind,
+    RegionId, RegionRef, RemOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation,
+    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME,
+    ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
+    SortOrdering, SqrtOperation, SubOperation, TanOperation, TanhOperation, TransposeOperation, Type as RyftType,
+    TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -16838,7 +16835,7 @@ mod tests {
 
     #[test]
     fn test_manual_collective_lowering_revalidates_raw_bindings() {
-        use ryft_core::operations::collectives::CollectiveOptions;
+        use ryft_core::CollectiveOptions;
 
         let mesh = test_manual_mesh("x", 2);
         let replicated = Sharding::replicated(mesh.clone(), 1);
@@ -16889,8 +16886,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_manual_collective_lowering_revalidates_dynamic_raw_bindings() {
-        use ryft_core::operations::collectives::CollectiveOptions;
-        use ryft_core::{ArrayIrOperation, MemberOperation};
+        use ryft_core::{ArrayIrOperation, CollectiveOptions, MemberOperation};
 
         let mesh = test_manual_mesh("x", 2);
         let replicated = Sharding::replicated(mesh.clone(), 1);

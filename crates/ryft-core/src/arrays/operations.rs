@@ -14,13 +14,11 @@ use crate::differentiation::{
     MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
     TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
+// TODO(eaplatanios): Import from `crate::operations` directly.
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
-use crate::operations::collectives::{
-    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelSumScatterOperation,
-};
+// TODO(eaplatanios): Import from `crate::operations` directly.
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
@@ -38,16 +36,18 @@ use crate::operations::{
     FloorOperation, GatherOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
     Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
     MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
-    OrOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
-    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
-    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation,
-    SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
+    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
+    PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
+    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation, ShardingOperations,
+    SignOperation, SinOperation, SliceOperation, Sort, SortOperation, SqrtOperation, StopGradient,
+    StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -999,14 +999,14 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::collectives::{CollectiveMode, CollectiveOptions, ParallelAllGatherOutputVariance};
     use crate::operations::{
-        AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
-        CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
-        MulOperation, RandomAlgorithm, ReduceOperation, ReductionKind, RematerializationOptimizationBarrier,
-        ScanOperation, SinOperation, WhileOperation, ZeroOperation,
+        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, ConcatenateOperation,
+        ConditionOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
+        CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
+        DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation,
+        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation, WhileOperation,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
