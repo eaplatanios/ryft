@@ -2,10 +2,10 @@ use std::fmt::Display;
 
 use ryft_macros::capability;
 
-use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, Dimension, DimensionVariable, LogicalMesh, Shape, Sharding, ShardingDimension,
+    ArrayType, DataType, Dimension, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, Shape, Sharding,
+    ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
@@ -49,9 +49,9 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
-    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError,
+    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1856,7 +1856,7 @@ mod tests {
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer};
-    use crate::programs::{Program, ProgramBuilder, ProgramRenderingMode};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};
 
     use super::*;
 

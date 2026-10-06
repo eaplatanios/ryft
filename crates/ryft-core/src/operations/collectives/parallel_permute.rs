@@ -89,6 +89,15 @@ pub struct ParallelPermuteOperation {
 
 impl ParallelPermuteOperation {
     /// Creates a new [`ParallelPermuteOperation`] over the axis with the provided name and resolved axis size.
+    /// Construction preserves the supplied pairs, while type inference validates them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis whose participants exchange their inputs.
+    ///   - `axis_size`: Number of participants along `axis_name`, resolved when the operation is staged.
+    ///   - `source_target_pairs`: Pairs of `(source, target)` coordinates in `0..axis_size` along `axis_name`, with
+    ///     unique sources and unique targets. Each pair sends the entire input of participant `source` to participant
+    ///     `target`, and every participant that no pair targets receives zeros.
     #[inline]
     pub fn new(axis_name: String, axis_size: usize, source_target_pairs: Vec<(usize, usize)>) -> Self {
         Self { axis_name, axis_size, source_target_pairs, mesh: None }
@@ -666,10 +675,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue,
-        DimensionVariable, Layout, Memory, MeshAxis, Shape, Sharding, StridedLayout,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, Memory, MeshAxis, Shape, Sharding, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
