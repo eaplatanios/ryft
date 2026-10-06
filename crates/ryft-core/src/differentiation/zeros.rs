@@ -298,7 +298,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<
 
 /// Role of a differential boundary whose zero-space leaves are reconstructed by [`ZeroSpaceBoundaryReconstruction`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ZeroSpaceBoundaryRole {
+pub(crate) enum ZeroSpaceBoundaryRole {
     /// Cotangents of the primal input boundary, returned by a _pullback_ function.
     InputCotangent,
 
@@ -368,7 +368,7 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 /// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
 /// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
 /// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
-pub struct ZeroSpaceBoundaryReconstruction<V: Value> {
+pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
     /// Semantic role of the differential boundary reconstructed by this instance.
     role: ZeroSpaceBoundaryRole,
 
@@ -403,7 +403,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
     /// captures residual values whose count or types disagree with its declaration.
-    pub fn capture<
+    pub(crate) fn capture<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
     >(
         context: &C,
@@ -455,7 +455,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Returns a [`ProgramError`] if a zero cannot be materialized or if `live_values` does not contain exactly one
     /// value for every nonzero-space boundary leaf.
-    pub fn rebuild<
+    pub(crate) fn rebuild<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
         I: IntoIterator<Item = C::Value>,
     >(
@@ -500,7 +500,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// # Errors
     ///
     /// Propagates zero-materialization and callback errors unchanged, stopping before processing subsequent leaves.
-    pub fn rebuild_with<
+    pub(crate) fn rebuild_with<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
         R,
         F: FnMut(usize, Option<V>) -> Result<R, ProgramError>,

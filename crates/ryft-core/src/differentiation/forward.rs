@@ -587,7 +587,7 @@ impl<
     ///     which the tangent references supplied to [`apply`](Self::apply) must not alias.
     ///   - `output_structure`: Parameter structure used to rebuild the complete public tangent output after typed
     ///     zeros have been inserted for the omitted leaves.
-    pub fn new(
+    pub(crate) fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,

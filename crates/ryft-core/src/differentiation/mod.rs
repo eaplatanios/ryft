@@ -217,7 +217,7 @@ pub use reverse::{
     transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
-pub use zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
+pub use zeros::ResidualZeroProvider;
 
 /// Represents differentiation-related errors.
 ///
