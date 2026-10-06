@@ -1885,10 +1885,13 @@ mod tests {
         // of the operation families they pair with.
         fn requires_array_operations<V: ArrayOperations>() {}
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
+        fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
 
         requires_array_operations::<Array<'static>>();
         requires_array_operations::<ShardMapTracer>();
-        requires_array_operations::<ryft_core::ArrayIrValue<Array<'static>>>();
+        requires_array_operations::<crate::XlaValue<'static>>();
+        requires_array_ir_operations::<crate::XlaValue<'static>>();
+        requires_dimension_operations::<crate::XlaDimension<'static>>();
         requires_array_operations::<XlaTracer<'static>>();
         requires_array_ir_operations::<XlaTracer<'static>>();
         requires_array_ir_operations::<Tracer<TracingContext<XlaConstant, XlaOperation>>>();

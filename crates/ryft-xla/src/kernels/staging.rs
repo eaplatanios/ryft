@@ -1359,7 +1359,7 @@ pub(crate) mod tests {
             .zip(program.input_types())
             .map(|(value, r#type)| {
                 let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
-                ArrayIrValue::Array(
+                crate::XlaValue::Array(
                     crate::Array::from_host_buffer(&domain, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
                 )
             })
@@ -1368,7 +1368,7 @@ pub(crate) mod tests {
             .unwrap()
             .into_iter()
             .map(|value| {
-                let ArrayIrValue::Array(value) = value else { panic!("derivative returned a non-array value") };
+                let crate::XlaValue::Array(value) = value else { panic!("derivative returned a non-array value") };
                 value.block_until_ready().unwrap();
                 let bytes = value
                     .addressable_shards()

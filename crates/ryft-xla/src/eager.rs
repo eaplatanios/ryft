@@ -1,10 +1,10 @@
 use ryft_core::macros::check_count;
 use ryft_core::operations::collectives::ShapeChangingCollectiveValue;
 use ryft_core::{
-    Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Compare, ComparisonDirection,
-    Concretizable, Context, DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
-    DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation,
-    Operation, OrOperation, ProgramError, Select, Sub, Typed, Value, WhilePredicate, XorOperation,
+    Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Concretizable, Context,
+    DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
+    DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
+    Select, Sub, Typed, Value, WhilePredicate, XorOperation,
 };
 
 use crate::arrays_v0::host::materialize_dense_array_bytes;
@@ -173,21 +173,6 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
             _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
         };
         Ok(DimensionValue::new(output_type, extent)?)
-    }
-}
-
-// Comparing two first-class dimensions produces a Boolean array, and an XLA array can only be created inside a
-// session-backed `XlaDomain`, which two dimension values cannot provide. Concrete composite values over XLA arrays
-// (e.g., `ArrayIrValue<Array>`) therefore report that such a comparison needs a domain, consistently with the
-// projection errors of their other dimension-member operations, while comparisons staged in an `XlaDomain` context
-// are supported.
-impl<'o> Compare<Array<'o>> for DimensionValue {
-    fn compare(&self, _other: &Self, _direction: ComparisonDirection) -> Result<Array<'o>, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "eagerly comparing first-class dimensions over XLA arrays requires an `XlaDomain` to hold the \
-                      Boolean result; compare them in an `XlaDomain` context instead"
-                .to_string(),
-        })
     }
 }
 
@@ -2363,8 +2348,8 @@ mod tests {
             CustomCallRaggedOutputBinding,
         };
         use ryft_core::{
-            ArrayBatch, ArrayBatchingPolicy, ArrayIrValue, BatchableOperation, BatchingContext, DimensionValue,
-            EmptyRegionDriver, RaggedAxis, ReduceOperation,
+            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, DimensionValue, EmptyRegionDriver,
+            RaggedAxis, ReduceOperation,
         };
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2400,7 +2385,10 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             input.execution_domain(),
-            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+            crate::XlaValue::Dimension(crate::XlaDimension::new(
+                DimensionValue::constant(3).unwrap(),
+                input.domain().clone(),
+            )),
         );
         let data = ArrayBatch::new(input, BatchAxis::new(0))
             .unwrap()
@@ -4702,20 +4690,5 @@ mod tests {
         let output: Array<'_> =
             batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(read_f32s(&output), vec![1.0, 4.0, 9.0]);
-    }
-
-    #[test]
-    fn test_eager_dimension_compare() {
-        // Comparing two first-class dimensions into an XLA array needs a session-backed domain to hold the result.
-        let extent = DimensionValue::constant(2).unwrap();
-        assert_eq!(
-            Compare::<Array<'static>>::compare(&extent, &extent, ComparisonDirection::Equal),
-            Err(ProgramError::UnsupportedOperation {
-                message:
-                    "eagerly comparing first-class dimensions over XLA arrays requires an `XlaDomain` to hold the \
-                          Boolean result; compare them in an `XlaDomain` context instead"
-                        .to_string(),
-            }),
-        );
     }
 }

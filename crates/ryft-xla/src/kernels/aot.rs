@@ -374,7 +374,7 @@ impl<'c> LoadedKernel<'c> {
 #[cfg(test)]
 pub(crate) mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayIrValue, DataType, Device, LogicalMesh, Typed};
+    use ryft_core::{DataType, Device, LogicalMesh, Typed};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::kernels::staging::tests::binding;
@@ -428,7 +428,7 @@ pub(crate) mod tests {
     ) -> KernelAotBundle {
         let r#type = ArrayType::scalar(data_type);
         let captures = if capture {
-            vec![ArrayIrValue::Array(
+            vec![crate::XlaValue::Array(
                 Array::from_host_buffer(domain, r#type.clone(), mesh.clone(), 7i32.to_ne_bytes()).unwrap(),
             )]
         } else {

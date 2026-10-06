@@ -12,6 +12,7 @@ pub mod profile_guided;
 pub mod sharding;
 pub mod telemetry;
 pub mod types;
+pub mod values;
 
 pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
 pub use arrays_v0::ArrayError;
@@ -37,6 +38,7 @@ pub use profile_guided::{
     AdaptiveProfileGuidedXlaFunction,
 };
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
+pub use values::{XlaDimension, XlaReference, XlaValue};
 
 #[cfg(test)]
 pub(crate) mod tests {

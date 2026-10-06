@@ -14,18 +14,19 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, BatchingError,
-    BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
-    Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
-    DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, ExternalReferenceBinding,
-    InterpretableOperation, InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType,
-    ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
-    ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
-    ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
-    RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection,
-    SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, StageRequest, StagedFunction,
-    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
-    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
+    BindingRegionDriver, CallRequest, Compare, CompilationCacheDomain, CompilationContext, CompilationDomain,
+    CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
+    DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
+    DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
+    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, InterpretationDriver, Layout, LogicalMesh,
+    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
+    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape,
+    Sharding, ShardingDimension, SortDirection, SpecializationCache, SpecializationCacheEntry,
+    SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
+    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
+    Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -52,7 +53,7 @@ use crate::experimental::operations::ShardMapOperation;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
 use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
-use crate::{Array, ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt};
+use crate::{Array, ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt, XlaDimension, XlaValue};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -909,6 +910,11 @@ fn ensure_effect_dispatch_allowed() -> Result<(), XlaDomainError> {
 /// and is therefore backed by a live PJRT client: tracing only uses the domain as a type witness and never needs a
 /// clientless instance, while compiling ahead of time without devices requires a compile-target abstraction rather
 /// than an execution domain without a client.
+///
+/// The concrete values of this domain are [`XlaValue`]s, every member of which carries the domain that it belongs to.
+/// Composite values therefore dispatch their capabilities through this domain eagerly, free transform entry points
+/// recover it from their inputs, and first-class dimensions can produce arrays (e.g., when compared or converted to
+/// scalars) without an explicit context.
 pub struct XlaDomain<'c> {
     /// Session that owns the client, compilation cache, default effect scope, and kernel runtimes of this domain.
     session: Arc<XlaSession<'c>>,
@@ -1019,9 +1025,9 @@ impl<'c> XlaDomain<'c> {
         Self { compilation_options: Arc::new(compilation_options), ..self.clone() }
     }
 
-    /// Test-only builder that attaches a concrete [`DeviceMesh`] to a sibling of this domain. Used by XLA-internal unit
+    /// Returns a sibling of this domain that places mesh-less eager outputs on `mesh`. Used to keep arrays derived from
+    /// a first-class dimension on the mesh of the array that the dimension was read from, and by XLA-internal unit
     /// tests that exercise the [`Self::constant`] materialization helper.
-    #[cfg(test)]
     pub(crate) fn with_mesh(&self, mesh: DeviceMesh) -> Self {
         Self { mesh: Some(mesh), ..self.clone() }
     }
@@ -1111,7 +1117,7 @@ impl<'c> XlaDomain<'c> {
 
 impl<'c> Domain for XlaDomain<'c> {
     type Type = ArrayIrType;
-    type Value = ArrayIrValue<Array<'c>>;
+    type Value = XlaValue<'c>;
     type Constant = XlaConstant;
     type Operation = XlaOperation;
 }
@@ -1131,22 +1137,15 @@ impl<'c> Context for XlaDomain<'c> {
     /// [`XlaConstant::Captured`] payload is a symbolic index into a compiled function's capture table carrying only a
     /// type and no data, so there is nothing to materialize without the surrounding capture table and lifting it is
     /// always rejected.
-    fn lift(&self, constant: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
+    fn lift(&self, constant: XlaConstant) -> Result<XlaValue<'c>, ProgramError> {
         match constant {
             XlaConstant::Captured(constant) => Err(TypeError::invalid(format!(
                 "xla captured constant {constant} requires a captured program capture table"
             ))
             .into()),
-            XlaConstant::Dimension(value) => Ok(ArrayIrValue::Dimension(value)),
+            XlaConstant::Dimension(value) => Ok(XlaValue::Dimension(XlaDimension::new(value, self.clone()))),
             XlaConstant::Boolean(value) => {
-                let output_type = ArrayType::scalar(DataType::Boolean);
-                let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
-                let output_type = output_type
-                    .replicated(&mesh)
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                let output = Array::from_host_buffer(self, output_type, mesh, [u8::from(value)])
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                Ok(ArrayIrValue::Array(output))
+                Ok(XlaValue::Array(self.eager_scalar(DataType::Boolean, &[u8::from(value)])?))
             }
         }
     }
@@ -1180,7 +1179,7 @@ impl<'c> Context for XlaDomain<'c> {
             if self.mesh.is_some() {
                 let kind = if name == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
                 let value = self.constant(&array_type, kind).map_err(|error| TypeError::invalid(error.to_string()))?;
-                return Ok(vec![ArrayIrValue::Array(value)]);
+                return Ok(vec![XlaValue::Array(value)]);
             }
         }
         self.eager_bind(operation, driver, inputs)
@@ -1221,8 +1220,8 @@ impl<'c> Context for XlaDomain<'c> {
 // The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
 // compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
 // available through this type-only capability because they require explicit first-class extent operands.
-impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
-    fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
+impl<'c> Zero<XlaValue<'c>> for XlaDomain<'c> {
+    fn zero(&self, r#type: &ArrayIrType) -> Result<XlaValue<'c>, ProgramError> {
         let mut outputs =
             self.bind(XlaOperation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
@@ -1236,8 +1235,8 @@ impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
 // capture table. The implementation exists because interpretation- and batching-capable operation families require a
 // [`Constant`] leaf on their contexts; programs whose constants were compiled into capture tables never take the
 // captured path.
-impl<'c> Constant<ArrayIrValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
-    fn constant(&self, value: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
+impl<'c> Constant<XlaValue<'c>, XlaConstant> for XlaDomain<'c> {
+    fn constant(&self, value: XlaConstant) -> Result<XlaValue<'c>, ProgramError> {
         self.lift(value)
     }
 }
@@ -1255,8 +1254,8 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType>
         &self,
         context: &XlaDomain<'c>,
         driver: &D,
-        inputs: &[ArrayIrValue<Array<'c>>],
-    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
+        inputs: &[XlaValue<'c>],
+    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
@@ -1276,8 +1275,8 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant
         &self,
         _context: &XlaDomain<'c>,
         _driver: &D,
-        _inputs: &[ArrayIrValue<Array<'c>>],
-    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
+        _inputs: &[XlaValue<'c>],
+    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "eager shard_map replay must bind through a client-backed domain context".to_string(),
         })
@@ -1318,6 +1317,46 @@ fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Executes `operation` eagerly on host-side reference handles if it is a reference operation, and returns
+    /// [`None`] otherwise. Reference operations act on shared handles rather than on device computations, so they
+    /// execute through the generic [`ArrayIrValue`] reference implementations in `ryft-core` (which own handle
+    /// validation and locking), and new references are bound to this domain.
+    fn eager_reference_bind(
+        &self,
+        operation: &XlaOperation,
+        inputs: &[XlaValue<'c>],
+    ) -> Option<Result<Vec<XlaValue<'c>>, ProgramError>> {
+        let context = EagerContext::<ArrayIrValue<Array<'c>>>::new();
+        let inputs = || inputs.iter().cloned().map(XlaValue::into_array_ir_value).collect::<Vec<_>>();
+        let outputs = match operation {
+            XlaOperation::ReferenceNew(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            XlaOperation::ReferenceRead(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            XlaOperation::ReferenceWrite(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            XlaOperation::ReferenceSwap(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            XlaOperation::ReferenceAddUpdate(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            XlaOperation::ReferenceAtomicAddUpdate(operation) => {
+                operation.interpret(&context, &EmptyRegionDriver, &inputs())
+            }
+            XlaOperation::ReferenceFreeze(operation) => operation.interpret(&context, &EmptyRegionDriver, &inputs()),
+            _ => return None,
+        };
+        Some(
+            outputs
+                .map(|outputs| outputs.into_iter().map(|output| XlaValue::from_array_ir_value(output, self)).collect()),
+        )
+    }
+
+    /// Uploads a replicated scalar with the provided host `bytes` and `data_type`, placed through [`Self::eager_mesh`].
+    fn eager_scalar(&self, data_type: DataType, bytes: &[u8]) -> Result<Array<'c>, ProgramError> {
+        let output_type = ArrayType::scalar(data_type);
+        let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
+        let output_type = output_type
+            .replicated(&mesh)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        Array::from_host_buffer(self, output_type, mesh, bytes)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+    }
+
     /// Eagerly executes one staged operation on concrete input [`Array`]s — the JAX-style op-by-op dispatch path
     /// behind [`Context::bind`].
     ///
@@ -1332,13 +1371,22 @@ impl<'c> XlaDomain<'c> {
     /// operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their nested programs as attached
     /// regions and flow through this same path, and the compiler handles their control flow, so no host interpreter
     /// loops are needed.
+    ///
+    /// Work that involves no device computation never reaches the compile cache. Reference operations act on host-side
+    /// handles (refer to [`Self::eager_reference_bind`]), while dimension operations, dimension comparisons, and the
+    /// conversions between dimensions and scalars are decided on the host, and only their array results are uploaded
+    /// (refer to [`Self::eager_scalar`]). Reference operands of any other operation, and reference state carried by
+    /// attached regions, are rejected because XLA eager execution lowers each operation.
     fn eager_bind<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
         &self,
         operation: XlaOperation,
         driver: D,
-        inputs: &[ArrayIrValue<Array<'c>>],
-    ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
-        if inputs.iter().any(|input| matches!(input, ArrayIrValue::Reference(_))) {
+        inputs: &[XlaValue<'c>],
+    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
+        if let Some(outputs) = self.eager_reference_bind(&operation, inputs) {
+            return outputs;
+        }
+        if inputs.iter().any(|input| matches!(input, XlaValue::Reference(_))) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "XLA eager execution lowers each operation and cannot bind a reference operand; discharge \
                           references before lowering"
@@ -1371,7 +1419,8 @@ impl<'c> XlaDomain<'c> {
             let inputs = inputs
                 .iter()
                 .map(|input| {
-                    <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<DimensionType>>::projected(input).cloned()
+                    <XlaValue<'c> as ryft_core::ValueProjection<DimensionType>>::projected(input)
+                        .map(|dimension| dimension.value().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().bind(
@@ -1379,7 +1428,10 @@ impl<'c> XlaDomain<'c> {
                 Vec::new(),
                 inputs.as_slice(),
             )?;
-            return Ok(outputs.into_iter().map(ArrayIrValue::Dimension).collect());
+            return Ok(outputs
+                .into_iter()
+                .map(|output| XlaValue::Dimension(XlaDimension::new(output, self.clone())))
+                .collect());
         }
         if let XlaOperation::DimensionSize(operation) = &operation {
             if driver.regions().count() != 0 {
@@ -1387,9 +1439,11 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            let array = <XlaValue<'c> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             let extent = array.dimension_size(operation.axis())?;
-            return Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?)]);
+            // Arrays derived from this dimension are placed on the mesh of the array that it was read from.
+            let value = DimensionValue::new(operation.output_type().clone(), extent)?;
+            return Ok(vec![XlaValue::Dimension(XlaDimension::new(value, self.with_mesh(array.mesh().clone())))]);
         }
         if let XlaOperation::DimensionFromScalar(operation) = &operation {
             if driver.regions().count() != 0 {
@@ -1397,8 +1451,10 @@ impl<'c> XlaDomain<'c> {
             }
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-            let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            return Ok(vec![ArrayIrValue::Dimension(array.to_dimension(operation.output_type().variable().clone())?)]);
+            let array = <XlaValue<'c> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
+            // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
+            let value = array.to_dimension(operation.output_type().variable().clone())?;
+            return Ok(vec![XlaValue::Dimension(XlaDimension::new(value, self.with_mesh(array.mesh().clone())))]);
         }
 
         if matches!(&operation, XlaOperation::DimensionToScalar(_)) {
@@ -1406,24 +1462,30 @@ impl<'c> XlaDomain<'c> {
                 return Err(TypeError::invalid("dimension_to_scalar does not accept attached regions").into());
             }
             check_count!("input", inputs, 1, ProgramError);
-            let dimension =
-                <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
-            let extent = i64::try_from(dimension.extent()).unwrap();
-            let output_type = ArrayType::scalar(DataType::I64);
-            let mesh = self.eager_mesh(&[], std::slice::from_ref(&output_type))?;
-            let output_type = output_type
-                .replicated(&mesh)
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            let output = Array::from_host_buffer(self, output_type, mesh, extent.to_ne_bytes().as_slice())
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            return Ok(vec![ArrayIrValue::Array(output)]);
+            let dimension = <XlaValue<'c> as ryft_core::ValueProjection<DimensionType>>::projected(&inputs[0])?;
+            let extent = i64::try_from(dimension.value().extent()).unwrap();
+            return Ok(vec![XlaValue::Array(self.eager_scalar(DataType::I64, extent.to_ne_bytes().as_slice())?)]);
+        }
+        if let XlaOperation::Compare(operation) = &operation
+            && let [XlaValue::Dimension(left), XlaValue::Dimension(right)] = inputs
+        {
+            if driver.regions().count() != 0 {
+                return Err(TypeError::invalid("compare does not accept attached regions").into());
+            }
+            // Both extents are concrete, so the predicate is decided on the host by the comparison of first-class
+            // dimensions (which proves it from their types and extents), instead of compiling a program per extent
+            // pair. Only the Boolean result is materialized in this domain.
+            let output =
+                Compare::<ArrayIrValue<ryft_core::Array>>::compare(left.value(), right.value(), operation.direction())?;
+            let output = Concretizable::<bool>::concretize(&output)?;
+            return Ok(vec![XlaValue::Array(self.eager_scalar(DataType::Boolean, &[u8::from(output)])?)]);
         }
 
         let array_inputs = inputs
             .iter()
             .filter_map(|input| match input {
-                ArrayIrValue::Array(array) => Some(array.clone()),
-                ArrayIrValue::Dimension(_) | ArrayIrValue::Reference(_) => None,
+                XlaValue::Array(array) => Some(array.clone()),
+                XlaValue::Dimension(_) | XlaValue::Reference(_) => None,
             })
             .collect::<Vec<_>>();
 
@@ -1478,7 +1540,7 @@ impl<'c> XlaDomain<'c> {
         let outputs = self
             .execute_xla_program(&compiled, array_inputs)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        Ok(outputs.into_iter().map(ArrayIrValue::Array).collect())
+        Ok(outputs.into_iter().map(XlaValue::Array).collect())
     }
 
     /// Traces one eager operation application into a single-instruction program over the inputs' physical types
@@ -1488,7 +1550,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         operation: XlaOperation,
         driver: D,
-        inputs: &[ArrayIrValue<Array<'c>>],
+        inputs: &[XlaValue<'c>],
         array_inputs: &[Array<'c>],
     ) -> Result<Arc<XlaCompiledProgram<'c>>, ProgramError> {
         // Trace the single-instruction program, attaching the provided region bodies to that instruction.
@@ -1503,10 +1565,9 @@ impl<'c> XlaDomain<'c> {
             let input_atoms = inputs
                 .iter()
                 .map(|input| match input {
-                    ArrayIrValue::Array(array) => {
-                        Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned())))
-                    }
-                    ArrayIrValue::Dimension(dimension) => {
+                    XlaValue::Array(array) => Ok(builder.add_input(ArrayIrType::Array(array.r#type().into_owned()))),
+                    XlaValue::Dimension(dimension) => {
+                        let dimension = dimension.value();
                         if let Some(&atom) = dimension_atoms.get(dimension) {
                             return Ok(atom);
                         }
@@ -1520,7 +1581,7 @@ impl<'c> XlaDomain<'c> {
                         dimension_atoms.insert(dimension, atom);
                         Ok(atom)
                     }
-                    ArrayIrValue::Reference(_) => {
+                    XlaValue::Reference(_) => {
                         unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
                     }
                 })
@@ -2078,7 +2139,7 @@ struct XlaEagerDispatchQuery<'a, 'c> {
     regions: &'a [RegionKey<XlaConstant, XlaOperation>],
 
     /// Inputs of the application, which contain no references.
-    inputs: &'a [ArrayIrValue<Array<'c>>],
+    inputs: &'a [XlaValue<'c>],
 
     /// Mesh that the eager lowering compiles against (refer to [`XlaEagerDispatchKey`] for more information).
     mesh: Option<&'a DeviceMesh>,
@@ -2102,9 +2163,9 @@ impl XlaEagerDispatchKeyView for XlaEagerDispatchQuery<'_, '_> {
 
     fn input(&self, index: usize) -> XlaEagerDispatchInputRef<'_> {
         match &self.inputs[index] {
-            ArrayIrValue::Array(array) => XlaEagerDispatchInputRef::Array(array.r#type()),
-            ArrayIrValue::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension),
-            ArrayIrValue::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
+            XlaValue::Array(array) => XlaEagerDispatchInputRef::Array(array.r#type()),
+            XlaValue::Dimension(dimension) => XlaEagerDispatchInputRef::Dimension(dimension.value()),
+            XlaValue::Reference(_) => unreachable!("reference inputs are rejected at the `eager_bind` entry guard"),
         }
     }
 
@@ -3965,7 +4026,7 @@ impl<'c> XlaDomain<'c> {
             let declared = <&ArrayType>::try_from(declared).map_err(ProgramError::from)?;
             // Array inputs borrow their types, while the composite type of other inputs is built only to report them.
             match input {
-                ArrayIrValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
+                XlaValue::Array(array) => validate_xla_input_type(declared, &array.r#type())?,
                 input => validate_xla_input_type(
                     declared,
                     <&ArrayType>::try_from(input.r#type().as_ref()).map_err(ProgramError::from)?,
@@ -3984,7 +4045,7 @@ impl<'c> XlaDomain<'c> {
         }
         let (outputs, fence) = execution.into_parts();
         validate_runtime_outputs(executable.compiled_program().output_types(), &outputs)?;
-        let output = Request::reconstruct(&executable, outputs.into_iter().map(ArrayIrValue::Array).collect())?;
+        let output = Request::reconstruct(&executable, outputs.into_iter().map(XlaValue::Array).collect())?;
         Ok((output, fence))
     }
 
@@ -4064,7 +4125,7 @@ impl<'c> XlaDomain<'c> {
                 Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
             for &logical_input_index in &reference_state_input_indices {
                 let reference = match arguments.get(logical_input_index) {
-                    Some(ArrayIrValue::Reference(reference)) => reference,
+                    Some(XlaValue::Reference(reference)) => reference.handle(),
                     Some(value) => {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
                             reason: format!(
@@ -4118,10 +4179,10 @@ impl<'c> XlaDomain<'c> {
 
             let mut mutated_outputs = BTreeMap::new();
             for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
-                let ArrayIrValue::Reference(reference) = &arguments[logical_input_index] else {
+                let XlaValue::Reference(reference) = &arguments[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
                 };
-                let guard_index = guard_indices[&reference.id()];
+                let guard_index = guard_indices[&reference.handle().id()];
                 if let Some(logical_output_index) = state.output_index() {
                     mutated_outputs.insert(guard_index, logical_output_index);
                 }
@@ -4147,10 +4208,10 @@ impl<'c> XlaDomain<'c> {
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
                 for &logical_input_index in &reference_state_input_indices {
-                    let ArrayIrValue::Reference(reference) = &logical_arguments[logical_input_index] else {
+                    let XlaValue::Reference(reference) = &logical_arguments[logical_input_index] else {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
-                    let snapshot = observations[guard_indices[&reference.id()]].snapshot().clone();
+                    let snapshot = observations[guard_indices[&reference.handle().id()]].snapshot().clone();
                     if snapshot.mesh() != &program.mesh {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
                             reason: format!(
@@ -4159,7 +4220,7 @@ impl<'c> XlaDomain<'c> {
                             ),
                         });
                     }
-                    execution_arguments[logical_input_index] = ArrayIrValue::Array(snapshot);
+                    execution_arguments[logical_input_index] = XlaValue::Array(snapshot);
                 }
                 drop(guards);
 
@@ -4374,7 +4435,7 @@ impl<'c> XlaDomain<'c> {
                     .into());
                 }
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
-                Request::reconstruct(&executable, public_outputs.into_iter().map(ArrayIrValue::Array).collect())
+                Request::reconstruct(&executable, public_outputs.into_iter().map(XlaValue::Array).collect())
             })();
             Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
         })();
@@ -6803,6 +6864,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    use crate::XlaReference;
     use crate::experimental::shard_map::ShardMap;
     use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
@@ -7005,8 +7067,8 @@ mod tests {
         ProjectedContext::new(XlaSession::new(client).domain())
     }
 
-    fn program_array<'a, 'c>(value: &'a ArrayIrValue<Array<'c>>) -> &'a Array<'c> {
-        let ArrayIrValue::Array(array) = value else {
+    fn program_array<'a, 'c>(value: &'a XlaValue<'c>) -> &'a Array<'c> {
+        let XlaValue::Array(array) = value else {
             panic!("expected an array IR value");
         };
         array
@@ -7813,21 +7875,24 @@ mod tests {
             .bind(
                 XlaOperation::Dimension(DimensionOperation::Add(add)),
                 Vec::new(),
-                &[ArrayIrValue::Dimension(left), ArrayIrValue::Dimension(right)],
+                &[
+                    XlaValue::Dimension(XlaDimension::new(left, domain.clone())),
+                    XlaValue::Dimension(XlaDimension::new(right, domain.clone())),
+                ],
             )
             .unwrap()
             .remove(0);
-        let ArrayIrValue::Dimension(output) = output else {
+        let XlaValue::Dimension(output) = output else {
             panic!("dimension arithmetic must produce a dimension value");
         };
-        assert_eq!(output.extent(), 5);
+        assert_eq!(output.value().extent(), 5);
         assert_eq!(domain.cache_size(), 0);
 
         let scalar = domain
-            .bind(DimensionToScalarOperation, Vec::new(), &[ArrayIrValue::Dimension(output.clone())])
+            .bind(DimensionToScalarOperation, Vec::new(), &[XlaValue::Dimension(output.clone())])
             .unwrap()
             .remove(0);
-        let ArrayIrValue::Array(scalar) = scalar else {
+        let XlaValue::Array(scalar) = scalar else {
             panic!("dimension_to_scalar must produce an array");
         };
         assert_eq!(read_i64s(&client, &scalar), vec![5]);
@@ -7837,14 +7902,14 @@ mod tests {
             .bind(
                 ryft_core::DimensionFromScalarOperation::new(output.r#type().variable().clone()),
                 Vec::new(),
-                &[ArrayIrValue::Array(scalar)],
+                &[XlaValue::Array(scalar)],
             )
             .unwrap()
             .remove(0);
-        let ArrayIrValue::Dimension(from_scalar) = from_scalar else {
+        let XlaValue::Dimension(from_scalar) = from_scalar else {
             panic!("dimension_from_scalar must produce a dimension value");
         };
-        assert_eq!(from_scalar.extent(), 5);
+        assert_eq!(from_scalar.value().extent(), 5);
         assert_eq!(domain.cache_size(), 0);
     }
 
@@ -8776,14 +8841,14 @@ mod tests {
             .bind(
                 DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap(),
                 Vec::new(),
-                &[ArrayIrValue::Array(input.clone())],
+                &[XlaValue::Array(input.clone())],
             )
             .unwrap()
             .remove(0);
-        let ArrayIrValue::Dimension(extent) = extent else {
+        let XlaValue::Dimension(extent) = extent else {
             panic!("dimension_size must produce a dimension value");
         };
-        assert_eq!(extent.extent(), 6);
+        assert_eq!(extent.value().extent(), 6);
         assert_eq!(domain.cache_size(), 0);
 
         let two = DimensionValue::constant(2).unwrap();
@@ -8792,25 +8857,32 @@ mod tests {
             .bind(
                 XlaOperation::Dimension(DimensionOperation::Div(division)),
                 Vec::new(),
-                &[ArrayIrValue::Dimension(extent), ArrayIrValue::Dimension(two.clone())],
+                &[XlaValue::Dimension(extent), XlaValue::Dimension(XlaDimension::new(two.clone(), domain.clone()))],
             )
             .unwrap()
             .remove(0);
-        let ArrayIrValue::Dimension(three) = three else {
+        let XlaValue::Dimension(three) = three else {
             panic!("dimension division must produce a dimension value");
         };
-        assert_eq!(three.extent(), 3);
+        assert_eq!(three.value().extent(), 3);
         assert_eq!(domain.cache_size(), 0);
 
-        let reshape_inputs =
-            [ArrayIrValue::Array(input), ArrayIrValue::Dimension(two.clone()), ArrayIrValue::Dimension(three.clone())];
+        let reshape_inputs = [
+            XlaValue::Array(input),
+            XlaValue::Dimension(XlaDimension::new(two.clone(), domain.clone())),
+            XlaValue::Dimension(three.clone()),
+        ];
         let reshaped = domain.bind(DynamicReshapeOperation::new(), Vec::new(), &reshape_inputs).unwrap().remove(0);
         assert_eq!(program_array(&reshaped).shape().as_slice(), &[2, 3]);
         assert_eq!(domain.cache_size(), 1);
 
         let four = DimensionValue::constant(4).unwrap();
-        let broadcast_inputs =
-            [reshaped, ArrayIrValue::Dimension(four), ArrayIrValue::Dimension(two), ArrayIrValue::Dimension(three)];
+        let broadcast_inputs = [
+            reshaped,
+            XlaValue::Dimension(XlaDimension::new(four, domain.clone())),
+            XlaValue::Dimension(XlaDimension::new(two, domain.clone())),
+            XlaValue::Dimension(three),
+        ];
         let broadcast = domain
             .bind(DynamicBroadcastOperation::new(vec![1, 2]), Vec::new(), &broadcast_inputs)
             .unwrap()
@@ -9999,10 +10071,10 @@ mod tests {
                 let output = ryft_core::compilation::call_function(
                     &domain,
                     compiled.executable_function(),
-                    ArrayIrValue::Array(input.clone()),
+                    XlaValue::Array(input.clone()),
                 )
                 .unwrap();
-                let ArrayIrValue::Array(output) = output else {
+                let XlaValue::Array(output) = output else {
                     panic!("array-only compiled function returned a first-class dimension");
                 };
                 output.block_until_ready().unwrap();
@@ -10031,7 +10103,7 @@ mod tests {
             let value =
                 Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
-            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)])
+            function.call((), vec![XlaValue::Array(size), XlaValue::Array(value)])
         };
         assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
         assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
@@ -10322,9 +10394,9 @@ mod tests {
         )
         .unwrap();
         let array =
-            ryft_core::compilation::call_function(&engine, compiled.executable_function(), ArrayIrValue::Array(source))
+            ryft_core::compilation::call_function(&engine, compiled.executable_function(), XlaValue::Array(source))
                 .unwrap();
-        let ArrayIrValue::Array(array) = array else {
+        let XlaValue::Array(array) = array else {
             panic!("array-only compiled function returned a first-class dimension");
         };
         array.block_until_ready().unwrap();
@@ -10424,9 +10496,9 @@ mod tests {
 
         let input = Array::from_host_buffer(&domain, input_type, mesh, []).unwrap();
         let output =
-            ryft_core::compilation::call_function(&domain, compiled.executable_function(), ArrayIrValue::Array(input))
+            ryft_core::compilation::call_function(&domain, compiled.executable_function(), XlaValue::Array(input))
                 .unwrap();
-        let ArrayIrValue::Array(output) = output else {
+        let XlaValue::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
         assert_eq!(output.data_type(), DataType::Zero);
@@ -10476,13 +10548,13 @@ mod tests {
         let (zero_output, value_output) = ryft_core::compilation::call_function(
             &domain,
             compiled.executable_function(),
-            (ArrayIrValue::Array(value), ArrayIrValue::Array(zero)),
+            (XlaValue::Array(value), XlaValue::Array(zero)),
         )
         .unwrap();
-        let ArrayIrValue::Array(zero_output) = zero_output else {
+        let XlaValue::Array(zero_output) = zero_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
-        let ArrayIrValue::Array(value_output) = value_output else {
+        let XlaValue::Array(value_output) = value_output else {
             panic!("array-only compiled function returned a first-class dimension");
         };
 
@@ -10537,13 +10609,10 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = ryft_core::compilation::call_function(
-                &domain,
-                compiled.executable_function(),
-                ArrayIrValue::Array(input),
-            )
-            .unwrap();
-            let ArrayIrValue::Array(output) = output else {
+            let output =
+                ryft_core::compilation::call_function(&domain, compiled.executable_function(), XlaValue::Array(input))
+                    .unwrap();
+            let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
             output.block_until_ready().unwrap();
@@ -10939,13 +11008,10 @@ mod tests {
                 values_to_bytes(values.as_slice()).as_slice(),
             )
             .unwrap();
-            let output = ryft_core::compilation::call_function(
-                &domain,
-                compiled.executable_function(),
-                ArrayIrValue::Array(input),
-            )
-            .unwrap();
-            let ArrayIrValue::Array(output) = output else {
+            let output =
+                ryft_core::compilation::call_function(&domain, compiled.executable_function(), XlaValue::Array(input))
+                    .unwrap();
+            let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
             output.block_until_ready().unwrap();
@@ -11024,10 +11090,10 @@ mod tests {
             let output = ryft_core::compilation::call_function(
                 &domain,
                 compiled.executable_function(),
-                ArrayIrValue::Array(input.clone()),
+                XlaValue::Array(input.clone()),
             )
             .unwrap();
-            let ArrayIrValue::Array(output) = output else {
+            let XlaValue::Array(output) = output else {
                 panic!("array-only compiled function returned a first-class dimension");
             };
             output
@@ -11212,7 +11278,7 @@ mod tests {
             let value =
                 Array::from_host_buffer(&domain, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
-            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)]).unwrap()
+            function.call((), vec![XlaValue::Array(size), XlaValue::Array(value)]).unwrap()
         };
 
         assert_eq!(read_f32s(&client, program_array(&call(2))), vec![4.0]);
@@ -11346,13 +11412,13 @@ mod tests {
                 Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
-                .interpret_in_context(&domain, vec![ArrayIrValue::Array(input.clone())])
+                .interpret_in_context(&domain, vec![XlaValue::Array(input.clone())])
                 .unwrap()
                 .into_iter()
                 .map(|value| match value {
-                    ArrayIrValue::Array(array) => array,
-                    ArrayIrValue::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
-                    ArrayIrValue::Reference(_) => panic!("padding fixture returned a reference"),
+                    XlaValue::Array(array) => array,
+                    XlaValue::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
+                    XlaValue::Reference(_) => panic!("padding fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -11478,13 +11544,13 @@ mod tests {
                 Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
                     .unwrap();
             let eager = program
-                .interpret_in_context(&domain, vec![ArrayIrValue::Array(input.clone())])
+                .interpret_in_context(&domain, vec![XlaValue::Array(input.clone())])
                 .unwrap()
                 .into_iter()
                 .map(|value| match value {
-                    ArrayIrValue::Array(array) => array,
-                    ArrayIrValue::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
-                    ArrayIrValue::Reference(_) => panic!("attention fixture returned a reference"),
+                    XlaValue::Array(array) => array,
+                    XlaValue::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
+                    XlaValue::Reference(_) => panic!("attention fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -12009,7 +12075,7 @@ mod tests {
         };
 
         let eager = program
-            .interpret_in_context(&domain, inputs(4, 2).into_iter().map(ArrayIrValue::Array).collect::<Vec<_>>())
+            .interpret_in_context(&domain, inputs(4, 2).into_iter().map(XlaValue::Array).collect::<Vec<_>>())
             .unwrap();
         let compiled_valid = domain.execute_xla_program(&compiled, inputs(4, 2)).unwrap();
         assert_eq!(read_f32s(&client, program_array(&eager[0])), vec![7.0, 7.0]);
@@ -12222,7 +12288,7 @@ mod tests {
         );
         let call = |values: &[f32]| {
             let input = f32_vector(&domain, &mesh, values);
-            function.call((), ArrayIrValue::Array(input)).unwrap()
+            function.call((), XlaValue::Array(input)).unwrap()
         };
 
         let three = call(&[1.0, 2.0, 3.0]);
@@ -12665,7 +12731,7 @@ mod tests {
         let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> = domain
             .stage(CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
                 add_capture,
-                vec![ArrayIrValue::Array(capture.clone())],
+                vec![XlaValue::Array(capture.clone())],
                 ArrayIrType::Array(input_type.clone()),
                 XlaOptions::new(mesh.clone()).with_donate(true),
             ))
@@ -13035,18 +13101,14 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain();
 
-        // The guard is operation-agnostic: it keys off unresolved reference state rather than the specific reference
-        // operation, so one representative operation pins the diagnostic.
-        assert_eq!(
-            domain.bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]),
-            Err(ProgramError::UnsupportedOperation {
-                message: "`reference_new` carries reference state that XLA eager execution cannot lower; discharge \
-                          references before lowering"
-                    .to_string(),
-            }),
-        );
+        // Top-level reference operations execute eagerly on their host-side handles (their full lifecycle is covered
+        // by the `values` tests), so they validate their inputs like the core reference implementations do.
+        assert!(domain.bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]).is_err());
 
-        let reference = ArrayIrValue::Reference(ArrayReference::new(f32_vector(&domain, &mesh, &[1.0])));
+        let reference = XlaValue::Reference(XlaReference::new(
+            ArrayReference::new(f32_vector(&domain, &mesh, &[1.0])),
+            domain.clone(),
+        ));
         assert_eq!(
             domain.bind(AddOperation::new(), Vec::new(), &[reference]),
             Err(ProgramError::UnsupportedOperation {
@@ -13422,15 +13484,15 @@ mod tests {
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
 
-        let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32).unwrap());
-        let eager_replacement = ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap());
+        let eager_input = ryft_core::ArrayIrValue::Array(CpuArray::scalar(3.0f32).unwrap());
+        let eager_replacement = ryft_core::ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap());
         let eager_reference = eager_input.reference_new().unwrap();
         eager_reference.write(&eager_replacement).unwrap();
         let eager_snapshot = eager_reference.read().unwrap();
         eager_reference.add_update(&eager_input).unwrap();
         let eager_final = eager_reference.freeze().unwrap();
-        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap()));
-        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(8.0f32).unwrap()));
+        assert_eq!(eager_snapshot, ryft_core::ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap()));
+        assert_eq!(eager_final, ryft_core::ArrayIrValue::Array(CpuArray::scalar(8.0f32).unwrap()));
     }
 
     #[test]
@@ -14773,7 +14835,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let left = f32_vector(&domain, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&domain, &mesh, &[3.0, 4.0]);
-        let inputs = [ArrayIrValue::Array(left), ArrayIrValue::Array(right)];
+        let inputs = [XlaValue::Array(left), XlaValue::Array(right)];
 
         let first = domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).unwrap();
         let second = domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).unwrap();
@@ -14797,7 +14859,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaSession::new(&client).domain();
         fn negate<'c>(domain: &XlaDomain<'c>, input: Array<'c>) {
-            let inputs = [ArrayIrValue::Array(input)];
+            let inputs = [XlaValue::Array(input)];
             domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
         }
         let misses = |domain: &XlaDomain<'_>| domain.eager_dispatch_statistics().misses;
@@ -14840,9 +14902,9 @@ mod tests {
         let single_device_vector = f32_vector(&single_device_domain, &single_device_mesh, &[1.0, 2.0, 3.0, 4.0]);
         let reshape = |rows: &DimensionValue, columns: &DimensionValue| {
             let inputs = [
-                ArrayIrValue::Array(single_device_vector.clone()),
-                ArrayIrValue::Dimension(rows.clone()),
-                ArrayIrValue::Dimension(columns.clone()),
+                XlaValue::Array(single_device_vector.clone()),
+                XlaValue::Dimension(XlaDimension::new(rows.clone(), single_device_domain.clone())),
+                XlaValue::Dimension(XlaDimension::new(columns.clone(), single_device_domain.clone())),
             ];
             single_device_domain.bind(DynamicReshapeOperation::new(), Vec::new(), &inputs).unwrap().remove(0)
         };
@@ -14871,8 +14933,11 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let vector = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let two = DimensionValue::constant(2).unwrap();
-        let inputs =
-            [ArrayIrValue::Array(vector), ArrayIrValue::Dimension(two.clone()), ArrayIrValue::Dimension(two.clone())];
+        let inputs = [
+            XlaValue::Array(vector),
+            XlaValue::Dimension(XlaDimension::new(two.clone(), domain.clone())),
+            XlaValue::Dimension(XlaDimension::new(two, domain.clone())),
+        ];
         let output = domain.bind(DynamicReshapeOperation::new(), Vec::new(), &inputs).unwrap().remove(0);
         let output = program_array(&output);
         assert_eq!(output.shape().as_slice(), &[2, 2]);
@@ -14897,8 +14962,8 @@ mod tests {
                 .unwrap()
         };
         let inputs = [
-            ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)),
-            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+            XlaValue::Array(boolean_scalar(&domain, &mesh, true)),
+            XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
         ];
 
         // Branches that are rebuilt for every application but are structurally equal share one cache entry.
@@ -14934,8 +14999,8 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let operation = XlaOperation::Array(AddOperation::new().into());
         let inputs = [
-            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+            XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone())),
         ];
         let query = XlaEagerDispatchQuery {
             operation: &operation,
@@ -14963,7 +15028,10 @@ mod tests {
         let other_options = Arc::new(domain.compilation_options.as_ref().clone());
         let other_options_query = XlaEagerDispatchQuery { compilation_options: &other_options, ..query };
         assert!(borrowed_key != &other_options_query as &dyn XlaEagerDispatchKeyView);
-        let other_inputs = [inputs[0].clone(), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
+        let other_inputs = [
+            inputs[0].clone(),
+            XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone())),
+        ];
         let other_inputs_query = XlaEagerDispatchQuery { inputs: &other_inputs, ..query };
         assert!(borrowed_key != &other_inputs_query as &dyn XlaEagerDispatchKeyView);
         let meshless_query = XlaEagerDispatchQuery { mesh: None, ..query };
@@ -14979,8 +15047,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain();
         let inputs = [
-            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
-            ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])),
+            XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0])),
+            XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0])),
         ];
         for _ in 0..2 {
             assert!(domain.bind(XlaOperation::Array(AddOperation::new().into()), Vec::new(), &inputs).is_err());
@@ -15005,12 +15073,12 @@ mod tests {
         let local = f32_vector(&domain, &mesh, &[1.0, 2.0]);
         let foreign = f32_vector(&other_domain, &mesh, &[3.0, 4.0]);
         let operation = XlaOperation::Array(AddOperation::new().into());
-        let local_inputs = [ArrayIrValue::Array(local.clone()), ArrayIrValue::Array(local.clone())];
+        let local_inputs = [XlaValue::Array(local.clone()), XlaValue::Array(local.clone())];
         domain.bind(operation.clone(), Vec::new(), &local_inputs).unwrap();
 
         // The second input's type and the first input's mesh match the cached entry, so this lookup hits the cache,
         // and placement validation must still reject the foreign input.
-        let mixed_inputs = [ArrayIrValue::Array(local), ArrayIrValue::Array(foreign)];
+        let mixed_inputs = [XlaValue::Array(local), XlaValue::Array(foreign)];
         let error = domain.bind(operation, Vec::new(), &mixed_inputs).unwrap_err();
         assert!(error.to_string().contains("different PJRT client"), "{error}");
         assert_eq!(domain.eager_dispatch_statistics().hits, 1);
@@ -15024,7 +15092,7 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain();
-        let inputs = [ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]))];
+        let inputs = [XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0]))];
         domain.bind(XlaOperation::Array(NegOperation::new().into()), Vec::new(), &inputs).unwrap();
         assert_eq!((domain.session().eager_dispatch_cache.len(), domain.cache_size()), (1, 1));
         domain.clear_cache();
@@ -15084,8 +15152,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
         };
-        let condition_inputs =
-            [ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)), ArrayIrValue::Array(input.clone())];
+        let condition_inputs = [XlaValue::Array(boolean_scalar(&domain, &mesh, true)), XlaValue::Array(input.clone())];
         measure("eager condition with freshly built branches (end to end)", &mut || {
             let branches = [
                 branch(XlaOperation::Array(AddOperation::new().into())),
@@ -15189,7 +15256,7 @@ mod tests {
             .bind(
                 operation.clone(),
                 [doubled.clone(), squared.clone()],
-                &[ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)), ArrayIrValue::Array(input.clone())],
+                &[XlaValue::Array(boolean_scalar(&domain, &mesh, true)), XlaValue::Array(input.clone())],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&true_outputs[0])), vec![2.0, 4.0, 6.0, 8.0]);
@@ -15198,7 +15265,7 @@ mod tests {
             .bind(
                 operation,
                 [doubled, squared],
-                &[ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)), ArrayIrValue::Array(input)],
+                &[XlaValue::Array(boolean_scalar(&domain, &mesh, false)), XlaValue::Array(input)],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&false_outputs[0])), vec![1.0, 4.0, 9.0, 16.0]);
@@ -15238,8 +15305,8 @@ mod tests {
                 XlaOperation::Condition(ConditionOperation::new()),
                 [branch(false), branch(true)],
                 &[
-                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)),
-                    ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0])),
+                    XlaValue::Array(boolean_scalar(&domain, &mesh, false)),
+                    XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0])),
                 ],
             )
             .unwrap();
@@ -15286,9 +15353,9 @@ mod tests {
                 operation.clone(),
                 [branch(false), branch(true)],
                 &[
-                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, true)),
-                    ArrayIrValue::Dimension(extent.clone()),
-                    ArrayIrValue::Array(scalar.clone()),
+                    XlaValue::Array(boolean_scalar(&domain, &mesh, true)),
+                    XlaValue::Dimension(XlaDimension::new(extent.clone(), domain.clone())),
+                    XlaValue::Array(scalar.clone()),
                 ],
             )
             .unwrap();
@@ -15300,9 +15367,9 @@ mod tests {
                 operation,
                 [branch(false), branch(true)],
                 &[
-                    ArrayIrValue::Array(boolean_scalar(&domain, &mesh, false)),
-                    ArrayIrValue::Dimension(extent),
-                    ArrayIrValue::Array(scalar),
+                    XlaValue::Array(boolean_scalar(&domain, &mesh, false)),
+                    XlaValue::Dimension(XlaDimension::new(extent, domain.clone())),
+                    XlaValue::Array(scalar),
                 ],
             )
             .unwrap();
@@ -15355,7 +15422,7 @@ mod tests {
         let operation = XlaOperation::While(WhileOperation::new());
 
         let outputs = domain
-            .bind(operation, vec![condition, body], &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0))])
+            .bind(operation, vec![condition, body], &[XlaValue::Array(f32_scalar(&domain, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![3.0]);
@@ -15409,8 +15476,8 @@ mod tests {
             .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain();
-        let input = ArrayIrValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
-        let index = ArrayIrValue::Array(
+        let input = XlaValue::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
+        let index = XlaValue::Array(
             Array::from_host_buffer(&domain, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
                 .unwrap(),
         );
@@ -15428,7 +15495,7 @@ mod tests {
             .bind(
                 XlaOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
                 Vec::new(),
-                &[input, ArrayIrValue::Array(f32_vector(&domain, &mesh, &[9.0])), index],
+                &[input, XlaValue::Array(f32_vector(&domain, &mesh, &[9.0])), index],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, program_array(&updated[0])), vec![1.0, 2.0, 9.0]);
@@ -15466,7 +15533,7 @@ mod tests {
         let scan = ScanOperation::new(1, 4);
 
         let outputs = domain
-            .bind(XlaOperation::Scan(scan), [body], &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0))])
+            .bind(XlaOperation::Scan(scan), [body], &[XlaValue::Array(f32_scalar(&domain, &mesh, 0.0))])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![4.0]);
@@ -15516,8 +15583,7 @@ mod tests {
             let initial =
                 Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), &(-1_i64).to_ne_bytes()).unwrap();
             let scan = ScanOperation::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
-            let outputs =
-                domain.bind(XlaOperation::Scan(scan), [body.clone()], &[ArrayIrValue::Array(initial)]).unwrap();
+            let outputs = domain.bind(XlaOperation::Scan(scan), [body.clone()], &[XlaValue::Array(initial)]).unwrap();
             assert_eq!(read_i64s(&client, program_array(&outputs[0])), vec![last_index]);
             assert_eq!(read_i64s(&client, program_array(&outputs[1])), vec![0, 1, 2, 3]);
         }
@@ -15560,7 +15626,10 @@ mod tests {
                 .bind(
                     XlaOperation::Scan(scan),
                     [body.clone()],
-                    &[ArrayIrValue::Array(f32_scalar(&domain, &mesh, 0.0)), ArrayIrValue::Dimension(length.clone())],
+                    &[
+                        XlaValue::Array(f32_scalar(&domain, &mesh, 0.0)),
+                        XlaValue::Dimension(XlaDimension::new(length.clone(), domain.clone())),
+                    ],
                 )
                 .unwrap();
             assert_eq!(outputs.len(), 1);
@@ -15599,7 +15668,7 @@ mod tests {
         let carry = f32_scalar(&domain, &mesh, 0.0);
         let xs = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let outputs = domain
-            .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
+            .bind(XlaOperation::Scan(scan), vec![body], &[XlaValue::Array(carry), XlaValue::Array(xs)])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![10.0]);
@@ -15647,7 +15716,7 @@ mod tests {
         .unwrap();
         let carry = f32_scalar(&domain, &mesh, 0.0);
         let outputs = domain
-            .bind(XlaOperation::Scan(scan), vec![body], &[ArrayIrValue::Array(carry), ArrayIrValue::Array(xs)])
+            .bind(XlaOperation::Scan(scan), vec![body], &[XlaValue::Array(carry), XlaValue::Array(xs)])
             .unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![10.0]);
@@ -15683,14 +15752,14 @@ mod tests {
 
         let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain
-            .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[ArrayIrValue::Array(input.clone())])
+            .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[XlaValue::Array(input.clone())])
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
-        let second = domain.bind(operation, CalleeRegionDriver::new(&[callee]), &[ArrayIrValue::Array(input)]).unwrap();
+        let second = domain.bind(operation, CalleeRegionDriver::new(&[callee]), &[XlaValue::Array(input)]).unwrap();
         assert_eq!(read_f32s(&client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }
@@ -15754,7 +15823,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(operation, vec![body_region], &[ArrayIrValue::Array(input)]).unwrap();
+        let outputs = domain.bind(operation, vec![body_region], &[XlaValue::Array(input)]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = program_array(&outputs[0]);

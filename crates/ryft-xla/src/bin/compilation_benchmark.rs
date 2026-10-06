@@ -6,12 +6,14 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
-    ArrayIrType, ArrayIrValue, ArrayType, CompilationDomain, CompiledFunction, DataType, Device, DeviceMesh, Dimension,
-    DiskCache, JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction,
-    ValueProjection, stage_function,
+    ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, DataType, Device, DeviceMesh, Dimension, DiskCache,
+    JitCacheStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Sin, StagedFunction, ValueProjection,
+    stage_function,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, jitted};
+use ryft_xla::{
+    Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, XlaSession, XlaValue, jitted,
+};
 use serde_json::{Value, json};
 
 type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, ArrayIrType, ArrayIrType>;
@@ -188,10 +190,10 @@ fn call_workload<'c>(
     compiled: &BenchmarkCompiledFunction<'c>,
     input: Array<'c>,
 ) -> Result<Array<'c>, Box<dyn std::error::Error>> {
-    match ryft_core::compilation::call_function(domain, compiled.executable_function(), ArrayIrValue::Array(input))? {
-        ArrayIrValue::Array(output) => Ok(output),
-        ArrayIrValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
-        ArrayIrValue::Reference(_) => Err("compilation benchmark produced a reference".into()),
+    match ryft_core::compilation::call_function(domain, compiled.executable_function(), XlaValue::Array(input))? {
+        XlaValue::Array(output) => Ok(output),
+        XlaValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
+        XlaValue::Reference(_) => Err("compilation benchmark produced a reference".into()),
     }
 }
 

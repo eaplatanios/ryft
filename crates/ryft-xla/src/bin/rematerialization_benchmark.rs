@@ -21,15 +21,15 @@ use std::time::{Duration, Instant};
 
 use ryft_core::compilation::{AnalyzableCompilationDomain, call_function};
 use ryft_core::{
-    ArrayIrType, ArrayIrValue, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh,
-    Dimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory,
-    MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
+    DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
+    MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Value,
     ValueProjection, differentiate_at, rematerialize, stage_function,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
-use ryft_xla::{Array, FromPjrt, XlaDomain, XlaOptions, XlaSession};
+use ryft_xla::{Array, FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
 
 type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
@@ -306,7 +306,7 @@ fn measure<'c>(
     let compiled: BenchmarkCompiledFunction<'c> = domain.compile(lowered).unwrap();
     let compile = start.elapsed();
     let memory = domain.analyze(compiled.executable_function()).unwrap().memory;
-    let inputs = (ArrayIrValue::Array(inputs.0), ArrayIrValue::Array(inputs.1), ArrayIrValue::Array(inputs.2));
+    let inputs = (XlaValue::Array(inputs.0), XlaValue::Array(inputs.1), XlaValue::Array(inputs.2));
     let execute = || {
         let (up, down) = call_function(domain, compiled.executable_function(), inputs.clone()).unwrap();
         let gradients = [up, down].map(|gradient| ValueProjection::<ArrayType>::into_projected(gradient).unwrap());

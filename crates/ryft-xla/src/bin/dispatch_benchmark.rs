@@ -1,8 +1,10 @@
 //! Per-call dispatch latency benchmark for small eager and jitted operations, for comparison with JAX.
 //!
-//! Every case applies one tiny operation (an `f32[8]` add, or a `condition` over such adds) on a single CPU device, so
-//! the measured time is dispatch overhead rather than computation. Each case runs warm-up calls and then several timed
-//! rounds without per-call synchronization (the same methodology as
+//! Every case applies one tiny operation (an `f32[8]` add, a `condition` over such adds, a first-class dimension add,
+//! or an `f32[8]` reference read) on a single CPU device, so the measured time is dispatch overhead rather than
+//! computation. The dimension and reference cases come in pairs that compare dispatch through the session-carrying
+//! [`XlaValue`] members with the direct host implementations of the session-free `ArrayIrValue` members. Each case
+//! runs warm-up calls and then several timed rounds without per-call synchronization (the same methodology as
 //! `python/scripts/compare_dispatch_performance_with_jax.py`), and reports the per-call mean of every round.
 
 use std::collections::HashMap;
@@ -12,12 +14,13 @@ use std::time::Instant;
 
 use ryft_core::{
     Add, AddOperation, ArrayIrType, ArrayIrValue, ArrayType, ConditionOperation, Context, DataType, Device, DeviceMesh,
-    Dimension, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, Placeholder, Shape, Sharding,
+    Dimension, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, Placeholder, ReferenceNew,
+    ReferenceRead, Shape, Sharding,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
-use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaSession, jitted};
+use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDimension, XlaSession, XlaValue, jitted};
 use serde_json::json;
 
 /// Command-line arguments of this benchmark.
@@ -47,7 +50,9 @@ fn usage() -> &'static str {
      Options:\n\
        --iterations N     Timed calls per round (default: 10000)\n\
        --rounds N         Timed rounds per case (default: 5)\n\
-       --case NAME        Only run the named case (`eager_add`, `eager_condition`, `jit_add`, or `pjrt_add`)\n\
+       --case NAME        Only run the named case (`eager_add`, `eager_condition`, `xla_dimension_add`,\n\
+                          `host_dimension_add`, `xla_reference_read`, `host_reference_read`, `jit_add`, or\n\
+                          `pjrt_add`)\n\
        --smoke            Use small defaults\n\
        -h, --help         Print this help"
 }
@@ -133,6 +138,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         results.insert("eager_add", measure(&arguments, || drop(Add::add(&input, &input).unwrap())));
     }
 
+    // First-class dimension addition through a session-carrying `XlaDimension`, which binds the operation through its
+    // domain, and through a session-free `DimensionValue`, which adds the extents directly on the host.
+    let extent = DimensionValue::constant(8)?;
+    let xla_extent = XlaDimension::new(extent.clone(), domain.clone());
+    if arguments.selects("xla_dimension_add") {
+        results.insert("xla_dimension_add", measure(&arguments, || drop(Add::add(&xla_extent, &xla_extent).unwrap())));
+    }
+    if arguments.selects("host_dimension_add") {
+        results.insert("host_dimension_add", measure(&arguments, || drop(Add::add(&extent, &extent).unwrap())));
+    }
+
+    // Reference reads through a session-carrying `XlaValue`, which binds the read through its domain, and through a
+    // session-free `ArrayIrValue`, which reads the handle directly.
+    let xla_reference = XlaValue::Array(input.clone()).reference_new()?;
+    if arguments.selects("xla_reference_read") {
+        results.insert("xla_reference_read", measure(&arguments, || drop(xla_reference.read().unwrap())));
+    }
+    let host_reference = ArrayIrValue::Array(input.clone()).reference_new()?;
+    if arguments.selects("host_reference_read") {
+        results.insert("host_reference_read", measure(&arguments, || drop(host_reference.read().unwrap())));
+    }
+
     // Eager `condition` whose branch programs are rebuilt for every application, like closures traced per call.
     let branch_type = ArrayIrType::Array(input_type.clone());
     let branch = |operation: XlaOperation| {
@@ -145,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let predicate_type = ArrayType::scalar(DataType::Boolean).replicated(&mesh)?;
     let predicate = Array::from_host_buffer(&domain, predicate_type, mesh.clone(), [1u8])?;
-    let condition_inputs = [ArrayIrValue::Array(predicate), ArrayIrValue::Array(input.clone())];
+    let condition_inputs = [XlaValue::Array(predicate), XlaValue::Array(input.clone())];
     if arguments.selects("eager_condition") {
         results.insert(
             "eager_condition",

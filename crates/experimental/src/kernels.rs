@@ -455,7 +455,7 @@ fn execute_aot_case<'c>(
         samples.push(u64::try_from(start.elapsed().as_nanos()).unwrap());
     }
     if let Some(directory) = std::env::var_os("RYFT_KERNEL_PROFILE_DIRECTORY") {
-        let facts = XlaKernelExecutionFacts::from_client(client, &mesh).unwrap();
+        let facts = XlaKernelExecutionFacts::from_target(runtime.target().unwrap(), &mesh).unwrap();
         let lowering: std::time::Duration = serde_json::from_value(report["lowering_duration"].clone()).unwrap();
         let compilation: std::time::Duration = serde_json::from_value(report["compilation_duration"].clone()).unwrap();
         let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
@@ -1712,7 +1712,7 @@ mod tuning {
         KernelOutputEmbedding, KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest,
         KernelTuningRunner, XlaKernelCompilerBinding, XlaKernelExecutionFacts, XlaKernelTarget, stage_kernel,
     };
-    use ryft_xla::{Array as XlaArray, FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
+    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession, XlaValue};
 
     use crate::tests::{TestPlatform, test_for_each_platform};
 
@@ -1826,7 +1826,8 @@ mod tuning {
             vec![Device::from_pjrt(&device).unwrap()],
         )
         .unwrap();
-        let facts = XlaKernelExecutionFacts::from_client(client, &mesh).unwrap();
+        let session = XlaSession::new(client);
+        let facts = XlaKernelExecutionFacts::from_target(session.target().unwrap(), &mesh).unwrap();
         let candidates = vec![
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(1).unwrap()),
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(2).unwrap()),
@@ -1866,7 +1867,6 @@ mod tuning {
                 (schedule, binding)
             })
             .collect();
-        let session = XlaSession::new(client);
         let inputs = case
             .input_types
             .iter()

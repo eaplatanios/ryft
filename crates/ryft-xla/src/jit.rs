@@ -85,27 +85,26 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use ryft_core::{
-    ArrayIrType, ArrayIrValue, ArrayType, CapturingContext, ClosedProgram, CompilationDomain,
-    CompilationStagingRequest, CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher,
-    Constant, Context, DeviceMesh, DifferentiableType, DomainTracingContext, ExecutableFunction,
-    ForwardModeDifferentiate, JitCacheStatistics, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
-    ProjectedValue, ReferenceExecution, ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value,
-    ValueProjection, call_function, call_function_statefully, call_function_statefully_async,
-    try_jit_with_options as core_try_jit_with_options,
+    ArrayIrType, ArrayType, CapturingContext, ClosedProgram, CompilationDomain, CompilationStagingRequest,
+    CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, Constant, Context, DeviceMesh,
+    DifferentiableType, DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics,
+    Parameterized, ParameterizedFamily, ProgramError, ProjectedContext, ProjectedValue, ReferenceExecution,
+    ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection, call_function,
+    call_function_statefully, call_function_statefully_async, try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_pjrt::Execution;
 
 use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaCompiledProgram;
 use crate::experimental::ops::{XlaConstant, XlaOperation};
-use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions};
+use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions, XlaValue};
 
 /// Composite tracer retained by the experimental stateful XLA program.
 ///
 /// # Stability
 ///
 /// This alias is experimental while the external-reference ABI is evolving.
-pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
+pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, XlaValue<'c>>>;
 
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
 pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaStatefulCompileTracer<'c>>;
@@ -124,7 +123,7 @@ type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
 /// # Stability
 ///
 /// This alias is experimental while the external-reference ABI is evolving.
-pub type XlaStatefulValue<'c> = ArrayIrValue<Array<'c>>;
+pub type XlaStatefulValue<'c> = XlaValue<'c>;
 
 /// Traced output tree produced by one heterogeneous stateful XLA closure.
 type XlaStatefulTraceOutput<'c, P> = <P as Parameterized<ArrayIrType>>::To<XlaStatefulCompileTracer<'c>>;
@@ -179,7 +178,7 @@ where
         ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaStatefulValue<'c>>,
 {
     let structure = values.parameter_structure();
-    let parameters = values.into_parameters().map(ArrayIrValue::Array);
+    let parameters = values.into_parameters().map(XlaValue::Array);
     XlaProgramParameterValues::<P, XlaStatefulValue<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
@@ -994,7 +993,7 @@ impl<'c> XlaDomain<'c> {
         )?;
         let outputs = executable
             .function
-            .reconstruct_outputs(flat_outputs.into_iter().map(ArrayIrValue::Array).collect())
+            .reconstruct_outputs(flat_outputs.into_iter().map(XlaValue::Array).collect())
             .map_err(XlaDomainError::from)?;
         Ok(Execution::new(project_arrays::<Out>(outputs)?, fence))
     }
@@ -1765,7 +1764,7 @@ where
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
 {
-    let captures = captures.into_iter().map(ArrayIrValue::Array).collect();
+    let captures = captures.into_iter().map(XlaValue::Array).collect();
     let input_structure = input_types.parameter_structure();
     let input_types = XlaProgramParameters::<In>::from_parameters(
         input_structure,
@@ -1849,7 +1848,7 @@ mod tests {
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::{
-        Add, AddOperation, ArgMax, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        Add, AddOperation, ArgMax, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayReference,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
         CaptureReference, Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind,
         Cumulative, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
@@ -1876,7 +1875,10 @@ mod tests {
         compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions, XlaSession};
+    use crate::{
+        AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions, XlaReference,
+        XlaSession, XlaValue,
+    };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
     #[derive(Clone)]
@@ -2766,7 +2768,10 @@ mod tests {
             ryft_core::call_function(
                 &domain,
                 compiled.executable_function(),
-                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(rejected_update)),
+                (
+                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                    XlaValue::Array(rejected_update),
+                ),
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external reference state requires `call_statefully`",
@@ -2778,9 +2783,15 @@ mod tests {
                 Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = compiled
-                .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+                .call_statefully(
+                    &domain,
+                    (
+                        XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                        XlaValue::Array(update),
+                    ),
+                )
                 .unwrap();
-            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
             assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![expected]);
         }
@@ -2861,15 +2872,15 @@ mod tests {
             .call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(reference.clone()),
-                    ArrayIrValue::Array(scalar(3.0)),
-                    ArrayIrValue::Reference(tangent_reference.clone()),
-                    ArrayIrValue::Array(scalar(100.0)),
+                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                    XlaValue::Array(scalar(3.0)),
+                    XlaValue::Reference(XlaReference::new(tangent_reference.clone(), domain.clone())),
+                    XlaValue::Array(scalar(100.0)),
                 ),
             )
             .unwrap();
-        let ArrayIrValue::Array(primal) = primal else { panic!("stateful primal output must be an array") };
-        let ArrayIrValue::Array(tangent) = tangent else { panic!("stateful tangent output must be an array") };
+        let XlaValue::Array(primal) = primal else { panic!("stateful primal output must be an array") };
+        let XlaValue::Array(tangent) = tangent else { panic!("stateful tangent output must be an array") };
         assert_eq!(read_f32_array(&client, &primal), vec![4.0]);
         assert_eq!(read_f32_array(&client, &tangent), vec![110.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![4.0]);
@@ -2924,10 +2935,13 @@ mod tests {
         let input_cotangent = compiled
             .call_statefully(
                 &domain,
-                (ArrayIrValue::Reference(cotangent_reference.clone()), ArrayIrValue::Array(scalar(2.0))),
+                (
+                    XlaValue::Reference(XlaReference::new(cotangent_reference.clone(), domain.clone())),
+                    XlaValue::Array(scalar(2.0)),
+                ),
             )
             .unwrap();
-        let ArrayIrValue::Array(input_cotangent) = input_cotangent else {
+        let XlaValue::Array(input_cotangent) = input_cotangent else {
             panic!("stateful cotangent output must be an array")
         };
         assert_eq!(read_f32_array(&client, &input_cotangent), vec![7.0]);
@@ -2950,7 +2964,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let vector = |values: &[f32]| {
-            ArrayIrValue::Array(
+            XlaValue::Array(
                 Array::from_host_buffer(
                     &domain,
                     array_type.clone(),
@@ -2960,7 +2974,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        let read = |value: ArrayIrValue<Array<'_>>| {
+        let read = |value: XlaValue<'_>| {
             read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap())
         };
         let (value, gradient) = domain
@@ -3000,12 +3014,9 @@ mod tests {
             domain: &XlaDomain<'c>,
             input: Array<'c>,
             policy: P,
-        ) -> (ArrayIrValue<Array<'c>>, ArrayIrValue<Array<'c>>) {
+        ) -> (XlaValue<'c>, XlaValue<'c>) {
             let function = rematerialize(sine_of_dot).with_policy(policy);
-            domain
-                .differentiate_at(ArrayIrValue::Array(input))
-                .value_and_gradient(|x| function.call(x))
-                .unwrap()
+            domain.differentiate_at(XlaValue::Array(input)).value_and_gradient(|x| function.call(x)).unwrap()
         }
         let input = || {
             Array::from_host_buffer(
@@ -3021,7 +3032,7 @@ mod tests {
             [value_and_gradient(&domain, input(), DotsSavable), value_and_gradient(&domain, input(), offload.unwrap())]
         {
             // XLA's elementary functions may differ from the host ones in the last bit.
-            let assert_close = |actual: ArrayIrValue<Array<'_>>, expected: Vec<f32>| {
+            let assert_close = |actual: XlaValue<'_>, expected: Vec<f32>| {
                 let actual = read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(actual).unwrap());
                 assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6));
                 assert_eq!(actual.len(), expected.len());
@@ -3070,7 +3081,7 @@ mod tests {
         let array = |r#type: &ArrayType, values: &[f32]| {
             Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
         };
-        let input = ArrayIrValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
+        let input = XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
         let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert!(pullback.residuals().is_empty());
         let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap();
@@ -3102,8 +3113,8 @@ mod tests {
             .call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(buffer.clone()),
-                    ArrayIrValue::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
+                    XlaValue::Reference(XlaReference::new(buffer.clone(), domain.clone())),
+                    XlaValue::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
                 ),
             )
             .unwrap();
@@ -3177,8 +3188,8 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully(&domain, ArrayIrValue::Array(input)).unwrap();
-        let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        let output = compiled.call_statefully(&domain, XlaValue::Array(input)).unwrap();
+        let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
@@ -3208,8 +3219,8 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        let output = compiled.call_statefully_async(&domain, ArrayIrValue::Array(input)).r#await().unwrap();
-        let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        let output = compiled.call_statefully_async(&domain, XlaValue::Array(input)).r#await().unwrap();
+        let XlaValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
@@ -3235,8 +3246,10 @@ mod tests {
             Array::from_host_buffer(&domain, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
         );
         for _ in 0..2 {
-            let output = compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap();
-            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let output = compiled
+                .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+                .unwrap();
+            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![7.0]);
             assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![7.0]);
         }
@@ -3309,10 +3322,12 @@ mod tests {
         let (await_started, await_observed) = mpsc::channel();
         let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(first_gate.clone()));
-        let first_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
+        let first_read = read
+            .call_statefully_async(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())));
         let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(second_gate.clone()));
-        let second_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
+        let second_read = read
+            .call_statefully_async(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())));
 
         std::thread::scope(|scope| {
             let (mutation_finished, mutation_result) = mpsc::channel();
@@ -3325,7 +3340,10 @@ mod tests {
                 mutation_finished
                     .send(mutate.call_statefully(
                         domain,
-                        (ArrayIrValue::Reference(mutation_reference), ArrayIrValue::Array(update)),
+                        (
+                            XlaValue::Reference(XlaReference::new(mutation_reference, domain.clone())),
+                            XlaValue::Array(update),
+                        ),
                     ))
                     .unwrap();
             });
@@ -3367,7 +3385,10 @@ mod tests {
         );
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         compiled
-            .call_statefully_async(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+            .call_statefully_async(
+                &domain,
+                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            )
             .r#await()
             .unwrap();
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
@@ -3402,13 +3423,13 @@ mod tests {
                 .unwrap();
         let first = compiled.call_statefully_async(
             &domain,
-            (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(first_update)),
+            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(first_update)),
         );
         let second_update =
             Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         let second = compiled.call_statefully_async(
             &domain,
-            (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(second_update)),
+            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(second_update)),
         );
 
         predecessor.complete(Err(Arc::from("injected predecessor failure")));
@@ -3451,12 +3472,10 @@ mod tests {
         let completion = ControlledReferenceCompletion::new();
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(completion.clone()));
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        drop(
-            compiled.call_statefully_async(
-                &domain,
-                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)),
-            ),
-        );
+        drop(compiled.call_statefully_async(
+            &domain,
+            (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+        ));
 
         completion.complete(Ok(()));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
@@ -3491,7 +3510,7 @@ mod tests {
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
             .unwrap();
         assert!(matches!(
-            compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),
+            compiled.call_statefully(&domain, XlaValue::Reference(XlaReference::new(view, domain.clone()))),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason
                     == "external state input 0 must be a root reference handle that uses its allocation's stored \
@@ -3531,8 +3550,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let ArrayIrValue::Array(output) =
-            sharded.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap()
+        let XlaValue::Array(output) = sharded
+            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            .unwrap()
         else {
             panic!("stateful read output must be an array")
         };
@@ -3560,7 +3580,7 @@ mod tests {
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
-                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)),
+                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == format!(
@@ -3610,8 +3630,11 @@ mod tests {
         )
         .unwrap();
 
-        let ArrayIrValue::Array(output) = compiled
-            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+        let XlaValue::Array(output) = compiled
+            .call_statefully(
+                &domain,
+                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            )
             .unwrap()
         else {
             panic!("stateful sharded output must be an array")
@@ -3641,7 +3664,10 @@ mod tests {
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
-                (ArrayIrValue::Reference(reversed_reference.clone()), ArrayIrValue::Array(update)),
+                (
+                    XlaValue::Reference(XlaReference::new(reversed_reference.clone(), domain.clone())),
+                    XlaValue::Array(update),
+                ),
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == "external state input 0 reference mesh does not match the compiled device mesh",
@@ -3678,17 +3704,17 @@ mod tests {
             .call_statefully(
                 &domain,
                 vec![
-                    ArrayIrValue::Reference(reference.clone()),
-                    ArrayIrValue::Array(array(&[11.0, 13.0, 17.0, 19.0])),
-                    ArrayIrValue::Reference(tangent_reference.clone()),
-                    ArrayIrValue::Array(array(&[41.0, 43.0, 47.0, 53.0])),
+                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                    XlaValue::Array(array(&[11.0, 13.0, 17.0, 19.0])),
+                    XlaValue::Reference(XlaReference::new(tangent_reference.clone(), domain.clone())),
+                    XlaValue::Array(array(&[41.0, 43.0, 47.0, 53.0])),
                 ],
             )
             .unwrap();
         let outputs = outputs
             .iter()
             .map(|output| match output {
-                ArrayIrValue::Array(array) => read_sharded_f32_array(array),
+                XlaValue::Array(array) => read_sharded_f32_array(array),
                 _ => panic!("nonlinear outputs are arrays"),
             })
             .collect::<Vec<_>>();
@@ -3742,17 +3768,17 @@ mod tests {
             .call_statefully(
                 &domain,
                 vec![
-                    ArrayIrValue::Reference(reference.clone()),
-                    ArrayIrValue::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
-                    ArrayIrValue::Reference(destination.clone()),
-                    ArrayIrValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
+                    XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                    XlaValue::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
+                    XlaValue::Reference(XlaReference::new(destination.clone(), domain.clone())),
+                    XlaValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
                 ],
             )
             .unwrap();
         let outputs = outputs
             .iter()
             .map(|output| match output {
-                ArrayIrValue::Array(array) => read_sharded_f32_array(array),
+                XlaValue::Array(array) => read_sharded_f32_array(array),
                 _ => panic!("nonlinear outputs are arrays"),
             })
             .collect::<Vec<_>>();
@@ -3817,7 +3843,10 @@ mod tests {
         compiled
             .call_statefully(
                 &domain,
-                vec![ArrayIrValue::Array(array(&[1.0, 2.0])), ArrayIrValue::Reference(destination.clone())],
+                vec![
+                    XlaValue::Array(array(&[1.0, 2.0])),
+                    XlaValue::Reference(XlaReference::new(destination.clone(), domain.clone())),
+                ],
             )
             .unwrap();
         assert_eq!(read_sharded_f32_array(&destination.read().unwrap()), vec![6.0, 9.0, 6.0, 9.0]);
@@ -3900,8 +3929,11 @@ mod tests {
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
-        let ArrayIrValue::Array(output) = compiled
-            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+        let XlaValue::Array(output) = compiled
+            .call_statefully(
+                &domain,
+                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            )
             .unwrap()
         else {
             panic!("stateful shard-map output must be an array")
@@ -3999,8 +4031,11 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let ArrayIrValue::Array(output) = compiled
-            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+        let XlaValue::Array(output) = compiled
+            .call_statefully(
+                &domain,
+                (XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())), XlaValue::Array(update)),
+            )
             .unwrap()
         else {
             panic!("stateful shard-map output must be an array")
@@ -4058,8 +4093,9 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let ArrayIrValue::Array(output) =
-                read.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap()
+            let XlaValue::Array(output) = read
+                .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+                .unwrap()
             else {
                 panic!("stateful bounded-dynamic output must be an array")
             };
@@ -4097,9 +4133,15 @@ mod tests {
                 Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                     .unwrap();
             let output = function
-                .call_statefully((), (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+                .call_statefully(
+                    (),
+                    (
+                        XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                        XlaValue::Array(update),
+                    ),
+                )
                 .unwrap();
-            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
             assert_eq!(read_f32_array(&client, &output), vec![expected]);
         }
         let statistics = function.statistics();
@@ -4127,15 +4169,15 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![ArrayIrValue::Reference(reference.clone())],
+            vec![XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone()))],
             ArrayIrType::Array(array_type.clone()),
             &domain,
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
         let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
-        let output = compiled.call_statefully(&domain, ArrayIrValue::Array(update)).unwrap();
-        let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+        let output = compiled.call_statefully(&domain, XlaValue::Array(update)).unwrap();
+        let XlaValue::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_f32_array(&client, &output), vec![3.0]);
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
     }
@@ -4161,13 +4203,15 @@ mod tests {
                 captures[0].add_update(&update)?;
                 captures[0].read().map_err(Into::into)
             },
-            vec![ArrayIrValue::Reference(reference.clone())],
+            vec![XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone()))],
             reference_type.clone(),
             &domain,
             XlaOptions::new(mesh),
         )
         .unwrap();
-        let error = compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).err();
+        let error = compiled
+            .call_statefully(&domain, XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())))
+            .err();
         assert!(
             matches!(
                 &error,
@@ -4196,7 +4240,10 @@ mod tests {
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, _| captures[0].read().map_err(Into::into),
-            vec![ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Reference(reference)],
+            vec![
+                XlaValue::Reference(XlaReference::new(reference.clone(), domain.clone())),
+                XlaValue::Reference(XlaReference::new(reference, domain.clone())),
+            ],
             ArrayIrType::Array(array_type),
             &domain,
             XlaOptions::new(mesh),
@@ -4247,16 +4294,16 @@ mod tests {
             .call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(higher_reference.clone()),
-                    ArrayIrValue::Reference(lower_reference.clone()),
-                    ArrayIrValue::Array(update),
+                    XlaValue::Reference(XlaReference::new(higher_reference.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(lower_reference.clone(), domain.clone())),
+                    XlaValue::Array(update),
                 ),
             )
             .unwrap();
-        let ArrayIrValue::Array(higher_output) = higher_output else {
+        let XlaValue::Array(higher_output) = higher_output else {
             panic!("first stateful public output must be an array")
         };
-        let ArrayIrValue::Array(lower_output) = lower_output else {
+        let XlaValue::Array(lower_output) = lower_output else {
             panic!("second stateful public output must be an array")
         };
         assert_eq!(read_f32_array(&client, &higher_output), vec![3.0]);
@@ -4322,9 +4369,9 @@ mod tests {
                         .send(compiled.call_statefully(
                             domain,
                             (
-                                ArrayIrValue::Reference(first),
-                                ArrayIrValue::Reference(second),
-                                ArrayIrValue::Array(update),
+                                XlaValue::Reference(XlaReference::new(first, domain.clone())),
+                                XlaValue::Reference(XlaReference::new(second, domain.clone())),
+                                XlaValue::Array(update),
                             ),
                         ))
                         .unwrap();
@@ -4389,10 +4436,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(pre_handoff_first.clone()),
-                    ArrayIrValue::Reference(pre_handoff_second.clone()),
-                    ArrayIrValue::Reference(pre_handoff_read_only.clone()),
-                    ArrayIrValue::Array(wrong_update),
+                    XlaValue::Reference(XlaReference::new(pre_handoff_first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_handoff_second.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_handoff_read_only.clone(), domain.clone())),
+                    XlaValue::Array(wrong_update),
                 ),
             ),
             Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected_error,
@@ -4413,10 +4460,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(pre_submission_first.clone()),
-                    ArrayIrValue::Reference(pre_submission_second.clone()),
-                    ArrayIrValue::Reference(pre_submission_read_only.clone()),
-                    ArrayIrValue::Array(update),
+                    XlaValue::Reference(XlaReference::new(pre_submission_first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_submission_second.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_submission_read_only.clone(), domain.clone())),
+                    XlaValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -4439,10 +4486,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(post_handoff_first.clone()),
-                    ArrayIrValue::Reference(post_handoff_second.clone()),
-                    ArrayIrValue::Reference(post_handoff_read_only.clone()),
-                    ArrayIrValue::Array(update),
+                    XlaValue::Reference(XlaReference::new(post_handoff_first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(post_handoff_second.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(post_handoff_read_only.clone(), domain.clone())),
+                    XlaValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -4473,10 +4520,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(pre_commit_first.clone()),
-                    ArrayIrValue::Reference(pre_commit_second.clone()),
-                    ArrayIrValue::Reference(pre_commit_read_only.clone()),
-                    ArrayIrValue::Array(update),
+                    XlaValue::Reference(XlaReference::new(pre_commit_first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_commit_second.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(pre_commit_read_only.clone(), domain.clone())),
+                    XlaValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -4504,10 +4551,10 @@ mod tests {
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(committed_first.clone()),
-                    ArrayIrValue::Reference(committed_second.clone()),
-                    ArrayIrValue::Reference(committed_read_only.clone()),
-                    ArrayIrValue::Array(update),
+                    XlaValue::Reference(XlaReference::new(committed_first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(committed_second.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(committed_read_only.clone(), domain.clone())),
+                    XlaValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -4554,7 +4601,11 @@ mod tests {
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
-                (ArrayIrValue::Reference(first.clone()), ArrayIrValue::Reference(frozen), ArrayIrValue::Array(update),),
+                (
+                    XlaValue::Reference(XlaReference::new(first.clone(), domain.clone())),
+                    XlaValue::Reference(XlaReference::new(frozen, domain.clone())),
+                    XlaValue::Array(update),
+                ),
             ),
             Err(XlaDomainError::Reference(ReferenceError::Frozen)),
         ));
@@ -7032,7 +7083,7 @@ mod tests {
     /// Tracing context that stages the decode-loop demo's `While` condition and body region programs in the XLA
     /// domain universe: its tracers are exactly [`XlaCompileTracer`]s, so the shared [`decode_step`] model runs
     /// unchanged inside the staged regions and in the eager reference loop.
-    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>;
+    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, XlaValue<'c>>;
 
     /// Shape and sampling hyperparameters of the tiny decode-loop demo model.
     #[derive(Copy, Clone)]

@@ -8,14 +8,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ryft_core::{ArrayIrType, ArrayIrValue, ArrayType, CompilationCacheDomain, Parameterized, ParameterizedFamily};
+use ryft_core::{ArrayIrType, ArrayType, CompilationCacheDomain, Parameterized, ParameterizedFamily};
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
 use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::{Array, ExecutableXlaFunction, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions};
+use crate::{Array, ExecutableXlaFunction, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions, XlaValue};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -466,8 +466,8 @@ where
     /// Executes with the active executable and advances adaptive profiling when this call wins ownership.
     pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
@@ -502,8 +502,8 @@ where
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
-        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
-        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<ArrayIrValue<Array<'c>>>,
+        In::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaValue<'c>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
