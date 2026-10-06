@@ -1,7 +1,7 @@
 //! Operations that rearrange, select, and relocate array data without changing element values. Each operation is
 //! defined by an [`Operation`](crate::Operation) type (e.g., [`SliceOperation`]) together with a value capability
-//! trait (e.g., [`Slice`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so
-//! the same code executes immediately or records into a program depending on the value it runs on.
+//! trait (e.g., [`Slice`]) whose functions apply it to eager [`Array`]s and traced values alike, so the same code
+//! executes immediately or records into a program depending on the value it runs on.
 //!
 //! The operations fall into four groups:
 //!
@@ -68,6 +68,7 @@
 //! # }
 //! ```
 
+use crate::arrays::Array;
 use crate::operations::Capability;
 
 pub mod broadcasting;

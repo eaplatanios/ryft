@@ -5376,6 +5376,20 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_value_slice_axis() {
+        // Composite values slice one axis of their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).slice_axis(1, 0, 2, 1),
+            Ok(ArrayIrValue::Array(matrix.slice_axis(1, 0, 2, 1).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).slice_axis(0, 0, 1, 1),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_array_index_axis() {
         let input = Array::matrix(2, 3, vec![10i32, 20, 30, 40, 50, 60]).unwrap();
         assert_eq!(input.index_axis(-1, 1, false), Ok(Array::vector(vec![20i32, 50]).unwrap()));
@@ -5385,16 +5399,16 @@ mod tests {
     }
 
     #[test]
-    fn test_slice_provided_functions_composite() {
-        // The provided functions read the array metadata of composite values through their array view.
+    fn test_array_ir_value_index_axis() {
+        // Composite values index one axis of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let composite = ArrayIrValue::Array(matrix.clone());
-        assert_eq!(composite.slice_axis(1, 0, 2, 1), Ok(ArrayIrValue::Array(matrix.slice_axis(1, 0, 2, 1).unwrap())));
-        assert_eq!(composite.index_axis(0, 1, false), Ok(ArrayIrValue::Array(matrix.index_axis(0, 1, false).unwrap())));
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            dimension.slice_axis(0, 0, 1, 1),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+            ArrayIrValue::Array(matrix.clone()).index_axis(0, 1, false),
+            Ok(ArrayIrValue::Array(matrix.index_axis(0, 1, false).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).index_axis(0, 1, false),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 

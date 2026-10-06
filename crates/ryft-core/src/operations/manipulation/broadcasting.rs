@@ -3098,6 +3098,20 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_broadcast_to_composite() {
+        // Composite values broadcast their array members, and first-class dimensions are rejected.
+        let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(vector.clone()).broadcast_to([3, 2]),
+            Ok(ArrayIrValue::Array(vector.broadcast_to([3, 2]).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).broadcast_to([2]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_broadcast_broadcast_leading() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.broadcast_leading([2]), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()));
@@ -3137,6 +3151,20 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_broadcast_leading_composite() {
+        // Composite values prepend axes to their array members, and first-class dimensions are rejected.
+        let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(vector.clone()).broadcast_leading([3]),
+            Ok(ArrayIrValue::Array(vector.broadcast_leading([3]).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).broadcast_leading([3]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_broadcast_broadcast_arrays() {
         // Common shape inference must not promote either payload to the other's element type.
         let integers = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1_i32, 2]).unwrap();
@@ -3165,21 +3193,17 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_provided_functions_composite() {
-        // The provided functions read the array metadata of composite values through their array view.
+    fn test_broadcast_broadcast_arrays_composite() {
+        // Composite values broadcast their array members to a common shape, and first-class dimensions are rejected.
         let vector = Array::vector(vec![1.0f32, 2.0]).unwrap();
-        let composite = ArrayIrValue::Array(vector.clone());
-        assert_eq!(composite.broadcast_to([3, 2]), Ok(ArrayIrValue::Array(vector.broadcast_to([3, 2]).unwrap())));
-        assert_eq!(composite.broadcast_leading([3]), Ok(ArrayIrValue::Array(vector.broadcast_leading([3]).unwrap())));
         let scalar = Array::scalar(5.0f32).unwrap();
         assert_eq!(
-            ArrayIrValue::broadcast_arrays(&[composite, ArrayIrValue::Array(scalar.clone())]),
+            ArrayIrValue::broadcast_arrays(&[ArrayIrValue::Array(vector.clone()), ArrayIrValue::Array(scalar.clone())]),
             Ok(Array::broadcast_arrays(&[vector, scalar]).unwrap().into_iter().map(ArrayIrValue::Array).collect()),
         );
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            dimension.broadcast_to([2]),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+            ArrayIrValue::broadcast_arrays(&[ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap())]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 

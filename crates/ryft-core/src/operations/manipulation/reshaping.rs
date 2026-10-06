@@ -2586,6 +2586,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reshape_reshape_to_sizes_composite() {
+        // Composite values reshape their array members by sizes, and first-class dimensions are rejected.
+        let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).reshape_to_sizes(&[3, -1]),
+            Ok(ArrayIrValue::Array(matrix.reshape_to_sizes(&[3, -1]).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).reshape_to_sizes(&[2]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_reshape_flatten() {
         let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
         assert_eq!(input.flatten(), Array::vector(vec![1i32, 2, 3, 4]));
@@ -2599,6 +2613,17 @@ mod tests {
         )
         .with_memory(Memory::Host { pinned: true });
         assert_eq!(vector.flatten(), Ok(vector.clone()));
+    }
+
+    #[test]
+    fn test_reshape_flatten_composite() {
+        // Composite values flatten their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(ArrayIrValue::Array(matrix.clone()).flatten(), Ok(ArrayIrValue::Array(matrix.flatten().unwrap())));
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).flatten(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]
@@ -2626,6 +2651,20 @@ mod tests {
                 Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1), Dimension::Static(3)]),
             )
             .with_memory(Memory::Host { pinned: true })),
+        );
+    }
+
+    #[test]
+    fn test_reshape_expand_dimensions_composite() {
+        // Composite values expand the dimensions of their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).expand_dimensions(0),
+            Ok(ArrayIrValue::Array(matrix.expand_dimensions(0).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).expand_dimensions(0),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 
@@ -2664,6 +2703,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reshape_squeeze_composite() {
+        // Composite values squeeze their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).squeeze([0]),
+            Ok(ArrayIrValue::Array(matrix.squeeze([0]).unwrap()))
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).squeeze([0]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_reshape_squeeze_all() {
         let input = Array::matrix(1, 1, vec![7i32]).unwrap();
         assert_eq!(input.squeeze_all(), Array::scalar(7i32));
@@ -2688,22 +2741,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_provided_functions_composite() {
-        // The provided functions read the array metadata of composite values through their array view.
+    fn test_reshape_squeeze_all_composite() {
+        // Composite values squeeze all unit axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(1, 3, vec![1.0f32, 2.0, 3.0]).unwrap();
-        let composite = ArrayIrValue::Array(matrix.clone());
-        assert_eq!(composite.flatten(), Ok(ArrayIrValue::Array(matrix.flatten().unwrap())));
         assert_eq!(
-            composite.reshape_to_sizes(&[3, -1]),
-            Ok(ArrayIrValue::Array(matrix.reshape_to_sizes(&[3, -1]).unwrap()))
+            ArrayIrValue::Array(matrix.clone()).squeeze_all(),
+            Ok(ArrayIrValue::Array(matrix.squeeze_all().unwrap()))
         );
-        assert_eq!(composite.expand_dimensions(0), Ok(ArrayIrValue::Array(matrix.expand_dimensions(0).unwrap())));
-        assert_eq!(composite.squeeze([0]), Ok(ArrayIrValue::Array(matrix.squeeze([0]).unwrap())));
-        assert_eq!(composite.squeeze_all(), Ok(ArrayIrValue::Array(matrix.squeeze_all().unwrap())));
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            dimension.flatten(),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).squeeze_all(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 

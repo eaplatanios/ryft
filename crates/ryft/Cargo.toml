@@ -48,3 +48,7 @@ neuron = ["xla", "ryft-xla/neuron"]
 metal = ["xla", "ryft-xla/metal"]
 mps = ["xla", "ryft-xla/mps"]
 triton = ["xla", "ryft-xla/triton"]
+
+[[example]]
+name = "stable_hlo_matmul"
+required-features = ["ryft-mlir", "ryft-pjrt"]

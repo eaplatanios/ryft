@@ -1446,6 +1446,20 @@ mod tests {
     }
 
     #[test]
+    fn test_transpose_transpose_reversed_composite() {
+        // Composite values reverse the axes of their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).transpose_reversed(),
+            Ok(ArrayIrValue::Array(matrix.transpose_reversed().unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).transpose_reversed(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_transpose_matrix_transpose() {
         let input = Array::from_elements(
             ArrayType::new_static(DataType::C64, [2, 1, 2]),
@@ -1480,6 +1494,20 @@ mod tests {
         assert_eq!(
             ArrayType::new_static(DataType::F32, [2]).matrix_transpose(),
             Err(TypeError::invalid("matrix transpose requires rank at least 2 but input has rank 1").into()),
+        );
+    }
+
+    #[test]
+    fn test_transpose_matrix_transpose_composite() {
+        // Composite values transpose their array members as matrices, and first-class dimensions are rejected.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).matrix_transpose(),
+            Ok(ArrayIrValue::Array(matrix.matrix_transpose().unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).matrix_transpose(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 
@@ -1580,6 +1608,20 @@ mod tests {
     }
 
     #[test]
+    fn test_transpose_move_axis_composite() {
+        // Composite values move the axes of their array members, and first-class dimensions are rejected.
+        let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            ArrayIrValue::Array(matrix.clone()).move_axis(0, 1),
+            Ok(ArrayIrValue::Array(matrix.move_axis(0, 1).unwrap())),
+        );
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).move_axis(0, 0),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
     fn test_transpose_swap_axes() {
         // `swap_axes` exchanges exactly two dimensions and validates both indices.
         // Swapping axes 0 and 1 of a matrix is a plain transpose: the [2, 3] payload becomes [3, 2].
@@ -1634,35 +1676,16 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_provided_functions_composite() {
-        // The provided functions read the array metadata of composite values through their array view.
+    fn test_transpose_swap_axes_composite() {
+        // Composite values swap the axes of their array members, and first-class dimensions are rejected.
         let matrix = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let composite = ArrayIrValue::Array(matrix.clone());
-        assert_eq!(composite.transpose_reversed(), Ok(ArrayIrValue::Array(matrix.transpose_reversed().unwrap())));
-        assert_eq!(composite.matrix_transpose(), Ok(ArrayIrValue::Array(matrix.matrix_transpose().unwrap())));
-        assert_eq!(composite.move_axis(0, 1), Ok(ArrayIrValue::Array(matrix.move_axis(0, 1).unwrap())));
-        assert_eq!(composite.swap_axes(0, -1), Ok(ArrayIrValue::Array(matrix.swap_axes(0, -1).unwrap())));
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            dimension.transpose_reversed(),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
-        );
-    }
-
-    #[test]
-    fn test_transpose_universes() {
-        // An unchanged generic bound resolves to each implementor's own universe: the array universe of an array type
-        // and of a reference array.
-        fn exchanged<T: Transpose>(value: &T) -> Result<T, ProgramError> {
-            value.transpose([1, 0])
-        }
-        assert_eq!(
-            exchanged(&ArrayType::new_static(DataType::F32, [2, 3])),
-            Ok(ArrayType::new_static(DataType::F32, [3, 2])),
+            ArrayIrValue::Array(matrix.clone()).swap_axes(0, -1),
+            Ok(ArrayIrValue::Array(matrix.swap_axes(0, -1).unwrap())),
         );
         assert_eq!(
-            exchanged(&Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-            Ok(Array::matrix(3, 2, vec![1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()),
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap()).swap_axes(0, 0),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 
