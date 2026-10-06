@@ -671,9 +671,7 @@ impl Operation for ParallelRaggedAllToAllOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> InterpretableOperation<C>
-    for ParallelRaggedAllToAllOperation
-{
+impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for ParallelRaggedAllToAllOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -708,15 +706,157 @@ impl<C: Domain<Type = ArrayType, Value: ParallelRaggedAllToAllEvaluation>> Inter
             });
         }
 
-        Ok(vec![C::Value::evaluate_parallel_ragged_all_to_all(
-            self,
-            operand,
-            output,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            receive_sizes,
-        )?])
+        // Execute the exchange on the host. The public `ParallelRaggedAllToAll` capability cannot reach this point
+        // for an `Array`, which is never inside an axis binder, so only the degenerate exchange above and the
+        // batching-internal physical representation, in which every input carries one leading participant axis,
+        // are evaluated here. Inference has validated the input types, but not the metadata values: they must be
+        // non-negative, every source and destination region must be in bounds, every send size must equal the
+        // corresponding receive size, and the received regions of an overwriting exchange must not overlap.
+        let input_offsets = input_offsets.non_negative_integer_elements("input_offsets")?;
+        let send_sizes = send_sizes.non_negative_integer_elements("send_sizes")?;
+        let output_offsets = output_offsets.non_negative_integer_elements("output_offsets")?;
+        let receive_sizes = receive_sizes.non_negative_integer_elements("receive_sizes")?;
+        let participant_count = if physical { self.axis_size } else { 1 };
+        let metadata_length = input_offsets.len() / participant_count;
+        let input_extent = operand.r#type().shape().dimensions()[usize::from(physical)].value().unwrap();
+        let output_extent = output.r#type().shape().dimensions()[usize::from(physical)].value().unwrap();
+        let groups = if physical { self.participant_groups() } else { vec![vec![0]] };
+        let trailing_start = usize::from(physical) + 1;
+        let row_element_count = operand.r#type().shape().dimensions()[trailing_start..]
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(dimension.value().unwrap()))
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`",
+                ),
+            })?;
+        let row_byte_count = row_element_count
+            .checked_mul(ArrayAddressing::new(operand.r#type().into_owned())?.element_byte_width())
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!(
+                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row byte size does not fit in `usize`",
+                ),
+            })?;
+
+        // Validate the complete exchange before copying anything. `output_offsets` are sender-owned metadata in the
+        // receiver coordinate frame, while `receive_sizes` are indexed receiver-first and sender-second.
+        let overwrite = !self.accumulates_updates();
+        let mut received_regions = overwrite.then(|| vec![Vec::new(); participant_count]);
+        let mut transfers = Vec::new();
+        for group in &groups {
+            let slices_per_peer = metadata_length / group.len();
+            for (sender_position, &sender) in group.iter().enumerate() {
+                for (receiver_position, &receiver) in group.iter().enumerate() {
+                    for slice in 0..slices_per_peer {
+                        let send_index = receiver_position * slices_per_peer + slice;
+                        let receive_index = sender_position * slices_per_peer + slice;
+                        let sender_metadata_index = sender * metadata_length + send_index;
+                        let receiver_metadata_index = receiver * metadata_length + receive_index;
+                        let input_offset = input_offsets[sender_metadata_index];
+                        let send_size = send_sizes[sender_metadata_index];
+                        let output_offset = output_offsets[sender_metadata_index];
+                        let receive_size = receive_sizes[receiver_metadata_index];
+
+                        let input_end =
+                            input_offset.checked_add(send_size).ok_or_else(|| ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region for participant \
+                                     {sender} at metadata index {send_index} overflows `usize`",
+                                ),
+                            })?;
+                        if input_end > input_extent {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region [{input_offset}, \
+                                     {input_end}) for participant {sender} exceeds input extent {input_extent}",
+                                ),
+                            });
+                        }
+
+                        if send_size != receive_size {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` send size {send_size} from \
+                                     participant {sender} to participant {receiver} does not match receive size \
+                                     {receive_size}",
+                                ),
+                            });
+                        }
+
+                        let output_end =
+                            output_offset.checked_add(receive_size).ok_or_else(|| ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region for participant \
+                                     {receiver} from participant {sender} overflows `usize`",
+                                ),
+                            })?;
+                        if output_end > output_extent {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region [{output_offset}, \
+                                     {output_end}) for participant {receiver} exceeds output extent {output_extent}",
+                                ),
+                            });
+                        }
+
+                        if receive_size != 0
+                            && let Some(received_regions) = &mut received_regions
+                        {
+                            received_regions[receiver].push((output_offset, output_end));
+                        }
+
+                        if send_size != 0 && row_byte_count != 0 {
+                            // The regions were checked against the extents above, so every row lies within the
+                            // `participant_count × extent` rows of an existing buffer and no byte offset overflows.
+                            let source_start = (sender * input_extent + input_offset) * row_byte_count;
+                            let destination_start = (receiver * output_extent + output_offset) * row_byte_count;
+                            let byte_count = send_size * row_byte_count;
+                            transfers.push((source_start, destination_start, byte_count, send_size));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mut received_regions) = received_regions {
+            for (receiver, regions) in received_regions.iter_mut().enumerate() {
+                regions.sort_unstable();
+                for regions in regions.windows(2) {
+                    if regions[1].0 < regions[0].1 {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "`{}` received output regions [{}, {}) and [{}, {}) overlap for participant {}",
+                                PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
+                                regions[0].0,
+                                regions[0].1,
+                                regions[1].0,
+                                regions[1].1,
+                                receiver,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let operand_bytes = operand.logical_bytes();
+        let mut result_bytes = output.logical_bytes();
+        for (source_start, destination_start, byte_count, row_count) in transfers {
+            let source = &operand_bytes[source_start..source_start + byte_count];
+            let destination = &mut result_bytes[destination_start..destination_start + byte_count];
+            if overwrite {
+                destination.copy_from_slice(source);
+            } else {
+                let mut dimensions = vec![Dimension::Static(row_count)];
+                dimensions.extend(operand.r#type().shape().dimensions()[trailing_start..].iter().cloned());
+                let segment_type = ArrayType::new(operand.r#type().data_type(), Shape::new(dimensions));
+                let source = Array::from_logical_bytes(segment_type.clone(), source)?;
+                let destination_array = Array::from_logical_bytes(segment_type, destination)?;
+                destination.copy_from_slice(destination_array.add(&source)?.logical_bytes().as_slice());
+            }
+        }
+
+        Ok(vec![Array::from_logical_bytes(output.r#type().into_owned(), result_bytes.as_slice())?])
     }
 }
 
@@ -1342,12 +1482,8 @@ impl MemberOperation<ArrayIrType> for ParallelRaggedAllToAllOperation {
     }
 }
 
-impl<
-    C: Domain<
-            Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: ParallelRaggedAllToAllEvaluation + Value<Type = ArrayType>>,
-        >,
-> MemberInterpretableOperation<C> for ParallelRaggedAllToAllOperation
+impl<C: Domain<Type = ArrayIrType, Value: ValueProjection<ArrayType, Projected = Array>>>
+    MemberInterpretableOperation<C> for ParallelRaggedAllToAllOperation
 {
     #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -1611,195 +1747,6 @@ impl<
             output_offsets,
             receive_sizes,
         ])
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Reference-value capability used by eager interpretation of [`ParallelRaggedAllToAllOperation`].
-///
-/// The public [`ParallelRaggedAllToAll`] trait stages the operation through a named-axis context. This narrower
-/// crate-owned capability instead executes already-materialized values in either the public per-participant
-/// representation or the explicitly marked internal batching representation.
-pub(crate) trait ParallelRaggedAllToAllEvaluation: Sized {
-    /// Executes `operation` over the six inputs in their canonical order and in the representation that `operation`
-    /// carries, returning `output` with the received segments written into it (or added to it, for an accumulating
-    /// operation).
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Exchange to execute, which determines the input representation and update semantics.
-    ///   - `operand`: Array whose segments are sent.
-    ///   - `output`: Array into which the received segments are written (or added).
-    ///   - `input_offsets`: Start row of every sent segment in `operand`.
-    ///   - `send_sizes`: Number of rows of every sent segment.
-    ///   - `output_offsets`: Start row of every sent segment in the `output` of its receiver.
-    ///   - `receive_sizes`: Number of rows of every received segment.
-    ///
-    /// All inputs must already be validated against the type contract of [`ParallelRaggedAllToAllOperation`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ProgramError`] if the metadata violate the runtime preconditions of
-    /// [`ParallelRaggedAllToAllOperation`]: if they contain negative values, if a source or destination region is out
-    /// of bounds, if a send size differs from the corresponding receive size, or if the received regions of an
-    /// overwriting exchange overlap.
-    fn evaluate_parallel_ragged_all_to_all(
-        operation: &ParallelRaggedAllToAllOperation,
-        operand: &Self,
-        output: &Self,
-        input_offsets: &Self,
-        send_sizes: &Self,
-        output_offsets: &Self,
-        receive_sizes: &Self,
-    ) -> Result<Self, ProgramError>;
-}
-
-impl ParallelRaggedAllToAllEvaluation for Array {
-    fn evaluate_parallel_ragged_all_to_all(
-        operation: &ParallelRaggedAllToAllOperation,
-        operand: &Self,
-        output: &Self,
-        input_offsets: &Self,
-        send_sizes: &Self,
-        output_offsets: &Self,
-        receive_sizes: &Self,
-    ) -> Result<Self, ProgramError> {
-        let physical = operation.is_physical();
-        let input_offsets = input_offsets.non_negative_integer_elements("input_offsets")?;
-        let send_sizes = send_sizes.non_negative_integer_elements("send_sizes")?;
-        let output_offsets = output_offsets.non_negative_integer_elements("output_offsets")?;
-        let receive_sizes = receive_sizes.non_negative_integer_elements("receive_sizes")?;
-        let participant_count = if physical { operation.axis_size() } else { 1 };
-        let metadata_length = input_offsets.len() / participant_count;
-        let input_extent = operand.r#type().shape().dimensions()[usize::from(physical)].value().unwrap();
-        let output_extent = output.r#type().shape().dimensions()[usize::from(physical)].value().unwrap();
-        let groups = if physical { operation.participant_groups() } else { vec![vec![0]] };
-        let trailing_start = usize::from(physical) + 1;
-        let row_element_count = operand.r#type().shape().dimensions()[trailing_start..]
-            .iter()
-            .try_fold(1usize, |count, dimension| count.checked_mul(dimension.value().unwrap()))
-            .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`",
-                ),
-            })?;
-        let row_byte_count = row_element_count
-            .checked_mul(ArrayAddressing::new(operand.r#type().into_owned())?.element_byte_width())
-            .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!(
-                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row byte size does not fit in `usize`",
-                ),
-            })?;
-
-        // Validate the complete exchange before copying anything. `output_offsets` are sender-owned metadata in the
-        // receiver coordinate frame, while `receive_sizes` are indexed receiver-first and sender-second.
-        let overwrite = !operation.accumulates_updates();
-        let mut received_regions = overwrite.then(|| vec![Vec::new(); participant_count]);
-        let mut transfers = Vec::new();
-        for group in &groups {
-            let slices_per_peer = metadata_length / group.len();
-            for (sender_position, &sender) in group.iter().enumerate() {
-                for (receiver_position, &receiver) in group.iter().enumerate() {
-                    for slice in 0..slices_per_peer {
-                        let send_index = receiver_position * slices_per_peer + slice;
-                        let receive_index = sender_position * slices_per_peer + slice;
-                        let sender_metadata_index = sender * metadata_length + send_index;
-                        let receiver_metadata_index = receiver * metadata_length + receive_index;
-                        let input_offset = input_offsets[sender_metadata_index];
-                        let send_size = send_sizes[sender_metadata_index];
-                        let output_offset = output_offsets[sender_metadata_index];
-                        let receive_size = receive_sizes[receiver_metadata_index];
-                        let input_end =
-                            input_offset.checked_add(send_size).ok_or_else(|| ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region for participant \
-                                     {sender} at metadata index {send_index} overflows `usize`",
-                                ),
-                            })?;
-                        if input_end > input_extent {
-                            return Err(ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region [{input_offset}, \
-                                     {input_end}) for participant {sender} exceeds input extent {input_extent}",
-                                ),
-                            });
-                        }
-                        if send_size != receive_size {
-                            return Err(ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` send size {send_size} from \
-                                     participant {sender} to participant {receiver} does not match receive size \
-                                     {receive_size}",
-                                ),
-                            });
-                        }
-                        let output_end =
-                            output_offset.checked_add(receive_size).ok_or_else(|| ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region for participant \
-                                     {receiver} from participant {sender} overflows `usize`",
-                                ),
-                            })?;
-                        if output_end > output_extent {
-                            return Err(ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region [{output_offset}, \
-                                     {output_end}) for participant {receiver} exceeds output extent {output_extent}",
-                                ),
-                            });
-                        }
-                        if receive_size != 0
-                            && let Some(received_regions) = &mut received_regions
-                        {
-                            received_regions[receiver].push((output_offset, output_end));
-                        }
-                        if send_size != 0 && row_byte_count != 0 {
-                            // The regions were checked against the extents above, so every row lies within the
-                            // `participant_count × extent` rows of an existing buffer and no byte offset overflows.
-                            let source_start = (sender * input_extent + input_offset) * row_byte_count;
-                            let destination_start = (receiver * output_extent + output_offset) * row_byte_count;
-                            let byte_count = send_size * row_byte_count;
-                            transfers.push((source_start, destination_start, byte_count, send_size));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(mut received_regions) = received_regions {
-            for (receiver, regions) in received_regions.iter_mut().enumerate() {
-                regions.sort_unstable();
-                for regions in regions.windows(2) {
-                    if regions[1].0 < regions[0].1 {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` received output regions [{}, {}) and \
-                                 [{}, {}) overlap for participant {receiver}",
-                                regions[0].0, regions[0].1, regions[1].0, regions[1].1,
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        let operand_bytes = operand.logical_bytes();
-        let mut result_bytes = output.logical_bytes();
-        for (source_start, destination_start, byte_count, row_count) in transfers {
-            let source = &operand_bytes[source_start..source_start + byte_count];
-            let destination = &mut result_bytes[destination_start..destination_start + byte_count];
-            if overwrite {
-                destination.copy_from_slice(source);
-            } else {
-                let mut dimensions = vec![Dimension::Static(row_count)];
-                dimensions.extend(operand.r#type().shape().dimensions()[trailing_start..].iter().cloned());
-                let segment_type = ArrayType::new(operand.r#type().data_type(), Shape::new(dimensions));
-                let source = Array::from_logical_bytes(segment_type.clone(), source)?;
-                let destination_array = Array::from_logical_bytes(segment_type, destination)?;
-                destination.copy_from_slice(destination_array.add(&source)?.logical_bytes().as_slice());
-            }
-        }
-        Array::from_logical_bytes(output.r#type().into_owned(), result_bytes.as_slice())
     }
 }
 
