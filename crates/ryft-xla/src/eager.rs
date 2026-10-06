@@ -106,7 +106,7 @@ impl AssertionValue for Array<'_> {
     }
 }
 
-impl DimensionSize<usize> for Array<'_> {
+impl DimensionSize<usize, ArrayType> for Array<'_> {
     /// Returns the concrete global extent of `axis` from this array's complete shard metadata.
     ///
     /// The descriptor list includes remote shards, so taking the greatest exclusive slice end recovers the global
@@ -124,7 +124,7 @@ impl DimensionSize<usize> for Array<'_> {
     }
 }
 
-impl DimensionFromScalar<DimensionValue> for Array<'_> {
+impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
     /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         let operation = DimensionFromScalarOperation::new(output);

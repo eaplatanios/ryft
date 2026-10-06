@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use ryft_macros::Parameter;
+use ryft_macros::{Parameter, capability};
 
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionError,
@@ -14,7 +14,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
-use crate::operations::{ConstantOperation, DimensionConstant};
+use crate::operations::{Capability, ConstantOperation, DimensionConstant};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -302,7 +302,8 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// # Ok(())
 /// # }
 /// ```
-pub trait DimensionSize<Output = Self>: Typed + Sized {
+#[capability]
+pub trait DimensionSize<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns the runtime extent of `axis` in the representation selected by `Output`.
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Output, ProgramError>;
 }
@@ -315,7 +316,7 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V> for V
+> DimensionSize<V, ArrayIrType> for V
 {
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         let r#type = self.r#type();
@@ -333,7 +334,7 @@ impl<
     }
 }
 
-impl DimensionSize<usize> for Array {
+impl DimensionSize<usize, ArrayType> for Array {
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
         let axis = axis.into();
         let position = axis.normalize(self.r#type().rank()).map_err(|_| {
@@ -353,7 +354,7 @@ impl DimensionSize<usize> for Array {
     }
 }
 
-impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayIrValue<A> {
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize<Self, ArrayIrType> for ArrayIrValue<A> {
     fn dimension_size<I: Into<Axis>>(&self, axis: I) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let input_type = array.r#type();
@@ -371,7 +372,7 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V> for ProjectedValue<ArrayType, V>
+> DimensionSize<V, ArrayType> for ProjectedValue<ArrayType, V>
 {
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         // The projected view stages into and returns the parent composite carrier,

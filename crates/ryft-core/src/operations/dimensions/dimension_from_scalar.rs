@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
     DimensionValue, DimensionVariable,
@@ -14,8 +16,8 @@ use crate::macros::{
     impl_reference_dischargeable_operation,
 };
 use crate::operations::{
-    ConstantOperation, DimensionSize, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation,
-    ScanOperation, Transpose, TransposeOperation,
+    Capability, ConstantOperation, DimensionSize, DimensionSizeOperation, DimensionToScalarOperation,
+    DynamicBroadcastOperation, ScanOperation, Transpose, TransposeOperation,
 };
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -249,7 +251,8 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// # Ok(())
 /// # }
 /// ```
-pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
+#[capability]
+pub trait DimensionFromScalar<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this rank-zero integer array as a first-class dimension value described by `output`.
     fn to_dimension(&self, output: DimensionVariable) -> Result<Output, ProgramError>;
 }
@@ -259,7 +262,7 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,
-> DimensionFromScalar<V> for V
+> DimensionFromScalar<V, ArrayIrType> for V
 {
     fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self
@@ -269,7 +272,7 @@ impl<
     }
 }
 
-impl DimensionFromScalar<DimensionValue> for Array {
+impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         let operation = DimensionFromScalarOperation::new(output);
         DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
@@ -277,7 +280,9 @@ impl DimensionFromScalar<DimensionValue> for Array {
     }
 }
 
-impl<A: Value<Type = ArrayType> + DimensionFromScalar<DimensionValue>> DimensionFromScalar for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + DimensionFromScalar<DimensionValue>> DimensionFromScalar<Self, ArrayIrType>
+    for ArrayIrValue<A>
+{
     fn to_dimension(&self, output: DimensionVariable) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         Ok(Self::Dimension(array.to_dimension(output)?))
@@ -289,7 +294,7 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,
-> DimensionFromScalar<V> for ProjectedValue<ArrayType, V>
+> DimensionFromScalar<V, ArrayType> for ProjectedValue<ArrayType, V>
 {
     fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self

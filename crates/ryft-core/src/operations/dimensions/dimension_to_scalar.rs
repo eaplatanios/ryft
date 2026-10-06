@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use ryft_macros::capability;
+
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
     DimensionValue,
@@ -11,6 +13,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
@@ -138,12 +141,13 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 /// # Ok(())
 /// # }
 /// ```
-pub trait DimensionToScalar<Output = Self>: Typed + Sized {
+#[capability]
+pub trait DimensionToScalar<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Returns this dimension as an ordinary rank-zero signed 64-bit array represented by `Output`.
     fn to_scalar(&self) -> Result<Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for V
+impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V, ArrayIrType> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
 {
@@ -156,14 +160,14 @@ where
     }
 }
 
-impl DimensionToScalar<Array> for DimensionValue {
+impl DimensionToScalar<Array, DimensionType> for DimensionValue {
     #[inline]
     fn to_scalar(&self) -> Result<Array, ProgramError> {
         Array::scalar(i64::try_from(self.extent()).unwrap())
     }
 }
 
-impl<A: Value<Type = ArrayType>> DimensionToScalar for ArrayIrValue<A>
+impl<A: Value<Type = ArrayType>> DimensionToScalar<Self, ArrayIrType> for ArrayIrValue<A>
 where
     DimensionValue: DimensionToScalar<A>,
 {
@@ -173,7 +177,7 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for ProjectedValue<DimensionType, V>
+impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V, DimensionType> for ProjectedValue<DimensionType, V>
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
 {
