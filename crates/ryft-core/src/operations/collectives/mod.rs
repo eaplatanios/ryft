@@ -706,11 +706,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                         let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
                         collective_inputs.push(linear_inputs[0].clone());
                         collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                        linear_inputs[0].domain().bind(
-                            forward_operation,
-                            Vec::new(),
-                            collective_inputs.as_slice(),
-                        )
+                        linear_inputs[0].domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
                     },
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].domain();

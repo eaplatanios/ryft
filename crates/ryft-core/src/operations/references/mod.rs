@@ -129,11 +129,11 @@ pub(crate) mod tests {
     use crate::operations::{Add, AddOperation};
     use crate::parameters::Parameter;
     use crate::programs::{
-        ValueDirectDispatch, Effects, EmptyRegionDriver, NoReferenceTransform, Operation, ProgramError, ReferenceAccumulationPolicy,
+        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, ProgramError, ReferenceAccumulationPolicy,
         ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
         ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
         RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-        discharge_reference_free_operation,
+        ValueDirectDispatch, discharge_reference_free_operation,
     };
 
     use super::*;

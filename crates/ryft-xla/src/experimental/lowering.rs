@@ -14857,9 +14857,8 @@ mod tests {
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -14892,9 +14891,8 @@ mod tests {
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -14919,9 +14917,8 @@ mod tests {
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1, "{module}");
         assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 1, "{module}");
@@ -15062,9 +15059,8 @@ mod tests {
             let output = builder
                 .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
                 .unwrap()[0];
-            let program = builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 1, "{module}");
             assert_eq!(module.matches("result_layouts = [dense<[0, 1]> : tensor<2xindex>]").count(), 1, "{module}");
@@ -15083,9 +15079,8 @@ mod tests {
             let output = builder
                 .add_instruction(BroadcastOperation::new(output_type, Vec::new()), Vec::new(), vec![input], None)
                 .unwrap()[0];
-            let program = builder
-                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
             assert_eq!(
                 to_mlir_module_for_plain_program(&program, "main"),
                 Err(LoweringError::UnsupportedOp {
@@ -15644,9 +15639,8 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -15670,9 +15664,8 @@ mod tests {
         let mut builder = ryft_core::ProgramBuilder::<Array, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
         let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -15700,9 +15693,8 @@ mod tests {
             builder.add_instruction(TransposeOperation::new([2, 0, 1]), Vec::new(), vec![input], None).unwrap()[0];
         let output =
             builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -16840,9 +16832,8 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -16873,9 +16864,8 @@ mod tests {
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
@@ -17042,13 +17032,7 @@ mod tests {
 
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
-            |input| {
-                input
-                    .domain()
-                    .bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[])
-                    .unwrap()
-                    .remove(0)
-            },
+            |input| input.domain().bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[]).unwrap().remove(0),
             test_vector_type(4),
             mesh.clone(),
             Sharding::replicated(mesh.clone(), 1),
@@ -21810,9 +21794,7 @@ mod tests {
             (
                 input.clone(),
                 Array::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
-                windows
-                    .clone()
-                    .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(fill).unwrap())) }),
+                windows.clone().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(fill).unwrap())) }),
                 values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
             ),
             (
@@ -22202,8 +22184,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
-            let program =
-                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![], vec![Placeholder]).unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![], vec![Placeholder]).unwrap();
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
@@ -28972,8 +28953,7 @@ mod tests {
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
-            let program =
-                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -29066,8 +29046,7 @@ mod tests {
         let output = builder
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
             .unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.constant").count(), 1, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 0, "{stablehlo}");
@@ -29175,8 +29154,7 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let program =
-                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert!(stablehlo.contains(rendered_values), "low-precision literal {data_type}: {stablehlo}");
         }
@@ -29390,8 +29368,7 @@ mod tests {
                 Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let output = builder.add_constant(value);
-            let program =
-                builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
