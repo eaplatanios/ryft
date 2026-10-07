@@ -1756,8 +1756,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayTracingContext, DimensionBounds, DimensionType, MeshAxis,
-        MeshAxisType, RaggedAxis,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
+        RaggedAxis,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1855,7 +1855,7 @@ mod tests {
     fn trace_unrelated_axis_exchange(
         input_types: Vec<ArrayType>,
     ) -> Result<(ArrayType, Program<Array, ArrayOperation<Array>, Vec<Array>, Array>), ProgramError> {
-        ArrayTracingContext::trace(
+        TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
                 let inputs = inputs
@@ -2943,7 +2943,7 @@ mod tests {
             ArrayType::new_static(DataType::I32, [2, 2]),
             ArrayType::new_static(DataType::I32, [2, 2]),
         ];
-        let error = ArrayTracingContext::trace(
+        let error = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("x".to_string());
                 let inputs = inputs
@@ -3037,7 +3037,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 2))
                 .unwrap()
         };
-        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
                 let domain = inputs[0].dispatch_domain();
                 let context =
@@ -3304,7 +3304,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["x"]).unwrap())
                 .unwrap()
         };
-        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2)
                     .with_axis_name("y".to_string());
@@ -4638,7 +4638,7 @@ mod tests {
                 .with_sharding(sharding.clone().with_varying_manual_axes(varying_manual_axes.iter().copied()).unwrap())
                 .unwrap()
         };
-        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
@@ -4745,7 +4745,7 @@ mod tests {
 
         // A pending sum over the participating manual mesh axis is rejected before any input is made varying.
         assert_eq!(
-            ArrayTracingContext::trace_with_named_axes(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |inputs: Vec<_>| {
                     inputs[0]
                         .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
@@ -4827,7 +4827,7 @@ mod tests {
             typed(DataType::I32, 2),
         ];
         let axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
-        let (output_type, program) = ArrayTracingContext::trace_with_named_axes(
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
                 inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
                     "x",
@@ -4922,7 +4922,7 @@ mod tests {
 
         // Groups that do not partition the full axis are rejected before anything is staged.
         assert_eq!(
-            ArrayTracingContext::trace_with_named_axes(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |inputs: Vec<_>| {
                     inputs[0].parallel_ragged_all_to_all_with_axis_index_groups(
                         "x",

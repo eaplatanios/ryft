@@ -34,8 +34,7 @@ pub use elements::{
 pub use ir::{ArrayIrContext, ArrayIrValue};
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,
-    DimensionOperations, DimensionTracingContext,
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, DimensionOperation, DimensionOperations,
 };
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,

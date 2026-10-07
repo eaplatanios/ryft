@@ -295,12 +295,12 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Closed [`Operation`] family for Ryft's array IR, whose values include ordinary arrays,
-/// first-class runtime dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of
-/// [`ArrayOperation`] and [`DimensionOperation`]: it selects the member family, projects the composite type boundary
-/// once, delegates to that family, and lifts the inferred result types back into [`ArrayIrType`]. Reference operations
-/// remain composite-native because their signatures cross the array/reference boundary and their ordered state
-/// semantics must remain visible to generic program passes.
+/// Closed [`Operation`] family for Ryft's array IR, whose values include ordinary arrays, first-class runtime
+/// dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of [`ArrayOperation`] and
+/// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
+/// family, and lifts the inferred result types back into [`ArrayIrType`]. Reference operations remain composite-native
+/// because their signatures cross the array/reference boundary and their ordered state semantics must remain visible
+/// to generic program passes.
 ///
 /// Operations whose signatures mix arrays and dimensions are represented as explicit variants because no homogeneous
 /// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
@@ -569,41 +569,6 @@ impl<
 {
 }
 
-/// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
-/// [`ArrayOperation`] family.
-pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
-
-/// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.
-pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
-
-// The array-only family has no reference inputs and therefore declares no access layout. It still implements the
-// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's transform type
-// (i.e., `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference
-// cotangents. For this family, that selection resolves to the reference-free provider, which ordinary array gradients
-// never invoke.
-impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
-    type Transform = NoReferenceTransform<NoReferent, ArrayType>;
-
-    fn base_input_count(&self) -> usize {
-        0
-    }
-
-    fn reference_access_descriptor(
-        &self,
-        _input_index: usize,
-    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
-        None
-    }
-
-    fn with_reference_access_transforms(
-        &self,
-        _input_index: usize,
-        _transforms: Vec<Self::Transform>,
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
-    }
-}
-
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ArrayOperation<A>) -> Self {
@@ -641,6 +606,34 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),
             operation => Self::Array(operation),
         }
+    }
+}
+
+// The array-only family has no reference inputs and therefore declares no access layout. It still implements the
+// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's transform type
+// (i.e., `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference
+// cotangents. For this family, that selection resolves to the reference-free provider, which ordinary array gradients
+// never invoke.
+impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
+    type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+    fn base_input_count(&self) -> usize {
+        0
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        _input_index: usize,
+        _transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
     }
 }
 
@@ -1041,13 +1034,15 @@ mod tests {
 
         requires_array_operations::<Array>();
         requires_array_operations::<ArrayIrValue<Array>>();
-        requires_array_operations::<Tracer<ArrayTracingContext>>();
+        requires_array_operations::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
         requires_array_operations::<Tracer<CompositeTracingContext>>();
         requires_array_operations::<LinearizationTracer<EagerArrayContext>>();
         requires_array_operations::<LinearizationTracer<EagerCompositeContext>>();
         requires_array_operations::<BatchingTracer<EagerArrayContext, ArrayBatchingPolicy>>();
         requires_array_operations::<BatchingTracer<EagerCompositeContext, ArrayIrBatchingPolicy>>();
-        requires_array_operations::<BatchingTracer<NestedContext<ArrayTracingContext>, ArrayBatchingPolicy>>();
+        requires_array_operations::<
+            BatchingTracer<NestedContext<TracingContext<Array, ArrayOperation<Array>>>, ArrayBatchingPolicy>,
+        >();
         requires_array_operations::<BatchingTracer<NestedContext<CompositeTracingContext>, ArrayIrBatchingPolicy>>();
     }
 
@@ -1100,7 +1095,7 @@ mod tests {
         fn requires_dimension_operations<V: DimensionOperations>() {}
 
         requires_dimension_operations::<DimensionValue>();
-        requires_dimension_operations::<Tracer<DimensionTracingContext>>();
+        requires_dimension_operations::<Tracer<TracingContext<DimensionValue, DimensionOperation<DimensionValue>>>>();
 
         // `ArrayIrOperations` pins this bundle on its first-class-dimension member profile, so the dimension member
         // projected out of every canonical composite value must satisfy it as well.

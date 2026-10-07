@@ -2191,10 +2191,11 @@ mod tests {
         assert_eq!(sum.into_inner(), vec![Leaf(11), Leaf(22)]);
 
         // A failed `+` operator poisons a staged trace, which reports the error at its boundary.
-        type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
-        let traced = ArrayTracingContext::trace(
-            |inputs: Vec<Tracer<ArrayTracingContext>>| {
-                let left = Parameterwise::<Tracer<ArrayTracingContext>, _>::from(vec![inputs[0].clone()]);
+        let traced = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
+                let left = Parameterwise::<Tracer<TracingContext<Array, ArrayOperation<Array>>>, _>::from(vec![
+                    inputs[0].clone(),
+                ]);
                 Ok((left + Parameterwise::from(vec![inputs[1].clone()])).into_inner().remove(0))
             },
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [3])],

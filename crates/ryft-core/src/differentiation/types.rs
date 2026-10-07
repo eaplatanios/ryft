@@ -1210,10 +1210,8 @@ mod tests {
 
     #[test]
     fn test_dense_array_coordinate_basis_stages_ordinary_primitives() {
-        type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
-
         let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let (_, program) = ArrayTracingContext::trace(
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
                 let context = input.context().clone();
                 let user = input.clone() * input;

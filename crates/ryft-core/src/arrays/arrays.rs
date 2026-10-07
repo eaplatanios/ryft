@@ -30,7 +30,7 @@ use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, T
 /// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
 /// over multidimensional arrays without depending on an optimized backend such as the Ryft XLA backend. Unit tests,
 /// documentation tests, and downstream crates can therefore interpret complete array programs eagerly and stage them
-/// through [`ArrayTracingContext`](crate::ArrayTracingContext).
+/// through [`TracingContext`](crate::TracingContext).
 ///
 /// The payload is a shared immutable byte buffer whose physical placement is determined by the array's [`ArrayType`].
 /// Missing [`Layout`](crate::Layout) metadata implies a dense row-major storage while explicit strided and tiled
