@@ -157,10 +157,7 @@ where
 {
     #[inline]
     fn to_scalar(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .domain()
-            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
+        Ok(self.domain().bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?.remove(0))
     }
 }
 
@@ -181,7 +178,8 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, DimensionType> for ProjectedValue<DimensionType, V>
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, DimensionType>
+    for ProjectedValue<DimensionType, V>
 where
     V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
 {

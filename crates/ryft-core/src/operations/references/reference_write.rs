@@ -451,7 +451,8 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + Update
 impl<Transform, V> ReferenceWrite<Transform, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
@@ -474,7 +475,8 @@ impl<Transform, V> ReferenceWrite<Transform, V, ProjectedValue<ArrayType, V>, Re
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,

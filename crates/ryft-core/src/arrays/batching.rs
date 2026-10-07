@@ -43,9 +43,9 @@ use crate::operations::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    ValueDirectDispatch, Operation, OperationProjection, Program, ProgramError, ProjectedValue, ProvenanceScope, ReferenceType,
-    Region, RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed,
-    Value, ValueProjection,
+    Operation, OperationProjection, Program, ProgramError, ProjectedValue, ProvenanceScope, ReferenceType, Region,
+    RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed, Value,
+    ValueDirectDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 

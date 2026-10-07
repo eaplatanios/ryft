@@ -387,11 +387,12 @@ impl ScaledDot for Array {
     }
 }
 
-// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
-// context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
-// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
-// transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> ScaledDot<ArrayType> for V
+// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own context.
+// The `ValueDomainDispatch` marker makes this disjoint from the eager reference value types, which implement the
+// capability directly, so it covers the transform tracers and backend-owned values without conflicting with concrete
+// implementations.
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    ScaledDot<ArrayType> for V
 where
     V::Domain: Context<Operation: From<ScaledDotOperation>>,
 {

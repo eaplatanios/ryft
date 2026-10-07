@@ -328,11 +328,8 @@ where
     let (outer, auxiliary) = jacobian_forward_in_context(
         context,
         |outer_primals, outer_capture| {
-            let nested_context = outer_primals
-                .parameters()
-                .next()
-                .map(Value::domain)
-                .ok_or(DifferentiationError::EmptyInput)?;
+            let nested_context =
+                outer_primals.parameters().next().map(Value::domain).ok_or(DifferentiationError::EmptyInput)?;
             jacobian_reverse_in_context(&nested_context, function, outer_primals, outer_capture, holomorphic)
                 .map_err(ProgramError::from)
         },

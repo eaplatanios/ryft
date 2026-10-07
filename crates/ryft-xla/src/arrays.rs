@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Memory, Parameter, Parameterized, ProjectedContext,
-    Sharding, ShardingDimension, ShardingError, StaticShape, ValueDomainDispatch, Typed, Value, check_sharding,
+    Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, ValueDomainDispatch, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -901,21 +901,16 @@ impl Typed for XlaArray<'_> {
 }
 
 impl<'o> Value for XlaArray<'o> {
-    // A concrete `XlaArray` dispatches AND executes through the rich, PJRT-backed `XlaDomain`: the blanket value
-    // capabilities in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...) bind their
-    // operations through `domain()`, which is what makes every operation on concrete arrays execute
-    // eagerly, op by op, through the domain recovered below, while free transform entry points (e.g.,
-    // `ryft_core::batching::batch`) recover the same domain through `domain()`. `ryft-core`'s own
-    // `ryft_core::arrays::Array` instead keeps the constant-only `EagerContext` dispatch domain and provides direct
-    // host kernels for each capability, relying on in-crate coherence between those direct impls and the blankets; a
-    // downstream backend crate cannot take that route because the coherence check cannot rule out future
-    // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
-    // capability surface and only capabilities without operation-binding blankets (`Concretizable<bool>`,
-    // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
+    // A concrete `XlaArray` binds and executes every operation through its rich, PJRT-backed `XlaDomain`: it uses
+    // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (arithmetic, comparison, selection,
+    // manipulation, reductions, ...) bind their operations through `domain()` and execute them eagerly, op by op,
+    // through the domain recovered below, and free transform entry points (e.g., `ryft_core::batching::batch`) recover
+    // the same domain. Only capabilities without operation-binding blankets (`Concretizable<bool>`, `WhilePredicate`,
+    // and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<XlaDomain<'o>, ArrayType>;
 
-    /// Recovers the eager [`XlaDomain`] this [`XlaArray`] belongs to (see [`XlaArray::domain`]), and with it the
+    /// Recovers the eager [`XlaDomain`] this [`XlaArray`] belongs to (see [`XlaArray::xla_domain`]), and with it the
     /// session, compilation cache, effect scope, and compilation options that receiver-based operations execute with.
     /// Association is per value: receiver-based `x + y` and `y + x` may choose different scopes even when their
     /// numerical values match. Fork scopes at task boundaries rather than inside expressions.
@@ -1906,7 +1901,10 @@ mod tests {
         let reassociated = array.clone().associate(&sibling).unwrap();
         assert!(Arc::ptr_eq(reassociated.xla_domain().session(), &session));
         assert!(std::ptr::eq(reassociated.xla_domain().compilation_options(), sibling.compilation_options()));
-        assert!(!std::ptr::eq(reassociated.xla_domain().compilation_options(), original.xla_domain().compilation_options()));
+        assert!(!std::ptr::eq(
+            reassociated.xla_domain().compilation_options(),
+            original.xla_domain().compilation_options()
+        ));
         assert_eq!(reassociated, original);
 
         // Associating with a domain of another session on the same client switches the session (and therefore its

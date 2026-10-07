@@ -1213,11 +1213,7 @@ impl<
                         let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
                         collective_inputs.push(linear_inputs[0].clone());
                         collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                        linear_inputs[0].domain().bind(
-                            forward_operation,
-                            Vec::new(),
-                            collective_inputs.as_slice(),
-                        )
+                        linear_inputs[0].domain().bind(forward_operation, Vec::new(), collective_inputs.as_slice())
                     },
                     move |residuals, output_cotangents| {
                         // The transpose region maps the output cotangent to the input cotangent by selecting the
@@ -1585,11 +1581,12 @@ impl<
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<ParallelAllGatherOperation>>
-                                + DimensionConstant
-                                + NamedAxes,
+                        + DimensionConstant
+                        + NamedAxes,
         > + DimensionSize<V>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Mul>
         + ValueProjection<ArrayType, Projected: ParallelVary>,
@@ -2962,8 +2959,8 @@ mod tests {
             .unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelAllGatherOperation::new(
                     "x".to_string(),

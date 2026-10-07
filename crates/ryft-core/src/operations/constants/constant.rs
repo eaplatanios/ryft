@@ -3,8 +3,8 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayType,
-    DimensionOperation, DimensionValue,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayType, DimensionOperation,
+    DimensionValue,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
@@ -175,18 +175,6 @@ impl<
 
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
-
-impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ConstantOperation<ArrayIrValue<A>> {
-    // The eager dispatch domain of `ArrayIrValue` binds only `ConstantOperation<ArrayIrValue<A>>`, so the same
-    // family-neutral `From<ConstantOperation<DimensionValue>>` bound is satisfied there by wrapping the dimension
-    // payload into the composite value. This is what lets `DimensionConstant` stage dimension literals against eager
-    // values too.
-
-    #[inline]
-    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
-        ConstantOperation::new(ArrayIrValue::Dimension(operation.value().clone()))
-    }
-}
 
 impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
     // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
@@ -563,12 +551,9 @@ mod tests {
             value => panic!("expected a dimension value but got {value}"),
         };
 
-        // Eager contexts materialize the literal directly, both in the full array IR operation family and in the
-        // minimal family that backs the eager dispatch domain of `ArrayIrValue`, whose only operation is a constant.
-        let full = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3).unwrap();
-        assert_eq!(dimension_extent(full), (3, Some(3)));
-        let minimal = EagerContext::<ArrayIrValue<Array>>::new().dimension_constant(3).unwrap();
-        assert_eq!(dimension_extent(minimal), (3, Some(3)));
+        // Eager contexts materialize the literal directly.
+        let eager = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3).unwrap();
+        assert_eq!(dimension_extent(eager), (3, Some(3)));
 
         // The capability is not tied to the array IR family: a pure dimension program materializes the same literal.
         let dimension = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().dimension_constant(2);

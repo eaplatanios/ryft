@@ -20,7 +20,8 @@ pub trait AttentionIota: Value<Type = ArrayIrType> {
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<IotaOperation<ArrayType>>>,
         > + DimensionSize
@@ -41,11 +42,10 @@ impl<
                 matches!(dimension, Dimension::Dynamic(_)).then(|| dimensions[axis].clone())
             })
             .collect::<Vec<_>>();
-        let mut outputs = target.domain().bind(
-            IotaOperation::new(output_type, axis)?,
-            Vec::new(),
-            dynamic_dimensions.as_slice(),
-        )?;
+        let mut outputs =
+            target
+                .domain()
+                .bind(IotaOperation::new(output_type, axis)?, Vec::new(), dynamic_dimensions.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

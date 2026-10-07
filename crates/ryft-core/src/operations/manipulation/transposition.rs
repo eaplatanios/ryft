@@ -579,8 +579,13 @@ impl Transpose for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
-    Transpose<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<TransposeOperation>>,
+        >,
+> Transpose<ArrayType> for V
 {
     #[inline]
     fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
@@ -589,11 +594,8 @@ impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        let mut outputs = self.domain().bind(
-            TransposeOperation::new(permutation),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+        let mut outputs =
+            self.domain().bind(TransposeOperation::new(permutation), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -647,8 +649,8 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
-        ValueDomainDispatch, Typed,
+        BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Typed,
+        ValueDomainDispatch,
     };
 
     use super::*;
@@ -1374,7 +1376,7 @@ mod tests {
             type Domain = InvalidOutputContext;
 
             fn domain(&self) -> Self::Domain {
-                self.domain()
+                InvalidOutputContext(self.output_count)
             }
         }
 

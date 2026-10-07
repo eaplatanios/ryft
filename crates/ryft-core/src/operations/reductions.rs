@@ -1396,22 +1396,25 @@ impl Reduce for Array {
     }
 }
 
-// Any context-carrying value reduces by binding a `ReduceOperation` through its context. The `From<ReduceOperation>`
-// bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
-// the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>>
-    Reduce<ArrayType> for V
+// Any context-carrying value reduces by binding a `ReduceOperation` through its context. The `ValueDomainDispatch`
+// marker makes this disjoint from the eager value types, which implement the capability directly, so it covers the
+// transform tracers without conflicting with the concrete implementations.
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ReduceOperation>>,
+        >,
+> Reduce<ArrayType> for V
 {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() && !(kind == ReductionKind::LogSumExp && self.r#type().data_type().is_complex()) {
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
             return Ok(self.clone());
         }
-        let mut outputs = self.domain().bind(
-            ReduceOperation::new(axes.to_vec(), kind),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+        let mut outputs =
+            self.domain()
+                .bind(ReduceOperation::new(axes.to_vec(), kind), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1943,10 +1946,15 @@ impl ArgMax for Array {
 }
 
 // Any context-carrying value computes the index by binding an `ArgMaxOperation` through its context. The
-// `From<ArgMaxOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>>
-    ArgMax<ArrayType> for V
+// `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability directly,
+// so it covers the transform tracers without conflicting with the concrete implementations.
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>,
+        >,
+> ArgMax<ArrayType> for V
 {
     fn argmax_with_index_data_type<A: Into<Axis>>(
         &self,
@@ -2156,10 +2164,15 @@ impl ArgMin for Array {
 }
 
 // Any context-carrying value computes the index by binding an `ArgMinOperation` through its context. The
-// `From<ArgMinOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>>
-    ArgMin<ArrayType> for V
+// `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability directly,
+// so it covers the transform tracers without conflicting with the concrete implementations.
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>,
+        >,
+> ArgMin<ArrayType> for V
 {
     fn argmin_with_index_data_type<A: Into<Axis>>(
         &self,

@@ -609,9 +609,8 @@ where
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError> {
         // Any context-carrying value reshapes by binding a `ReshapeOperation` through its own context. The
-        // `From<ReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation
-        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
         let operation = ReshapeOperation::new(shape).with_output_sharding(output_sharding);
         let input_type = self.r#type().into_owned();
         let output_type = input_type
@@ -1314,7 +1313,11 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for Array
 }
 
 impl<
-    V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>>,
+    V: Value<
+            Type = ArrayIrType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>,
+        >,
 > DynamicReshape<ArrayIrType> for V
 {
     fn dynamic_reshape_with_output_sharding(
@@ -1713,7 +1716,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         BindingRegionDriver, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
-        ValueDomainDispatch, Typed,
+        Typed, ValueDomainDispatch,
     };
     use crate::tracing::Trace;
 
@@ -1748,7 +1751,7 @@ mod tests {
         type Domain = InvalidOutputContext<V, O>;
 
         fn domain(&self) -> Self::Domain {
-            self.domain()
+            InvalidOutputContext(self.output_count, PhantomData)
         }
     }
 

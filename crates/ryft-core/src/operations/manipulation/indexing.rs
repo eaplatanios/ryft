@@ -770,7 +770,7 @@ impl<
 impl<V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>>
     Indexed<'_, '_, '_, V, ArrayType>
 {
-    /// Lifts a host coordinate literal into the input's execution domain, placed in the input's memory space.
+    /// Lifts a host coordinate literal into the input's domain, placed in the input's memory space.
     /// A backend's stored constant family may contain capture handles, so coordinate literals use the ordinary
     /// constant operation payload instead, which compiled contexts lower directly.
     fn constant(&self, value: Array) -> Result<V, ProgramError> {

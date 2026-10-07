@@ -1821,8 +1821,10 @@ impl Gather for Array {
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
-    Gather<Stored, ArrayType> for V
+impl<
+    Stored: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>,
+> Gather<Stored, ArrayType> for V
 where
     V::Domain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
 {
@@ -1907,10 +1909,7 @@ pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array, T = <Self as Ca
 
 impl<Stored: Value<Type = ArrayType>, A> DynamicGather<Stored, ArrayIrType> for ArrayIrValue<A>
 where
-    A: Value<Type = ArrayType, Domain: Zero<A>>
-        + ManualVariationAlignment<ArrayType>
-        + Gather<Stored>
-        + Reshape,
+    A: Value<Type = ArrayType, Domain: Zero<A>> + ManualVariationAlignment<ArrayType> + Gather<Stored> + Reshape,
 {
     fn dynamic_gather_axis<AxisValue: Into<Axis>>(
         &self,
@@ -1942,7 +1941,8 @@ where
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DynamicGather<Stored, ArrayIrType> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>>
+    DynamicGather<Stored, ArrayIrType> for V
 where
     V: DimensionSize
         + DynamicBroadcast<ArrayIrType>
@@ -2100,8 +2100,8 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        ValueDirectDispatch, EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
-        ReferenceDischargeValue, ReferenceDischargeableOperation,
+        EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ValueDirectDispatch,
     };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracingContext, Trace, Tracer, TracingContext};

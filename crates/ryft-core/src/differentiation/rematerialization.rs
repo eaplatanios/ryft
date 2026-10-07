@@ -314,7 +314,7 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
 
     /// Stages one call of this function on the provided `input` value in the provided `context` and returns its output
     /// value. This is the explicit-context counterpart of [`call`](Self::call), which supports functions without
-    /// inputs and contexts that are not the dispatch domain of the input values.
+    /// inputs and contexts that are not the domain of the input values.
     ///
     /// # Errors
     ///
@@ -1434,9 +1434,8 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call() {
-        // Each call stages one `rematerialize` operation, whose body is the traced closure, into the dispatch domain of
-        // its inputs. Repeated calls of one function stage equal operations because they share the reference to its
-        // policy.
+        // Each call stages one `rematerialize` operation, whose body is the traced closure, into the domain of its
+        // inputs. Repeated calls of one function stage equal operations because they share the reference to its policy.
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
         let program = trace(|x| function.call(function.call(x)?));
         assert_eq!(

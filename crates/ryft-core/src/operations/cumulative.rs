@@ -693,11 +693,16 @@ impl Cumulative for Array {
     }
 }
 
-// Any context-carrying value scans by binding a `CumulativeOperation` through its context. The
-// `From<CumulativeOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>>>
-    Cumulative<ArrayType> for V
+// Any context-carrying value scans by binding a `CumulativeOperation` through its context. The `ValueDomainDispatch`
+// marker makes this disjoint from the eager value types, which implement the capability directly, so it covers the
+// transform tracers without conflicting with the concrete implementations.
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>,
+        >,
+> Cumulative<ArrayType> for V
 {
     fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
         let axis = axis.into();

@@ -2752,8 +2752,8 @@ impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<
         Self: 'o,
     {
         // A concrete composite value executes the kernel on its array members through the mixed-universe interpretation
-        // rule, which also verifies the extents of dynamic outputs against the trailing dimension inputs. Its eager
-        // dispatch domain binds only constants, so the generic implementation below never applies to it.
+        // rule, which also verifies the extents of dynamic outputs against the trailing dimension inputs. It uses
+        // `ValueDirectDispatch`, so the generic implementation below never applies to it.
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         operation.interpret_in_parent(&EagerContext::<Self>::new(), &EmptyRegionDriver, inputs.as_slice())
     }
@@ -2772,9 +2772,9 @@ where
     {
         // Any context-carrying value calls foreign kernels by binding a `CustomCallOperation` through its own context,
         // in either universe, because the operation is also a native member operation of the composite array IR
-        // universe. The `From<CustomCallOperation>` bound makes this disjoint from the eager value types (whose context
-        // operation is `ConstantOperation`), so it covers the transform tracers and backend-owned values without
-        // conflicting with the concrete implementations above.
+        // universe. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement
+        // the capability directly, so it covers the transform tracers and backend-owned values without conflicting with
+        // the concrete implementations above.
         let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
@@ -2815,7 +2815,8 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, ValueDirectDispatch, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDomainDispatch,
+        BindingRegionDriver, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDirectDispatch,
+        ValueDomainDispatch,
     };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace, TracingContext};

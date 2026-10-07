@@ -744,9 +744,8 @@ impl Typed for Array {
 impl Value for Array {
     type Dispatch = ValueDirectDispatch;
 
-    // A concrete `Array`'s active context is the reference backend's rich eager domain (unlike the constant-only
-    // `EagerContext<Array>` it declares as its `Value::Domain`, which cannot bind operations), so free transform
-    // entry points such as `crate::batching::batch` serve top-level concrete values.
+    // A concrete `Array`'s domain is the reference backend's rich eager domain, so free transform entry points such as
+    // `crate::batching::batch` serve top-level concrete values, while its capabilities are implemented directly.
     type Domain = EagerContext<Self, ArrayOperation<Self>>;
 
     #[inline]

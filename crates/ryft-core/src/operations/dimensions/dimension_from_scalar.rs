@@ -262,7 +262,8 @@ pub trait DimensionFromScalar<Output = Self, T = <Self as Capability>::Universe>
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,
@@ -294,7 +295,8 @@ impl<A: Value<Type = ArrayType> + DimensionFromScalar<DimensionValue>> Dimension
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,

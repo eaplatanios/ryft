@@ -144,32 +144,30 @@ impl RaggedCase {
                 // Both floating data inputs are active; integer transfer metadata are fixed runtime captures.
                 let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
                 let captures = inputs[2..6].iter().cloned().map(ShardMapTracer::into_value).collect::<Vec<_>>();
-                let (primal, tangent) = inputs[0]
-                    .clone()
-                    .into_value()
-                    .domain()
-                    .differentiate_at(active)
-                    .with_captures(captures)
-                    .jvp(vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()], |active, captures| {
-                        let active = active
-                            .into_iter()
-                            .map(ValueProjection::<ArrayType>::into_projected)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let captures = captures
-                            .into_iter()
-                            .map(ValueProjection::<ArrayType>::into_projected)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(active[0]
-                            .parallel_ragged_all_to_all(
-                                "x",
-                                &active[1],
-                                &captures[0],
-                                &captures[1],
-                                &captures[2],
-                                &captures[3],
-                            )?
-                            .into_value())
-                    })?;
+                let (primal, tangent) =
+                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).jvp(
+                        vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()],
+                        |active, captures| {
+                            let active = active
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let captures = captures
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(active[0]
+                                .parallel_ragged_all_to_all(
+                                    "x",
+                                    &active[1],
+                                    &captures[0],
+                                    &captures[1],
+                                    &captures[2],
+                                    &captures[3],
+                                )?
+                                .into_value())
+                        },
+                    )?;
                 Ok(vec![
                     ValueProjection::<ArrayType>::into_projected(primal)?,
                     ValueProjection::<ArrayType>::into_projected(tangent)?,
@@ -178,32 +176,29 @@ impl RaggedCase {
             "vjp" => {
                 let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
                 let captures = inputs[2..6].iter().cloned().map(ShardMapTracer::into_value).collect::<Vec<_>>();
-                let (primal, pullback) = inputs[0]
-                    .clone()
-                    .into_value()
-                    .domain()
-                    .differentiate_at(active)
-                    .with_captures(captures)
-                    .vjp(|active, captures| {
-                        let active = active
-                            .into_iter()
-                            .map(ValueProjection::<ArrayType>::into_projected)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let captures = captures
-                            .into_iter()
-                            .map(ValueProjection::<ArrayType>::into_projected)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(active[0]
-                            .parallel_ragged_all_to_all(
-                                "x",
-                                &active[1],
-                                &captures[0],
-                                &captures[1],
-                                &captures[2],
-                                &captures[3],
-                            )?
-                            .into_value())
-                    })?;
+                let (primal, pullback) =
+                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).vjp(
+                        |active, captures| {
+                            let active = active
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let captures = captures
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(active[0]
+                                .parallel_ragged_all_to_all(
+                                    "x",
+                                    &active[1],
+                                    &captures[0],
+                                    &captures[1],
+                                    &captures[2],
+                                    &captures[3],
+                                )?
+                                .into_value())
+                        },
+                    )?;
                 let cotangents = pullback.apply(inputs[6].clone().into_value())?;
                 Ok(vec![
                     ValueProjection::<ArrayType>::into_projected(primal)?,

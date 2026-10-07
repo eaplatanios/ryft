@@ -143,8 +143,10 @@ pub trait StopGradient<T = <Self as Capability>::Universe>: Capability + Sized {
     fn stop_gradient(&self) -> Result<Self, ProgramError>;
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<StopGradientOperation<T>>>>> StopGradient<T>
-    for V
+impl<
+    T: Type,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<StopGradientOperation<T>>>>,
+> StopGradient<T> for V
 {
     #[inline]
     fn stop_gradient(&self) -> Result<Self, ProgramError> {
@@ -153,8 +155,7 @@ impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context
         // transform rules. The `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the
         // concrete eager value types (whose context operation is `ConstantOperation`), which implement `StopGradient`
         // directly.
-        let mut outputs =
-            self.domain().bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -167,8 +168,8 @@ impl StopGradient for Array {
     }
 }
 
-// A concrete composite value stops the gradients of its array member. Its eager dispatch domain binds only constants,
-// so the generic implementation above never applies to it.
+// A concrete composite value stops the gradients of its array member. It uses `ValueDirectDispatch`, so the generic
+// implementation above never applies to it.
 impl<A: Value<Type = ArrayType> + StopGradient<ArrayType>> StopGradient<ArrayIrType> for ArrayIrValue<A> {
     #[inline]
     fn stop_gradient(&self) -> Result<Self, ProgramError> {

@@ -526,7 +526,8 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + 
 impl<U: ReferenceMemberType, Transform, V> ReferenceAtomicAddUpdate<Transform, V, V, U> for V
 where
     Transform: ReferenceTransform<Type = U, Referent = U::Referent>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = U,
             Domain: Context<
                 Operation: OperationProvider<
@@ -563,11 +564,10 @@ impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, ProjectedValue<ArrayTy
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
-            Domain: Context<
-                Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>>,
-            >,
+            Domain: Context<Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
 {
     fn atomic_add_update_through(

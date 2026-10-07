@@ -72,8 +72,7 @@ use ryft_core::{
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
-/// concrete backend value family looks like from outside `ryft-core` and the execution domain every register value
-/// names.
+/// concrete backend value family looks like from outside `ryft-core` and the domain every register value names.
 type RegisterDestination = EagerContext<RegisterValue, RegisterOperation>;
 
 /// Discharge context over the downstream destination universe.

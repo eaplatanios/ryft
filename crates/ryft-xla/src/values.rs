@@ -27,8 +27,8 @@ use std::fmt::{Debug, Display};
 use ryft_core::{
     Add, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, Compare, CompareOperation,
     ComparisonDirection, Concretizable, Context, DimensionType, DimensionValue, Div, Mul, Neg, Parameter, ProgramError,
-    ProjectedContext, ReferenceId, ReferenceType, Sub, ValueDomainDispatch, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value, ValueProjection, WhilePredicate,
+    ProjectedContext, ReferenceId, ReferenceType, Sub, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueDomainDispatch, ValueProjection, WhilePredicate,
 };
 use ryft_macros::Parameter;
 
@@ -312,7 +312,9 @@ impl<'c> Value for XlaValue<'c> {
         // folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
         // client's default devices.
         match self {
-            Self::Array(value) if value.xla_domain().mesh().is_err() => value.xla_domain().with_mesh(value.mesh().clone()),
+            Self::Array(value) if value.xla_domain().mesh().is_err() => {
+                value.xla_domain().with_mesh(value.mesh().clone())
+            }
             _ => self.xla_domain().clone(),
         }
     }
@@ -656,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_dimension_execution_domain() {
+    fn test_xla_dimension_domain() {
         // Dimension arithmetic dispatches through the dimension's domain, which evaluates it on the host.
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
@@ -733,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_domain() {
+    fn test_xla_value_xla_domain() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
@@ -799,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_execution_domain() {
+    fn test_xla_value_domain() {
         let client = execution_client();
         let domain = XlaSession::new(&client).domain();
         let mesh = mesh_on(&client, 0);
@@ -818,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_value_execution_domain_places_dimension_derived_arrays_on_the_source_mesh() {
+    fn test_xla_value_domain_places_dimension_derived_arrays_on_the_source_mesh() {
         let client = load_cpu_plugin()
             .unwrap()
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))

@@ -598,7 +598,7 @@ macro_rules! define_dimension_arithmetic_operation {
 ///
 /// The generated trait is a universe-parameterized [`Capability`](crate::Capability) that exposes one semantic binary
 /// method. Its blanket implementation for values of the [`DimensionType`](crate::DimensionType) universe constructs and
-/// binds the corresponding operation through the value's dispatch domain. Concrete eager values provide backend-owned
+/// binds the corresponding operation through the value's domain. Concrete eager values provide backend-owned
 /// implementations.
 ///
 /// # Examples
@@ -624,7 +624,7 @@ macro_rules! define_dimension_arithmetic_operation {
 ///     `DimensionMaxOperation`).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_capability {
-    // Defines a binary capability that binds its validated operation through the value's dispatch domain.
+    // Defines a binary capability that binds its validated operation through the value's domain.
     (
         $(#[$capability_documentation:meta])*
         $capability:ident,
@@ -1165,13 +1165,14 @@ macro_rules! define_elementwise_operation {
     }};
 }
 
-/// Defines a value-level capability trait paired with an elementwise operation and its dispatch-domain implementation.
+/// Defines a value-level capability trait paired with an elementwise operation and its domain-binding implementation.
 /// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
 /// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
-/// covers every value whose dispatch domain can bind the operation for that value's own universe, and composite array
-/// IR values implement it through their array members (refer to the `#[capability]` attribute documented on
-/// [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise) structures implement it
-/// parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary capabilities).
+/// covers every [`ValueDomainDispatch`](crate::ValueDomainDispatch) value whose domain can bind the operation for that
+/// value's own universe, and composite array IR values implement it through their array members (refer to the
+/// `#[capability]` attribute documented on [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise)
+/// structures implement it parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary
+/// capabilities).
 ///
 /// # Examples
 ///

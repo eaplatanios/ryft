@@ -1085,15 +1085,15 @@ impl<O: Operation> Operation for Box<O> {
 /// }
 /// ```
 ///
-/// The consumers are the projection adapters that must *name* the member family rather than merely
-/// convert into the composite one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
-/// [`Domain::Operation`](crate::Domain::Operation) as `<C::Operation as OperationProjection<T>>::Projected`
-/// so that member-typed operations bind directly through the composite parent context, and
-/// [`ProjectedValue`](crate::ProjectedValue)'s blanket [`Value`] implementation derives its dispatch domains
-/// the same way. Code that only needs to convert a known operation into the composite family should keep writing plain
-/// `Operation: From<X>` bounds instead of this trait. Genuinely mixed operations, whose signatures cross member kinds,
-/// belong to no member family and are deliberately not projectable; dispatchers that inspect a composite operation must
-/// classify their own variants explicitly.
+/// The consumers are the projection adapters that must *name* the member family rather than merely convert into the
+/// composite one: [`ProjectedContext`](crate::ProjectedContext) defines its member-typed
+/// [`Domain::Operation`](crate::Domain::Operation) as `<C::Operation as OperationProjection<T>>::Projected` so that
+/// member-typed operations bind directly through the composite parent context, and
+/// [`ProjectedValue`](crate::ProjectedValue)'s blanket [`Value`] implementation derives its domain the same way. Code
+/// that only needs to convert a known operation into the composite family should keep writing plain `Operation:
+/// From<X>` bounds instead of this trait. Genuinely mixed operations, whose signatures cross member kinds, belong to no
+/// member family and are deliberately not projectable; dispatchers that inspect a composite operation must classify
+/// their own variants explicitly.
 pub trait OperationProjection<T: Type>: From<Self::Projected> {
     /// The `T`-typed member [`Operation`] family embedded in this composite family. This is the operation-side
     /// counterpart of [`ValueProjection::Projected`](crate::ValueProjection::Projected). Lifting a member operation

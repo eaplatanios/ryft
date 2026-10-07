@@ -653,7 +653,8 @@ impl RngBitGenerator for Array {
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayType,
             Domain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
         >,
@@ -770,7 +771,8 @@ impl<A: Value<Type = ArrayType> + RngBitGenerator> DynamicRngBitGenerator<ArrayI
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
         >,

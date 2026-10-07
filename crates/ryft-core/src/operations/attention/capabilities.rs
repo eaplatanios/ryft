@@ -103,11 +103,12 @@ impl DotProductAttentionBackward for Array {
     }
 }
 
-/// Any context-carrying value computes attention by binding a [`DotProductAttentionOperation`] through its own
-/// context. The `From<DotProductAttentionOperation>` bound makes this disjoint from the eager reference value types
-/// (whose context operation is [`ConstantOperation`]), so it covers
-/// the transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> DotProductAttention<ArrayType> for V
+/// Any context-carrying value computes attention by binding a [`DotProductAttentionOperation`] through its own context.
+/// The `ValueDomainDispatch` marker makes this disjoint from the eager reference value types, which implement the
+/// capability directly, so it covers the transform tracers and backend-owned values without conflicting with concrete
+/// implementations.
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    DotProductAttention<ArrayType> for V
 where
     V::Domain: Context<Operation: From<DotProductAttentionOperation>>,
 {
@@ -153,7 +154,8 @@ where
 /// Any context-carrying value computes the attention backward pass by binding a
 /// [`DotProductAttentionBackwardOperation`] through its own context; refer to the [`DotProductAttention`] blanket
 /// implementation for the disjointness argument.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> DotProductAttentionBackward for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    DotProductAttentionBackward for V
 where
     V::Domain: Context<Operation: From<DotProductAttentionBackwardOperation>>,
 {

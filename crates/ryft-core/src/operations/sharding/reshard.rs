@@ -289,19 +289,21 @@ pub trait Reshard<T = <Self as Capability>::Universe>: Capability + Clone {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>>
-    Reshard<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ReshardOperation>>,
+        >,
+> Reshard<ArrayType> for V
 {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         // Any context-carrying value reshards by binding a `ReshardOperation` through its own context. The
-        // `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation
-        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
-        let mut outputs = self.domain().bind(
-            ReshardOperation::new(sharding.clone()),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
+        let mut outputs =
+            self.domain()
+                .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

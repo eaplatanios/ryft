@@ -322,10 +322,8 @@ impl ParallelRaggedAllToAllOperation {
     /// that any of them varies over, so that the output type records every manual axis over which the result can
     /// differ.
     fn stage<
-        V: Value<
-                Type = ArrayType,
-                Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes,
-            > + ParallelVary,
+        V: Value<Type = ArrayType, Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
+            + ParallelVary,
     >(
         mut self,
         inputs: [&V; 6],
@@ -1702,8 +1700,11 @@ impl ParallelRaggedAllToAll<ArrayType> for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
-        + ParallelVary,
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes,
+        > + ParallelVary,
 > ParallelRaggedAllToAll<ArrayType> for V
 {
     #[inline]

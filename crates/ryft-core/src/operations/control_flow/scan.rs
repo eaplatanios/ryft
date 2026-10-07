@@ -4575,7 +4575,7 @@ mod tests {
         (TestScanOperation::new(1, lengths[0]), body)
     }
 
-    /// Binds `operation` with the attached `body` to `inputs` in their execution domain and returns all of its outputs.
+    /// Binds `operation` with the attached `body` to `inputs` in their domain and returns all of its outputs.
     fn bind_scan<V: Value<Type = ArrayType>>(
         operation: TestScanOperation,
         body: TestProgram,
@@ -4587,7 +4587,7 @@ mod tests {
         inputs[0].domain().bind(TestOperation::Scan(operation), vec![body], inputs)
     }
 
-    /// Applies the three-iteration cumulative-product scan to `initial` and `values` in their execution domain and
+    /// Applies the three-iteration cumulative-product scan to `initial` and `values` in their domain and
     /// returns its final carry.
     fn apply_product_scan<V: Value<Type = ArrayType>>(initial: V, values: V) -> Result<V, ProgramError>
     where
@@ -13054,9 +13054,7 @@ mod tests {
         let body = product_body_with_type(scalar_type.clone());
         let (_, program) = TracingContext::<Array, TestOperation>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, TestOperation>>>| {
-                inputs[0]
-                    .domain()
-                    .bind(TestOperation::Scan(TestScanOperation::new(1, 2)), vec![body], &inputs)
+                inputs[0].domain().bind(TestOperation::Scan(TestScanOperation::new(1, 2)), vec![body], &inputs)
             },
             vec![scalar_type.clone(), stacked_type.clone()],
             vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],

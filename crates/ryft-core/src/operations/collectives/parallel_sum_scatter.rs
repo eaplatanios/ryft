@@ -924,11 +924,12 @@ impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScat
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<ParallelSumScatterOperation>>
-                                + NamedAxes
-                                + DimensionConstant,
+                        + NamedAxes
+                        + DimensionConstant,
         > + Assert
         + DimensionSize<V>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Div + Rem + Compare<V>>
@@ -1872,8 +1873,8 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
                 let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
@@ -1942,8 +1943,8 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
                 let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;

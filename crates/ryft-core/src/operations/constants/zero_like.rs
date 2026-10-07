@@ -152,7 +152,11 @@ impl<A: Value<Type = ArrayType> + ZeroLike> ZeroLike for ArrayIrValue<A> {
     }
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ZeroLikeOperation<T>>>>> ZeroLike<T> for V {
+impl<
+    T: Type,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ZeroLikeOperation<T>>>>,
+> ZeroLike<T> for V
+{
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
         let operation = ZeroLikeOperation::new();

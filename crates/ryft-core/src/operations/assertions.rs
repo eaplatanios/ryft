@@ -1064,7 +1064,11 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
 
 impl<
     T: Type + Into<ArrayIrType>,
-    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<T>>>>,
+    V: Value<
+            Type = T,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<T>>>,
+        >,
 > Assert<T> for V
 {
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {

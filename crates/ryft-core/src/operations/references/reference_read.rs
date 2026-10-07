@@ -25,11 +25,11 @@ use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceTransform, Concretizable, EffectClasses, Effects, MaybeZero, NoReferenceTransform, Operation,
-    OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceTransform,
-    ReferenceType, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
-    batch_reference_transforms, infer_reference_view_type,
+    OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
+    ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
+    ValueDomainDispatch, ValueProjection, batch_reference_transforms, infer_reference_view_type,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -396,7 +396,8 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice>
 impl<Transform, V> ReferenceRead<Transform, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
@@ -413,7 +414,8 @@ impl<Transform, V> ReferenceRead<Transform, V, <V as ValueProjection<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType, Transform>>>,
         > + ValueProjection<ArrayType>,

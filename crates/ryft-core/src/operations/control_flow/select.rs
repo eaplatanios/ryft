@@ -525,13 +525,13 @@ impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
     }
 }
 
-// Context-carrying values (e.g., staged tracers, batching tracers, and differentiation tracers) select by binding
-// a `SelectOperation` through their own context after aligning the manual variation of all three inputs. The
-// `From<SelectOperation<T>>` bound keeps this implementation disjoint from the eager value implementations above,
-// whose dispatch context operation is a `ConstantOperation`.
+// Context-carrying values (e.g., staged tracers, batching tracers, and differentiation tracers) select by binding a
+// `SelectOperation` through their own context after aligning the manual variation of all three inputs. The
+// `ValueDomainDispatch` marker keeps this implementation disjoint from the eager value implementations above.
 impl<
     T: Type,
-    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<SelectOperation<T>>>> + ManualVariationAlignment<T>,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<SelectOperation<T>>>>
+        + ManualVariationAlignment<T>,
 > Select<T> for V
 {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {

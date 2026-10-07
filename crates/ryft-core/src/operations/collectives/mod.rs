@@ -357,12 +357,12 @@ impl CollectiveOptions {
     }
 }
 
-/// Value that stages shape-changing collectives directly through its homogeneous array dispatch domain. This marker
-/// opts a value into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`]
-/// implementations. Each implementation separately requires its operation to be supported by the dispatch domain,
-/// named-axis resolution through [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait
-/// alone does not require support for every collective. Backend array types implement it to reuse these staging rules
-/// without defining their own collective capability implementations.
+/// Value that stages shape-changing collectives directly through its homogeneous array domain. This marker opts a value
+/// into the provided [`ParallelAllGather`], [`ParallelSumScatter`], and [`ParallelAllToAll`] implementations. Each
+/// implementation separately requires its operation to be supported by the domain, named-axis resolution through
+/// [`NamedAxes`], and manual variation through [`ParallelVary`]; implementing this trait alone does not require support
+/// for every collective. Backend array types implement it to reuse these staging rules without defining their own
+/// collective capability implementations.
 ///
 /// Homogeneous [`Tracer`], [`BatchingTracer`], and [`DifferentiationTracer`] values opt in. Projected array values
 /// instead delegate through their composite value so that runtime output extents remain explicit inputs; they must

@@ -1093,7 +1093,8 @@ impl Concatenate for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Concatenate<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    Concatenate<ArrayType> for V
 where
     V::Domain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
 {
@@ -1105,8 +1106,8 @@ where
         V: 'i,
     {
         // Any context-carrying value concatenates by binding a `ConcatenateOperation<ArrayType>` through its own
-        // context. The conversion bound makes this disjoint from the eager value types (whose operation is
-        // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+        // context. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the
+        // capability directly, so it covers the transform tracers without conflicting with the concrete
         // implementations.
         let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(rank) = inputs.first().map(|input| input.r#type().rank()) else {
@@ -1312,7 +1313,8 @@ impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicCon
     }
 }
 
-impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>>
+    DynamicConcatenate<ArrayIrType> for V
 where
     V::Domain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
 {

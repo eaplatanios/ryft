@@ -444,11 +444,11 @@ impl<
 }
 
 /// Capability to add an update into the value stored by a reference in program order. Concrete values implement their
-/// runtime update semantics directly. Values whose dispatch domain is a [`Context`] project the referent of their
-/// reference type through [`ReferenceMemberType::referent`] and use the context's operation family to select and bind
-/// the update operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a
-/// family without reference operations may reject construction. This capability supports arbitrary reference-aware type
-/// universes so reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
+/// runtime update semantics directly. Values whose domain is a [`Context`] project the referent of their reference type
+/// through [`ReferenceMemberType::referent`] and use the context's operation family to select and bind the update
+/// operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a family without
+/// reference operations may reject construction. This capability supports arbitrary reference-aware type universes so
+/// reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that staged values
 /// implement this capability for every universe with reference members (e.g., [`ArrayIrType`]), concrete composite
@@ -512,7 +512,8 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + 
 impl<U: ReferenceMemberType, Transform, V> ReferenceAddUpdate<Transform, V, V, U> for V
 where
     Transform: ReferenceTransform<Type = U, Referent = U::Referent>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = U,
             Domain: Context<
                 Operation: OperationProvider<
@@ -549,7 +550,8 @@ impl<Transform, V> ReferenceAddUpdate<Transform, V, ProjectedValue<ArrayType, V>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, Transform>>>,
         >,

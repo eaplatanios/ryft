@@ -4993,8 +4993,7 @@ mod tests {
                         .unwrap();
                         let constant_sum = shard_map::<_, _, ArrayType, _>(
                             |input: ShardMapTracer| {
-                                let constant: ShardMapTracer =
-                                    input.domain().fill(&input.r#type(), 3.0_f32).unwrap();
+                                let constant: ShardMapTracer = input.domain().fill(&input.r#type(), 3.0_f32).unwrap();
                                 constant.parallel_reduce(ReductionKind::Sum, "x").unwrap()
                             },
                             inputs[0].clone(),

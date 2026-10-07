@@ -538,8 +538,11 @@ impl ParallelPermute<ArrayType> for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
-        + ParallelVary,
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes,
+        > + ParallelVary,
 > ParallelPermute<ArrayType> for V
 {
     fn parallel_permute(
@@ -711,8 +714,8 @@ mod tests {
     ) -> (ArrayType, Program<Array, ArrayOperation<Array>, Array, Array>) {
         TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = BatchingTracer::new(context, ArrayBatch::new(input, BatchAxis::new(0))?);
                 Ok(input.parallel_permute("x", source_target_pairs)?.into_batch().into_value())
             },

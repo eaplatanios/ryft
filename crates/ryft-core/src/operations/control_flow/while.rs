@@ -3211,8 +3211,8 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Parameter;
     use crate::programs::{
-        BindingRegionDriver, ValueDirectDispatch, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance,
-        ProvenanceScope, ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
+        BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
+        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, ValueDirectDispatch,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -4273,7 +4273,7 @@ mod tests {
     fn test_bounded_while_truncation_differentiates_consistently_across_paths() {
         // A loop whose condition never turns false truncates at the bound by definition: with bound 3 the doubling
         // loop computes `f(x) = 8 x`, so at `x = 2` the value is 16 and the gradient is 8 — identical between plain
-        // interpretation, the eager-domain entry point, and the staged dispatch domain (where every mask batch
+        // interpretation, the eager-domain entry point, and the staged domain (where every mask batch
         // item is true).
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         let outputs = EagerContext::<Array, TestDomainOperation>::new()
@@ -8504,7 +8504,7 @@ mod tests {
     fn test_bounded_while_jvp_after_batching_composes_with_masked_scan() {
         use crate::batching::{Batch, BatchableOperation, BatchingTracer};
 
-        // F5 x F6 composition: jvp of a *vmapped bounded* while under the non-concretizing staged dispatch domain.
+        // F5 x F6 composition: jvp of a *vmapped bounded* while under the non-concretizing staged domain.
         // Batching stages one masked bounded while (the predicate `x < 8` is per batch item and the iteration bound 5
         // survives the staged rewrite), so the while JVP rule takes the bounded staged path: stored residual
         // stacks plus a masked linear scan on the tangent side. Batch items [1, 5, 9] double 3, 1, and 0 times, so the

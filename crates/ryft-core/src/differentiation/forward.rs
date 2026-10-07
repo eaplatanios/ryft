@@ -24,11 +24,11 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation, OperationPayloadProjection,
-    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
-    ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot,
-    ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, ValueDomainDispatch, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation,
+    OperationPayloadProjection, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
+    ProvenanceScope, ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType,
+    ReferenceRoot, ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -7447,7 +7447,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_forward_mode_differentiate_jvp_in_execution_domain() {
+    fn test_forward_mode_differentiate_jvp_in_value_domain() {
         // The builder's `jvp` terminal serves top-level concrete values through their `Value::Domain`
         // declarations. A concrete array input recovers the eager array domain, so both dual halves are concrete.
         let (value, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
@@ -7751,7 +7751,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_forward_mode_differentiate_linearize_in_execution_domain() {
+    fn test_forward_mode_differentiate_linearize_in_value_domain() {
         // The builder's `linearize` terminal serves top-level concrete values through their `Value::Domain`
         // declarations. Primal work executes eagerly at the concrete linearization point while the pushforward program
         // accumulates.

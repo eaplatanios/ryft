@@ -314,14 +314,19 @@ pub trait ConstrainSharding<T = <Self as Capability>::Universe>: Capability + Cl
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ConstrainShardingOperation>>>>
-    ConstrainSharding<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ConstrainShardingOperation>>,
+        >,
+> ConstrainSharding<ArrayType> for V
 {
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         // Any context-carrying value constrains its sharding by binding a `ConstrainShardingOperation` through its own
-        // context. The `From<ConstrainShardingOperation>` bound makes this disjoint from the eager value types (whose
-        // context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
-        // concrete implementations.
+        // context. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the
+        // capability directly, so it covers the transform tracers without conflicting with the concrete
+        // implementations.
         let mut outputs = self.domain().bind(
             ConstrainShardingOperation::new(sharding.clone()),
             Vec::new(),

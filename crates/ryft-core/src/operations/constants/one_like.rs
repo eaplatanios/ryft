@@ -146,7 +146,9 @@ impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
     }
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<OneLikeOperation<T>>>>> OneLike<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<OneLikeOperation<T>>>>>
+    OneLike<T> for V
+{
     #[inline]
     fn one_like(&self) -> Result<Self, ProgramError> {
         let operation = OneLikeOperation::new();

@@ -555,7 +555,8 @@ pub trait Clamp<T = <Self as Capability>::Universe>: Capability + Sized {
 
 impl<
     T: Type,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = T,
             Domain: Context<
                 Type = T,

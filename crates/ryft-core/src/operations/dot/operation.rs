@@ -259,9 +259,10 @@ impl Dot for Array {
     }
 }
 
-// Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
-// disjoint from eager values, whose context operation is `ConstantOperation`.
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Dot<V, ArrayType> for V
+// Context-carrying values stage a dot through their context. The `ValueDomainDispatch` marker keeps this implementation
+// disjoint from eager values, which implement the capability directly.
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Dot<V, ArrayType>
+    for V
 where
     V::Domain: Context<Type = ArrayType>,
     <V::Domain as Domain>::Operation: From<DotOperation>,
@@ -454,7 +455,8 @@ impl RaggedDot for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> RaggedDot<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    RaggedDot<ArrayType> for V
 where
     V::Domain: Context<Type = ArrayType>,
     <V::Domain as Domain>::Operation: From<RaggedDotOperation>,
@@ -467,10 +469,7 @@ where
     ) -> Result<Self, ProgramError> {
         let inputs = [self.clone(), rhs.clone(), group_sizes.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        Ok(self
-            .domain()
-            .bind(RaggedDotOperation::new(dimensions.clone()), Vec::new(), &inputs)?
-            .remove(0))
+        Ok(self.domain().bind(RaggedDotOperation::new(dimensions.clone()), Vec::new(), &inputs)?.remove(0))
     }
 }
 

@@ -1629,7 +1629,8 @@ impl Pad for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Pad<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Pad<ArrayType>
+    for V
 where
     V::Domain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
 {
@@ -1905,7 +1906,8 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIr
     }
 }
 
-impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>> DynamicPad<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>>
+    DynamicPad<ArrayIrType> for V
 where
     V::Domain: Context<Type = ArrayIrType, Operation: From<PadOperation<ArrayIrType>>>,
 {

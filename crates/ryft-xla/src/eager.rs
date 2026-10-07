@@ -4207,7 +4207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_domain_recovery() {
+    fn test_domain_recovery() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -4264,15 +4264,13 @@ mod tests {
         let primal = f32_scalar(&domain, &mesh, 0.0);
         let tangent = f32_scalar(&domain, &mesh, 3.0);
 
-        let (value, tangent) =
-            primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
+        let (value, tangent) = primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![3.0]);
 
         let primal = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 0.0));
         let tangent = c64_scalar(&domain, &mesh, num_complex::Complex::new(1.0, 2.0));
-        let (value, tangent) =
-            primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
+        let (value, tangent) = primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![0.0]);
     }
@@ -4585,15 +4583,10 @@ mod tests {
             assert_eq!(read_f64_coordinates(&array), vec![1.0, 2.0, 3.0]);
 
             let r#type = array.r#type().into_owned();
-            let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
-                &array.domain(),
-                &r#type,
-                &r#type,
-                0,
-                3,
-            )
-            .unwrap()
-            .into_value();
+            let basis =
+                <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&array.domain(), &r#type, &r#type, 0, 3)
+                    .unwrap()
+                    .into_value();
             assert_eq!(basis.data_type(), data_type);
             assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
             assert_eq!(read_f64_coordinates(&basis), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);

@@ -329,12 +329,10 @@ impl<A: Value<Type = ArrayType>> ReferenceFreeze<Self, ArrayIrType> for ArrayIrV
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
-            Domain: Context<
-                Type = ArrayIrType,
-                Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
-            >,
+            Domain: Context<Type = ArrayIrType, Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>,
         >,
 > ReferenceFreeze<V, ArrayIrType> for V
 {
@@ -345,12 +343,10 @@ impl<
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
-            Domain: Context<
-                Type = ArrayIrType,
-                Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
-            >,
+            Domain: Context<Type = ArrayIrType, Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>,
         > + ValueProjection<ArrayType>,
 > ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected, ReferenceType<ArrayType>>
     for ProjectedValue<ReferenceType<ArrayType>, V>

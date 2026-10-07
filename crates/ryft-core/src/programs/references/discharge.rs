@@ -4557,7 +4557,7 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError, Typed};
-    use crate::programs::values::{ValueDirectDispatch, Value};
+    use crate::programs::values::{Value, ValueDirectDispatch};
 
     use super::*;
 

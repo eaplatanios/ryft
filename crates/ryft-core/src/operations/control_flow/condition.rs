@@ -1249,13 +1249,12 @@ impl ConditionType for ArrayIrType {
 
 /// Stages a [`ConditionOperation`] that applies `true_function` to `inputs` when `predicate` is `true` and
 /// `false_function` otherwise, returning the outputs of the selected branch. This is the value-level analogue of
-/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). Like other free entry points,
-/// it binds the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a
-/// staged value or the operation-executing eager domain of a concrete value): each function is traced into a branch
-/// [`Program`] through a [`NestedTracingContext`] over the execution domain of `predicate`, and both branches must
-/// return values of the same types. An output that both branches forward from the same input equals that input
-/// whichever branch runs, so, as in JAX's `cond`, it is pruned from the branches and returned as the input itself
-/// instead of through the condition.
+/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). Like other free entry points, it
+/// binds the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
+/// operation-executing eager domain of a concrete value): each function is traced into a branch [`Program`] through a
+/// [`NestedTracingContext`] over the domain of `predicate`, and both branches must return values of the same types. An
+/// output that both branches forward from the same input equals that input whichever branch runs, so, as in JAX's
+/// `cond`, it is pruned from the branches and returned as the input itself instead of through the condition.
 ///
 /// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
 /// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the

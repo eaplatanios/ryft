@@ -225,11 +225,12 @@ impl<A: Value<Type = ArrayType> + Tag<ArrayType>> Tag<ArrayIrType> for ArrayIrVa
     }
 }
 
-impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<TagOperation<T>>>>> Tag<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<TagOperation<T>>>>>
+    Tag<T> for V
+{
     #[inline]
     fn tag(self, key: &str) -> Result<Self, ProgramError> {
-        let mut outputs =
-            self.domain().bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))?;
+        let mut outputs = self.domain().bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

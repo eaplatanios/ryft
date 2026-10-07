@@ -202,14 +202,13 @@ impl CollectiveCase {
                 Ok(vec![output])
             }
             "jvp" => {
-                let (primal, tangent) =
-                    input.clone().into_value().domain().differentiate_at(input.into_value()).jvp(
-                        seed.into_value(),
-                        |input| {
-                            let input = ValueProjection::<ArrayType>::into_projected(input)?;
-                            Ok(self.apply(input)?.into_value())
-                        },
-                    )?;
+                let (primal, tangent) = input.clone().into_value().domain().differentiate_at(input.into_value()).jvp(
+                    seed.into_value(),
+                    |input| {
+                        let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                        Ok(self.apply(input)?.into_value())
+                    },
+                )?;
                 Ok(vec![
                     ValueProjection::<ArrayType>::into_projected(primal)?,
                     ValueProjection::<ArrayType>::into_projected(tangent)?,

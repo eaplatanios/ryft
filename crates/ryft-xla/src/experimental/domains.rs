@@ -15865,9 +15865,9 @@ mod tests {
         let domain = array_domain(&client);
 
         // A collective on a concrete array outside any `batch` / `shard_map` binder has no axis to resolve against,
-        // mirroring JAX's "unbound axis name" error for a top-level `psum`. The value-level `ParallelReduce`
-        // capability is not even implemented for `XlaArray` (its dispatch domain carries no named-axis environment), so
-        // this binds the operation directly and asserts the axis-resolution failure surfaced at compile time.
+        // mirroring JAX's "unbound axis name" error for a top-level `psum`. The value-level `ParallelReduce` capability
+        // is not even implemented for `XlaArray` (its domain carries no named-axis environment), so this binds the
+        // operation directly and asserts the axis-resolution failure surfaced at compile time.
         let input = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
         let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
         assert!(matches!(

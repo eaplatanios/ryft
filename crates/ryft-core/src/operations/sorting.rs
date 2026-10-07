@@ -764,8 +764,8 @@ impl<
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError> {
         // Context-carrying values bind a `SortOperation` through the first input's context after aligning the manual
-        // variation of the inputs. The `From<SortOperation>` bound keeps this implementation disjoint from the eager
-        // reference arrays, whose dispatch domain does not provide a sort operation.
+        // variation of the inputs. The `ValueDomainDispatch` marker keeps this implementation disjoint from the eager
+        // reference arrays, which implement the capability directly.
         let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let aligned_inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
         inputs[0].domain().bind(operation, Vec::new(), &aligned_inputs)
@@ -901,7 +901,7 @@ impl<V: Value<Type = ArrayType, Domain: Iota<V>> + Sort + Slice + Reshape> TopK<
         }
 
         // The `i32` index passenger holds the index of every element along the ranked axis, and it is built through the
-        // `Iota` capability of the dispatch domain of the value, which materializes it for eager arrays and stages an
+        // `Iota` capability of the domain of the value, which materializes it for eager arrays and stages an
         // `IotaOperation` for context-carrying values. The passenger shares the sharding of the value, including its
         // varying manual axes. An iota holds the same elements on every device, so typing it as varying is always valid
         // (i.e., it is what a `parallel_vary` of the invariant iota produces, and an integer iota has no cotangent for

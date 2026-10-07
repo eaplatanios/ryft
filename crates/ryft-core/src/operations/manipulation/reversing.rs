@@ -254,8 +254,13 @@ impl Reverse for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReverseOperation>>>>
-    Reverse<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<ReverseOperation>>,
+        >,
+> Reverse<ArrayType> for V
 {
     fn reverse<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
         let axes =
@@ -264,8 +269,7 @@ impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<
         if axes.is_empty() {
             return Ok(self.clone());
         }
-        let mut outputs =
-            self.domain().bind(ReverseOperation::new(axes), Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(ReverseOperation::new(axes), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

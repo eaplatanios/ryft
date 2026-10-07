@@ -674,8 +674,13 @@ impl Broadcast for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
-    Broadcast<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>,
+        >,
+> Broadcast<ArrayType> for V
 {
     #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
@@ -1567,9 +1572,9 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     }
 
     /// Broadcasts `self` to host-provided sizes using trailing-axis alignment. This creates exact dimension constants
-    /// in the receiver's dispatch context and delegates to [`DynamicBroadcast::dynamic_broadcast_to`]. The staged
-    /// operation therefore has explicit dimension inputs even though the output shape is statically known. Invalid
-    /// ranks or incompatible extents yield a [`TypeError`].
+    /// in the receiver's domain and delegates to [`DynamicBroadcast::dynamic_broadcast_to`]. The staged operation
+    /// therefore has explicit dimension inputs even though the output shape is statically known. Invalid ranks or
+    /// incompatible extents yield a [`TypeError`].
     ///
     /// # Parameters
     ///
@@ -1615,7 +1620,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     /// become exact dimension constants. No numeric promotion is performed. Empty input returns an empty vector.
     ///
     /// Shape compatibility follows [`Broadcast::broadcast_arrays`]. Invalid array kinds or incompatible shapes return a
-    /// [`TypeError`]. The inputs must belong to compatible dispatch contexts so their dimension values can be shared.
+    /// [`TypeError`]. The inputs must belong to compatible domains so their dimension values can be shared.
     ///
     /// # Example
     ///
@@ -1980,7 +1985,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         BindingRegionDriver, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance,
-        ProvenanceScope, ValueDomainDispatch, Typed,
+        ProvenanceScope, Typed, ValueDomainDispatch,
     };
     use crate::tracing::TracingContext;
 
@@ -2015,7 +2020,7 @@ mod tests {
         type Domain = InvalidOutputContext<V, O>;
 
         fn domain(&self) -> Self::Domain {
-            self.domain()
+            InvalidOutputContext(self.output_count, PhantomData)
         }
     }
 

@@ -579,8 +579,10 @@ pub trait ConvertElementType<T = <Self as Capability>::Universe>: Capability + S
     }
 }
 
-impl<T: ElementType, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ConvertElementTypeOperation<T>>>>>
-    ConvertElementType<T> for V
+impl<
+    T: ElementType,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ConvertElementTypeOperation<T>>>>,
+> ConvertElementType<T> for V
 {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, false);
@@ -885,8 +887,10 @@ pub trait ReducePrecision<T = <Self as Capability>::Universe>: Capability + Size
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError>;
 }
 
-impl<T: ElementType, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ReducePrecisionOperation<T>>>>>
-    ReducePrecision<T> for V
+impl<
+    T: ElementType,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ReducePrecisionOperation<T>>>>,
+> ReducePrecision<T> for V
 {
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError> {
         let operation = ReducePrecisionOperation::<V::Type>::new(exponent_bits, mantissa_bits);

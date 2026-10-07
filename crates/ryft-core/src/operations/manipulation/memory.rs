@@ -249,17 +249,20 @@ pub trait TransferToMemory<T = <Self as Capability>::Universe>: Capability + Siz
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>>>
-    TransferToMemory<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>,
+        >,
+> TransferToMemory<ArrayType> for V
 {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
-        // Context-carrying values bind through their owning context. The operation conversion bound keeps this disjoint
-        // from reference arrays, whose dispatch domain does not provide a memory transfer operation.
-        let outputs = self.domain().bind(
-            TransferToMemoryOperation::new(destination),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+        // Context-carrying values bind through their owning context. The `ValueDomainDispatch` marker keeps this
+        // disjoint from reference arrays, which implement the capability directly.
+        let outputs =
+            self.domain()
+                .bind(TransferToMemoryOperation::new(destination), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.into_iter().next().unwrap())
     }
@@ -342,7 +345,7 @@ mod tests {
     use crate::parameters::Parameter;
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, ValueDomainDispatch, Typed,
+        BindingRegionDriver, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, Typed, ValueDomainDispatch,
     };
     use crate::tracing::{Trace, TracingContext};
 
@@ -512,7 +515,7 @@ mod tests {
             type Domain = InvalidOutputContext;
 
             fn domain(&self) -> Self::Domain {
-                self.domain()
+                InvalidOutputContext(self.output_count)
             }
         }
 

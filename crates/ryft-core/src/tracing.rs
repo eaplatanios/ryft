@@ -22,7 +22,7 @@
 //!   - [`Trace::trace`] accepts abstract input types and traces in the implementing [`Domain`]'s type, constant, and
 //!     operation universe. [`Trace::infer_output_type`] performs the same trace but returns only the output types.
 //!   - [`trace`] and [`infer_output_type`] accept example values. The values contribute only their abstract types; they
-//!     are neither executed nor captured, and their statically known execution domain selects the tracing universe.
+//!     are neither executed nor captured, and their statically known domain selects the tracing universe.
 //!   - [`TracingContext::trace`] names the value, operation, and capture representations directly.
 //!     [`TracingContext::trace_with_named_axes`] additionally seeds named-axis bindings for operations such as
 //!     collectives.

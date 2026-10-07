@@ -811,8 +811,13 @@ impl Slice for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<SliceOperation>>>>
-    Slice<ArrayType> for V
+impl<
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<SliceOperation>>,
+        >,
+> Slice<ArrayType> for V
 {
     fn slice<L: Clone + Into<Dimension>>(
         &self,
@@ -821,9 +826,8 @@ impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<
         strides: &[usize],
     ) -> Result<Self, ProgramError> {
         // Any context-carrying value slices by binding a `SliceOperation` through its own context. The
-        // `From<SliceOperation>` bound makes this disjoint from the eager value types (whose context operation
-        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
         let output_type = self.r#type().slice(start_indices, limits, strides)?;
         if output_type.eq(self.r#type().as_ref()) {
             return Ok(self.clone());
@@ -1248,20 +1252,20 @@ impl UpdateSlice for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
-        + ManualVariationAlignment<ArrayType>,
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>,
+        > + ManualVariationAlignment<ArrayType>,
 > UpdateSlice<ArrayType> for V
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         // Any context-carrying value updates a slice by binding an `UpdateSliceOperation` through its own context. The
-        // `From<UpdateSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-        // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
         let inputs = [self.clone(), update.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs =
-            self.domain()
-                .bind(UpdateSliceOperation::new(start_indices.to_vec()), Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(UpdateSliceOperation::new(start_indices.to_vec()), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1996,11 +2000,7 @@ where
                         let mut slice_inputs = Vec::with_capacity(1 + forward_start_indices.len());
                         slice_inputs.push(linear_inputs[0].clone());
                         slice_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
-                        Ok(vec![
-                            linear_inputs[0]
-                                .domain()
-                                .bind_array(forward_operation, slice_inputs.as_slice())?,
-                        ])
+                        Ok(vec![linear_inputs[0].domain().bind_array(forward_operation, slice_inputs.as_slice())?])
                     },
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].domain();
@@ -2747,15 +2747,12 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
 
 impl<
     T: Type,
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = T,
             Domain: Context<
                 Operation: From<DynamicSliceOperation<T>>
-                               + OperationProvider<
-                    T,
-                    DynamicSliceOperation,
-                    Operation = <V::Domain as Domain>::Operation,
-                >,
+                               + OperationProvider<T, DynamicSliceOperation, Operation = <V::Domain as Domain>::Operation>,
             >,
         > + ManualVariationAlignment<T>,
 > DynamicSlice<T> for V
@@ -3153,7 +3150,8 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<
                 Operation: From<DynamicSliceOperation<V::Type>>
@@ -3989,8 +3987,11 @@ impl DynamicUpdateSlice for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>
-        + ManualVariationAlignment<ArrayType>,
+    V: Value<
+            Type = ArrayType,
+            Dispatch = ValueDomainDispatch,
+            Domain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>,
+        > + ManualVariationAlignment<ArrayType>,
 > DynamicUpdateSlice<ArrayType> for V
 {
     fn dynamic_update_slice_with_negative_indices(
@@ -4000,9 +4001,9 @@ impl<
         allow_negative_indices: bool,
     ) -> Result<Self, ProgramError> {
         // Any context-carrying value dynamic-update-slices by binding a `DynamicUpdateSliceOperation` through its own
-        // context. The `From<DynamicUpdateSliceOperation>` bound makes this disjoint from the eager value types (whose
-        // context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
-        // concrete implementations.
+        // context. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the
+        // capability directly, so it covers the transform tracers without conflicting with the concrete
+        // implementations.
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;

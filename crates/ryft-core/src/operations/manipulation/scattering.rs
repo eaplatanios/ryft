@@ -2086,7 +2086,8 @@ impl Scatter for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Scatter<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
+    Scatter<ArrayType> for V
 where
     V::Domain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
 {
@@ -2099,9 +2100,8 @@ where
         options: &ScatterOptions,
     ) -> Result<Self, ProgramError> {
         // Any context-carrying value scatters by binding a `ScatterOperation` through its own context. The
-        // `From<ScatterOperation>` bound makes this disjoint from the eager value types (whose context operation
-        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
+        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
+        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
         let inputs = [self.clone(), indices.clone(), updates.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.domain().bind(

@@ -18,8 +18,8 @@ use crate::operations::{Capability, ConstantOperation, DimensionConstant};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, TypeIdentityRenaming,
-    Typed, Value, ValueDomainDispatch, ValueProjection,
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`DimensionSizeOperation`].
@@ -313,7 +313,8 @@ pub trait DimensionSize<Output = Self, T = <Self as Capability>::Universe>: Capa
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<
                 Type = ArrayIrType,
@@ -369,7 +370,8 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize<Self, Arra
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<
                 Type = ArrayIrType,
@@ -385,11 +387,7 @@ impl<
         if let Dimension::Static(extent) = operation.input_dimension() {
             return self.value().domain().dimension_constant(*extent);
         }
-        Ok(self
-            .value()
-            .domain()
-            .bind(operation, Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
+        Ok(self.value().domain().bind(operation, Vec::new(), std::slice::from_ref(self.value()))?.remove(0))
     }
 }
 

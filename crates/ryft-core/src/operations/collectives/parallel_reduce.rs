@@ -662,7 +662,8 @@ impl ParallelReduce for Array {
 // a `ParallelReduceOperation` through its own context (i.e., a staged tracer records the operation, a batching tracer
 // resolves the named axis against the batching context stack, and a JVP dual forwards to the primal-side resolution).
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayType,
             Domain: Context<
                 Operation: From<ConstantOperation<Array>>
@@ -1629,8 +1630,8 @@ mod tests {
         let (mesh, _, varying) = mesh_scalar_types();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 3)
-                    .with_axis_name("i".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 3).with_axis_name("i".to_string());
                 let input = BatchingTracer::new(context, ArrayBatch::replicated(input));
                 Ok(input.parallel_reduce(ReductionKind::Sum, "i")?.into_batch().into_value())
             },

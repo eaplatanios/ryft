@@ -314,22 +314,21 @@ impl<A: Value<Type = ArrayType>> ReferenceNew<Self, ArrayIrType> for ArrayIrValu
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         >,
 > ReferenceNew<V, ArrayIrType> for V
 {
     fn reference_new(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .domain()
-            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
+        Ok(self.domain().bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?.remove(0))
     }
 }
 
 impl<
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         > + ValueProjection<ReferenceType<ArrayType>>,

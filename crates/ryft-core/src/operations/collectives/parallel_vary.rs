@@ -19,8 +19,8 @@ use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed, Value,
-    ValueDomainDispatch, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed,
+    Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Name of [`ParallelVaryOperation`].
@@ -517,9 +517,7 @@ impl<V: Value<Type = DataType>> ManualVariationAlignment<DataType> for V {
     }
 }
 
-impl<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary> ManualVariationAlignment<ArrayType>
-    for V
-{
+impl<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary> ManualVariationAlignment<ArrayType> for V {
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
         // Every input is weakened to the union of the axes that any input varies over, computed once from the unaligned
         // inputs together with the mesh of the first input that varies over each axis. Each input resolves names

@@ -1068,11 +1068,12 @@ impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<
 
 impl<V> ParallelAllToAll<ArrayIrType> for V
 where
-    V: Value<Dispatch = ValueDomainDispatch, 
+    V: Value<
+            Dispatch = ValueDomainDispatch,
             Type = ArrayIrType,
             Domain: Context<Type = ArrayIrType, Operation: From<ParallelAllToAllOperation>>
-                                + NamedAxes
-                                + DimensionConstant,
+                        + NamedAxes
+                        + DimensionConstant,
         > + Assert
         + DimensionSize<V>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType> + Mul + Div + Rem + Compare<V>>
@@ -1207,9 +1208,8 @@ impl<V: ParallelAllToAll<ArrayIrType> + ValueProjection<ArrayType, Projected = P
 }
 
 impl<
-    V: ShapeChangingCollectiveValue<
-            Domain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
-        > + ParallelVary,
+    V: ShapeChangingCollectiveValue<Domain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes>
+        + ParallelVary,
 > ParallelAllToAll<ArrayType> for V
 {
     fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
@@ -2294,8 +2294,8 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
                 let mut outputs = operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0;
@@ -2667,8 +2667,8 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
-                    .with_axis_name("x".to_string());
+                let batch_context =
+                    BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2).with_axis_name("x".to_string());
                 let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
                 let context = DifferentiationContext::fused(batch_context);
                 let item =
@@ -2707,9 +2707,8 @@ mod tests {
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
                     let axis_extent = input.domain().dimension_constant(2)?;
-                    let batch_context =
-                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.domain(), axis_extent)
-                            .with_axis_name("x".to_string());
+                    let batch_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.domain(), axis_extent)
+                        .with_axis_name("x".to_string());
                     let item = BatchingTracer::new(batch_context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?);
                     let context = DifferentiationContext::fused(batch_context);
                     let item = DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(item)?, context);

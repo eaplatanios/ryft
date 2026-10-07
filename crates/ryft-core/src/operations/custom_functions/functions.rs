@@ -2071,8 +2071,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         // and the function composes with those transforms.
         let operation =
             CustomFunctionOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
-        let outputs =
-            first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
+        let outputs = first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -2278,9 +2277,7 @@ where
             BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
-    Specification: Into<
-        BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>,
-    >,
+    Specification: Into<BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>>,
     Equivalent: Fn(&V, &V) -> bool,
 {
     let batch_axis = batch_axis.into();
