@@ -4,8 +4,9 @@
 use std::sync::OnceLock;
 
 use ryft_core::kernels::{KernelParameterAccess, VerifiedKernel};
-use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::{ArrayIrType, DataType, EffectClass, Memory, Operation, Typed};
+use ryft_core::{
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, EffectClass, Memory, Operation, Typed,
+};
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
     CudaScalarType,

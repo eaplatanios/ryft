@@ -1850,20 +1850,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
-        ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative, DataType, Device,
-        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
-        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
-        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic, Memory, MeshAxis,
-        MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError,
-        ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape,
-        ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh,
-        TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation, ZeroLike, differentiate_at,
+        ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative, CustomCall,
+        CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
+        DimensionBounds, DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers,
+        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
+        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
+        Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
+        ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 

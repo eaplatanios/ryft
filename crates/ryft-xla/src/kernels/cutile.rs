@@ -5,8 +5,7 @@
 //! CUDA embedding. Neither loading an executable nor executing it requires the Python compiler.
 
 use ryft_core::kernels::VerifiedKernel;
-use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::{EffectClass, Typed};
+use ryft_core::{CustomCallOperation, EffectClass, Typed};
 use ryft_cuda::kernels::cutile::{
     Argument, COMPILER_SCHEMA_VERSION, CUDA_TILE_VERSION, CompiledKernel, TILEIRAS_VERSION, Target,
 };

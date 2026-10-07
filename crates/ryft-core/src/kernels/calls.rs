@@ -22,10 +22,9 @@ use crate::kernels::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
 use crate::operations::attention::AttentionConfiguration;
-use crate::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
 use crate::operations::{
-    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, DimensionFromScalar,
-    DimensionFromScalarOperation, PadOperation,
+    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomCallArrayAttribute,
+    CustomCallAttribute, CustomCallOperation, DimensionFromScalar, DimensionFromScalarOperation, PadOperation,
 };
 use crate::parameters::Placeholder;
 use crate::programs::{
@@ -969,7 +968,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
     /// Encodes exact custom-call attribute kinds and bits rather than their untyped display forms.
     fn custom_call_semantic_fields(key: &mut String, operation: &CustomCallOperation) {
         Self::semantic_field(key, operation.target_name());
-        for (name, value) in operation.attributes() {
+        Self::custom_call_attribute_semantic_fields(key, operation.attributes());
+    }
+
+    /// Encodes named custom-call attributes, recursing into nested dictionaries, with floating-point values encoded
+    /// by their IEEE bits.
+    fn custom_call_attribute_semantic_fields(key: &mut String, attributes: &[(String, CustomCallAttribute)]) {
+        for (name, value) in attributes {
             Self::semantic_field(key, name);
             match value {
                 CustomCallAttribute::String(value) => {
@@ -978,8 +983,40 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 }
                 CustomCallAttribute::Bytes(value) => Self::semantic_field(key, &format!("bytes {value:02x?}")),
                 CustomCallAttribute::Boolean(value) => Self::semantic_field(key, &format!("boolean {value}")),
+                CustomCallAttribute::I8(value) => Self::semantic_field(key, &format!("i8 {value}")),
+                CustomCallAttribute::I16(value) => Self::semantic_field(key, &format!("i16 {value}")),
+                CustomCallAttribute::I32(value) => Self::semantic_field(key, &format!("i32 {value}")),
                 CustomCallAttribute::I64(value) => Self::semantic_field(key, &format!("i64 {value}")),
+                CustomCallAttribute::U8(value) => Self::semantic_field(key, &format!("u8 {value}")),
+                CustomCallAttribute::U16(value) => Self::semantic_field(key, &format!("u16 {value}")),
+                CustomCallAttribute::U32(value) => Self::semantic_field(key, &format!("u32 {value}")),
+                CustomCallAttribute::U64(value) => Self::semantic_field(key, &format!("u64 {value}")),
+                CustomCallAttribute::F32(value) => Self::semantic_field(key, &format!("f32 {:08x}", value.to_bits())),
                 CustomCallAttribute::F64(value) => Self::semantic_field(key, &format!("f64 {:016x}", value.to_bits())),
+                CustomCallAttribute::Array(array) => Self::semantic_field(
+                    key,
+                    &match array {
+                        CustomCallArrayAttribute::I8(values) => format!("i8 array {values:?}"),
+                        CustomCallArrayAttribute::I16(values) => format!("i16 array {values:?}"),
+                        CustomCallArrayAttribute::I32(values) => format!("i32 array {values:?}"),
+                        CustomCallArrayAttribute::I64(values) => format!("i64 array {values:?}"),
+                        CustomCallArrayAttribute::U8(values) => format!("u8 array {values:?}"),
+                        CustomCallArrayAttribute::U16(values) => format!("u16 array {values:?}"),
+                        CustomCallArrayAttribute::U32(values) => format!("u32 array {values:?}"),
+                        CustomCallArrayAttribute::U64(values) => format!("u64 array {values:?}"),
+                        CustomCallArrayAttribute::F32(values) => {
+                            format!("f32 array {:08x?}", values.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+                        }
+                        CustomCallArrayAttribute::F64(values) => format!(
+                            "f64 array {:016x?}",
+                            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        ),
+                    },
+                ),
+                CustomCallAttribute::Dictionary(attributes) => {
+                    Self::semantic_field(key, &format!("dictionary {}", attributes.len()));
+                    Self::custom_call_attribute_semantic_fields(key, attributes);
+                }
             }
         }
     }

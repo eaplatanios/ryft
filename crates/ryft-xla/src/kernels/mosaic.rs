@@ -9,8 +9,7 @@
 //! runtime and PTX 9.0. These target names are checked against actual device facts rather than silently normalized.
 
 use ryft_core::kernels::{KernelExtension, KernelParameterAccess, VerifiedKernel};
-use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::{EffectClass, Typed};
+use ryft_core::{CustomCallOperation, EffectClass, Typed};
 use ryft_mosaic::kernels::gpu::{CompiledKernel, Target};
 use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
     MOSAIC_GPU_FFI_TARGET, MOSAIC_GPU_RESOURCE_SCHEMA_VERSION, MOSAIC_GPU_SERDE_VERSION,
@@ -157,8 +156,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
-    use ryft_core::operations::custom_call::CustomCallAttribute;
-    use ryft_core::{ArrayType, DataType};
+    use ryft_core::{ArrayType, CustomCallAttribute, DataType};
     use ryft_mosaic::kernels::gpu::{Compiler, Options};
 
     use crate::kernels::staging::XlaKernelDeviceFacts;

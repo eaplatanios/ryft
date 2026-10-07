@@ -10,15 +10,15 @@ use ryft_core::operations::attention::{
     AttentionInputs, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
-use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
-    CaptureReference, CeilOperation, ClampOperation, CollectiveMode, ComparisonDirection, ComplexOperation,
-    ConjugateOperation, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_CALL_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
+    CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation, CollectiveMode,
+    ComparisonDirection, ComplexOperation, ConjugateOperation, ConstantOperation, ConvertElementTypeOperation,
+    CosOperation, CumulativeKind, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation,
     DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation,
     DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, ImaginaryOperation, Instruction,
@@ -41,9 +41,9 @@ use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCall
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef,
-    DictionaryAttributeRef, FloatTypeRef, IntegerTypeRef, Location, LocationRef, Module, Operation as MlirOperation,
-    OperationPrintingFlags, Region, Size as MlirSize, StringRef, SymbolVisibility, TensorTypeRef, Type,
-    TypeAndAttributes, TypeRef, Value as MlirValue, ValueAndAttributes, ValueRef,
+    DictionaryAttributeRef, FloatTypeRef, IntegerTypeRef, Location, LocationRef, Module, NamedAttributeRef,
+    Operation as MlirOperation, OperationPrintingFlags, Region, Size as MlirSize, StringRef, SymbolVisibility,
+    TensorTypeRef, Type, TypeAndAttributes, TypeRef, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
 use crate::ToMlir;
@@ -5857,14 +5857,105 @@ fn lower_custom_call_memory_layouts(
     Ok(Some(CustomCallMemoryLayouts { operands, results }))
 }
 
+/// Lowers named custom-call attributes to MLIR named attributes, in declaration order. Refer to
+/// [`lower_custom_call_attribute`] for the encoding of each attribute kind.
+fn lower_custom_call_attributes<'c, 't: 'c>(
+    attributes: &[(String, CustomCallAttribute)],
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<NamedAttributeRef<'c, 't>>, LoweringError> {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            let value = lower_custom_call_attribute(value, context, location)?;
+            Ok(context.named_attribute(context.identifier(name.as_str()), value))
+        })
+        .collect()
+}
+
+/// Lowers one typed custom-call attribute to the MLIR attribute that XLA's typed FFI decodes into the matching handler
+/// attribute type (refer to XLA's `xla/ffi/attribute_map.cc`). Signed integers become signless integer attributes and
+/// unsigned integers become unsigned integer attributes of the same width, because the FFI decodes integer
+/// signedness from the attribute type. Signed-integer and floating-point arrays become dense array attributes, while
+/// unsigned arrays become dense elements attributes of a rank-1 unsigned tensor type, which is the only unsigned
+/// array encoding that the FFI decodes. Binary data becomes a string attribute holding the exact bytes, and
+/// dictionaries recurse.
+fn lower_custom_call_attribute<'c, 't: 'c>(
+    value: &CustomCallAttribute,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<AttributeRef<'c, 't>, LoweringError> {
+    let unsigned_tensor_type = |bit_width: usize, length: usize| {
+        context.tensor_type(context.unsigned_integer_type(bit_width), &[MlirSize::Static(length)], None, location)
+    };
+    Ok(match value {
+        CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
+        CustomCallAttribute::Bytes(bytes) => context.string_attribute(StringRef::from(bytes.as_slice())).as_ref(),
+        CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
+        CustomCallAttribute::I8(integer) => {
+            context.integer_attribute(context.signless_integer_type(8), i64::from(*integer)).as_ref()
+        }
+        CustomCallAttribute::I16(integer) => {
+            context.integer_attribute(context.signless_integer_type(16), i64::from(*integer)).as_ref()
+        }
+        CustomCallAttribute::I32(integer) => {
+            context.integer_attribute(context.signless_integer_type(32), i64::from(*integer)).as_ref()
+        }
+        CustomCallAttribute::I64(integer) => {
+            context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
+        }
+        CustomCallAttribute::U8(integer) => {
+            context.integer_attribute(context.unsigned_integer_type(8), i64::from(*integer)).as_ref()
+        }
+        CustomCallAttribute::U16(integer) => {
+            context.integer_attribute(context.unsigned_integer_type(16), i64::from(*integer)).as_ref()
+        }
+        CustomCallAttribute::U32(integer) => {
+            context.integer_attribute(context.unsigned_integer_type(32), i64::from(*integer)).as_ref()
+        }
+        // MLIR stores integer attributes as 64-bit words and the unsigned type reinterprets their bits.
+        CustomCallAttribute::U64(integer) => {
+            context.integer_attribute(context.unsigned_integer_type(64), integer.cast_signed()).as_ref()
+        }
+        CustomCallAttribute::F32(float) => context.float_attribute(context.float32_type(), f64::from(*float)).as_ref(),
+        CustomCallAttribute::F64(float) => context.float_attribute(context.float64_type(), *float).as_ref(),
+        CustomCallAttribute::Array(array) => match array {
+            CustomCallArrayAttribute::I8(values) => context.dense_i8_array_attribute(values)?.as_ref(),
+            CustomCallArrayAttribute::I16(values) => context.dense_i16_array_attribute(values)?.as_ref(),
+            CustomCallArrayAttribute::I32(values) => context.dense_i32_array_attribute(values)?.as_ref(),
+            CustomCallArrayAttribute::I64(values) => context.dense_i64_array_attribute(values)?.as_ref(),
+            CustomCallArrayAttribute::U8(values) => {
+                context.dense_u8_elements_attribute(unsigned_tensor_type(8, values.len())?, values)?.as_ref()
+            }
+            CustomCallArrayAttribute::U16(values) => {
+                context.dense_u16_elements_attribute(unsigned_tensor_type(16, values.len())?, values)?.as_ref()
+            }
+            CustomCallArrayAttribute::U32(values) => {
+                context.dense_u32_elements_attribute(unsigned_tensor_type(32, values.len())?, values)?.as_ref()
+            }
+            CustomCallArrayAttribute::U64(values) => {
+                context.dense_u64_elements_attribute(unsigned_tensor_type(64, values.len())?, values)?.as_ref()
+            }
+            CustomCallArrayAttribute::F32(values) => context.dense_f32_array_attribute(values)?.as_ref(),
+            CustomCallArrayAttribute::F64(values) => context.dense_f64_array_attribute(values)?.as_ref(),
+        },
+        CustomCallAttribute::Dictionary(attributes) => {
+            context.dictionary_attribute(&lower_custom_call_attributes(attributes, context, location)?).as_ref()
+        }
+    })
+}
+
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
-/// (`api_version = 4`). Typed attributes become the `backend_config` dictionary, array layouts become complete
-/// StableHLO operand/result layout lists, and flat input/output aliases become StableHLO output-operand aliases.
-/// An ordered call additionally consumes and produces the current token for its assertion or I/O effect, so calls
-/// in that effect class remain ordered even when their array results do not carry a data dependency. An unordered impure call retains
-/// the same handler ABI but uses a fresh local token without joining the ordered chain. Handlers are resolved by the XLA
-/// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
-/// `Client::register_ffi_handler`).
+/// (`api_version = 4`). Typed attributes become the `backend_config` dictionary, array layouts (the declared input
+/// layouts, or the input and output types' own layouts) become complete StableHLO operand/result layout lists, and
+/// flat input/output aliases become StableHLO output-operand aliases. A call with an ordered effect class additionally
+/// consumes and produces the current token of its ordering domain (ordered assertions, or ordered I/O for both
+/// [`EffectClass::OrderedIo`] and [`EffectClass::DeviceOrderedIo`]), so calls in that class remain ordered even when
+/// their array results do not carry a data dependency, and their handlers receive a trailing token argument and
+/// result. An [`EffectClass::UnorderedIo`] call is only marked `has_side_effect = true`, which keeps it alive without
+/// ordering it and gives its handler the same token-free ABI as a pure call (and as JAX's `has_side_effect=True`).
+/// Handlers are resolved by the XLA runtime through the target name at execution time (e.g., registered via
+/// `ryft-pjrt`'s `Client::register_ffi_handler`).
 fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &CustomCallOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -5875,45 +5966,42 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    // Every impure registered handler keeps its trailing token ABI; unordered calls use an independent local chain.
-    let mut local_tokens = EffectTokens::default();
-    let joins_ordered_chain = matches!(
-        operation.effect_class(),
-        Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo | EffectClass::OrderedAssertion)
-    );
-    let token_class = if operation.effect_class() == Some(EffectClass::OrderedAssertion) {
-        EffectClass::OrderedAssertion
-    } else {
-        EffectClass::OrderedIo
+    let token_class = match operation.effect_class() {
+        None | Some(EffectClass::UnorderedIo) => None,
+        Some(EffectClass::OrderedAssertion) => Some(EffectClass::OrderedAssertion),
+        Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo) => Some(EffectClass::OrderedIo),
+        Some(EffectClass::OrderedState) => {
+            return Err(LoweringError::UnresolvedState {
+                construct: format!("{CUSTOM_CALL_OPERATION_NAME} {}", operation.target_name()),
+            });
+        }
     };
-    let effect_tokens = if joins_ordered_chain { effect_tokens } else { &mut local_tokens };
+    let has_token = token_class.is_some();
     check_count!("input", input_types, input_values.len(), ProgramError);
-    let attributes = operation
-        .attributes()
-        .iter()
-        .map(|(name, value)| {
-            let value = match value {
-                CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
-                CustomCallAttribute::Bytes(bytes) => {
-                    context.string_attribute(StringRef::from(bytes.as_slice())).as_ref()
-                }
-                CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
-                CustomCallAttribute::I64(integer) => {
-                    context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
-                }
-                CustomCallAttribute::F64(float) => context.float_attribute(context.float64_type(), *float).as_ref(),
-            };
-            context.named_attribute(context.identifier(name.as_str()), value)
-        })
-        .collect::<Vec<_>>();
+    let input_types = if operation.input_layouts().is_empty() {
+        Cow::Borrowed(input_types)
+    } else {
+        Cow::Owned(
+            input_types
+                .iter()
+                .zip(operation.input_layouts())
+                .map(|(input_type, layout)| match layout {
+                    Some(layout) => input_type.clone().with_layout(layout.clone()),
+                    None => input_type.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let input_types = input_types.as_ref();
+    let attributes = lower_custom_call_attributes(operation.attributes(), context, location)?;
     let backend_config = context.dictionary_attribute(&attributes);
-    let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, operation.has_side_effect())?;
+    let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, has_token)?;
     #[cfg(feature = "mosaic-gpu")]
     let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
     {
         let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")
             .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
-        if operation.has_side_effect() {
+        if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
         }
@@ -5928,7 +6016,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     }) {
         let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")
             .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
-        if operation.has_side_effect() {
+        if has_token {
             layouts.operands.push(Vec::new());
             layouts.results.push(Vec::new());
         }
@@ -5937,14 +6025,14 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         memory_layouts
     };
     let mut lowered_inputs = input_values.to_vec();
-    if operation.has_side_effect() {
+    if let Some(token_class) = token_class {
         lowered_inputs.push(current_or_new_token(token_class, effect_tokens, block, location)?);
     }
     let mut lowered_output_types = output_types
         .iter()
         .map(|output_type| lower_tensor_type(output_type, context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    if operation.has_side_effect() {
+    if has_token {
         lowered_output_types.push(context.stable_hlo_token_type()?.as_ref());
     }
     let output_operand_aliases = operation
@@ -5969,7 +6057,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         &lowered_output_types,
         location,
     )?)?;
-    if operation.has_side_effect() {
+    if let Some(token_class) = token_class {
         effect_tokens.set(
             token_class,
             lowered
@@ -14207,21 +14295,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
     use ryft_core::{
-        AndOperation, Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
-        ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
-        BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
-        Context, Cos, CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension,
-        DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
-        DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
-        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
-        Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot,
-        RandomAlgorithm, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, RngBitGeneratorOperation,
-        ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
-        SliceOperation, StagingContext, StridedLayout, Tile, TileDimension, TiledLayout, Trace, TracingContext,
-        Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation,
-        ZeroOperation, i1, i2, i4, u1, u2, u4,
+        AndOperation, Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation,
+        Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BroadcastOperation,
+        CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos,
+        CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension, DimensionAddOperation,
+        DimensionBounds, DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType,
+        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
+        DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill,
+        GatherDimensionNumbers, IotaOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation,
+        OneOperation, OrOperation, PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder,
+        Provenance, ProvenanceScope, RaggedDot, RandomAlgorithm, ReduceOperation, ReshapeOperation,
+        ReverseModeDifferentiate, RngBitGeneratorOperation, ScanOperation, ScatterDimensionNumbers, SelectOperation,
+        Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
+        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
+        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -23674,8 +23761,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
-        use ryft_core::operations::custom_call::CustomCallOperation;
-        use ryft_core::{PrintOperation, StridedLayout, Tile, TileDimension, TiledLayout};
+        use ryft_core::{CustomCallOperation, PrintOperation, StridedLayout, Tile, TileDimension, TiledLayout};
 
         // A side-effecting custom call lowers its typed attributes, complete memory-layout lists, buffer alias,
         // and one hidden ordered-I/O token. A second side-effecting call consumes that token even though the first
@@ -23785,6 +23871,80 @@ mod tests {
             Err(LoweringError::UnsupportedOp {
                 op: "custom_call with tiled array layout `tiled{1,0:T(2)}`".to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_custom_call_attributes_layouts_and_unordered_effects() {
+        use ryft_core::{CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, EffectClass, TiledLayout};
+
+        // Every attribute kind lowers to the MLIR attribute that XLA's typed FFI decodes into the matching handler
+        // type, a declared input layout replaces the input's own (default) layout, and an unordered effectful call
+        // is only marked `has_side_effect` without threading a token through its handler ABI.
+        let array_type = test_matrix_type(2, 3);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let operation = CustomCallOperation::new("ryft.test.configured", vec![array_type.clone()])
+            .with_attribute("string", "x")
+            .with_attribute("bytes", vec![0u8, 255])
+            .with_attribute("boolean", true)
+            .with_attribute("i8", -8i8)
+            .with_attribute("i16", -16i16)
+            .with_attribute("i32", -32i32)
+            .with_attribute("i64", -64i64)
+            .with_attribute("u8", 8u8)
+            .with_attribute("u16", 16u16)
+            .with_attribute("u32", 32u32)
+            .with_attribute("u64", u64::MAX)
+            .with_attribute("f32", 2.5f32)
+            .with_attribute("f64", 3.5f64)
+            .with_attribute("i8_array", vec![1i8, -2])
+            .with_attribute("i16_array", vec![1i16, -2])
+            .with_attribute("i32_array", vec![1i32, -2])
+            .with_attribute("i64_array", vec![1i64, -2])
+            .with_attribute("u8_array", CustomCallArrayAttribute::U8(vec![1, 2]))
+            .with_attribute("u16_array", vec![1u16, 2])
+            .with_attribute("u32_array", vec![1u32, 2])
+            .with_attribute("u64_array", vec![1u64, 2])
+            .with_attribute("f32_array", vec![0.5f32, 1.5])
+            .with_attribute("f64_array", vec![0.25f64])
+            .with_attribute(
+                "dictionary",
+                CustomCallAttribute::Dictionary(vec![
+                    ("mode".to_string(), CustomCallAttribute::from("fast")),
+                    (
+                        "nested".to_string(),
+                        CustomCallAttribute::Dictionary(vec![("size".to_string(), CustomCallAttribute::from(4i32))]),
+                    ),
+                ]),
+            )
+            .with_input_layouts([Some(TiledLayout::new(vec![0, 1], Vec::new()).into())])
+            .with_effect_class(EffectClass::UnorderedIo);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                    %0 = stablehlo.custom_call @ryft.test.configured(%arg0) {api_version = 4 : i32, backend_config = {boolean = true, bytes = "\00\FF", dictionary = {mode = "fast", nested = {size = 4 : i32}}, f32 = 2.500000e+00 : f32, f32_array = array<f32: 5.000000e-01, 1.500000e+00>, f64 = 3.500000e+00 : f64, f64_array = array<f64: 2.500000e-01>, i16 = -16 : i16, i16_array = array<i16: 1, -2>, i32 = -32 : i32, i32_array = array<i32: 1, -2>, i64 = -64 : i64, i64_array = array<i64: 1, -2>, i8 = -8 : i8, i8_array = array<i8: 1, -2>, string = "x", u16 = 16 : ui16, u16_array = dense<[1, 2]> : tensor<2xui16>, u32 = 32 : ui32, u32_array = dense<[1, 2]> : tensor<2xui32>, u64 = 18446744073709551615 : ui64, u64_array = dense<[1, 2]> : tensor<2xui64>, u8 = 8 : ui8, u8_array = dense<[1, 2]> : tensor<2xui8>}, has_side_effect = true, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[1, 0]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "#},
         );
     }
 
@@ -23912,7 +24072,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_dynamic_custom_call_alias() {
-        use ryft_core::operations::custom_call::CustomCallOperation;
+        use ryft_core::CustomCallOperation;
 
         // A composite custom call receives its declared extent as trailing scalar SSA metadata, but only the array
         // operand enters the FFI call. An alias continues to refer to that leading array operand and the result is

@@ -51,12 +51,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
 #[cfg(test)]
-use ryft_core::StagingContext;
 use ryft_core::{
     ArrayIrType, ArrayType, Atom, AtomId, ConstrainShardingOperation, Context, Dimension, Domain, DomainTracingContext,
     Instruction, LogicalMesh, MeshAxisType, NamedAxis, Operation, ParallelVary, Parameter, ParameterError,
     Parameterized, ParameterizedFamily, Placeholder, ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation,
-    Shape, Sharding, ShardingDimension, ShardingError, Type, Typed, Value, ValueProjection,
+    Shape, Sharding, ShardingDimension, ShardingError, StagingContext, Type, Typed, Value, ValueProjection,
 };
 #[cfg(test)]
 use ryft_mlir::Block;
@@ -6062,7 +6061,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_custom_call_lowers_inside_manual_region_and_executes_on_cpu() {
-        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+        use ryft_core::{CustomCall, CustomCallOperation};
 
         use crate::tests::{ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered};
 

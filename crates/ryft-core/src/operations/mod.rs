@@ -77,6 +77,11 @@ pub use control_flow::{
     transpose_primal_condition,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
+pub use custom_call::{
+    CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
+    CustomCallInputOutputAlias, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
+    CustomCallRaggedOutputBinding,
+};
 pub use custom_functions::{
     BatchingRuleConsistencyError, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
     CustomCallPrimal, CustomFunction, CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule,

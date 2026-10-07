@@ -2258,8 +2258,7 @@ mod tests {
     /// `ryft.test.add_one` handler at execution time.
     #[test]
     fn test_eager_custom_call_executes_registered_ffi_handler() {
-        use ryft_core::TiledLayout;
-        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+        use ryft_core::{CustomCall, CustomCallOperation, TiledLayout};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2301,6 +2300,130 @@ mod tests {
         assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5]);
     }
 
+    #[test]
+    fn test_eager_custom_call_passes_typed_attributes_to_ffi_handler() {
+        use std::sync::{Mutex, OnceLock};
+
+        use ryft_core::{CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation, EffectClass};
+        use ryft_pjrt::extensions::ffi::{
+            FfiAttribute, FfiAttributes, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler,
+            FfiHandlerTraits, FfiInput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+        };
+
+        // This handler records how XLA's typed FFI decodes every attribute of its call, which verifies that each
+        // `CustomCallAttribute` kind reaches handlers with exactly its declared scalar or array element type. It also
+        // rejects any token operand, because an unordered effectful call must use the same token-free ABI as a pure
+        // call.
+        const TARGET: &str = "ryft.test.inspect_attributes";
+        static OBSERVED_ATTRIBUTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        fn render_entry(name: &str, attribute: FfiAttribute<'_>) -> Result<String, FfiError> {
+            let value = match attribute {
+                FfiAttribute::Scalar { scalar } => format!("{scalar:?}"),
+                FfiAttribute::String { string } => format!("{string:?}"),
+                FfiAttribute::Array { array } => format!("{:?}", array.iter().collect::<Result<Vec<_>, _>>()?),
+                FfiAttribute::Dictionary { dictionary } => render_dictionary(&dictionary)?,
+            };
+            Ok(format!("{name}={value}"))
+        }
+
+        fn render_dictionary(dictionary: &FfiAttributes<'_>) -> Result<String, FfiError> {
+            let entries = dictionary
+                .iter()
+                .map(|entry| entry.and_then(|(name, attribute)| render_entry(name, attribute)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("{{{}}}", entries.join(", ")))
+        }
+
+        fn inspect(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+            let inputs = call_frame.inputs().collect::<Result<Vec<_>, _>>()?;
+            if inputs.len() != 1
+                || inputs.iter().any(|FfiInput::Buffer { buffer }| buffer.element_type() == FfiBufferType::Token)
+            {
+                return Err(FfiError::invalid_argument("expected exactly one array input and no token input"));
+            }
+            let entries = call_frame
+                .attributes()
+                .map(|entry| entry.and_then(|(name, attribute)| render_entry(name, attribute)))
+                .collect::<Result<Vec<_>, _>>()?;
+            OBSERVED_ATTRIBUTES.lock().unwrap().push(entries.join(", "));
+            Ok(())
+        }
+
+        unsafe extern "C" fn handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation.
+            unsafe {
+                match FfiCallFrame::from_c_api(call_frame) {
+                    Err(_) => std::ptr::null_mut(),
+                    Ok(call_frame) if call_frame.register_metadata(FfiTypeId::default()) => std::ptr::null_mut(),
+                    Ok(call_frame) if call_frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
+                    Ok(call_frame) => match call_frame.api() {
+                        Err(_) => std::ptr::null_mut(),
+                        Ok(api) => match inspect(&call_frame) {
+                            Ok(()) => std::ptr::null_mut(),
+                            Err(error) => error.to_c_api(api),
+                        },
+                    },
+                }
+            }
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0]);
+        let operation = CustomCallOperation::new(TARGET, Vec::new())
+            .with_attribute("boolean", true)
+            .with_attribute("i8", -8i8)
+            .with_attribute("i16", -16i16)
+            .with_attribute("i32", -32i32)
+            .with_attribute("i64", -64i64)
+            .with_attribute("u8", 8u8)
+            .with_attribute("u16", 16u16)
+            .with_attribute("u32", 32u32)
+            .with_attribute("u64", u64::MAX)
+            .with_attribute("f32", 2.5f32)
+            .with_attribute("f64", 3.5f64)
+            .with_attribute("string", "x")
+            .with_attribute("i8_array", vec![1i8, -2])
+            .with_attribute("i32_array", vec![1i32, -2])
+            .with_attribute("u8_array", CustomCallArrayAttribute::U8(vec![1, 2]))
+            .with_attribute("u64_array", vec![1u64, 2])
+            .with_attribute("f32_array", vec![0.5f32, 1.5])
+            .with_attribute("f64_array", vec![0.25f64])
+            .with_attribute(
+                "dictionary",
+                CustomCallAttribute::Dictionary(vec![("size".to_string(), CustomCallAttribute::from(4i32))]),
+            )
+            .with_effect_class(EffectClass::UnorderedIo);
+        assert_eq!(CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap(), Vec::new());
+        assert_eq!(
+            *OBSERVED_ATTRIBUTES.lock().unwrap(),
+            vec![
+                "boolean=Predicate(true), dictionary={size=I32(4)}, f32=F32(2.5), f32_array=[F32(0.5), F32(1.5)], \
+                 f64=F64(3.5), f64_array=[F64(0.25)], i16=I16(-16), i32=I32(-32), i32_array=[I32(1), I32(-2)], \
+                 i64=I64(-64), i8=I8(-8), i8_array=[I8(1), I8(-2)], string=\"x\", u16=U16(16), u32=U32(32), \
+                 u64=U64(18446744073709551615), u64_array=[U64(1), U64(2)], u8=U8(8), u8_array=[U8(1), U8(2)]"
+                    .to_string(),
+            ],
+        );
+    }
+
     /// Batching a custom call with `CustomCallBatching::BroadcastAll` executes the registered handler on device:
     /// every operand is materialized on the batch axis and the elementwise `ryft.test.add_one` handler receives one
     /// batch-prefixed buffer in a single call, agreeing with the per-row result.
@@ -2310,7 +2433,7 @@ mod tests {
     /// its body region, into the composite family.
     #[test]
     fn test_eager_custom_call_batching_executes_registered_ffi_handler() {
-        use ryft_core::operations::custom_call::{CustomCall, CustomCallBatching, CustomCallOperation};
+        use ryft_core::{CustomCall, CustomCallBatching, CustomCallOperation};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2363,13 +2486,10 @@ mod tests {
     /// preserves the result's ragged metadata, and lets a downstream sum mask the padded suffix.
     #[test]
     fn test_eager_ragged_custom_call_contract_composes_with_masked_reduction() {
-        use ryft_core::operations::custom_call::{
-            CustomCallBatching, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
-            CustomCallRaggedOutputBinding,
-        };
         use ryft_core::{
-            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, DimensionValue,
-            DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, RaggedAxis, ReduceOperation,
+            ArrayBatch, ArrayBatchingPolicy, BatchableOperation, BatchingContext, CustomCallBatching,
+            CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding, CustomCallRaggedOutputBinding,
+            DimensionValue, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, RaggedAxis, ReduceOperation,
         };
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2446,8 +2566,7 @@ mod tests {
     /// foreign kernels (the bare operation rejects differentiation).
     #[test]
     fn test_eager_custom_call_differentiates_through_custom_function() {
-        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::{DomainTracer, custom_function};
+        use ryft_core::{CustomCall, CustomCallOperation, DomainTracer, custom_function};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2488,8 +2607,7 @@ mod tests {
     /// through its user-provided rules.
     #[test]
     fn test_eager_custom_call_differentiates_through_from_custom_call() {
-        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::{CustomFunction, DomainTracer};
+        use ryft_core::{CustomCall, CustomCallOperation, CustomFunction, DomainTracer};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

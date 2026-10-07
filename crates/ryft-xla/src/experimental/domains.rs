@@ -6835,7 +6835,6 @@ mod tests {
         AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionBackwardOperation,
         DotProductAttentionOperation,
     };
-    use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::{
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
@@ -6844,20 +6843,21 @@ mod tests {
         CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
         CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
-        CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
-        DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
-        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
-        DotOperation, DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
-        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
-        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
-        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
-        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, RngBitGeneratorOperation, ScaledDotOperation,
-        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-        SelectOperation, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext,
-        StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
+        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
+        DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather,
+        DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
+        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
+        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
+        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
+        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        Reshape, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation,
+        SortDirection, SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
+        ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]

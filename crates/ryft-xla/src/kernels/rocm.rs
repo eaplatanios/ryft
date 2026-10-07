@@ -3,8 +3,9 @@
 use std::sync::{Arc, OnceLock};
 
 use ryft_core::kernels::{GridExecution, KernelParameterAccess, VerifiedKernel};
-use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::{ArrayIrType, DataType, Dimension, EffectClass, Memory, Operation, Typed};
+use ryft_core::{
+    ArrayIrType, CustomCallAttribute, CustomCallOperation, DataType, Dimension, EffectClass, Memory, Operation, Typed,
+};
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
     FfiTypeId, FfiTypeInformation, FfiUserData, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,

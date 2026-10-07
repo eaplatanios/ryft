@@ -9,19 +9,19 @@ use ryft_core::kernels::{
     KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension, KernelExtensionMemory, KernelOperation,
     KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
-use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom, AtomId,
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation, Context,
-    CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource, DifferentiableOperation,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver, MaybeZero,
-    Operation, OperationBoundaryPruning, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramError,
-    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region, RegionInterface, RegionLiveness, RegionSlot, Tracer, TracingContext, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    CotangentAccumulator, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
+    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OutputRegionProvenance,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionLiveness, RegionSlot,
+    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::XlaTarget;
@@ -1182,9 +1182,8 @@ pub(crate) fn select_kernels(
 pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::EffectClass;
+    use ryft_core::{CustomCallOperation, EffectClass};
     use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
-    use ryft_core::operations::custom_call::CustomCallOperation;
 
     use crate::experimental::ops::XlaProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};

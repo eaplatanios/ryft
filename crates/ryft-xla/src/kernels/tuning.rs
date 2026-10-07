@@ -393,8 +393,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::{Grid, KernelCallOperation, KernelCompilationError, KernelDefinition};
-    use ryft_core::operations::custom_call::CustomCallOperation;
-    use ryft_core::{ReferenceCompletion, ReferenceCompletionBackend};
+    use ryft_core::{CustomCallOperation, ReferenceCompletion, ReferenceCompletionBackend};
 
     use super::*;
 

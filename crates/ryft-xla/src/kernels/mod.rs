@@ -38,10 +38,9 @@ use ryft_core::kernels::{
     KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
     VerifiedKernel,
 };
-use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    ArrayIrType, ArrayType, Context, DataType, EffectClass, Layout, Memory, MeshAxis, MeshAxisType, Operation,
-    ProgramError, ShardingDimension, TypeError, Typed,
+    ArrayIrType, ArrayType, Context, CustomCallOperation, DataType, EffectClass, Layout, Memory, MeshAxis,
+    MeshAxisType, Operation, ProgramError, ShardingDimension, TypeError, Typed,
 };
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};

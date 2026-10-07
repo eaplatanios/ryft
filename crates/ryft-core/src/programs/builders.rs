@@ -393,9 +393,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// identities are instantiated from the caller-provided input types, and [`TypeIdentity`](crate::TypeIdentity)s
     /// defined inside the source graph are replaced with fresh identities for each splice. Every fresh replacement
     /// is checked against the source graph, the destination builder, and replacements generated earlier in the same
-    /// splice. Every instruction and live constant is otherwise rebuilt verbatim. This is, for example, the
-    /// reconciliation primitive an unknown-predicate `condition` uses to graft each branch's residual [`Program`]
-    /// into the reconciled branch it emits during partial evaluation.
+    /// splice. Every instruction and live constant is otherwise rebuilt verbatim. Conditional reconstruction, for
+    /// example, uses this relocation to graft partitioned branch programs into their shared known and residual
+    /// signatures when partial evaluation has a known symbolic predicate.
     #[inline]
     pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
