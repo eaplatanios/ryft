@@ -491,11 +491,28 @@ pub trait ManualVariationAlignment<T = <Self as Capability>::Universe>: Capabili
     ///
     /// Returns a [`ProgramError`] if staging a variation transition on one of the inputs fails.
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>;
+
+    /// Returns `inputs`, in the same order, each weakened to vary over every manual axis that `target` varies over.
+    /// Unlike [`align_manual_variation`](Self::align_manual_variation), this alignment is one-directional: inputs keep
+    /// any additional axes that they vary over, and nothing makes `target` vary more. Operations whose inputs must
+    /// cover the variation of one distinguished value use it, such as the inputs and branch outputs of a `condition`
+    /// whose predicate varies. Axis resolution follows [`align_manual_variation`](Self::align_manual_variation), with
+    /// the mesh of `target` serving the axes that the trace does not bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if staging a variation transition on one of the inputs fails.
+    fn align_manual_variation_to(inputs: &[Self], target: &Sharding) -> Result<Vec<Self>, ProgramError>;
 }
 
 impl<V: Value<Type = DataType>> ManualVariationAlignment<DataType> for V {
     #[inline]
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+
+    #[inline]
+    fn align_manual_variation_to(inputs: &[Self], _target: &Sharding) -> Result<Vec<Self>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -518,28 +535,24 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context + NamedAxes> + ParallelV
                 }
             }
         }
-        inputs
-            .iter()
-            .map(|input| {
-                let context = input.dispatch_domain();
-                let input_type = input.r#type().into_owned();
-                axes.iter()
-                    .filter(|(axis, _)| {
-                        !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
-                    })
-                    .try_fold(input.clone(), |input, (axis, mesh)| match context.named_axis(axis) {
-                        Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
-                        Some(NamedAxis::Batched { .. }) => Ok(input),
-                        None => input.parallel_vary_on_mesh(axis, mesh),
-                    })
-            })
-            .collect()
+        vary_over_manual_axes(inputs, &axes)
+    }
+
+    #[inline]
+    fn align_manual_variation_to(inputs: &[Self], target: &Sharding) -> Result<Vec<Self>, ProgramError> {
+        let axes = target.varying_manual_axes().iter().map(|axis| (axis.clone(), target.mesh().clone())).collect();
+        vary_over_manual_axes(inputs, &axes)
     }
 }
 
 impl<V: Value<Type = DimensionType>> ManualVariationAlignment<DimensionType> for V {
     #[inline]
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+
+    #[inline]
+    fn align_manual_variation_to(inputs: &[Self], _target: &Sharding) -> Result<Vec<Self>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -565,13 +578,57 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Manual
             })
             .collect())
     }
+
+    fn align_manual_variation_to(inputs: &[Self], target: &Sharding) -> Result<Vec<Self>, ProgramError> {
+        // As above, only array members are varied, while dimension and reference members pass through unchanged.
+        let arrays = inputs
+            .iter()
+            .filter(|input| matches!(input.r#type().as_ref(), ArrayIrType::Array(_)))
+            .cloned()
+            .map(ValueProjection::<ArrayType>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut arrays = V::Projected::align_manual_variation_to(&arrays, target)?.into_iter();
+        Ok(inputs
+            .iter()
+            .map(|input| match input.r#type().as_ref() {
+                ArrayIrType::Array(_) => Self::from_projected(arrays.next().unwrap()),
+                _ => input.clone(),
+            })
+            .collect())
+    }
+}
+
+/// Weakens each of `inputs` to vary over every axis in `axes` that it does not already vary over, staging a
+/// [`ParallelVaryOperation`] per missing axis. Each input resolves an axis name against its own context: a name that a
+/// `batch` level binds shadows the mesh axis and is skipped, and a name that the context does not bind uses the mesh
+/// recorded for it in `axes` (refer to [`ParallelVary::parallel_vary_on_mesh`]).
+fn vary_over_manual_axes<V: Value<Type = ArrayType, DispatchDomain: Context + NamedAxes> + ParallelVary>(
+    inputs: &[V],
+    axes: &BTreeMap<String, LogicalMesh>,
+) -> Result<Vec<V>, ProgramError> {
+    inputs
+        .iter()
+        .map(|input| {
+            let context = input.dispatch_domain();
+            let input_type = input.r#type().into_owned();
+            axes.iter()
+                .filter(|(axis, _)| {
+                    !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
+                })
+                .try_fold(input.clone(), |input, (axis, mesh)| match context.named_axis(axis) {
+                    Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
+                    Some(NamedAxis::Batched { .. }) => Ok(input),
+                    None => input.parallel_vary_on_mesh(axis, mesh),
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -1348,6 +1405,89 @@ mod tests {
                         broadcast [output_type=f32[][sharding={mesh<['devices'=2:manual]>, []}], output_axes=[]] %0
                     %4:f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
                         parallel_vary [axis_name=\"devices\"] %3
+                in (%4, %1, %2)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_align_manual_variation_to() {
+        // Each input gains the target's axes that it lacks and keeps its other axes, so the alignment never weakens
+        // the target or makes inputs agree with each other beyond the target.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 0);
+        let target = sharding.clone().with_varying_manual_axes(["a"]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
+        let varying_over_a = ArrayType::scalar(DataType::F32).with_sharding(target.clone()).unwrap();
+        let varying_over_b = ArrayType::scalar(DataType::F32)
+            .with_sharding(sharding.clone().with_varying_manual_axes(["b"]).unwrap())
+            .unwrap();
+        let varying = ArrayType::scalar(DataType::F32)
+            .with_sharding(sharding.with_varying_manual_axes(["a", "b"]).unwrap())
+            .unwrap();
+        let (outputs, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation_to(&inputs, &target),
+            vec![invariant.clone(), varying_over_b.clone(), varying_over_a.clone()],
+            vec![
+                ("a".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() }),
+                ("b".to_string(), NamedAxis::Mesh { axis: 1, size: 2, mesh }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![varying_over_a.clone(), varying.clone(), varying_over_a.clone()]);
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{invariant}, %1:{varying_over_b}, %2:{varying_over_a} .
+                let %3:{varying_over_a} = parallel_vary [axis_name=\"a\"] %0
+                    %4:{varying} = parallel_vary [axis_name=\"a\"] %1
+                in (%3, %4, %2)"
+            },
+        );
+
+        // Dimension values carry no manual variation, so they pass through unchanged and in order.
+        let dimensions = vec![DimensionValue::constant(3).unwrap(), DimensionValue::constant(5).unwrap()];
+        assert_eq!(ManualVariationAlignment::align_manual_variation_to(&dimensions, &target), Ok(dimensions));
+    }
+
+    #[test]
+    fn test_manual_variation_alignment_align_manual_variation_to_array_ir() {
+        // Array members of a composite `ArrayIrType` value align to the target like plain array values, including the
+        // placement of an unsharded member on the axis's mesh, while a dimension member passes through at its position.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let target = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = ArrayType::scalar(DataType::F32).with_sharding(target.clone()).unwrap();
+        let extent = DimensionType::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+        let (outputs, program) =
+            DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::trace_with_named_axes(
+                |inputs: Vec<_>| ManualVariationAlignment::align_manual_variation_to(&inputs, &target),
+                vec![
+                    ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                    ArrayIrType::Dimension(extent.clone()),
+                    ArrayIrType::Array(varying.clone()),
+                ],
+                vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            )
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                ArrayIrType::Array(varying.clone()),
+                ArrayIrType::Dimension(extent),
+                ArrayIrType::Array(varying.clone()),
+            ],
+        );
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[], %1:dimension<extent ∈ [1, 4)>, %2:{varying} .
+                let %3:{invariant} = broadcast [output_type={invariant}, output_axes=[]] %0
+                    %4:{varying} = parallel_vary [axis_name=\"devices\"] %3
                 in (%4, %1, %2)"
             },
         );
