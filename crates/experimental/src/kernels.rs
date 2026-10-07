@@ -1540,8 +1540,8 @@ mod cutile {
 
     #[test]
     fn test_shard_map_on_cuda() {
-        use ryft_core::{ProjectedValue, Sharding, ShardingDimension, Typed};
-        use ryft_xla::experimental::{ShardMapTracer, shard_map};
+        use ryft_core::{ProjectedValue, Sharding, ShardingDimension, Typed, shard_map};
+        use ryft_xla::experimental::XlaArrayTracer;
         use ryft_xla::{CompiledXlaFunction, XlaCompileTracer, XlaOptions, compile_with_options};
 
         if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
@@ -1577,8 +1577,8 @@ mod cutile {
                 let domain = session.domain();
                 let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_options(
                     |input: XlaCompileTracer<'_>| {
-                        shard_map::<_, _, ArrayType, _>(
-                            |local: ShardMapTracer| {
+                        shard_map(
+                            |local: XlaArrayTracer| {
                                 let local_type = local.r#type().into_owned();
                                 let definition: KernelDefinition = KernelDefinition::trace(
                                     KernelCallOperation::new(

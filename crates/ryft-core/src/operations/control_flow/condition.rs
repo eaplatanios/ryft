@@ -1252,8 +1252,8 @@ impl ConditionType for ArrayIrType {
 
 /// Represents the ability to stage a [`ConditionOperation`] that applies one of two branch functions to structured
 /// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the
-/// value-level analogue of [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It binds the
-/// condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
+/// value-level analogue of [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It binds
+/// the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
 /// operation-executing eager domain of a concrete value): each function is traced into a branch [`Program`] through a
 /// [`NestedTracingContext`] over the predicate's domain, and both branches must return values of the same types. An
 /// output that both branches forward from the same input equals that input whichever branch runs, so, as in JAX's
@@ -1281,6 +1281,20 @@ impl ConditionType for ArrayIrType {
 ///
 /// The universe parameter `T` defaults to the `Capability` universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, Condition, ProgramError};
+/// let predicate = Array::scalar(true)?;
+/// let output = predicate.condition(
+///     (Array::scalar(2.0f32)?, Array::scalar(3.0f32)?),
+///     |(first, second)| Ok(first + second),
+///     |(first, second)| Ok(first * second),
+/// )?;
+/// assert_eq!(output, Array::scalar(5.0f32)?);
+/// # Ok::<(), ProgramError>(())
+/// ```
 #[capability]
 pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Domain: Context> {
     /// Applies `true_function` or `false_function` to `inputs` according to this scalar Boolean predicate.

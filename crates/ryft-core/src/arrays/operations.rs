@@ -42,10 +42,10 @@ use crate::operations::{
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
     RoundingOperations, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, ScatterOperation, Select,
-    SelectOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Sort, SortOperation,
-    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
-    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Sort,
+    SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -191,7 +191,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Compare<Self, T>
     + Select<T>
     + ManipulationOperations<T>
-    + ShardingOperations<T>
+    + ShardingOperations
     + StopGradient<T>
     + Tag<T>
     + RngBitGenerator<T>
@@ -223,7 +223,7 @@ impl<
         + Compare<V, T>
         + Select<T>
         + ManipulationOperations<T>
-        + ShardingOperations<T>
+        + ShardingOperations
         + StopGradient<T>
         + Tag<T>
         + RngBitGenerator<T>
@@ -449,6 +449,13 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Composite rematerialized call whose body uses the complete array IR storage universe.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
+    // TODO(eaplatanios): Why is the payload here boxed?
+    /// Composite manual SPMD computation whose local body runs once per device coordinate along its active manual
+    /// axes, with array and reference boundaries and first-class dimensions inside the body (refer to the documentation
+    /// of [`ShardMapOperation`]). The payload is boxed because its boundary metadata is much larger than the other
+    /// payloads of this family.
+    ShardMap(Box<ShardMapOperation>),
+
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
@@ -506,7 +513,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// [`DynamicZero`](crate::operations::constants::DynamicZero),
 /// [`DynamicOne`](crate::operations::constants::DynamicOne), and
 /// [`DynamicIota`](crate::operations::constants::DynamicIota), and the variants that function-level APIs and
-/// transforms stage on behalf of values, namely control flow, rematerialization, linear calls, and custom functions.
+/// transforms stage on behalf of values, namely control flow, rematerialization, linear calls, custom functions, and
+/// shard maps.
 ///
 /// Array capabilities apply directly to composite values, and checked arithmetic over first-class dimensions uses
 /// their member projection:
@@ -934,6 +942,7 @@ mod tests {
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::references::ArrayReferenceTransform;
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -957,7 +966,7 @@ mod tests {
         CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
         DimensionMulOperation, DimensionSizeOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
         DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation,
-        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation, WhileOperation,
+        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, ShardMap, SinOperation, WhileOperation,
         ZeroOperation,
     };
     use crate::parameters::Placeholder;
@@ -3559,6 +3568,7 @@ mod tests {
             ArrayIrOperation::CustomFunction(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::ShardMap(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::CustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LiftedCustomFunction(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LiftedCustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
@@ -3736,6 +3746,19 @@ mod tests {
                 MemberKindSignature::RegionForwarding,
             ),
             (
+                ArrayIrOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
+                    ShardMap::from_shardings(
+                        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                        Vec::new(),
+                        Vec::new(),
+                        vec!["x".to_string()],
+                    ),
+                    Vec::<ArrayIrType>::new(),
+                    Vec::<ArrayIrType>::new(),
+                ))),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
                 ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(composite_rules.reference())),
                 MemberKindSignature::RegionForwarding,
             ),
@@ -3772,7 +3795,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 39);
+        assert_eq!(expected.len(), 40);
         assert_eq!(
             expected
                 .iter()

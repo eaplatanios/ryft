@@ -1887,11 +1887,11 @@ where
                 outer_context.invoke_with_provenance_scope(
                     ProvenanceScope::new("ragged_identity_mask"),
                     || -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-                        // Inside a manual region (e.g., the body of a `shard_map` operation in the XLA backend), the
-                        // input and the extents of every masked ragged axis are combined elementwise, so they must
-                        // vary over the same manual mesh axes. The input can carry a tangent, and so they are aligned
-                        // through the value-level capability, which stages real `parallel_vary` transitions only for
-                        // the axes that a value lacks and stages nothing outside a manual region.
+                        // Inside a manual region (e.g., the body of a `shard_map` operation), the input and the extents
+                        // of every masked ragged axis are combined elementwise, so they must vary over the same manual
+                        // mesh axes. The input can carry a tangent, and so they are aligned through the value-level
+                        // capability, which stages real `parallel_vary` transitions only for the axes that a value
+                        // lacks and stages nothing outside a manual region.
                         let mut aligned_values = Vec::with_capacity(1 + masked.len());
                         aligned_values
                             .push(<C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone()));

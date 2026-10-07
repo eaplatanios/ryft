@@ -21,9 +21,9 @@ pub enum MeshAxisType {
     /// type-level sharding metadata and propagated before compilation.
     Explicit,
 
-    /// Used for mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like `shard_map` which is analogous to
-    /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
+    /// Used for mesh axes for which the user manages all device communication explicitly (e.g., inside the body of a
+    /// [`ShardMapOperation`](crate::ShardMapOperation) staged by [`shard_map`](fn@crate::shard_map), which is analogous
+    /// to JAX's [`shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }
 
@@ -202,11 +202,10 @@ impl Display for LogicalMesh {
 impl Debug for LogicalMesh {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LogicalMesh")
-            .field("axes", &self.0.axes)
-            .field("axis_indices", &self.0.axis_indices)
-            .finish()
+        // The `axis_indices` lookup table is omitted because it is fully determined by `axes` and its `HashMap`
+        // iteration order varies across processes, while this rendering feeds process-independent keys (e.g.,
+        // kernel semantic keys).
+        formatter.debug_struct("LogicalMesh").field("axes", &self.0.axes).finish()
     }
 }
 
@@ -412,6 +411,13 @@ mod tests {
         assert_eq!(mesh.device_count(), 6);
         assert_eq!(mesh.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:explicit]");
         assert_eq!(LogicalMesh::new(Vec::new()).unwrap().to_string(), "[]");
+        assert_eq!(
+            format!("{mesh:?}"),
+            concat!(
+                "LogicalMesh { axes: [MeshAxis { name: \"x\", size: 2, type: Auto }, ",
+                "MeshAxis { name: \"y\", size: 3, type: Manual }, MeshAxis { name: \"z\", size: 1, type: Explicit }] }",
+            ),
+        );
 
         // A quote, backslash, or control character inside a name cannot imitate the separator between two names.
         let render = |names: &[&str]| {
