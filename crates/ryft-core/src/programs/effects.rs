@@ -25,12 +25,12 @@ pub enum EffectClass {
     /// Use [`DeviceOrderedIo`](Self::DeviceOrderedIo) when per-device order suffices.
     OrderedIo,
 
-    /// Observable input/output [`EffectClass`] whose execution order relative to other ordered I/O effects executing
-    /// on the same device is observable and must be preserved, while occurrences on different devices have no
-    /// promised relative order. Operations with this effect must not be folded away or get eliminated. Every device
-    /// participating in a multi-device execution runs its own copy of the effect and preserves program order among
-    /// the ordered I/O effects it executes, so this class is the one to declare for effects that tolerate replicated
-    /// per-device execution (e.g., inside `shard_map` operation bodies in the XLA backend).
+    /// Observable input/output [`EffectClass`] whose execution order relative to other ordered I/O effects
+    /// executing on the same device is observable and must be preserved, while occurrences on different devices have
+    /// no promised relative order. Operations with this effect must not be folded away or get eliminated. Every device
+    /// participating in a multi-device execution runs its own copy of the effect and preserves program order among the
+    /// ordered I/O effects it executes, so this class is the one to declare for effects that tolerate replicated
+    /// per-device execution (e.g., inside the body of a [`ShardMapOperation`](crate::ShardMapOperation)).
     DeviceOrderedIo,
 
     /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other effects is not
