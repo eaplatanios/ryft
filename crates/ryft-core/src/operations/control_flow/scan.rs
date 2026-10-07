@@ -788,8 +788,7 @@ where
         let length = self.length.value().ok_or_else(|| ProgramError::UnsupportedOperation {
             message: format!(
                 "cannot eagerly interpret homogeneous array `{SCAN_OPERATION_NAME}` with dynamic length `{}` \
-                 without an \
-                 explicit first-class dimension input",
+                 without an explicit first-class dimension input",
                 self.length,
             ),
         })?;
@@ -898,8 +897,8 @@ where
                             })
                             .ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "cannot eagerly allocate {} output {} because its dynamic dimension {} is not \
-                                     supplied as a first-class {} input",
+                                    "cannot eagerly allocate `{}` output `{}` because its dynamic dimension `{}` is \
+                                     not supplied as a first-class `{}` input",
                                     SCAN_OPERATION_NAME, r#type, variable, SCAN_OPERATION_NAME,
                                 ))
                             }),
@@ -1961,8 +1960,7 @@ impl ScanType for ArrayType {
         if length.variable().is_some() {
             return Err(TypeError::invalid(format!(
                 "homogeneous array `{SCAN_OPERATION_NAME}` requires a static length but got `{length}`; use a \
-                 composite \
-                 `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
+                 composite `{SCAN_OPERATION_NAME}` with a trailing first-class dimension input for a dynamic trip count",
             )));
         }
         if body_input_types.first() != Some(&ArrayType::scalar(DataType::I64)) {
