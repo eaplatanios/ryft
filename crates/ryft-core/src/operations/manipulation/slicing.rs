@@ -54,7 +54,7 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
-use crate::operations::sharding::Reshard;
+use crate::operations::sharding::reshard::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, EmptyRegionDriver, MaybeZero, Operation, OperationFormatter,

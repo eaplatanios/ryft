@@ -32,7 +32,7 @@ use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, ReshapeOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::reductions::ReduceOperation;
-use crate::operations::sharding::ReshardOperation;
+use crate::operations::sharding::reshard::ReshardOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };

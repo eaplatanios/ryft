@@ -560,41 +560,14 @@ impl<V: Value<Type = DimensionType>> ManualVariationAlignment<DimensionType> for
 impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: ManualVariationAlignment<ArrayType>>>
     ManualVariationAlignment<ArrayIrType> for V
 {
+    #[inline]
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
-        // Only array members carry manual variation. They are aligned among themselves and put back at their
-        // original positions, while dimension and reference members pass through unchanged.
-        let arrays = inputs
-            .iter()
-            .filter(|input| matches!(input.r#type().as_ref(), ArrayIrType::Array(_)))
-            .cloned()
-            .map(ValueProjection::<ArrayType>::into_projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut arrays = V::Projected::align_manual_variation(&arrays)?.into_iter();
-        Ok(inputs
-            .iter()
-            .map(|input| match input.r#type().as_ref() {
-                ArrayIrType::Array(_) => Self::from_projected(arrays.next().unwrap()),
-                _ => input.clone(),
-            })
-            .collect())
+        align_array_members(inputs, V::Projected::align_manual_variation)
     }
 
+    #[inline]
     fn align_manual_variation_to(inputs: &[Self], target: &Sharding) -> Result<Vec<Self>, ProgramError> {
-        // As above, only array members are varied, while dimension and reference members pass through unchanged.
-        let arrays = inputs
-            .iter()
-            .filter(|input| matches!(input.r#type().as_ref(), ArrayIrType::Array(_)))
-            .cloned()
-            .map(ValueProjection::<ArrayType>::into_projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut arrays = V::Projected::align_manual_variation_to(&arrays, target)?.into_iter();
-        Ok(inputs
-            .iter()
-            .map(|input| match input.r#type().as_ref() {
-                ArrayIrType::Array(_) => Self::from_projected(arrays.next().unwrap()),
-                _ => input.clone(),
-            })
-            .collect())
+        align_array_members(inputs, |arrays| V::Projected::align_manual_variation_to(arrays, target))
     }
 }
 
@@ -622,6 +595,29 @@ fn vary_over_manual_axes<V: Value<Type = ArrayType, DispatchDomain: Context + Na
                 })
         })
         .collect()
+}
+
+/// Projects and aligns only the array members of [`ArrayIrType`] inputs, then restores them to their original
+/// positions. Dimension and reference members pass through unchanged. The `align` callback must return one aligned
+/// array per projected input, in the same order.
+fn align_array_members<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>>(
+    inputs: &[V],
+    align: impl FnOnce(&[V::Projected]) -> Result<Vec<V::Projected>, ProgramError>,
+) -> Result<Vec<V>, ProgramError> {
+    let arrays = inputs
+        .iter()
+        .filter(|input| matches!(input.r#type().as_ref(), ArrayIrType::Array(_)))
+        .cloned()
+        .map(ValueProjection::<ArrayType>::into_projected)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut arrays = align(&arrays)?.into_iter();
+    Ok(inputs
+        .iter()
+        .map(|input| match input.r#type().as_ref() {
+            ArrayIrType::Array(_) => V::from_projected(arrays.next().unwrap()),
+            _ => input.clone(),
+        })
+        .collect())
 }
 
 #[cfg(test)]

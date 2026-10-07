@@ -1253,7 +1253,9 @@ impl ConditionType for ArrayIrType {
 /// it binds the condition in the [`execution_domain`](Value::execution_domain) of its values (i.e., the live trace of a
 /// staged value or the operation-executing eager domain of a concrete value): each function is traced into a branch
 /// [`Program`] through a [`NestedTracingContext`] over the execution domain of `predicate`, and both branches must
-/// return values of the same types.
+/// return values of the same types. An output that both branches forward from the same input equals that input
+/// whichever branch runs, so, as in JAX's `cond`, it is pruned from the branches and returned as the input itself
+/// instead of through the condition.
 ///
 /// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
 /// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
@@ -1263,10 +1265,12 @@ impl ConditionType for ArrayIrType {
 /// per-device values that they are, and the gradient of an input that was invariant is summed across devices by the
 /// transpose of its boundary `parallel_vary`, outside of the branches. JAX instead types such values as invariant, and
 /// a branch that varies an invariant input sums that input's gradient inside the branch, with a collective that
-/// devices taking different branches reach differently. As a consequence, an output that a branch forwards from an
-/// invariant input is typed as varying even though it is equal on every device. With an invariant predicate, or outside of manual regions, no alignment is
-/// staged. Values that the functions capture from the enclosing trace instead of receiving through `inputs` are not
-/// aligned at the boundary, so differentiable values should be passed through `inputs`.
+/// devices taking different branches reach differently. An output that both branches forward from the same invariant
+/// input keeps its invariance because it is returned as that input, while an output that only one branch forwards
+/// varies, because the other branch can produce a different value. With an invariant predicate, or outside of manual
+/// regions, no alignment is staged. The functions cannot use values of the enclosing trace other than through `inputs`
+/// (only constants can be closed over), so every differentiable value crosses the aligned boundary, while constants
+/// carry no tangent and so their alignment inside a branch never transposes into a collective.
 ///
 /// # Parameters
 ///
@@ -1299,11 +1303,11 @@ where
 {
     let context = predicate.execution_domain();
     let predicate_sharding = predicate.r#type().predicate_sharding().cloned();
-    let inputs = match &predicate_sharding {
+    let aligned_inputs = match &predicate_sharding {
         Some(sharding) => V::align_manual_variation_to(&inputs, sharding)?,
-        None => inputs,
+        None => inputs.clone(),
     };
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>| match &predicate_sharding {
         Some(sharding) => Tracer::align_manual_variation_to(&outputs, sharding),
         None => Ok(outputs),
@@ -1318,10 +1322,47 @@ where
         |inputs| false_function(inputs).and_then(align_outputs),
         input_types,
     )?;
-    let mut condition_inputs = Vec::with_capacity(inputs.len() + 1);
+
+    // An output that both branches forward from the same input is returned as the unaligned input, so it keeps the
+    // variation of that input, and the branches stop carrying it. Branches with different output counts are bound as
+    // they are, so that binding reports the mismatch.
+    let input_index = |branch: &Program<_, _, Vec<_>, Vec<_>>, output: usize| {
+        branch.input_ids().iter().position(|input| *input == branch.output_ids()[output])
+    };
+    let forwarded_inputs = if true_branch.output_ids().len() == false_branch.output_ids().len() {
+        (0..true_branch.output_ids().len())
+            .map(|output| match (input_index(&true_branch, output), input_index(&false_branch, output)) {
+                (Some(true_input), Some(false_input)) if true_input == false_input => Some(true_input),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let kept_outputs = (0..true_branch.output_ids().len())
+        .filter(|&output| forwarded_inputs.get(output).copied().flatten().is_none())
+        .collect::<Vec<_>>();
+    let branches = if kept_outputs.len() == true_branch.output_ids().len() {
+        vec![true_branch, false_branch]
+    } else {
+        vec![true_branch.with_outputs(&kept_outputs)?, false_branch.with_outputs(&kept_outputs)?]
+    };
+
+    let mut condition_inputs = Vec::with_capacity(aligned_inputs.len() + 1);
     condition_inputs.push(predicate.clone());
-    condition_inputs.extend(inputs);
-    context.bind(ConditionOperation::<V::Type>::new(), vec![true_branch, false_branch], &condition_inputs)
+    condition_inputs.extend(aligned_inputs);
+    let outputs = context.bind(ConditionOperation::<V::Type>::new(), branches, &condition_inputs)?;
+    if forwarded_inputs.iter().all(Option::is_none) {
+        return Ok(outputs);
+    }
+    let mut outputs = outputs.into_iter();
+    Ok(forwarded_inputs
+        .into_iter()
+        .map(|input| match input {
+            Some(input) => inputs[input].clone(),
+            None => outputs.next().unwrap(),
+        })
+        .collect())
 }
 
 /// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
@@ -10208,6 +10249,54 @@ mod tests {
                     }},
                 ]
                 in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_condition_condition_returns_forwarded_inputs_directly() {
+        // Both branches forward the invariant weight, which therefore equals that weight on every device whichever
+        // branch runs, so it is pruned from the branches and returned as the unaligned input with its invariant type.
+        // The other output is computed differently by the branches and is returned by the condition as a varying value.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding.clone()).unwrap();
+        let invariant_type =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone(), inputs[2].clone()],
+                    |inputs| Ok(vec![inputs[0].clone(), inputs[0].clone() * inputs[1].clone()]),
+                    |inputs| Ok(vec![inputs[0].clone(), inputs[1].clone()]),
+                )
+            },
+            vec![predicate_type, invariant_type.clone(), varying_type.clone()],
+            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output_types, vec![invariant_type, varying_type]);
+        let predicate = "bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        let invariant = "f32[][sharding={mesh<['devices'=2:manual]>, []}]";
+        let varying = "f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{predicate}, %1:{invariant}, %2:{varying} .
+                let %3:{varying} = parallel_vary [axis_name=\"devices\"] %1
+                    %4:{varying} = condition %0 %3 %2 [
+                        true={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:{varying} = mul %0 %1
+                            in (%2)
+                        }},
+                        false={{
+                            lambda %0:{varying}, %1:{varying} .
+                            in (%1)
+                        }},
+                    ]
+                in (%1, %4)"},
         );
     }
 

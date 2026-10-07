@@ -27,6 +27,7 @@ from ryft.jax.differential_testing import (
     DifferentialObservation,
     StableHloCollective,
     StagingObservation,
+    collectives_inside_branches,
 )
 from ryft.jax.distributed_collective_testing import (
     build_distributed_case_jax,
@@ -50,7 +51,8 @@ class DifferentialCase:
     lists semantic operation or attribute spellings that must occur in both modules. An exact-parity case must declare
     at least one of these contracts or an independent reference. `reference` provides host semantics checked separately
     against each backend. `validate` checks identities against actual outputs, and `suite` selects related workloads.
-    Capability cases that compare no module declare neither module contract.
+    Capability cases that compare no module declare neither module contract. A `ryft_exceeds_jax` case declares the
+    staging that each framework is expected to report in `ryft_staging` and `jax_staging`.
     """
 
     case_id: str
@@ -61,6 +63,8 @@ class DifferentialCase:
     reference: Callable[[], dict[str, tuple[tuple[float, ...], ...]]] | None = None
     suite: str = "general"
     validate: Callable[[DifferentialObservation], tuple[str, ...]] | None = None
+    ryft_staging: StagingObservation | None = None
+    jax_staging: StagingObservation | None = None
 
 
 def _configure_jax_devices(device_count: int = 4) -> None:
@@ -186,6 +190,74 @@ def _build_data_dependent_prefix_take(jax: Any, jax_numpy: Any, numpy: Any) -> D
         },
         staging=staging,
     )
+
+
+def _build_condition_varying_predicate_gradient(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds the value of a condition whose predicate varies across devices and records how JAX stages its gradient.
+
+    Each device of a four-device `x` mesh holds one element of `values = [1, -2, 3, -4]` and the replicated
+    `weight = [2]`, takes `weight * values` when its element is positive and `values` otherwise, and the result is
+    summed over the mesh. JAX transposes the condition branch by branch, so the cross-device sum of the weight's
+    cotangent (`psum_invariant`, lowered to `stablehlo.all_reduce`) lands inside the branch that only some devices take.
+    Executing that gradient on four CPU devices deadlocks in XLA's all-reduce rendezvous ("Expected 4 threads to join
+    the rendezvous, but only 2 of them arrived") and aborts the process, so this builder never executes it: it records
+    the collective placement of the lowered gradient as an `unsafe` staging observation instead.
+    """
+
+    mesh = jax.sharding.Mesh(jax.devices()[:4], ("x",))
+    partition = jax.sharding.PartitionSpec
+    weight = jax_numpy.array([2.0], dtype=jax_numpy.float32)
+    values = jax_numpy.array([1.0, -2.0, 3.0, -4.0], dtype=jax_numpy.float32)
+
+    def body(weight: Any, values: Any) -> Any:
+        output = jax.lax.cond(
+            values.sum() > 0,
+            lambda weight, values: weight * values,
+            lambda weight, values: values,
+            weight,
+            values,
+        )
+        return jax.lax.psum(output.sum(), "x")
+
+    function = jax.shard_map(body, mesh=mesh, in_specs=(partition(), partition("x")), out_specs=partition())
+    value = jax.jit(function)(weight, values)
+    gradient = jax.jit(jax.grad(function)).lower(weight, values).as_text()
+    families = collectives_inside_branches(gradient)
+    staging = (
+        StagingObservation(status="unsafe", category="collective_inside_branch")
+        if families
+        else StagingObservation(status="supported", output_type="f32[1]")
+    )
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="condition_varying_predicate_gradient",
+        observations={"value": _single_observation_values(value, numpy)},
+        staging=staging,
+        stablehlo=gradient,
+    )
+
+
+def _condition_varying_predicate_gradient_reference() -> dict[str, tuple[tuple[float, ...], ...]]:
+    """Returns the value and gradients that the condition computes on the four device elements."""
+
+    return {
+        "value": ((2.0,),),
+        "values_gradient": ((2.0, 1.0, 2.0, 1.0),),
+        "weight_gradient": ((4.0,),),
+    }
+
+
+def _validate_condition_varying_predicate_gradient(observation: DifferentialObservation) -> tuple[str, ...]:
+    """Checks that a supported module keeps collectives out of branches and an unsafe one places them inside."""
+
+    if observation.stablehlo is None:
+        return ("condition gradient: missing StableHLO module",)
+    families = collectives_inside_branches(observation.stablehlo)
+    if observation.staging is not None and observation.staging.status == "supported" and families:
+        return (f"condition gradient: supported module places {families!r} inside branches",)
+    if observation.staging is not None and observation.staging.status == "unsafe" and not families:
+        return ("condition gradient: unsafe module places no collective inside branches",)
+    return ()
 
 
 def _build_scaled_dot_and_matmul(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
@@ -412,7 +484,13 @@ DIFFERENTIAL_CASES = (
             ),
         ),
     ),
-    DifferentialCase("data_dependent_prefix_take", "ryft_exceeds_jax", _build_data_dependent_prefix_take),
+    DifferentialCase(
+        "data_dependent_prefix_take",
+        "ryft_exceeds_jax",
+        _build_data_dependent_prefix_take,
+        ryft_staging=StagingObservation(status="supported", output_type="f32[count]"),
+        jax_staging=StagingObservation(status="rejected", category="concretization"),
+    ),
     DifferentialCase(
         "scaled_dot_and_matmul",
         "parity",
@@ -430,6 +508,15 @@ DIFFERENTIAL_CASES = (
         "parity",
         _build_negative_dynamic_slice,
         stablehlo_patterns=("stablehlo.compare", "stablehlo.select", "stablehlo.dynamic_slice"),
+    ),
+    DifferentialCase(
+        "condition_varying_predicate_gradient",
+        "ryft_exceeds_jax",
+        _build_condition_varying_predicate_gradient,
+        reference=_condition_varying_predicate_gradient_reference,
+        validate=_validate_condition_varying_predicate_gradient,
+        ryft_staging=StagingObservation(status="supported", output_type="f32[1]"),
+        jax_staging=StagingObservation(status="unsafe", category="collective_inside_branch"),
     ),
 )
 

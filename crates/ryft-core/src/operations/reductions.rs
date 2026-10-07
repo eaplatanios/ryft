@@ -103,7 +103,7 @@ use crate::operations::manipulation::broadcasting::{
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::slicing::Slice;
-use crate::operations::sharding::Reshard;
+use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,

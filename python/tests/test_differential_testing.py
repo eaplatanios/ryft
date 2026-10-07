@@ -7,6 +7,8 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
+from functools import partial
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from ryft.jax.differential_testing import (
     DifferentialObservation,
     StableHloCollective,
     StagingObservation,
+    collectives_inside_branches,
     compare_case,
     differential_cases,
     main,
@@ -76,7 +79,7 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(
             [
                 (case.case_id, case.relationship, bool(case.collectives), bool(case.stablehlo_patterns))
-                for case in cases[:7]
+                for case in cases[:8]
             ],
             [
                 ("grouped_shape_changing_collectives", "parity", True, False),
@@ -86,13 +89,14 @@ class DifferentialTestingTest(unittest.TestCase):
                 ("scaled_dot_and_matmul", "parity", False, True),
                 ("dot_product_attention", "parity", False, True),
                 ("negative_dynamic_slice", "parity", False, True),
+                ("condition_varying_predicate_gradient", "ryft_exceeds_jax", False, False),
             ],
         )
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
-        self.assertTrue(cases[7:])
+        self.assertTrue(cases[8:])
         self.assertTrue(all(
             case.reference is not None and case.suite in ("collectives", *differential_testing.CUDA_SUITES)
-            for case in cases[7:]
+            for case in cases[8:]
         ))
 
     def test_observation_schema(self) -> None:
@@ -116,6 +120,17 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(
             observation_payload(observation)["staging"],
             {"status": "rejected", "category": "concretization"},
+        )
+        self.assertEqual(
+            parse_observation(
+                {
+                    "schema": SCHEMA,
+                    "case_id": "case",
+                    "observations": {},
+                    "staging": {"status": "unsafe", "category": "collective_inside_branch"},
+                }
+            ).staging,
+            StagingObservation(status="unsafe", category="collective_inside_branch"),
         )
         with self.assertRaisesRegex(ValueError, "unsupported differential observation schema 'old'"):
             parse_observation({"schema": "old"})
@@ -240,19 +255,23 @@ class DifferentialTestingTest(unittest.TestCase):
 
     def test_ryft_exceeds_jax_comparison(self) -> None:
         observations = {"two_matches": ((10.0, 20.0),), "zero_matches": ((),)}
+        ryft_staging = StagingObservation(status="supported", output_type="f32[count]")
+        jax_staging = StagingObservation(status="rejected", category="concretization")
         ryft = DifferentialObservation(
             schema=SCHEMA,
             case_id="data_dependent_prefix_take",
             observations=observations,
-            staging=StagingObservation(status="supported", output_type="f32[count]"),
+            staging=ryft_staging,
         )
         jax = DifferentialObservation(
             schema=SCHEMA,
             case_id="data_dependent_prefix_take",
             observations=observations,
-            staging=StagingObservation(status="rejected", category="concretization"),
+            staging=jax_staging,
         )
-        self.assertTrue(compare_case("ryft_exceeds_jax", (), ryft, jax).passed())
+        self.assertTrue(
+            compare_case("ryft_exceeds_jax", (), ryft, jax, ryft_staging=ryft_staging, jax_staging=jax_staging).passed()
+        )
 
         jax_supported = DifferentialObservation(
             schema=SCHEMA,
@@ -261,10 +280,77 @@ class DifferentialTestingTest(unittest.TestCase):
             staging=StagingObservation(status="supported", output_type="unexpected"),
         )
         self.assertEqual(
-            compare_case("ryft_exceeds_jax", (), ryft, jax_supported).differences,
-            ("JAX staging: expected concretization rejection but got StagingObservation(status='supported', "
-             "output_type='unexpected', category=None)",),
+            compare_case(
+                "ryft_exceeds_jax", (), ryft, jax_supported, ryft_staging=ryft_staging, jax_staging=jax_staging,
+            ).differences,
+            ("JAX staging: expected StagingObservation(status='rejected', output_type=None, "
+             "category='concretization') but got StagingObservation(status='supported', output_type='unexpected', "
+             "category=None)",),
         )
+        self.assertEqual(
+            compare_case("ryft_exceeds_jax", (), ryft, jax).differences,
+            ("staging: a `ryft_exceeds_jax` case must declare the staging of both frameworks",),
+        )
+
+    def test_ryft_exceeds_jax_comparison_checks_ryft_only_observations_against_the_reference(self) -> None:
+        ryft_staging = StagingObservation(status="supported", output_type="f32[1]")
+        jax_staging = StagingObservation(status="unsafe", category="collective_inside_branch")
+        reference = {"gradient": ((4.0,),), "value": ((2.0,),)}
+        ryft = DifferentialObservation(
+            schema=SCHEMA, case_id="case", observations=reference, staging=ryft_staging,
+        )
+        jax = DifferentialObservation(
+            schema=SCHEMA, case_id="case", observations={"value": ((2.0,),)}, staging=jax_staging,
+        )
+        compare = partial(
+            compare_case,
+            "ryft_exceeds_jax",
+            (),
+            reference=reference,
+            ryft_staging=ryft_staging,
+            jax_staging=jax_staging,
+        )
+        self.assertTrue(compare(ryft, jax).passed())
+
+        wrong_gradient = replace(ryft, observations={"gradient": ((3.0,),), "value": ((2.0,),)})
+        self.assertEqual(
+            compare(wrong_gradient, jax).differences,
+            (f"reference observations: ryft {wrong_gradient.observations!r} != expected {reference!r}",),
+        )
+        missing_value = replace(ryft, observations={"gradient": ((4.0,),)})
+        self.assertEqual(
+            compare(missing_value, jax).differences,
+            (
+                "shared observations: ryft {'value': None} != jax {'value': ((2.0,),)}",
+                f"reference observations: ryft {missing_value.observations!r} != expected {reference!r}",
+            ),
+        )
+
+    def test_collectives_inside_branches(self) -> None:
+        all_reduce = (
+            '"stablehlo.all_reduce"(%0) <{replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>}> ({\n'
+            '      ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):\n'
+            '        stablehlo.return %arg0 : tensor<f32>\n'
+            '      }) : (tensor<f32>) -> tensor<f32>'
+        )
+        inside = (
+            '    %1 = "stablehlo.case"(%0) ({\n'
+            '      stablehlo.return %2 : tensor<f32>\n'
+            '    }, {\n'
+            f'      %3 = {all_reduce}\n'
+            '      stablehlo.return %3 : tensor<f32>\n'
+            '    }) : (tensor<i32>) -> tensor<f32>\n'
+        )
+        outside = (
+            '    %1 = "stablehlo.if"(%0) ({\n'
+            '      stablehlo.return %2 : tensor<f32>\n'
+            '    }, {\n'
+            '      stablehlo.return %2 : tensor<f32>\n'
+            '    }) : (tensor<i1>) -> tensor<f32>\n'
+            f'    %3 = {all_reduce}\n'
+        )
+        self.assertEqual(collectives_inside_branches(inside), ("all_reduce",))
+        self.assertEqual(collectives_inside_branches(outside), ())
 
     def test_live_data_dependent_comparison(self) -> None:
         comparisons = run_comparison(repo_root(), ("data_dependent_prefix_take",))

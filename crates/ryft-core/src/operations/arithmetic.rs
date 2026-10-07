@@ -1433,7 +1433,7 @@ impl_rsqrt_for_primitive!(f64);
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`](crate::ArrayIrType), while host scalars (e.g., `f32`) implement it in their own universes.
+/// for [`ArrayIrType`], while host scalars (e.g., `f32`) implement it in their own universes.
 pub trait ArithmeticOperations<T = <Self as Capability>::Universe>:
     Capability
     + Sign<T>

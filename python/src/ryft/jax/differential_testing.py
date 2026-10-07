@@ -143,7 +143,7 @@ def _parse_staging(value: Any) -> StagingObservation:
     category = fields.get("category")
     if status == "supported":
         return StagingObservation(status=status, output_type=_required_string(output_type, "staging.output_type"))
-    if status == "rejected":
+    if status in ("rejected", "unsafe"):
         return StagingObservation(status=status, category=_required_string(category, "staging.category"))
     raise ValueError(f"field 'staging.status' has unsupported value '{status}'")
 
@@ -233,6 +233,36 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
     return tuple(collectives)
 
 
+_BRANCHING_PATTERN = re.compile(r'^(\s*)%[^=]*= "stablehlo\.(?:if|case)"\(')
+
+
+def collectives_inside_branches(module: str) -> tuple[str, ...]:
+    """Returns the collective families that a StableHLO module places inside `stablehlo.if` or `stablehlo.case`
+    branches, in module order.
+
+    A collective inside a branch is reached only by the devices that select that branch. Under a predicate or index
+    that differs across devices, the participants of the collective then disagree, which deadlocks or corrupts the
+    collective. The scan relies on the generic printer form of these operations, whose regions end on a line that starts
+    with `})` at the operation's own indentation.
+
+    # Parameters
+
+      - `module`: Textual StableHLO module emitted by Ryft or JAX.
+    """
+
+    families = []
+    region_indentations: list[str] = []
+    for line in module.splitlines():
+        if region_indentations and line.startswith(region_indentations[-1] + "})"):
+            region_indentations.pop()
+            continue
+        if region_indentations and (match := _COLLECTIVE_PATTERN.search(line)) is not None:
+            families.append(match.group(1))
+        if (match := _BRANCHING_PATTERN.match(line)) is not None:
+            region_indentations.append(match.group(1))
+    return tuple(families)
+
+
 def differential_cases() -> tuple[DifferentialCase, ...]:
     """Returns the shared case registry without importing JAX eagerly."""
 
@@ -278,8 +308,15 @@ def compare_case(
     jax: DifferentialObservation,
     stablehlo_patterns: tuple[str, ...] = (),
     reference: Mapping[str, tuple[tuple[float, ...], ...]] | None = None,
+    ryft_staging: StagingObservation | None = None,
+    jax_staging: StagingObservation | None = None,
 ) -> CaseComparison:
     """Compares one Ryft/JAX record pair according to its declared capability relationship.
+
+    An exact-parity case requires both frameworks to report identical observations, each matching `reference` when one
+    is provided. A `ryft_exceeds_jax` case instead compares the observations that JAX reports, requires Ryft to report
+    them identically, and checks Ryft's additional observations (e.g., results that JAX cannot produce) against
+    `reference`. Its staging observations must match the expected staging of each framework.
 
     # Parameters
 
@@ -289,20 +326,22 @@ def compare_case(
       - `jax`: JAX-side observation.
       - `stablehlo_patterns`: Semantic operation or attribute spellings that both StableHLO modules must contain.
       - `reference`: Independent host-computed outputs checked separately against each framework.
+      - `ryft_staging`: Expected Ryft staging observation of a `ryft_exceeds_jax` case.
+      - `jax_staging`: Expected JAX staging observation of a `ryft_exceeds_jax` case.
     """
 
     differences = []
     if ryft.case_id != jax.case_id:
         differences.append(f"case ID: ryft '{ryft.case_id}' != jax '{jax.case_id}'")
-    if ryft.observations != jax.observations:
-        differences.append(f"observations: ryft {ryft.observations!r} != jax {jax.observations!r}")
-    if reference is not None:
-        for side, observation in (("ryft", ryft), ("jax", jax)):
-            if observation.observations != reference:
-                differences.append(
-                    f"reference observations: {side} {observation.observations!r} != expected {reference!r}"
-                )
     if relationship == "parity":
+        if ryft.observations != jax.observations:
+            differences.append(f"observations: ryft {ryft.observations!r} != jax {jax.observations!r}")
+        if reference is not None:
+            for side, observation in (("ryft", ryft), ("jax", jax)):
+                if observation.observations != reference:
+                    differences.append(
+                        f"reference observations: {side} {observation.observations!r} != expected {reference!r}"
+                    )
         if ryft.staging != jax.staging:
             differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
         if not collectives and not stablehlo_patterns and reference is None:
@@ -324,12 +363,26 @@ def compare_case(
                 if missing:
                     differences.append(f"StableHLO: {side} module is missing semantic patterns {missing!r}")
     elif relationship == "ryft_exceeds_jax":
-        if ryft.staging != StagingObservation(status="supported", output_type="f32[count]"):
-            differences.append(f"Ryft staging: expected bounded symbolic support but got {ryft.staging!r}")
-        if jax.staging != StagingObservation(status="rejected", category="concretization"):
-            differences.append(f"JAX staging: expected concretization rejection but got {jax.staging!r}")
-        if collectives or ryft.stablehlo is not None or jax.stablehlo is not None:
-            differences.append("StableHLO: the staging-rejected capability case must not claim a module comparison")
+        shared = {name: ryft.observations.get(name) for name in jax.observations}
+        if shared != jax.observations:
+            differences.append(f"shared observations: ryft {shared!r} != jax {jax.observations!r}")
+        if reference is not None:
+            if ryft.observations != reference:
+                differences.append(f"reference observations: ryft {ryft.observations!r} != expected {reference!r}")
+            jax_reference = {name: reference.get(name) for name in jax.observations}
+            if jax.observations != jax_reference:
+                differences.append(
+                    f"reference observations: jax {jax.observations!r} != expected {jax_reference!r}"
+                )
+        if ryft_staging is None or jax_staging is None:
+            differences.append("staging: a `ryft_exceeds_jax` case must declare the staging of both frameworks")
+        else:
+            if ryft.staging != ryft_staging:
+                differences.append(f"Ryft staging: expected {ryft_staging!r} but got {ryft.staging!r}")
+            if jax.staging != jax_staging:
+                differences.append(f"JAX staging: expected {jax_staging!r} but got {jax.staging!r}")
+        if collectives:
+            differences.append("StableHLO: a `ryft_exceeds_jax` case does not compare collective projections")
     else:
         raise ValueError(f"unknown differential relationship '{relationship}'")
     return CaseComparison(case_id=ryft.case_id, differences=tuple(differences))
@@ -670,6 +723,8 @@ def run_comparison(
             jax[case.case_id],
             case.stablehlo_patterns,
             None if case.reference is None else case.reference(),
+            case.ryft_staging,
+            case.jax_staging,
         )
         differences = list(comparison.differences)
         if case.validate is not None:

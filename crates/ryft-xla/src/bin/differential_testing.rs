@@ -15,12 +15,13 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, ConvertElementTypeOperation, DataType, Device,
-    DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
-    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
-    MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute,
-    ParallelSumScatter, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape,
-    Sharding, ShardingDimension,
+    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, Compare, ComparisonDirection,
+    ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds,
+    DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers, DynamicSlice,
+    DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
+    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter,
+    Placeholder, ProgramBuilder, ProgramError, Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding,
+    ShardingDimension, Value, ValueProjection, ZeroLike, condition,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -99,6 +100,11 @@ fn registry() -> Vec<DifferentialCase> {
         DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul, collective: false },
         DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention, collective: false },
         DifferentialCase { case_id: "negative_dynamic_slice", emit: emit_negative_dynamic_slice, collective: false },
+        DifferentialCase {
+            case_id: "condition_varying_predicate_gradient",
+            emit: emit_condition_varying_predicate_gradient,
+            collective: false,
+        },
     ];
     for (index, case) in cases.iter().enumerate() {
         assert!(
@@ -713,6 +719,102 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
     })
 }
 
+/// Emits the value and gradients of a `condition` whose predicate varies across the devices of a manual region.
+///
+/// Each device of a four-device `x` mesh holds one element of `values = [1, -2, 3, -4]` and the replicated `weight
+/// = [2]`. Each device takes the `true` branch, `weight * values`, when its element is positive and the `false` branch,
+/// `values`, otherwise, and the result is summed over the mesh. [`ryft_core::condition`] varies the invariant weight
+/// before the branches, so the gradient of the weight is summed across devices after the transposed condition rather
+/// than inside the branch that only some devices take. The value is `2 - 2 + 6 - 4 = 2`, the weight gradient is the sum
+/// of the positive elements, `4`, and the values gradient is `[2, 1, 2, 1]`.
+fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let (client, device_mesh, sharded) = collective_runtime()?;
+    let mesh = device_mesh.logical_mesh().clone();
+    let replicated = Sharding::replicated(mesh.clone(), 1);
+    let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+        {
+            let replicated = replicated.clone();
+            let sharded = sharded.clone();
+            move |inputs: Vec<ShardMapTracer>| {
+                let (value, gradients) = inputs[0]
+                    .clone()
+                    .into_value()
+                    .dispatch_domain()
+                    .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                    .value_and_gradient(|(weight, values)| {
+                        let weight = ValueProjection::<ArrayType>::into_projected(weight)?;
+                        let values = ValueProjection::<ArrayType>::into_projected(values)?;
+                        Ok(shard_map::<_, _, ArrayType, _>(
+                            |(weight, values): (ShardMapTracer, ShardMapTracer)| {
+                                let sum = values.reduce(&[0], ReductionKind::Sum).unwrap();
+                                let predicate =
+                                    sum.compare(&sum.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
+                                let mut outputs = condition(
+                                    &predicate.into_value(),
+                                    vec![weight.into_value(), values.into_value()],
+                                    |inputs| {
+                                        let weight = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                                        let values = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                                        Ok(vec![(weight * values).into_value()])
+                                    },
+                                    |inputs| Ok(vec![inputs[1].clone()]),
+                                )
+                                .unwrap();
+                                ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
+                                    .unwrap()
+                                    .reduce(&[0], ReductionKind::Sum)
+                                    .unwrap()
+                                    .parallel_reduce(ReductionKind::Sum, "x")
+                                    .unwrap()
+                            },
+                            (weight, values),
+                            mesh.clone(),
+                            (replicated.clone(), sharded.clone()),
+                            Sharding::replicated(mesh.clone(), 0),
+                        )
+                        .unwrap()
+                        .into_value())
+                    })
+                    .unwrap();
+                vec![
+                    ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(gradients.0).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(gradients.1).unwrap(),
+                ]
+            }
+        },
+        vec![ArrayType::new_static(DataType::F32, [1]), ArrayType::new_static(DataType::F32, [4])],
+    )?;
+    let stablehlo = traced.to_mlir_module("main")?;
+    let outputs = execute_collective_inputs(
+        &client,
+        device_mesh,
+        stablehlo.as_str(),
+        &[
+            (replicated, &[1], &[1], &vec![vec![2.0f32]; 4]),
+            (sharded, &[4], &[1], &[vec![1.0f32], vec![-2.0], vec![3.0], vec![-4.0]]),
+        ],
+        &[vec![], vec![1], vec![1]],
+    )?;
+    // The value and the weight gradient are replicated, so every participant must hold the same one.
+    for (participant, output) in outputs.iter().enumerate() {
+        if output[0] != outputs[0][0] || output[1] != outputs[0][1] {
+            return Err(format!("participant {participant} disagrees on a replicated output: {output:?}").into());
+        }
+    }
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "condition_varying_predicate_gradient".into(),
+        observations: BTreeMap::from([
+            ("value", vec![outputs[0][0].clone()]),
+            ("weight_gradient", vec![outputs[0][1].clone()]),
+            ("values_gradient", vec![outputs.iter().flat_map(|output| output[2].clone()).collect()]),
+        ]),
+        staging: Some(StagingObservation::Supported { output_type: "f32[1]".to_string() }),
+        stablehlo: Some(stablehlo),
+    })
+}
+
 /// Parses selected case IDs, emits deterministic JSON records, and returns an error for an unknown case.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let cases = registry();
@@ -865,6 +967,7 @@ mod tests {
                 "scaled_dot_and_matmul",
                 "dot_product_attention",
                 "negative_dynamic_slice",
+                "condition_varying_predicate_gradient",
             ],
         );
     }
