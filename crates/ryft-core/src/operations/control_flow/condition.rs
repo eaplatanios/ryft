@@ -2,16 +2,18 @@
 //! branch [`Region`](crate::Region)s depending on a scalar Boolean predicate, together with its reference-discharge,
 //! interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. The
 //! [`ConditionType`] trait defines the predicate and manual-variation semantics of each type universe, the
-//! [`condition`] function stages a condition from two branch functions while aligning its boundary with a varying
-//! predicate, and [`transpose_primal_condition`] exposes the shared transposition rule to operation families that
-//! implement [`TransposableOperation`] for conditions themselves. This is the analogue of
-//! [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) and lowers to
-//! [StableHLO's `if`](https://openxla.org/stablehlo/spec#if).
+//! [`Condition::condition`] method stages a condition from two branch functions while aligning its boundary with a
+//! varying predicate, and [`transpose_primal_condition`] exposes the shared transposition rule to operation families
+//! that implement [`TransposableOperation`] for conditions themselves. This is the analogue of [JAX's
+//! `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) and lowers to [StableHLO's
+//! `if`](https://openxla.org/stablehlo/spec#if).
 
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+use ryft_macros::capability;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
@@ -29,6 +31,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME};
@@ -44,7 +47,7 @@ use crate::operations::manipulation::broadcasting::{
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::references::ReferenceNewOperation;
-use crate::parameters::Placeholder;
+use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
@@ -68,11 +71,11 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// to the selected branch.
 ///
 /// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
-/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
-/// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions
-/// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`]. The
-/// [`condition`] function stages a condition from two branch functions instead, and aligns its inputs and branch
-/// outputs with a predicate that varies over manual mesh axes (refer to [`ConditionType`]).
+/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots) order
+/// `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions with owned
+/// branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`]. The
+/// [`Condition::condition`] method stages a condition from two branch functions instead, and aligns its inputs and
+/// branch outputs with a predicate that varies over manual mesh axes (refer to [`ConditionType`]).
 ///
 /// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
@@ -1154,19 +1157,19 @@ where
 /// Boolean array member. A first-class dimension describes an array extent rather than Boolean data, even though its
 /// runtime representation is scalar, and a reference is a mutable state handle rather than a predicate value.
 ///
-/// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches, so
-/// every condition output must vary over each manual axis that the predicate varies over (refer to
+/// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches, so every
+/// condition output must vary over each manual axis that the predicate varies over (refer to
 /// [`validate_condition_output`](Self::validate_condition_output)). An invariant predicate keeps every device on the
-/// same branch. The [`condition`] function aligns the whole condition boundary with a varying predicate, varying the
-/// inputs before the branches and the branch outputs at their ends. A condition staged directly whose inputs do not
-/// vary over the predicate's axes still evaluates and partially evaluates, but its branches compute invariant-typed
-/// values from those inputs although devices take the branches differently. Splitting it around its known work (i.e.,
-/// partial evaluation with a symbolic known predicate and separate-context linearization) would turn such values into
-/// invariant-typed outputs of a known condition that differ across devices, so partial evaluation keeps the condition
-/// whole and separate-context linearization fails. Transposing it with respect to such an input fails as well, because
-/// the input's cotangent differs across devices and its mesh sum would run inside the branches. As for a `while` loop
-/// with a varying predicate, keeping collectives out of branches that devices may take differently is the program's
-/// responsibility.
+/// same branch. The [`Condition::condition`] method aligns the whole condition boundary with a varying predicate,
+/// varying the inputs before the branches and the branch outputs at their ends. A condition staged directly whose
+/// inputs do not vary over the predicate's axes still evaluates and partially evaluates, but its branches compute
+/// invariant-typed values from those inputs although devices take the branches differently. Splitting it around its
+/// known work (i.e., partial evaluation with a symbolic known predicate and separate-context linearization) would turn
+/// such values into invariant-typed outputs of a known condition that differ across devices, so partial evaluation
+/// keeps the condition whole and separate-context linearization fails. Transposing it with respect to such an input
+/// fails as well, because the input's cotangent differs across devices and its mesh sum would run inside the branches.
+/// As for a `while` loop with a varying predicate, keeping collectives out of branches that devices may take
+/// differently is the program's responsibility.
 pub trait ConditionType: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;
@@ -1247,17 +1250,17 @@ impl ConditionType for ArrayIrType {
     }
 }
 
-/// Stages a [`ConditionOperation`] that applies `true_function` to `inputs` when `predicate` is `true` and
-/// `false_function` otherwise, returning the outputs of the selected branch. This is the value-level analogue of
-/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). Like other free entry points, it
-/// binds the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
+/// Represents the ability to stage a [`ConditionOperation`] that applies one of two branch functions to structured
+/// inputs according to a scalar Boolean predicate, returning the outputs of the selected branch. This is the
+/// value-level analogue of [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). It binds the
+/// condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a staged value or the
 /// operation-executing eager domain of a concrete value): each function is traced into a branch [`Program`] through a
-/// [`NestedTracingContext`] over the domain of `predicate`, and both branches must return values of the same types. An
+/// [`NestedTracingContext`] over the predicate's domain, and both branches must return values of the same types. An
 /// output that both branches forward from the same input equals that input whichever branch runs, so, as in JAX's
 /// `cond`, it is pruned from the branches and returned as the input itself instead of through the condition.
 ///
 /// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
-/// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
+/// method then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
 /// predicate that the input does not already vary over before tracing the branches, and varies every branch output in
 /// the same way at the end of its branch (refer to [`ManualVariationAlignment::align_manual_variation_to`]). The
 /// branches therefore compute on varying values, so their outputs and partial-evaluation residuals are typed as the
@@ -1271,97 +1274,152 @@ impl ConditionType for ArrayIrType {
 /// (only constants can be closed over), so every differentiable value crosses the aligned boundary, while constants
 /// carry no tangent and so their alignment inside a branch never transposes into a collective.
 ///
-/// # Parameters
+/// Inputs and outputs may be leaves, tuples, vectors, maps, or custom [`Parameterized`] structures. Both branch
+/// outputs must have equal parameter structures, including static metadata: a runtime predicate selects value leaves,
+/// while the Rust structure is determined during tracing. The input and output structures may differ, and neither
+/// needs to implement `Clone`. Nested branch programs retain flat boundaries for positional replay.
 ///
-///   - `predicate`: Scalar Boolean predicate that selects the branch.
-///   - `inputs`: Values that both branches receive, in order.
-///   - `true_function`: Function that computes the outputs of the `true` branch from its inputs.
-///   - `false_function`: Function that computes the outputs of the `false` branch from its inputs.
-///
-/// # Errors
-///
-/// Returns a [`ProgramError`] if aligning the manual variation of a value fails, if tracing either function fails, or
-/// if binding the condition fails (e.g., because the predicate is not a scalar Boolean or the branches return
-/// different types).
-pub fn condition<V, True, False>(
-    predicate: &V,
-    inputs: Vec<V>,
-    true_function: True,
-    false_function: False,
-) -> Result<Vec<V>, ProgramError>
+/// The universe parameter `T` defaults to the `Capability` universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
+#[capability]
+pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Domain: Context> {
+    /// Applies `true_function` or `false_function` to `inputs` according to this scalar Boolean predicate.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Structured values received by both branches, including their static fields.
+    ///   - `true_function`: Function traced for the `true` branch over the input family's nested tracers.
+    ///   - `false_function`: Function traced for the `false` branch over the same input family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] if branch output structures or static metadata differ. Also returns
+    /// errors from manual-variation alignment, reconstruction, tracing, or binding (including invalid predicates and
+    /// mismatched branch output types).
+    fn condition<Input, Output, True, False>(
+        &self,
+        inputs: Input,
+        true_function: True,
+        false_function: False,
+    ) -> Result<Output::To<Self>, ProgramError>
+    where
+        Input: Parameterized<Self>,
+        Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>,
+        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>>,
+        Output::Family: ParameterizedFamily<Self>,
+        Output::ParameterStructure: PartialEq,
+        True: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+        False: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>;
+}
+
+// Region authoring is shared by eager and staged values: interpretation executes the attached programs directly
+// rather than re-entering this authoring capability, so direct values use the same domain-based implementation.
+impl<T, V> Condition<T> for V
 where
     V: Value<Type: ConditionType, Domain: Context<Operation: From<ConditionOperation<V::Type>>>>
+        + Capability<Universe = T>
         + ManualVariationAlignment,
     Tracer<NestedTracingContext<V::Domain>>: ManualVariationAlignment,
-    True: FnOnce(
-        Vec<Tracer<NestedTracingContext<V::Domain>>>,
-    ) -> Result<Vec<Tracer<NestedTracingContext<V::Domain>>>, ProgramError>,
-    False: FnOnce(
-        Vec<Tracer<NestedTracingContext<V::Domain>>>,
-    ) -> Result<Vec<Tracer<NestedTracingContext<V::Domain>>>, ProgramError>,
 {
-    let context = predicate.domain();
-    let predicate_sharding = predicate.r#type().predicate_sharding().cloned();
-    let aligned_inputs = match &predicate_sharding {
-        Some(sharding) => V::align_manual_variation_to(&inputs, sharding)?,
-        None => inputs.clone(),
-    };
-    let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<V::Domain>>>| match &predicate_sharding {
-        Some(sharding) => Tracer::align_manual_variation_to(&outputs, sharding),
-        None => Ok(outputs),
-    };
-    let (_, true_branch) = NestedTracingContext::trace(
-        context.clone(),
-        |inputs| true_function(inputs).and_then(align_outputs),
-        input_types.clone(),
-    )?;
-    let (_, false_branch) = NestedTracingContext::trace(
-        context.clone(),
-        |inputs| false_function(inputs).and_then(align_outputs),
-        input_types,
-    )?;
+    fn condition<Input, Output, True, False>(
+        &self,
+        inputs: Input,
+        true_function: True,
+        false_function: False,
+    ) -> Result<Output::To<Self>, ProgramError>
+    where
+        Input: Parameterized<Self>,
+        Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<Self::Domain>>>,
+        Output: Parameterized<Tracer<NestedTracingContext<Self::Domain>>>,
+        Output::Family: ParameterizedFamily<Self>,
+        Output::ParameterStructure: PartialEq,
+        True: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+        False: FnOnce(Input::To<Tracer<NestedTracingContext<Self::Domain>>>) -> Result<Output, ProgramError>,
+    {
+        let input_structure = inputs.parameter_structure();
+        let inputs = inputs.into_parameters().collect::<Vec<_>>();
+        let context = self.domain();
+        let predicate_sharding = self.r#type().predicate_sharding().cloned();
+        let aligned_inputs = match &predicate_sharding {
+            Some(sharding) => Self::align_manual_variation_to(&inputs, sharding)?,
+            None => inputs.clone(),
+        };
+        let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let align_outputs = |outputs: Output| {
+            let structure = outputs.parameter_structure();
+            let outputs = outputs.into_parameters().collect::<Vec<_>>();
+            let outputs = match &predicate_sharding {
+                Some(sharding) => Tracer::align_manual_variation_to(&outputs, sharding)?,
+                None => outputs,
+            };
+            Ok::<_, ProgramError>(Output::from_parameters(structure, outputs)?)
+        };
+        let (true_structure, true_branch) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs| {
+                let inputs = Input::To::<Tracer<NestedTracingContext<Self::Domain>>>::from_parameters(
+                    input_structure.clone(),
+                    inputs,
+                )?;
+                true_function(inputs).and_then(align_outputs)
+            },
+            input_types.clone(),
+        )?;
+        let (false_structure, false_branch) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs| {
+                let inputs =
+                    Input::To::<Tracer<NestedTracingContext<Self::Domain>>>::from_parameters(input_structure, inputs)?;
+                false_function(inputs).and_then(align_outputs)
+            },
+            input_types,
+        )?;
 
-    // An output that both branches forward from the same input is returned as the unaligned input, so it keeps the
-    // variation of that input, and the branches stop carrying it. Branches with different output counts are bound as
-    // they are, so that binding reports the mismatch.
-    let input_index = |branch: &Program<_, _, Vec<_>, Vec<_>>, output: usize| {
-        branch.input_ids().iter().position(|input| *input == branch.output_ids()[output])
-    };
-    let forwarded_inputs = if true_branch.output_ids().len() == false_branch.output_ids().len() {
-        (0..true_branch.output_ids().len())
+        if true_structure != false_structure {
+            return Err(ProgramError::InvalidArgument {
+                message: "`condition` branches must return the same parameter structure and static metadata"
+                    .to_string(),
+            });
+        }
+
+        // An output that both branches forward from the same input is returned as the unaligned input, so it keeps the
+        // variation of that input, and the branches stop carrying it. Matching output structures ensure that both
+        // branches have the same number of output leaves.
+        let input_index = |branch: &Program<_, _, Vec<_>, Vec<_>>, output: usize| {
+            branch.input_ids().iter().position(|input| *input == branch.output_ids()[output])
+        };
+        let forwarded_inputs = (0..true_branch.output_ids().len())
             .map(|output| match (input_index(&true_branch, output), input_index(&false_branch, output)) {
                 (Some(true_input), Some(false_input)) if true_input == false_input => Some(true_input),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let kept_outputs = (0..true_branch.output_ids().len())
-        .filter(|&output| forwarded_inputs.get(output).copied().flatten().is_none())
-        .collect::<Vec<_>>();
-    let branches = if kept_outputs.len() == true_branch.output_ids().len() {
-        vec![true_branch, false_branch]
-    } else {
-        vec![true_branch.with_outputs(&kept_outputs)?, false_branch.with_outputs(&kept_outputs)?]
-    };
+            .collect::<Vec<_>>();
+        let kept_outputs = (0..true_branch.output_ids().len())
+            .filter(|&output| forwarded_inputs.get(output).copied().flatten().is_none())
+            .collect::<Vec<_>>();
+        let branches = if kept_outputs.len() == true_branch.output_ids().len() {
+            vec![true_branch, false_branch]
+        } else {
+            vec![true_branch.with_outputs(&kept_outputs)?, false_branch.with_outputs(&kept_outputs)?]
+        };
 
-    let mut condition_inputs = Vec::with_capacity(aligned_inputs.len() + 1);
-    condition_inputs.push(predicate.clone());
-    condition_inputs.extend(aligned_inputs);
-    let outputs = context.bind(ConditionOperation::<V::Type>::new(), branches, &condition_inputs)?;
-    if forwarded_inputs.iter().all(Option::is_none) {
-        return Ok(outputs);
+        let mut condition_inputs = Vec::with_capacity(aligned_inputs.len() + 1);
+        condition_inputs.push(self.clone());
+        condition_inputs.extend(aligned_inputs);
+        let outputs = context.bind(ConditionOperation::<Self::Type>::new(), branches, &condition_inputs)?;
+        if forwarded_inputs.iter().all(Option::is_none) {
+            return Ok(Output::To::<Self>::from_parameters(true_structure, outputs)?);
+        }
+        let mut outputs = outputs.into_iter();
+        let outputs = forwarded_inputs
+            .into_iter()
+            .map(|input| match input {
+                Some(input) => inputs[input].clone(),
+                None => outputs.next().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        Ok(Output::To::<Self>::from_parameters(true_structure, outputs)?)
     }
-    let mut outputs = outputs.into_iter();
-    Ok(forwarded_inputs
-        .into_iter()
-        .map(|input| match input {
-            Some(input) => inputs[input].clone(),
-            None => outputs.next().unwrap(),
-        })
-        .collect())
 }
 
 /// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
@@ -2152,7 +2210,7 @@ mod tests {
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::operations::trigonometric::SinOperation;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialEvaluation;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
@@ -10054,8 +10112,7 @@ mod tests {
         // stages one condition without any manual-variation alignment, both in a trace and eagerly.
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
@@ -10088,8 +10145,7 @@ mod tests {
                 Ok(vec![Array::scalar(expected).unwrap()]),
             );
             assert_eq!(
-                condition(
-                    &Array::scalar(predicate).unwrap(),
+                Array::scalar(predicate).unwrap().condition(
                     vec![Array::scalar(3.0).unwrap()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
@@ -10100,6 +10156,214 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_condition_structured() {
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, first, second): (Tracer<_>, Tracer<_>, Tracer<_>)| {
+                predicate.condition(
+                    (first, second),
+                    |(first, second)| Ok((first.clone() * second, vec![first])),
+                    |(first, second)| Ok((first + second.clone(), vec![second])),
+                )
+            },
+            (ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(output_types, (ArrayType::scalar(DataType::F64), vec![ArrayType::scalar(DataType::F64)]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %0 %1
+                        in (%2, %0)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %0 %1
+                        in (%2, %1)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        assert_eq!(
+            program.interpret((
+                Array::scalar(true).unwrap(),
+                Array::scalar(3.0f64).unwrap(),
+                Array::scalar(4.0f64).unwrap(),
+            )),
+            Ok((Array::scalar(12.0f64).unwrap(), vec![Array::scalar(3.0f64).unwrap()])),
+        );
+        assert_eq!(
+            program.interpret((
+                Array::scalar(false).unwrap(),
+                Array::scalar(3.0f64).unwrap(),
+                Array::scalar(4.0f64).unwrap(),
+            )),
+            Ok((Array::scalar(7.0f64).unwrap(), vec![Array::scalar(4.0f64).unwrap()])),
+        );
+    }
+
+    #[test]
+    fn test_condition_condition_structured_eager() {
+        /// Inputs and outputs whose static fields must survive tracing and reconstruction.
+        #[derive(ryft_macros::Parameterized)]
+        struct Payload<P: Parameter> {
+            /// Runtime leaf selected by the condition.
+            value: P,
+
+            /// Static metadata shared by both branches.
+            label: &'static str,
+        }
+
+        // Only the structure skeleton is cloned or compared; payloads intentionally do not implement Clone.
+        impl Clone for Payload<Placeholder> {
+            fn clone(&self) -> Self {
+                Self { value: self.value, label: self.label }
+            }
+        }
+
+        impl PartialEq for Payload<Placeholder> {
+            fn eq(&self, other: &Self) -> bool {
+                self.label == other.label
+            }
+        }
+
+        /// A Condition bound alone provides the authoring capability to ordinary generic value callers.
+        fn choose<V: Condition>(predicate: &V, input: V) -> Result<V, ProgramError> {
+            predicate.condition(input, Ok, Ok)
+        }
+
+        let predicate = Array::scalar(true).unwrap();
+        let input = Array::scalar(3.0f32).unwrap();
+        assert_eq!(choose(&predicate, input.clone()), Ok(input.clone()));
+        let output = predicate
+            .condition(
+                Payload { value: input.clone(), label: "shared" },
+                |input| Ok(Payload { value: input.value.clone() + input.value, label: input.label }),
+                Ok,
+            )
+            .unwrap();
+        assert_eq!(output.value, Array::scalar(6.0f32).unwrap());
+        assert_eq!(output.label, "shared");
+
+        let result = predicate.condition(
+            Payload { value: input, label: "input" },
+            |input| Ok(Payload { value: input.value, label: "true" }),
+            |input| Ok(Payload { value: input.value, label: "false" }),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "`condition` branches must return the same parameter structure and static metadata",
+        ));
+
+        // A structural error is rejected before the enclosing trace binds a condition instruction.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, input): (Tracer<_>, Tracer<_>)| {
+                let result = predicate.condition(
+                    Payload { value: input.clone(), label: "input" },
+                    |input| Ok(Payload { value: input.value, label: "true" }),
+                    |input| Ok(Payload { value: input.value, label: "false" }),
+                );
+                assert!(matches!(
+                    result,
+                    Err(ProgramError::InvalidArgument { message, .. })
+                        if message == "`condition` branches must return the same parameter structure and static metadata",
+                ));
+                Ok(input)
+            },
+            (ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            lambda %0:bool[], %1:f32[] .
+            in (%1)"},
+        );
+
+        assert_eq!(predicate.condition((), |()| Ok(()), |()| Ok(())), Ok(()));
+        assert_eq!(predicate.condition(Vec::<Array>::new(), Ok, Ok), Ok(Vec::<Array>::new()));
+    }
+
+    #[test]
+    fn test_condition_condition_structured_composite() {
+        let predicate = ArrayIrValue::Array(Array::scalar(true).unwrap());
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(4.0f32).unwrap()));
+        let outputs = predicate
+            .condition(
+                (ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()), dimension.clone(), reference.clone()),
+                |(input, dimension, reference)| Ok((input.clone() + input, dimension, reference)),
+                Ok,
+            )
+            .unwrap();
+        assert_eq!(outputs.0, ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()));
+        assert_eq!(outputs.1, dimension);
+        assert_eq!(outputs.2, reference);
+    }
+
+    #[test]
+    fn test_condition_condition_validation() {
+        let input = Array::scalar(3.0f32).unwrap();
+        assert_eq!(
+            Array::scalar(1.0f32).unwrap().condition(input, Ok, Ok),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a value of type `f32[]`; expected `bool[]`"
+                    .to_string(),
+            }),
+        );
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, input): (Tracer<_>, Tracer<_>)| predicate.condition(input, Ok, Ok),
+            (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(error))
+                if error.to_string() == "`condition` predicate type must be a scalar boolean, but got `f32[]`",
+        ));
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, input): (Tracer<_>, Tracer<_>)| {
+                predicate.condition(input, Ok, |input| {
+                    Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap()))
+                })
+            },
+            (ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F32)),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(error))
+                if error.to_string()
+                    == "`condition` branch output type signature mismatch: expected [f32[]] but got [bool[]]",
+        ));
+    }
+
+    #[test]
+    fn test_condition_condition_structured_mismatched_paths() {
+        let predicate = Array::scalar(true).unwrap();
+        let input = Array::scalar(3.0f32).unwrap();
+        let result =
+            predicate.condition(input.clone(), |input| Ok(vec![input]), |input| Ok(vec![input.clone(), input]));
+        assert!(matches!(
+            result,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "`condition` branches must return the same parameter structure and static metadata",
+        ));
+        let result = predicate.condition(
+            input,
+            |input| Ok(std::collections::BTreeMap::from([("left", input)])),
+            |input| Ok(std::collections::BTreeMap::from([("right", input)])),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "`condition` branches must return the same parameter structure and static metadata",
+        ));
+    }
+
+    #[test]
     fn test_condition_condition_kernel_operations() {
         // `condition` serves the kernel operation family that the `#[kernel]` macro lowers Rust `if` statements to,
         // tracing each branch function exactly once and selecting its result at runtime.
@@ -10107,8 +10371,7 @@ mod tests {
         let false_calls = std::cell::Cell::new(0);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone()],
                     |inputs| {
                         true_calls.set(true_calls.get() + 1);
@@ -10178,8 +10441,7 @@ mod tests {
         let named_axes = vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })];
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![StagingContext::constant(inputs[0].context(), Array::scalar(1.0f32).unwrap())]),
@@ -10220,8 +10482,7 @@ mod tests {
             .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
                     |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
@@ -10264,8 +10525,7 @@ mod tests {
         let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
         let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone(), inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![inputs[0].clone(), inputs[1].clone()]),
@@ -10313,8 +10573,7 @@ mod tests {
         let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<_>>| {
-                condition(
-                    &inputs[0],
+                inputs[0].condition(
                     vec![inputs[1].clone(), inputs[2].clone()],
                     |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
                     |inputs| Ok(vec![inputs[0].clone()]),

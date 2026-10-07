@@ -4,7 +4,7 @@
 //! rules. Unlike [`ConditionOperation`](crate::ConditionOperation), which executes only one of its attached branch
 //! [`Region`](crate::Region)s, `select` consumes two ordinary branch values that have both already been computed.
 //!
-//! `select(condition, on_true, on_false)` takes the `on_true` element wherever `condition` is `true` and the `on_false`
+//! `condition.select(on_true, on_false)` takes the `on_true` element wherever `condition` is `true` and the `on_false`
 //! element elsewhere. The shapes of all three inputs broadcast together, and the two branch [`DataType`]s promote to
 //! the output data type. The condition must be [`DataType::Boolean`] and it does not take part in that promotion
 //! because it is a mask rather than a value. This is the three-argument form of JAX's
@@ -40,7 +40,7 @@
 //! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, ProgramError, Select, TracingContext};
 //! # fn main() -> Result<(), ProgramError> {
 //! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-//!     |(condition, on_true, on_false)| Select::select(&condition, &on_true, &on_false),
+//!     |(condition, on_true, on_false)| condition.select(&on_true, &on_false),
 //!     (
 //!         ArrayType::new_static(DataType::Boolean, [3]),
 //!         ArrayType::scalar(DataType::F32),
@@ -258,7 +258,7 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![C::Value::select(&inputs[0], &inputs[1], &inputs[2])?])
+        Ok(vec![inputs[0].select(&inputs[1], &inputs[2])?])
     }
 }
 
@@ -413,7 +413,7 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 }
 
 /// Represents the ability to choose each element from one of two values according to a Boolean condition. [`Select`]
-/// supplies [`SelectOperation`]'s interpretation capability. `select(condition, on_true, on_false)` takes the `on_true`
+/// supplies [`SelectOperation`]'s interpretation capability. `condition.select(on_true, on_false)` takes the `on_true`
 /// element wherever `condition` is `true` and the `on_false` element elsewhere. The condition is represented by the
 /// same value type as the branches (e.g., a Boolean [`Array`] for concrete arrays and a Boolean [`Tracer`] for staged
 /// values).
@@ -436,27 +436,27 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// let condition = Array::vector(vec![true, false, true])?;
 /// let on_true = Array::vector(vec![1.0, 2.0, 3.0])?;
 /// let on_false = Array::scalar(0.0)?;
-/// assert_eq!(Array::select(&condition, &on_true, &on_false)?.to_f64s(), vec![1.0, 0.0, 3.0]);
+/// assert_eq!(condition.select(&on_true, &on_false)?.to_f64s(), vec![1.0, 0.0, 3.0]);
 /// # Ok::<(), ProgramError>(())
 /// ```
 #[capability]
 pub trait Select<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the value whose elements are taken from `on_true` wherever `condition` is `true` and from `on_false`
+    /// Returns the value whose elements are taken from `on_true` wherever `self` is `true` and from `on_false`
     /// elsewhere. The inputs broadcast and the branch element types promote as described on [`Select`].
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if `condition` is not Boolean, if the inputs are not broadcast-compatible, if their
+    /// Returns a [`ProgramError`] if `self` is not Boolean, if the inputs are not broadcast-compatible, if their
     /// reduction state violates the constraints in the [module documentation](self), or if their context fails to
     /// bind the operation.
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
 impl Select for Array {
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let output_type = ElementwiseOperation::infer_output_types(
             &SelectOperation::<ArrayType>::new(),
-            &[condition.r#type().into_owned(), on_true.r#type().into_owned(), on_false.r#type().into_owned()],
+            &[self.r#type().into_owned(), on_true.r#type().into_owned(), on_false.r#type().into_owned()],
         )?
         .remove(0);
 
@@ -468,7 +468,7 @@ impl Select for Array {
         let on_false = on_false.promoted_to(output_data_type)?;
 
         let output_shape = output_type.static_shape().unwrap();
-        let condition_shape = condition.r#type().static_shape().unwrap();
+        let condition_shape = self.r#type().static_shape().unwrap();
         let on_true_shape = on_true.r#type().static_shape().unwrap();
         let on_false_shape = on_false.r#type().static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
@@ -476,7 +476,7 @@ impl Select for Array {
         let on_true_strides = on_true_shape.row_major_strides();
         let on_false_strides = on_false_shape.row_major_strides();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let condition_addressing = ArrayAddressing::new(condition.r#type().into_owned())?;
+        let condition_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let on_true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
         let on_false_addressing = ArrayAddressing::new(on_false.r#type().into_owned())?;
         let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
@@ -489,7 +489,7 @@ impl Select for Array {
                 &condition_strides,
             );
             let condition_range = condition_addressing.byte_range_for_flat_index(condition_index);
-            let (source, source_range) = if condition.storage_bytes()[condition_range.start] != 0 {
+            let (source, source_range) = if self.storage_bytes()[condition_range.start] != 0 {
                 let source_index = Self::broadcast_index(
                     output_index,
                     &output_shape,
@@ -517,11 +517,11 @@ impl Select for Array {
 }
 
 impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let condition = <Self as ValueProjection<ArrayType>>::projected(condition)?;
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let condition = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let on_true = <Self as ValueProjection<ArrayType>>::projected(on_true)?;
         let on_false = <Self as ValueProjection<ArrayType>>::projected(on_false)?;
-        Ok(Self::Array(A::select(condition, on_true, on_false)?))
+        Ok(Self::Array(condition.select(on_true, on_false)?))
     }
 }
 
@@ -534,9 +534,9 @@ impl<
         + ManualVariationAlignment<T>,
 > Select<T> for V
 {
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let inputs = V::align_manual_variation(&[condition.clone(), on_true.clone(), on_false.clone()])?;
-        let mut outputs = condition.domain().bind(SelectOperation::new(), Vec::new(), &inputs)?;
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let inputs = V::align_manual_variation(&[self.clone(), on_true.clone(), on_false.clone()])?;
+        let mut outputs = self.domain().bind(SelectOperation::new(), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -778,23 +778,19 @@ mod tests {
             Ok(vec![Array::vector(vec![7.0f64, 5.0, 7.0]).unwrap()]),
         );
         assert_eq!(
-            Array::select(
-                &Array::scalar(false).unwrap(),
-                &Array::vector(vec![1i32, 2]).unwrap(),
-                &Array::vector(vec![-1i32, -2]).unwrap(),
-            ),
+            Array::scalar(false)
+                .unwrap()
+                .select(&Array::vector(vec![1i32, 2]).unwrap(), &Array::vector(vec![-1i32, -2]).unwrap()),
             Ok(Array::vector(vec![-1i32, -2]).unwrap()),
         );
         assert_eq!(
-            Array::select(
-                &Array::vector(Vec::<bool>::new()).unwrap(),
-                &Array::scalar(1.0f32).unwrap(),
-                &Array::vector(Vec::<f32>::new()).unwrap(),
-            ),
+            Array::vector(Vec::<bool>::new())
+                .unwrap()
+                .select(&Array::scalar(1.0f32).unwrap(), &Array::vector(Vec::<f32>::new()).unwrap()),
             Ok(Array::vector(Vec::<f32>::new()).unwrap()),
         );
         assert_eq!(
-            Array::select(&Array::scalar(1f32).unwrap(), &Array::scalar(2f32).unwrap(), &Array::scalar(3f32).unwrap()),
+            Array::scalar(1f32).unwrap().select(&Array::scalar(2f32).unwrap(), &Array::scalar(3f32).unwrap()),
             Err(ProgramError::Type(TypeError::invalid("`select` condition data type `f32` is not `bool`"))),
         );
 
@@ -802,24 +798,19 @@ mod tests {
         let on_true = Array::vector(vec![f32::from_bits(0x7fc00123), 1.0]).unwrap();
         let on_false = Array::vector(vec![2.0f32, -0.0]).unwrap();
         assert_eq!(
-            Array::select(&Array::vector(vec![true, false]).unwrap(), &on_true, &on_false)
-                .unwrap()
-                .storage_bytes(),
+            Array::vector(vec![true, false]).unwrap().select(&on_true, &on_false).unwrap().storage_bytes(),
             Array::vector(vec![f32::from_bits(0x7fc00123), -0.0]).unwrap().storage_bytes(),
         );
 
         // Sub-byte and complex branches preserve their complete element encodings as well.
         assert_eq!(
-            Array::select(
-                &Array::vector(vec![true, false]).unwrap(),
-                &Array::vector(vec![i4::MIN, i4::MAX]).unwrap(),
-                &Array::scalar(i4::new(-1).unwrap()).unwrap(),
-            ),
+            Array::vector(vec![true, false])
+                .unwrap()
+                .select(&Array::vector(vec![i4::MIN, i4::MAX]).unwrap(), &Array::scalar(i4::new(-1).unwrap()).unwrap()),
             Ok(Array::vector(vec![i4::MIN, i4::new(-1).unwrap()]).unwrap()),
         );
         assert_eq!(
-            Array::select(
-                &Array::vector(vec![true, false]).unwrap(),
+            Array::vector(vec![true, false]).unwrap().select(
                 &Array::scalar(Complex::new(1.0f64, 2.0)).unwrap(),
                 &Array::vector(vec![Complex::new(3.0f64, 4.0), Complex::new(5.0, 6.0)]).unwrap(),
             ),
@@ -843,7 +834,7 @@ mod tests {
             &[0xaaaau16, 0xbbbb],
         )
         .unwrap();
-        let output = Array::select(&condition, &on_true, &on_false).unwrap();
+        let output = condition.select(&on_true, &on_false).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::U16, [2, 3]));
         assert_eq!(output.elements::<u16>(), Ok(vec![0x1111, 0x2222, 0x3333, 0xbbbb, 0xbbbb, 0xbbbb]));
         assert_eq!(output.storage_bytes(), [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb]);
@@ -854,8 +845,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            Array::select(
-                &Array::vector(vec![true, false]).unwrap(),
+            Array::vector(vec![true, false]).unwrap().select(
                 &Array::from_elements(branch_type.clone(), &[1f32, 2.0]).unwrap(),
                 &Array::from_elements(branch_type.clone(), &[3f32, 4.0]).unwrap(),
             ),
@@ -869,12 +859,12 @@ mod tests {
         let on_true = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let on_false = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(
-            ArrayIrValue::select(&condition, &on_true, &on_false),
+            condition.select(&on_true, &on_false),
             Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32, 4.0]).unwrap())),
         );
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            ArrayIrValue::select(&condition, &dimension, &on_false),
+            condition.select(&dimension, &on_false),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
@@ -952,7 +942,7 @@ mod tests {
             y: V,
         ) -> Result<V, ProgramError> {
             let mask = x.compare(&y, ComparisonDirection::GreaterThan)?;
-            Select::select(&mask, &(x.clone() + x), &(y.clone() + y.clone() + y))
+            mask.select(&(x.clone() + x), &(y.clone() + y.clone() + y))
         }
 
         assert_eq!(
@@ -980,7 +970,7 @@ mod tests {
         assert_eq!(
             differentiate_at((Array::scalar(2.0f32).unwrap(), Array::vector(vec![-1.0f64, 3.0]).unwrap()))
                 .jvp((Array::scalar(1.0f32).unwrap(), Array::vector(vec![10.0f64, 20.0]).unwrap()), |(x, y)| {
-                    Select::select(&y.compare(&y.zero_like()?, ComparisonDirection::LessThan)?, &x, &y)
+                    y.compare(&y.zero_like()?, ComparisonDirection::LessThan)?.select(&x, &y)
                 },),
             Ok((Array::vector(vec![2.0f64, 3.0]).unwrap(), Array::vector(vec![1.0f64, 20.0]).unwrap())),
         );
@@ -1055,7 +1045,7 @@ mod tests {
                         .gradient(|value| {
                             let zero = value.zero_like()?;
                             let condition = value.compare(&zero, ComparisonDirection::GreaterThan)?;
-                            Select::select(&condition, &(value.clone() * value), &zero)
+                            condition.select(&(value.clone() * value), &zero)
                         })
                         .map_err(Into::into)
                 }),
@@ -1331,7 +1321,7 @@ mod tests {
         let condition = context.input(condition_type.into());
         let on_true = context.input(branch_type.clone().into());
         let on_false = context.input(ArrayType::scalar(DataType::F32).into());
-        let output = Select::select(&condition, &on_true, &on_false).unwrap();
+        let output = condition.select(&on_true, &on_false).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(branch_type));
         let program = context
             .builder()

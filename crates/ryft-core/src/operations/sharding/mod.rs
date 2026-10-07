@@ -34,8 +34,8 @@
 //! placement (refer to the documentation of [`ConstrainShardingOperation::lowered_sharding`] for more information),
 //! so that the emitted constraint never contradicts the type the program was checked against.
 //!
-//! The [`reshard`] and [`constrain_sharding`] functions bind the reshard and the sharding constraint on every leaf
-//! of a structured value.
+//! The [`Reshard`] and [`ConstrainSharding`] capabilities apply resharding and sharding constraints to every leaf
+//! of a structured value through primitive value dispatch, preserving its structure and static fields.
 //!
 //! # Example
 //!
@@ -84,81 +84,28 @@
 //! output type still records only `target` as placement over `a` is enforced during lowering rather than being tracked
 //! by the type system. Neither operation changes the array's logical shape or elements.
 
-use crate::arrays::{ArrayType, Sharding, ShardingError};
-use crate::contexts::Context;
-use crate::macros::check_count;
-use crate::operations::Capability;
-use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{Operation, ProgramError, Value};
+use crate::parameters::Parameter;
 
 #[cfg(doc)]
-use crate::arrays::{ArrayIrType, MeshAxisType};
+use crate::arrays::{MeshAxisType, Sharding};
 
 pub mod constrain_sharding;
 pub mod reshard;
 pub mod shard_map;
 
 pub use constrain_sharding::{
-    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, constrain_sharding,
+    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
-pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardOperation, reshard};
+pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, ShardMapTracer, TracedShardMap, shard_map,
-    shard_map_with_options, trace_shard_map, trace_shard_map_with_options,
+    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer,
+    TracedShardMap, shard_map, shard_map_in_context, shard_map_with_options, trace_shard_map,
+    trace_shard_map_with_named_axes, trace_shard_map_with_options,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
-/// for every type that implements all of its members.
-///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and composite array IR values implement it
-/// for [`ArrayIrType`].
-pub trait ShardingOperations<T = <Self as Capability>::Universe>:
-    Capability + Reshard<T> + ConstrainSharding<T>
-{
-}
+/// for every receiver that implements both capabilities. `P` is the receiver's leaf parameter and defaults to `Self`
+/// for a single value; structured receivers use the same bundle with their nested leaf type.
+pub trait ShardingOperations<P: Parameter = Self>: Reshard<P> + ConstrainSharding<P> {}
 
-impl<T, V: Reshard<T> + ConstrainSharding<T>> ShardingOperations<T> for V {}
-
-// TODO(eaplatanios): Review this function.
-/// Binds one sharding-control operation per leaf of `input` through the leaf's dispatch domain, pairing each leaf with
-/// the correspondingly structured [`Sharding`] and validating the requested rank before binding. Shared by
-/// [`reshard()`] and [`constrain_sharding()`], which differ only in the operation that they bind per leaf.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::Type`] wrapping [`ShardingError::ShardingRankMismatch`] when a sharding's rank differs from
-/// its leaf's rank, and the errors of binding the operation otherwise.
-fn bind_sharding_control_per_leaf<Input, Leaf, O>(
-    input: Input,
-    shardings: Input::To<Sharding>,
-    operation: impl Fn(Sharding) -> O,
-) -> Result<Input, ProgramError>
-where
-    Input: Parameterized<Leaf, To<Leaf> = Input>,
-    Input::Family: ParameterizedFamily<Sharding>,
-    Leaf: Value<Type = ArrayType, Domain: Context<Type = ArrayType, Operation: From<O>>>,
-    O: Operation<Type = ArrayType>,
-{
-    let structure = input.parameter_structure();
-    let outputs = input
-        .into_parameters()
-        .zip(shardings.into_parameters())
-        .map(|(leaf, sharding)| {
-            let input_type = leaf.r#type();
-            if sharding.rank() != input_type.rank() {
-                return Err(ProgramError::Type(
-                    ShardingError::ShardingRankMismatch {
-                        sharding_rank: sharding.rank(),
-                        array_rank: input_type.rank(),
-                    }
-                    .into(),
-                ));
-            }
-            let mut outputs = leaf.domain().bind(operation(sharding), Vec::new(), std::slice::from_ref(&leaf))?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs.remove(0))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Input::from_parameters(structure, outputs)?)
-}
+impl<P: Parameter, S: Reshard<P> + ConstrainSharding<P>> ShardingOperations<P> for S {}
