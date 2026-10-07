@@ -7,11 +7,11 @@
 //!
 //! The operations fall into four groups:
 //!
-//!   - **Reading Positions:** [`AxisIndex`] returns the position of the current batch item or device shard along a
-//!     named axis. It exchanges nothing and is a context capability rather than a value capability, because the
+//!   - **Reading Positions:** [`AxisIndex`] returns the position of the current batch item or device shard along
+//!     a named axis. It exchanges nothing and is a context capability rather than a value capability, because the
 //!     position belongs to the enclosing binder rather than to any value.
-//!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with a
-//!     [`ReductionKind`](crate::ReductionKind), so that every participant receives the same result, and
+//!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with
+//!     a [`ReductionKind`](crate::ReductionKind), so that every participant receives the same result, and
 //!     [`ParallelVary`] marks a value that is invariant over a manual mesh axis as varying over it, which is the
 //!     transpose of a sum over that axis. [`ManualVariationAlignment`] aligns the manual variation of several inputs
 //!     before an operation combines them.
@@ -28,13 +28,13 @@
 //! A collective references its axis by name, and the enclosing binder determines how it executes. Staging resolves the
 //! name against the active [`NamedAxes`] environment and fails with [`AxisError::UnboundAxisName`] when no binder binds
 //! it. A named `batch` level consumes the collectives over its axis in its batching rules, which rearrange or reduce
-//! its batch items, while a `shard_map` manual region keeps them in the staged program, where they lower to
-//! cross-device communication over the manual mesh axis. There, the manual variation of every value (i.e., its
-//! [`Sharding::varying_manual_axes`]) records whether the devices along an axis may hold different values, and the
-//! collectives validate and update it. Only a collective whose participant groups each contain a single participant
-//! can be evaluated outside any binder.
+//! its batch items, while a manual region, in which every device runs the region body on its own shard of a manual mesh
+//! axis, keeps them in the staged program for its backend to lower to communication between the devices along that
+//! axis. There, the manual variation of every value (i.e., its [`Sharding::varying_manual_axes`]) records whether the
+//! devices along an axis may hold different values, and the collectives validate and update it. Only a collective
+//! whose participant groups each contain a single participant can be evaluated outside any binder.
 //!
-//! The single-input exchanges ([`ParallelPermuteOperation`], [`ParallelAllGatherOperation`],
+//! The single-input exchanges (e.g., [`ParallelPermuteOperation`], [`ParallelAllGatherOperation`],
 //! [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]) are linear, so their tangents ride the same
 //! collective and their transposes are other collectives over the same axis (e.g., an all-gather transposes to a
 //! sum-scatter). This module owns the machinery that provides those rules: the private `LinearCollectiveOperation`
@@ -67,6 +67,7 @@
 //!     BatchAxisSpecification::named("rows"),
 //! )?;
 //! assert_eq!(normalized, Array::matrix(2, 2, vec![0.25f32, 0.25, 0.75, 0.75])?);
+//!
 //! let gathered = batch(
 //!     |row: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
 //!         row.parallel_all_gather_tiled("rows", 0)
@@ -140,8 +141,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-// TODO(eaplatanios): Review this module's docstring.
 
 use std::fmt::Debug;
 
