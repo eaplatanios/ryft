@@ -37,16 +37,16 @@ use ryft_core::{
     ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
     ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness, RegionSlot, RemOperation,
     RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
-    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation,
-    SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation,
-    TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
-    UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
-    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation,
+    SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation,
+    SubOperation, TagOperation, TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
+    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch,
+    ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
-use crate::experimental::operations::ShardMapOperation;
 use crate::kernels::XlaKernelOperation;
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
@@ -557,8 +557,9 @@ where
     /// Call to a flat jitted XLA sub-program.
     JitCall(JitCallOperation<ArrayIrType>),
 
-    /// XLA-specific `shard_map`.
-    ShardMap(Box<ShardMapOperation<Constant>>),
+    /// Core `shard_map` operation (refer to [`ShardMapOperation`]), which lowering emits as a Shardy
+    /// `sdy.manual_computation` through its dedicated path rather than through the core composite lowering.
+    ShardMap(Box<ShardMapOperation>),
 }
 
 impl<Constant> ReferenceAccessOperation for XlaOperation<Constant>
@@ -693,6 +694,7 @@ where
             ArrayIrOperation::Scan(operation) => Self::Scan(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
+            ArrayIrOperation::ShardMap(operation) => Self::ShardMap(operation),
             // Custom function calls and carriers with attached rules follow their regions into the native variants.
             // Converted member calls keep their member definition. Calls registered in the array IR family itself
             // cannot follow their program, because constants of this family cannot represent array IR values, so their
@@ -1195,9 +1197,11 @@ where
 //
 // When the split fires, the callee is split through the shared
 // [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
-// enclosing known-side context
-// wrapped in a fresh `jit_call` over the original known call inputs, and the residual side is emitted as the
-// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
+// enclosing known-side context wrapped in a fresh `jit_call` over the known call inputs that it uses, and the residual
+// side is emitted as the residual `jit_call` over the surviving unknown call inputs plus the known-side call's
+// residual-edge outputs. Residual edges that would merely repeat a known call input or a known call output are
+// [forwarded](ryft_core::partial::PartitionedProgram::forward_residuals), so the residual call consumes that input or
+// output directly and the known-side call does not return the same value twice.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
 where
     V: PartialEq
@@ -1259,11 +1263,16 @@ where
         if partition.known_program().instructions().is_empty() {
             return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
         }
+        // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
+        // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
+        let partition = partition.forward_residuals()?;
         // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
-        // members of the original lifted-capture prefix; the residual callee's inputs are residual edges and unknown
-        // inputs, which never form a capture prefix. The guard above already preserved the boundary of any callee
-        // retaining attached-region capture constants, so neither derived callee can hold one.
-        let known_capture_count = input_known.iter().take(self.capture_count()).filter(|known| **known).count();
+        // members of the original lifted-capture prefix that it still uses; the residual callee's inputs are call
+        // inputs, known call outputs, and residual edges, which never form a capture prefix. The guard above already
+        // preserved the boundary of any callee retaining attached-region capture constants, so neither derived callee
+        // can hold one.
+        let known_capture_count =
+            partition.known_input_indices().iter().filter(|index| **index < self.capture_count()).count();
         context.inline_partitioned_program(
             partition,
             inputs,
@@ -1395,17 +1404,24 @@ where
 // condition and rematerialize rules.
 //
 // The rule linearizes the callee program capture-free through
-// [`Program::linearize`](ryft_core::Program::linearize), giving a primal sub-program
+// [`Program::linearize`](ryft_core::Program::linearize) under the operands' activity mask (an operand with a live
+// tangent is active, while the capture prefix, an operand with a structurally zero tangent, and a plumbing reference
+// operand that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal sub-program
 // `inputs -> [outputs..., residuals...]` and a tangent sub-program
-// `[live_input_tangents..., residuals...] -> [live_output_tangents...]` together with the residual count. Tangents
-// for zero differential spaces are omitted from both compact boundaries. It then:
+// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. Tangents for
+// zero differential spaces are omitted from both compact boundaries, and the tangent sub-program is projected onto the
+// output tangents that depend on an active input tangent (refer to
+// [`Linearization::live_tangent_program`](ryft_core::Linearization::live_tangent_program)), since every other output
+// tangent is a structural zero (JAX's `which_nz_out`). When no output tangent is live and the projected tangent
+// sub-program has no observable effects, the rule binds only the source call and pairs every output with a structurally
+// zero tangent. Otherwise, it:
 //
 //   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
 //      primal outputs followed by the residual values (program variables produced by the staged primal call).
-//   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the live operand tangents followed by
-//      those residual values, recovering the live output tangents.
-//   3. Pairs each primal output tracer with its tangent output tracer, restoring structural zeros for omitted
-//      zero-space outputs, into a [`DifferentiationDual`].
+//   2. Wraps the projected tangent sub-program in a fresh `jit_call` and stages it over the active operand tangents
+//      followed by those residual values, recovering the live output tangents.
+//   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an output
+//      without a live tangent, into a [`DifferentiationDual`].
 //
 // The callee program is materialized from the instruction's callee region in the context's constant universe `V`
 // (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
@@ -1441,28 +1457,46 @@ where
         // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
         // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
         // nondifferentiated plumbing that receives no tangent input; the remaining inputs take the operand duals'
-        // activity (a numeric operand is active, a plumbing reference operand is not). The primal sub-program produces
-        // `[outputs..., residuals...]` and the tangent sub-program consumes `[live(input_tangents)..., residuals...]`;
-        // the residual count is the number of trailing outputs of the primal sub-program beyond the original callee
-        // outputs.
+        // activity: an operand with a live tangent is active, while an operand with a structurally zero tangent is
+        // inactive like a missing one (JAX's `which_nz`), so it gets no tangent callee slot instead of being
+        // materialized as a zero operand. A plumbing reference operand (whose structurally zero tangent is a missing
+        // tangent reference) is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]`
+        // and the tangent sub-program consumes `[active(input_tangents)..., residuals...]`; the residual count is the
+        // number of trailing outputs of the primal sub-program beyond the original callee outputs.
         let capture_count = self.capture_count();
         let activity = inputs
             .iter()
             .enumerate()
-            .map(|(index, input)| index >= capture_count && input.is_tangent_active())
+            .map(|(index, input)| index >= capture_count && input.is_tangent_active() && !input.tangent().is_zero())
             .collect::<Vec<_>>();
         let input_indices = activity
             .iter()
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
-        let output_activity = callee.tangent_output_mask(&input_indices)?;
-        let (primal_program, tangent_program, _) = driver.linearize_program(callee, &input_indices)?.into_parts();
+        let linearization = driver.linearize_program(callee, &input_indices)?;
+
+        // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
+        // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee
+        // is projected onto the live output tangents, and every other output is paired with a structurally zero
+        // tangent. When no output tangent is live and the tangent callee has no observable effects, no tangent call is
+        // bound, and the source callee is bound as the primal call, since nothing would consume its residuals.
+        let (tangent_program, output_activity) = linearization.live_tangent_program(&input_indices)?;
+        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
+            let callee = Arc::new(callee.to_program());
+            return context
+                .primal()
+                .bind(XlaOperation::JitCall(*self), CalleeRegionDriver::new(&[callee]), &primal_operands)?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect();
+        }
+        let (primal_program, _, _) = linearization.into_parts();
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
         // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
         // survives verbatim and its length carries over.
         let primal_call = XlaOperation::JitCall(JitCallOperation::new(self.capture_count()));
@@ -1480,8 +1514,9 @@ where
         let primal_outputs = primal_call_outputs;
 
         // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the active operand tangents followed
-        // by the residual values. Inactive operands (the capture prefix, zero-space operands, and plumbing references)
-        // have no compact callee boundary slot.
+        // by the residual values. Structurally zero tangents are inactive, so every active operand tangent is a live
+        // value and materializing it only unwraps it, while inactive operands (the capture prefix, structurally zero
+        // tangents, zero-space operands, and plumbing references) have no compact callee boundary slot.
         let mut tangent_operands = inputs
             .iter()
             .zip(&activity)
@@ -1593,8 +1628,8 @@ pub(crate) fn materialize_transpose_cotangent<
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a live
-///     (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
+///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a
+///     live (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
 ///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
 ///     slot in the transposed callee at all.
 pub fn transpose_primal_jit_call<
@@ -1752,14 +1787,14 @@ mod tests {
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
         RegionRef, RematerializationOptimizationBarrier, RematerializeOperation, ResidualCandidate, ResidualDecision,
         ResidualPolicy, ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation,
-        TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution,
-        WhileOperation, ZeroOperation,
+        Sharding, ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer, TracingContext,
+        TransferToMemoryOperation, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::XlaArray;
     use crate::experimental::domains::{XlaDomain, XlaTracer};
-    use crate::experimental::shard_map::ShardMapTracer;
+    use crate::experimental::tracing::XlaArrayTracer;
 
     use super::{
         CaptureConstant, JIT_CALL_OPERATION_NAME, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation,
@@ -1875,7 +1910,7 @@ mod tests {
         fn requires_dimension_operations<V: ryft_core::DimensionOperations>() {}
 
         requires_array_operations::<XlaArray<'static>>();
-        requires_array_operations::<ShardMapTracer>();
+        requires_array_operations::<XlaArrayTracer>();
         requires_array_operations::<crate::XlaValue<'static>>();
         requires_array_ir_operations::<crate::XlaValue<'static>>();
         requires_dimension_operations::<crate::XlaDimension<'static>>();
@@ -1931,8 +1966,13 @@ mod tests {
         predicate.assert("identity must agree", &[]).unwrap();
         let predicate = dimension.not_equal(&dimension).unwrap();
         predicate.assert("identity must differ", &[]).unwrap();
-        assert!(matches!(context.builder().borrow().instructions(), [instruction]
-            if matches!(instruction.operation(), XlaOperation::Assert(operation) if operation.message() == "identity must differ")));
+        assert!(matches!(
+            context.builder().borrow().instructions(),
+            [instruction] if matches!(
+                instruction.operation(),
+                XlaOperation::Assert(operation) if operation.message() == "identity must differ",
+            ),
+        ));
 
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let mut builder = XlaProgramBuilder::new();
@@ -2916,6 +2956,151 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_jvp_treats_structurally_zero_tangents_as_inactive() {
+        // `f(x, y) = (sin(x), cos(y))` differentiated with respect to `x` only: the structurally zero tangent of `y`
+        // gets no tangent callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
+        // structural zero that the tangent call does not return.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            let y = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![y], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![sine, cosine],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                            %3:f64[4] = cos %1
+                            %4:f64[4] = cos %0
+                        in (%2, %3, %4)
+                    },
+                ]
+                    %6:f64[4] = jit_call %2 %5 [
+                        callee={
+                            lambda %0:f64[4], %1:f64[4] .
+                            let %2:f64[4] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    %7:f64[4] = zero [type=f64[4]]
+                in (%3, %4, %6, %7)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_jvp_omits_independent_output_tangents() {
+        // `f(x) = (sin(x), 0)`: the tangent of the constant output depends on no tangent input, so it is a structural
+        // zero that the tangent call does not return.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(r#type);
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[4] .
+                        let %1:f64[4] = sin %0
+                            %2:f64[4] = zero [type=f64[4]]
+                            %3:f64[4] = cos %0
+                        in (%1, %2, %3)
+                    },
+                ]
+                    %5:f64[4] = jit_call %1 %4 [
+                        callee={
+                            lambda %0:f64[4], %1:f64[4] .
+                            let %2:f64[4] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    %6:f64[4] = zero [type=f64[4]]
+                in (%2, %3, %5, %6)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_jvp_skips_tangent_calls_without_live_output_tangents() {
+        // `f(x, y) = sin(x)` differentiated with respect to `y` only: no output tangent depends on the tangent of `y`
+        // and the tangent callee has no effects, so only the source call is bound and the output tangent is a
+        // structural zero.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let output = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                        in (%2)
+                    },
+                ]
+                    %4:f64[4] = zero [type=f64[4]]
+                in (%3, %4)"},
+        );
+    }
+
+    #[test]
     fn test_jit_call_partial_evaluation_keeps_reference_bearing_callees_whole() {
         // The callee reads the reference before and after mutating it: `f(r, x) = { a = read(r); r += x; a * read(r) }`
         // Splitting it against a known `r` would hoist the first read into the outer trace and leave the mutation and
@@ -3460,7 +3645,8 @@ mod tests {
             .unwrap();
 
         // The known half landed in the outer program as one known-side `jit_call` over the symbolic known input,
-        // producing the fully known callee output plus the residual edge (the same folded value, twice).
+        // producing the fully known callee output once: the residual edge, which is the same folded value, is fed from
+        // that output.
         {
             let outer_builder = outer.builder().borrow();
             assert_eq!(outer_builder.instructions().len(), 1);
@@ -3471,7 +3657,7 @@ mod tests {
             );
             let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().to_program();
             assert_eq!(known_callee.input_ids().len(), 1);
-            assert_eq!(known_callee.output_ids().len(), 2);
+            assert_eq!(known_callee.output_ids().len(), 1);
             assert_eq!(known_callee.instructions().len(), 1);
             assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Array(ArrayOperation::Add(_)),));
         }
@@ -3496,6 +3682,71 @@ mod tests {
         assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
         assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_forwards_known_output_residuals() {
+        // The callee `f(a, x) = (sin(a), sin(a) * x)` partitioned with `a` known and `x` unknown: the residual call
+        // needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is fed
+        // from that output (JAX's `out_fwd`). The outer partition repeats the known call's output as its own residual
+        // edge, because `Program::partition` keeps one edge per residual feeder.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let a = builder.add_input(r#type.clone());
+            let x = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+            let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![sine, product],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let a = builder.add_input(r#type.clone());
+        let x = builder.add_input(r#type);
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.partition(&[true, false]).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[4] .
+                    let %1:f64[4] = jit_call %0 [
+                        callee={
+                            lambda %0:f64[4] .
+                            let %1:f64[4] = sin %0
+                            in (%1)
+                        },
+                    ]
+                    in (%1, %1)
+                }
+                residual={
+                    lambda %0:f64[4], %1:f64[4] .
+                    let %2:f64[4] = jit_call %0 %1 [
+                        callee={
+                            lambda %0:f64[4], %1:f64[4] .
+                            let %2:f64[4] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
     }
 
     #[test]

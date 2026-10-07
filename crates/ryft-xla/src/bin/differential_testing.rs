@@ -21,11 +21,11 @@ use ryft_core::{
     DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter,
     Placeholder, ProgramBuilder, ProgramError, Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding,
-    ShardingDimension, Value, ValueProjection, ZeroLike, condition,
+    ShardingDimension, Value, ValueProjection, ZeroLike, condition, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::experimental::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
 use ryft_xla::{FromPjrt, XlaArray, XlaSession};
 
 #[path = "differential_testing/collectives.rs"]
@@ -296,9 +296,9 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
     let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
         {
             let sharding = sharding.clone();
-            move |input: ShardMapTracer| {
-                shard_map::<_, _, (ArrayType, ArrayType, ArrayType), _>(
-                    |local_input: ShardMapTracer| {
+            move |input: XlaArrayTracer| {
+                shard_map(
+                    |local_input: XlaArrayTracer| {
                         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
                         (
                             local_input
@@ -358,9 +358,9 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let sharding = sharding.clone();
-            move |input: ShardMapTracer| {
-                shard_map::<_, _, ArrayType, _>(
-                    |local_input: ShardMapTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]).unwrap(),
+            move |input: XlaArrayTracer| {
+                shard_map(
+                    |local_input: XlaArrayTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]).unwrap(),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -426,9 +426,9 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let sharding = sharding.clone();
-            move |input: ShardMapTracer| {
-                shard_map::<_, _, ArrayType, _>(
-                    |local_input: ShardMapTracer| local_input.parallel_swap_axes("x", 0).unwrap(),
+            move |input: XlaArrayTracer| {
+                shard_map(
+                    |local_input: XlaArrayTracer| local_input.parallel_swap_axes("x", 0).unwrap(),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -583,7 +583,7 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
     let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
         {
             let dimensions = dimensions.clone();
-            move |(lhs, rhs, lhs_scale, rhs_scale): (ShardMapTracer, ShardMapTracer, ShardMapTracer, ShardMapTracer)| {
+            move |(lhs, rhs, lhs_scale, rhs_scale): (XlaArrayTracer, XlaArrayTracer, XlaArrayTracer, XlaArrayTracer)| {
                 lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
                     .unwrap()
             }
@@ -653,15 +653,15 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         (ArrayType, ArrayType),
     > = trace(
         move |(query, key, value, bias, mask, query_sequence_lengths, key_value_sequence_lengths): (
-            ShardMapTracer,
-            ShardMapTracer,
-            ShardMapTracer,
-            ShardMapTracer,
-            ShardMapTracer,
-            ShardMapTracer,
-            ShardMapTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
+            XlaArrayTracer,
         )| {
-            let (output, residual) = ShardMapTracer::dot_product_attention(
+            let (output, residual) = XlaArrayTracer::dot_product_attention(
                 AttentionInputs {
                     query,
                     key,
@@ -707,7 +707,7 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
         ),
     ]);
     let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
-        |(input, start): (ShardMapTracer, ShardMapTracer)| input.dynamic_slice(&[start], &[2]).unwrap(),
+        |(input, start): (XlaArrayTracer, XlaArrayTracer)| input.dynamic_slice(&[start], &[2]).unwrap(),
         (ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)),
     )?;
     Ok(DifferentialObservation {
@@ -735,7 +735,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
         {
             let replicated = replicated.clone();
             let sharded = sharded.clone();
-            move |inputs: Vec<ShardMapTracer>| {
+            move |inputs: Vec<XlaArrayTracer>| {
                 let (value, gradients) = inputs[0]
                     .clone()
                     .into_value()
@@ -744,8 +744,8 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                     .value_and_gradient(|(weight, values)| {
                         let weight = ValueProjection::<ArrayType>::into_projected(weight)?;
                         let values = ValueProjection::<ArrayType>::into_projected(values)?;
-                        Ok(shard_map::<_, _, ArrayType, _>(
-                            |(weight, values): (ShardMapTracer, ShardMapTracer)| {
+                        Ok(shard_map(
+                            |(weight, values): (XlaArrayTracer, XlaArrayTracer)| {
                                 let sum = values.reduce(&[0], ReductionKind::Sum).unwrap();
                                 let predicate =
                                     sum.compare(&sum.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();

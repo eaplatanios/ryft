@@ -1480,10 +1480,12 @@ where
     ///
     /// # Limitation
     ///
-    /// Programs that use `shard_map` or `linear_shard_map` will surface
-    /// [`BatchingError::UnsupportedOperation`](ryft_core::batching::BatchingError) at batch time — the batching rules
-    /// for those XLA-specific extension variants are not yet implemented. Non-shard-map ops (including the
-    /// `reshard` and `constrain_sharding` sharding-control primitives) batch correctly through the per-op rules.
+    /// Even once composite batching is available, a [`ShardMapOperation`](ryft_core::ShardMapOperation) batches mapped
+    /// inputs only for a static batch extent, because its batching rule turns the batch axis into a dimension of its
+    /// static boundary types, so a runtime extent operand makes its mapped batching fail with
+    /// [`ShardMapError::DynamicBatchExtentNotSupported`](ryft_core::ShardMapError::DynamicBatchExtentNotSupported).
+    /// Every other operation, including the `reshard` and `constrain_sharding` sharding-control operations, batches
+    /// through its own batching rule.
     #[track_caller]
     pub fn batch<'domain>(
         &'domain self,
@@ -1861,17 +1863,15 @@ mod tests {
         Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
-        ZeroLike, differentiate_at,
+        ReferenceType, Reshape, ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension,
+        Sin, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value,
+        ValueProjection, WhileOperation, ZeroLike, constrain_sharding, differentiate_at, reshard,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::XlaDomainError;
     use crate::experimental::domains::StatefulFailureInjection;
-    use crate::experimental::operations::ShardMapOperation;
     use crate::experimental::ops::{JitCallOperation, XlaConstant, XlaOperation};
-    use crate::experimental::shard_map::ShardMap;
     use crate::jit::{
         CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer,
         XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
@@ -2034,12 +2034,13 @@ mod tests {
             .with_sharding(reference_sharding.clone())
             .unwrap();
         let value_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
-        let shard_map = ShardMap::from_shardings(
+        let shard_map = ShardMap::new(
             mesh.clone(),
             vec![reference_sharding.clone(), sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-        );
+        )
+        .unwrap();
         let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let reference =
             body.add_input(ReferenceType::new(shard_map.local_input_type(0, &reference_type).unwrap()).into());
@@ -2056,15 +2057,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let inputs = vec![ArrayIrType::Reference(ReferenceType::new(reference_type)), ArrayIrType::Array(value_type)];
-        let operation = ShardMapOperation::from_program(
-            &body,
-            inputs.clone(),
-            mesh.clone(),
-            vec![reference_sharding, sharded.clone()],
-            vec![sharded],
-            vec!["x".to_string()],
-        )
-        .unwrap();
+        let operation = ShardMapOperation::from_program(&body, inputs.clone(), shard_map).unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let inputs = inputs.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let body = builder.import_program(body);
@@ -3802,7 +3795,9 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_shard_map_reverse_normalizes_replicated_output_seed() {
+    fn test_stateful_shard_map_reverse_adds_replicated_reference_cotangents_once() {
+        // The output seed `[1, 2]` reaches the replicated reference's cotangent destination `[5, 7]` exactly once,
+        // without any normalization by the size of the manual axis or per-device duplication of the destination.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -3822,10 +3817,8 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![reference_type.clone()],
-            logical_mesh.clone(),
-            vec![sharding.clone()],
-            vec![sharding.clone()],
-            vec!["x".to_string()],
+            ShardMap::new(logical_mesh.clone(), vec![sharding.clone()], vec![sharding.clone()], vec!["x".to_string()])
+                .unwrap(),
         )
         .unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3884,12 +3877,13 @@ mod tests {
 
         // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
         // performs `add_update(r_local, x_local); read(r_local)` over the `f32[2]` shards the device owns.
-        let shard_map = ShardMap::from_shardings(
+        let shard_map = ShardMap::new(
             logical_mesh,
             vec![sharded.clone(), sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-        );
+        )
+        .unwrap();
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let local_referent = shard_map.local_input_type(0, &global_type).unwrap();
@@ -3904,14 +3898,17 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
-            shard_map,
+        let operation = ShardMapOperation::from_program(
+            &body,
             vec![
                 ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ],
-            vec![ArrayIrType::Array(sharded_type.clone())],
-        )));
+            shard_map,
+        )
+        .unwrap();
+        assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
+        let operation = XlaOperation::ShardMap(Box::new(operation));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
                 let context = reference.domain();
@@ -3984,12 +3981,13 @@ mod tests {
         // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
         // along `x`, and the local body performs `read(r_local) + x_local` over the whole `f32[2]` referent and the
         // `f32[2]` shard of `x` the device owns.
-        let shard_map = ShardMap::from_shardings(
+        let shard_map = ShardMap::new(
             logical_mesh,
             vec![replicated, sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-        );
+        )
+        .unwrap();
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let local_referent = shard_map.local_input_type(0, &referent_type).unwrap();
@@ -4006,14 +4004,17 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
-            shard_map,
+        let operation = ShardMapOperation::from_program(
+            &body,
             vec![
                 ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
                 ArrayIrType::Array(sharded_type.clone()),
             ],
-            vec![ArrayIrType::Array(sharded_type.clone())],
-        )));
+            shard_map,
+        )
+        .unwrap();
+        assert_eq!(operation.global_output_types(), &[ArrayIrType::Array(sharded_type.clone())]);
+        let operation = XlaOperation::ShardMap(Box::new(operation));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
                 let context = reference.domain();
@@ -6463,8 +6464,8 @@ mod tests {
         // same MLIR program as the rest of the function body.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let constrained = crate::experimental::shard_map::constrain_sharding(x, target_sharding.clone())
-                    .expect("staged sharding constraint should succeed");
+                let constrained =
+                    constrain_sharding(x, target_sharding.clone()).expect("staged sharding constraint should succeed");
                 constrained.sin().unwrap()
             },
             input_type.clone(),
@@ -6536,9 +6537,9 @@ mod tests {
         // the same MLIR program. After trace+compile, the executable runs all three in one PJRT dispatch.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let a = crate::experimental::shard_map::reshard(x, constraint_a.clone()).unwrap();
-                let b = crate::experimental::shard_map::reshard(a.sin().unwrap(), constraint_b.clone()).unwrap();
-                crate::experimental::shard_map::reshard(b.sin().unwrap(), constraint_c.clone()).unwrap()
+                let a = reshard(x, constraint_a.clone()).unwrap();
+                let b = reshard(a.sin().unwrap(), constraint_b.clone()).unwrap();
+                reshard(b.sin().unwrap(), constraint_c.clone()).unwrap()
             },
             input_type.clone(),
             &engine,

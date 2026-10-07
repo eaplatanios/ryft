@@ -4,9 +4,8 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     ArrayIrType, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder,
-    ReferenceReadOperation, ReferenceType, Sharding, ShardingDimension,
+    ReferenceReadOperation, ReferenceType, ShardMap, ShardMapOperation, Sharding, ShardingDimension,
 };
-use ryft_xla::experimental::operations::ShardMapOperation;
 use ryft_xla::experimental::ops::{XlaConstant, XlaOperation};
 
 #[test]
@@ -27,10 +26,7 @@ fn test_shard_map_operation_from_program() {
     let operation = ShardMapOperation::from_program(
         &body,
         vec![reference_type.clone()],
-        mesh,
-        vec![sharding.clone()],
-        vec![sharding.clone(), sharding],
-        vec!["x".to_string()],
+        ShardMap::new(mesh, vec![sharding.clone()], vec![sharding.clone(), sharding], vec!["x".to_string()]).unwrap(),
     )
     .unwrap();
     let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();

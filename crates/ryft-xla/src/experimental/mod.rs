@@ -6,11 +6,11 @@ pub mod debugging;
 pub mod domains;
 /// StableHLO and Shardy lowering helpers for traced XLA programs.
 pub mod lowering;
-/// Experimental XLA-only higher-order primitives and staged operation helpers.
-pub mod operations;
 /// Backend-owned staged operation types for traced XLA programs.
 pub mod ops;
-pub mod shard_map;
+/// General XLA program tracing: the [`trace`] entry point, its [`TracedXlaProgram`] result, which lowers the traced
+/// program to StableHLO/Shardy MLIR for compilation and execution, and the [`TraceError`] of both stages.
+pub mod tracing;
 
 pub use lowering::RaggedDotLoweringStrategy;
 
@@ -19,7 +19,4 @@ pub use domains::{
     XlaOptimizedProgram, XlaSession,
 };
 
-pub use shard_map::{
-    ShardMapTraceError, ShardMapTracer, TracedShardMap, TracedXlaProgram, constrain_sharding, reshard, shard_map,
-    shard_map_with_options, trace,
-};
+pub use tracing::{TraceError, TracedXlaProgram, XlaArrayTracer, trace};

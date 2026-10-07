@@ -15,9 +15,10 @@ use thiserror::Error;
 use ryft_core::{
     Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
     DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program,
-    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin,
+    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin, shard_map,
+    shard_map_with_options,
 };
-use ryft_xla::experimental::{ShardMapTraceError, ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use ryft_xla::experimental::{TraceError, TracedXlaProgram, XlaArrayTracer, trace};
 
 /// Error type returned by the program statistics emitters.
 #[derive(Debug, Error)]
@@ -30,9 +31,9 @@ enum StatisticsError {
     #[error("{0}")]
     Differentiation(#[from] DifferentiationError),
 
-    /// Wrapper around shard-map tracing failures while building a case's program.
+    /// Wrapper around XLA tracing failures (including shard-map tracing failures) while building a case's program.
     #[error("{0}")]
-    ShardMapTrace(#[from] ShardMapTraceError),
+    XlaTrace(#[from] TraceError),
 
     /// Error returned when a requested case ID is unknown.
     #[error("unknown program statistics case `{case_id}`")]
@@ -300,8 +301,8 @@ fn emit_shard_map_basic() -> Result<ProgramStatistics, StatisticsError> {
         {
             let mesh = mesh.clone();
             move |x| {
-                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                    |local_x: ShardMapTracer| {
+                shard_map(
+                    |local_x: XlaArrayTracer| {
                         local_x.sin().unwrap_or_else(|error| panic!("basic shard_map case should trace sine: {error}"))
                     },
                     x,
@@ -320,22 +321,22 @@ fn emit_shard_map_basic() -> Result<ProgramStatistics, StatisticsError> {
 /// Emits the traced `shard_map` matrix-multiplication case.
 fn emit_shard_map_matmul() -> Result<ProgramStatistics, StatisticsError> {
     let mesh = shard_map_mesh();
-    let lhs_spec =
+    let lhs_sharding =
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-    let rhs_spec = Sharding::replicated(mesh.clone(), 2);
-    let out_spec = lhs_spec.clone();
+    let rhs_sharding = Sharding::replicated(mesh.clone(), 2);
+    let output_sharding = lhs_sharding.clone();
     let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
         {
             let mesh = mesh.clone();
             move |inputs| {
-                shard_map::<_, (ShardMapTracer, ShardMapTracer), ArrayType, ShardMapTracer>(
-                    |(lhs, rhs): (ShardMapTracer, ShardMapTracer)| {
+                shard_map(
+                    |(lhs, rhs): (XlaArrayTracer, XlaArrayTracer)| {
                         lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap()
                     },
                     inputs,
                     mesh.clone(),
-                    (lhs_spec.clone(), rhs_spec.clone()),
-                    out_spec.clone(),
+                    (lhs_sharding.clone(), rhs_sharding.clone()),
+                    output_sharding.clone(),
                 )
                 .unwrap_or_else(|error| panic!("matmul shard_map case should trace: {error}"))
             }
@@ -345,33 +346,28 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, StatisticsError> {
     Ok(traced.statistics())
 }
 
-/// Emits the nested traced `shard_map` case.
+/// Emits the nested traced `shard_map` case: an outer map that makes only `x` manual around an inner map over the
+/// remaining manual axis `y` of the same mesh, which inherits `x` from the outer map.
 fn emit_nested_shard_map() -> Result<ProgramStatistics, StatisticsError> {
-    let outer_mesh = LogicalMesh::new(vec![
+    let mesh = LogicalMesh::new(vec![
         MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-        MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-    ])
-    .unwrap();
-    let inner_mesh = LogicalMesh::new(vec![
-        MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
         MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
     ])
     .unwrap();
-    let outer_sharding = Sharding::new(outer_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-    let inner_sharding = Sharding::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+    let outer_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+    let inner_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let outer_mesh = outer_mesh.clone();
-            let inner_mesh = inner_mesh.clone();
+            let mesh = mesh.clone();
             move |x| {
-                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                shard_map_with_options(
                     {
-                        let inner_mesh = inner_mesh.clone();
-                        move |outer_x: ShardMapTracer| {
-                            let nested = shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                                |inner_x: ShardMapTracer| inner_x.clone() + inner_x,
+                        let mesh = mesh.clone();
+                        move |outer_x: XlaArrayTracer| {
+                            let nested = shard_map(
+                                |inner_x: XlaArrayTracer| inner_x.clone() + inner_x,
                                 outer_x.clone(),
-                                inner_mesh.clone(),
+                                mesh.clone(),
                                 inner_sharding.clone(),
                                 inner_sharding.clone(),
                             )
@@ -382,9 +378,10 @@ fn emit_nested_shard_map() -> Result<ProgramStatistics, StatisticsError> {
                         }
                     },
                     x,
-                    outer_mesh.clone(),
+                    mesh.clone(),
                     outer_sharding.clone(),
                     outer_sharding.clone(),
+                    vec!["x".to_string()],
                 )
                 .unwrap_or_else(|error| panic!("nested shard_map case should trace the outer shard_map: {error}"))
             }
@@ -558,7 +555,7 @@ mod tests {
 
     /// Verifies the exact expected statistics for every shard-map case, including the nested case's shared-arena
     /// attachment edges. The `shard_map_basic` expectation is anchored against a program rendering by the
-    /// `TracedXlaProgram::statistics` owner-module test in `experimental::shard_map`; the other two fixtures were
+    /// `test_traced_xla_program_statistics` owner-module test in `experimental::tracing`; the other two fixtures were
     /// pinned from the binary's emitted values after checking them for internal consistency, so they serve as
     /// change detectors rather than independently derived ground truth.
     #[test]
@@ -604,9 +601,9 @@ mod tests {
                         "input_count": 2,
                         "output_count": 1,
                         "constant_count": 0,
-                        "instruction_count": 1,
-                        "operation_counts": { "dot": 1 },
-                        "maximum_output_dependency_depth": 1,
+                        "instruction_count": 2,
+                        "operation_counts": { "dot": 1, "parallel_vary": 1 },
+                        "maximum_output_dependency_depth": 2,
                         "attached_regions": [],
                     },
                     {

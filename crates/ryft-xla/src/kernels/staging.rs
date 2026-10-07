@@ -2161,9 +2161,10 @@ pub(crate) mod tests {
     #[test]
     fn test_select_kernels_in_shard_map() {
         use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
-        use ryft_core::{ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-
-        use crate::experimental::operations::ShardMapOperation;
+        use ryft_core::{
+            ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, ShardMap, ShardMapOperation, Sharding,
+            ShardingDimension,
+        };
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding =
@@ -2185,10 +2186,7 @@ pub(crate) mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![global.clone().into()],
-            mesh,
-            vec![sharding.clone()],
-            vec![sharding],
-            vec!["device".to_owned()],
+            ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
         )
         .unwrap();
         let mut builder = XlaProgramBuilder::new();

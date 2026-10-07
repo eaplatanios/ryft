@@ -71,7 +71,7 @@ pub enum ArrayError {
     /// Error returned when the destination [`DeviceMesh`] has a mesh axis with
     /// [`MeshAxisType::Manual`]. `Manual` axes are
     /// managed explicitly by the user (e.g. inside
-    /// [`shard_map`](mod@crate::experimental::shard_map)); the compiled reshard path uses the SPMD
+    /// [`shard_map`](fn@ryft_core::shard_map)); the compiled reshard path uses the SPMD
     /// partitioner from the top level and can only plan `Auto` and `Explicit` axes.
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name} (type {axis_type:?})")]
     UnsupportedMeshAxisType { axis_name: String, axis_type: ryft_core::arrays::sharding::MeshAxisType },

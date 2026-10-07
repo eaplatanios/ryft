@@ -14,7 +14,7 @@ use serde::Deserialize;
 use ryft_core::{
     ArrayType, CollectiveOptions, DataType, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelRaggedAllToAll, ParallelReduce, ReductionKind, Sharding,
-    ShardingDimension,
+    ShardingDimension, shard_map,
 };
 #[cfg(feature = "cuda-13")]
 use ryft_pjrt::{
@@ -25,7 +25,7 @@ use ryft_pjrt::{
 #[cfg(feature = "cuda-13")]
 use ryft_xla::DistributedRuntime;
 #[cfg(any(test, feature = "cuda-13"))]
-use ryft_xla::experimental::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use ryft_xla::experimental::{TracedXlaProgram, XlaArrayTracer, trace};
 
 use super::DifferentialObservation;
 #[cfg(feature = "cuda-13")]
@@ -162,9 +162,9 @@ impl DistributedCollectiveCase {
         let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
         let output_sharding = sharding(&self.output_shape)?;
         let traced: TracedXlaProgram<Vec<ArrayType>, ArrayType> = trace(
-            |inputs: Vec<ShardMapTracer>| {
-                shard_map::<_, _, ArrayType, _>(
-                    |inputs: Vec<ShardMapTracer>| match self.operation.as_str() {
+            |inputs: Vec<XlaArrayTracer>| {
+                shard_map(
+                    |inputs: Vec<XlaArrayTracer>| match self.operation.as_str() {
                         "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x").unwrap(),
                         "all_gather" => inputs[0]
                             .parallel_all_gather_with_options(

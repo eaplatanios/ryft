@@ -1488,6 +1488,14 @@ where
                 operation.name(),
             ),
         }),
+        // A `shard_map` is lowered through its dedicated manual-computation path, which `XlaOperation::ShardMap`
+        // reaches without converting the operation into the core composite family.
+        ArrayIrOperation::ShardMap(_) => Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "core composite `{}` operation must be lowered through the XLA `shard_map` operation",
+                operation.name(),
+            ),
+        }),
     }
 }
 

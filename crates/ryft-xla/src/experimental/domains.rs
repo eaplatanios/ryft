@@ -42,14 +42,13 @@ use super::lowering::{
     RaggedDotLoweringStrategy, XlaExecutableSignature, contains_unresolved_references, contains_unresolved_state,
 };
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
-use super::shard_map::ShardMapTraceError;
+use super::tracing::TraceError;
 use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
 use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
 use crate::arrays_v0::{
     BoundedMaterializationKey, BoundedMaterializationProbe, BoundedMaterializationProducer,
     BoundedMaterializationWaiter, ExecuteArguments,
 };
-use crate::experimental::operations::ShardMapOperation;
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
 use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
@@ -64,7 +63,7 @@ pub enum XlaDomainError {
 
     /// Error surfaced while lowering a traced XLA program to StableHLO/Shardy MLIR.
     #[error("{0}")]
-    Lowering(#[from] ShardMapTraceError),
+    Lowering(#[from] TraceError),
 
     /// Error surfaced while materializing or marshalling [`XlaArray`] values.
     #[error("{0}")]
@@ -1257,29 +1256,6 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType>
         inputs: &[XlaValue<'c>],
     ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
-    }
-}
-
-/// Eager interpretation of a `shard_map` instruction is rejected: eager shard-map execution flows through
-/// [`Context::bind`]'s region channel instead ([`Program::interpret_in_context`](ryft_core::Program::interpret_in_context)
-/// materializes the attached body region and [`XlaDomain::bind`] SPMD-compiles the manual computation whole), and the
-/// [`InterpretationDriver`] this rule receives can replay the body region but cannot materialize it
-/// for a whole rebind. This implementation exists to satisfy the operation family's interpretation bound on
-/// [`XlaDomain`]-valued replays, which never dispatch it in practice.
-// TODO(eaplatanios): [regions] Deferred-behavior rejection: if a nested eager replay ever needs to execute a
-//  `shard_map` through this rule, extend `InterpretationDriver` with a whole-rebind request instead of
-//  interpreting the local body over global values (phase 7 or later of
-//  `.tasks/plan_first_class_program_regions.md`).
-impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant> {
-    fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
-        &self,
-        _context: &XlaDomain<'c>,
-        _driver: &D,
-        _inputs: &[XlaValue<'c>],
-    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "eager shard_map replay must bind through a client-backed domain context".to_string(),
-        })
     }
 }
 
@@ -2562,7 +2538,8 @@ impl Display for XlaCompilationAnalysis {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "XLA compilation analysis [flops={}, bytes accessed={}, generated code={} bytes, replicas={}, partitions={}]",
+            "XLA compilation analysis [flops={}, bytes accessed={}, generated code={} bytes, replicas={}, \
+             partitions={}]",
             self.floating_point_operations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unsupported".into()),
@@ -5486,9 +5463,9 @@ fn has_only_static_array_types(program: &FlatXlaProgram) -> bool {
     })
 }
 
-/// Returns whether `program` stages a `shard_map` anywhere, including inside nested regions. Traced `shard_map`
-/// boundaries are required to be static by [`ShardMap::trace`](crate::experimental::shard_map::ShardMap::trace), so a
-/// `shard_map` can still appear in a program that is bounded-dynamic elsewhere, which this predicate detects.
+/// Returns whether `program` stages a `shard_map` anywhere, including inside nested regions. `shard_map` boundaries
+/// are required to be static (refer to the documentation of [`ShardMapOperation`](ryft_core::ShardMapOperation)), so
+/// a `shard_map` can still appear in a program that is bounded-dynamic elsewhere, which this predicate detects.
 fn contains_shard_map(program: &FlatXlaProgram) -> bool {
     program.regions().iter().any(|region| {
         region
@@ -6705,7 +6682,8 @@ impl<'c> XlaDomain<'c> {
                                 selected.default_memory()?,
                             )?;
                             let token = manager.retrieve_buffer(0)?;
-                            // Only initial zero-byte token creation is awaited. Predecessor carriers remain pending inputs.
+                            // Only initial zero-byte token creation is awaited. Predecessor carriers remain pending
+                            // inputs.
                             manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
                             tokens.push(Arc::new(token));
                         }
@@ -6846,25 +6824,26 @@ mod tests {
         CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation,
         DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
         DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather,
-        DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
-        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
-        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        Reshape, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation,
-        SortDirection, SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
-        ZeroOperation, batch, try_jit_with_options,
+        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
+        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
+        DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, RngBitGeneratorOperation, ScaledDotOperation,
+        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+        SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation, SortDirection,
+        SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch,
+        shard_map, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::XlaReference;
-    use crate::experimental::shard_map::ShardMap;
+    use crate::experimental::tracing::XlaArrayTracer;
     use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -7543,9 +7522,12 @@ mod tests {
         )
         .unwrap();
         // A topology change cannot reach resharding, donation, or PJRT execution; the retained input stays readable.
-        assert!(matches!(domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
+        assert!(matches!(
+            domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
             Err(XlaDomainError::Kernel(crate::kernels::KernelEmbeddingError::Invalid { message }))
-                if message == "cross-process kernel execution requires a qualified collective ordering and completion contract"));
+                if message == "cross-process kernel execution requires a qualified collective ordering and \
+                               completion contract",
+        ));
         assert_eq!(read_f32s(&client, &input), vec![2.0, 5.0]);
     }
 
@@ -10113,7 +10095,8 @@ mod tests {
         let error = program_array(&invalid).block_until_ready().unwrap_err();
         assert!(
             error.to_string().contains(
-                "`dimension_from_scalar` failed: input dimension `data_extent` = 8 is outside its declared bounds [1, 8)"
+                "`dimension_from_scalar` failed: input dimension `data_extent` = 8 is outside its declared bounds \
+                 [1, 8)",
             ),
             "{error}",
         );
@@ -11873,7 +11856,8 @@ mod tests {
         let throughput_teraflops = floating_point_operations / (median_nanoseconds as f64 * 1e3);
 
         eprintln!(
-            "fused attention b{batch} h{heads} s{sequence} d{head_dimension}: compile={compilation_duration:?}, median={:.3} ms, throughput={throughput_teraflops:.2} TFLOP/s",
+            "fused attention b{batch} h{heads} s{sequence} d{head_dimension}: compile={compilation_duration:?}, \
+             median={:.3} ms, throughput={throughput_teraflops:.2} TFLOP/s",
             median_nanoseconds as f64 / 1e6,
         );
     }
@@ -12471,7 +12455,10 @@ mod tests {
         let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
+        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let shard_map =
+            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new()).unwrap();
+        let local_type = shard_map.local_input_type(0, &global_type).unwrap();
 
         // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
         // beside it. Here the gateway makes the program bounded-dynamic while the `shard_map` stays fully static.
@@ -12482,9 +12469,6 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let shard_map =
-            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new()).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
@@ -12497,17 +12481,9 @@ mod tests {
         let dynamic = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
             .unwrap()[0];
+        let operation = ShardMapOperation::from_program(&body, vec![global_type.into()], shard_map).unwrap();
         let mapped = builder
-            .add_instruction(
-                XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
-                    shard_map,
-                    vec![global_type.clone()],
-                    vec![global_type],
-                ))),
-                vec![body_region],
-                vec![global],
-                None,
-            )
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![global], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -13503,6 +13479,221 @@ mod tests {
         let eager_final = eager_reference.freeze().unwrap();
         assert_eq!(eager_snapshot, ryft_core::ArrayIrValue::Array(Array::scalar(5.0f32).unwrap()));
         assert_eq!(eager_final, ryft_core::ArrayIrValue::Array(Array::scalar(8.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_and_executes_pinned_host_reference_state_in_shard_maps() {
+        // A pinned-host allocation that a `shard_map` mutates through a sharded reference input discharges to a manual
+        // computation over its state: every device updates its own shard, the final state keeps the allocation's
+        // pinned-host placement, and the mapped output stays in device memory.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let device_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
+        let shard_map = ShardMap::new(
+            logical_mesh,
+            vec![sharding.clone(), sharding.clone()],
+            vec![sharding],
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let local_type = shard_map.local_input_type(1, &device_type).unwrap();
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(ReferenceType::new(local_type.clone()).into());
+            let update = builder.add_input(local_type.into());
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let state =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![state], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = ShardMapOperation::from_program(
+            &body,
+            vec![ReferenceType::new(host_type.clone()).into(), device_type.clone().into()],
+            shard_map,
+        )
+        .unwrap();
+        let program = {
+            let mut builder = XlaProgramBuilder::new();
+            let initial = builder.add_input(host_type.clone().into());
+            let update = builder.add_input(device_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            let body = builder.import_program(body);
+            let mapped = builder
+                .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![reference, update], None)
+                .unwrap()[0];
+            let state =
+                builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![mapped, state],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let initial = XlaArray::from_host_buffer(
+            &domain,
+            host_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let update = XlaArray::from_host_buffer(
+            &domain,
+            device_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![initial, update]).unwrap();
+        let shards = |array: &XlaArray<'_>| {
+            array
+                .addressable_shards()
+                .map(|shard| {
+                    let buffer = shard.buffer().unwrap();
+                    let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+                    (buffer.memory().unwrap().kind().unwrap().to_string(), values_from_bytes::<f32>(bytes.as_slice()))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outputs[0].r#type().as_ref(), &device_type);
+        assert_eq!(
+            shards(&outputs[0]),
+            vec![("device".to_string(), vec![11.0, 22.0]), ("device".to_string(), vec![33.0, 44.0])],
+        );
+        assert_eq!(outputs[1].r#type().as_ref(), &host_type);
+        assert_eq!(
+            shards(&outputs[1]),
+            vec![("pinned_host".to_string(), vec![11.0, 22.0]), ("pinned_host".to_string(), vec![33.0, 44.0])],
+        );
+    }
+
+    #[test]
+    fn test_xla_lowering_executes_shard_map_transpositions_for_callers_placed_along_manual_axes() {
+        // The caller places its input along the manual axis `x` and the explicit axis `y`, while the map places it
+        // along `x` only, so the transposed map assembles the cotangent along `x`. One placement-only `broadcast`
+        // restores the caller's placement along both axes, which compiles to local slicing without any collective,
+        // and every device receives its shard of the identity map's cotangent.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let along_x_and_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let caller_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x_and_y).unwrap();
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let input =
+                    ValueProjection::<ArrayType>::into_projected(inputs[0].clone()).map_err(ProgramError::from)?;
+                let output =
+                    shard_map(|x: XlaArrayTracer| x, input, logical_mesh.clone(), along_x.clone(), along_x.clone())
+                        .unwrap();
+                Ok(vec![output.into_value()])
+            },
+            vec![ArrayIrType::Array(caller_type.clone())],
+        )
+        .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let lowered = domain.lower_xla_program(&pullback, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+
+        // The serialized optimized HLO module names the opcode of every instruction (e.g., of its `parameter`), so it
+        // names no collective opcode.
+        let optimized = compiled.optimized_program().unwrap();
+        let names_opcode =
+            |opcode: &str| optimized.bytes.windows(opcode.len()).any(|window| window == opcode.as_bytes());
+        assert!(names_opcode("parameter"));
+        for opcode in ["all-gather", "all-reduce", "all-to-all", "collective-permute", "reduce-scatter"] {
+            assert!(!names_opcode(opcode), "the optimized program contains a `{opcode}`");
+        }
+
+        // TEMPORARY-ORACLE-BEGIN
+        {
+            let along_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder
+                .add_input(ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x.clone()).unwrap().into());
+            let resharded = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Reshard(ryft_core::ReshardOperation::new(along_y))),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let output = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Broadcast(ryft_core::BroadcastOperation::new(
+                        caller_type.clone(),
+                        vec![0],
+                    ))),
+                    Vec::new(),
+                    vec![resharded],
+                    None,
+                )
+                .unwrap()[0];
+            let old = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let lowered = domain.lower_xla_program(&old, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let optimized = compiled.optimized_program().unwrap();
+            let names = |opcode: &str| optimized.bytes.windows(opcode.len()).any(|window| window == opcode.as_bytes());
+            eprintln!("ORACLE old collective-permute: {}", names("collective-permute"));
+        }
+        // TEMPORARY-ORACLE-END
+        let cotangent_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x).unwrap();
+        let cotangent = XlaArray::from_host_buffer(
+            &domain,
+            cotangent_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![cotangent]).unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
+        let shards = outputs[0]
+            .addressable_shards()
+            .map(|shard| {
+                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                values_from_bytes::<f32>(bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shards, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]);
     }
 
     #[test]
@@ -15526,8 +15717,9 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        // Carry-only scan body `(index, carry) -> (carry + 1, carry + 1)`: the first output is the next carry and the second
-        // is the per-step stacked output, so scanning 4 steps from `0` yields the cumulative sums `[1, 2, 3, 4]`.
+        // Carry-only scan body `(index, carry) -> (carry + 1, carry + 1)`: the first output is the next carry and the
+        // second is the per-step stacked output, so scanning 4 steps from `0` yields the cumulative sums `[1, 2, 3,
+        // 4]`.
         let body = {
             let mut builder = XlaProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -15780,8 +15972,6 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_shard_map_over_sharded_inputs() {
-        use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -15811,21 +16001,14 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
         };
-        let body = FlatTracedShardMap::from_parts(
-            ShardMap::from_shardings(
-                logical_mesh,
-                vec![sharding.clone()],
-                vec![sharding.clone()],
-                vec!["x".to_string()],
-            ),
-            vec![global_type.clone()],
-            vec![local_type.clone()],
-            vec![global_type],
-            vec![local_type],
-            body_program,
-        );
-        let (operation, body_region) = ShardMapOperation::from_body(body);
+        let operation = ShardMapOperation::from_program(
+            &body_program,
+            vec![global_type.into()],
+            ShardMap::new(logical_mesh, vec![sharding.clone()], vec![sharding.clone()], vec!["x".to_string()]).unwrap(),
+        )
+        .unwrap();
         let operation = XlaOperation::ShardMap(Box::new(operation));
+        let body_region = body_program;
 
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
@@ -15902,12 +16085,12 @@ mod tests {
         assert_xla_session_array_ordered_effects(&client, false);
     }
 
-    /// Submits two prints through one session on one device of `client` and checks that they print in submission
-    /// order. With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token
-    /// (a not-yet-transferred host-to-device token buffer) and must stay pending until it is released. That fixture
-    /// only works on plugins that submit executables without waiting for unrecorded input definition events on the
-    /// host (the CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so
-    /// there the chain is proven through submission order and barrier completion alone.
+    /// Submits two prints through one session on one device of `client` and checks that they print in submission order.
+    /// With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token (a
+    /// not-yet-transferred host-to-device token buffer) and must stay pending until it is released. That fixture only
+    /// works on plugins that submit executables without waiting for unrecorded input definition events on the host (the
+    /// CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so there the
+    /// chain is proven through submission order and barrier completion alone.
     fn assert_xla_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
         use crate::experimental::debugging::with_captured_prints;
         use ryft_core::Print;
@@ -16028,8 +16211,11 @@ mod tests {
         corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
         corrupted.extend_from_slice(&metadata);
         corrupted.extend_from_slice(&serialized[metadata_end..]);
-        assert!(matches!(domain.deserialize_xla_program(&corrupted),
-            Err(XlaDomainError::InvalidPersistentExecutable { reason }) if reason == "effect signature does not match executable physical outputs"));
+        assert!(matches!(
+            domain.deserialize_xla_program(&corrupted),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "effect signature does not match executable physical outputs",
+        ));
         let mut builder = XlaProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
@@ -16106,7 +16292,14 @@ mod tests {
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
         let second =
             XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
-        let local_type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
+        let shard_map = ShardMap::new(
+            mesh.logical_mesh().clone(),
+            vec![r#type.sharding().unwrap().clone()],
+            Vec::new(),
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let local_type = shard_map.local_input_type(0, &r#type).unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(local_type.clone().into());
         builder
@@ -16122,20 +16315,7 @@ mod tests {
         let body = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        let body = crate::experimental::shard_map::FlatTracedShardMap::from_parts(
-            crate::experimental::shard_map::ShardMap::from_shardings(
-                mesh.logical_mesh().clone(),
-                vec![r#type.sharding().unwrap().clone()],
-                Vec::new(),
-                vec!["x".to_string()],
-            ),
-            vec![r#type.clone()],
-            vec![local_type],
-            Vec::new(),
-            Vec::new(),
-            body,
-        );
-        let (operation, body) = ShardMapOperation::from_body(body);
+        let operation = ShardMapOperation::from_program(&body, vec![r#type.clone().into()], shard_map).unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(r#type.into());
         let body = builder.import_program(body);
@@ -16598,7 +16778,8 @@ mod tests {
         assert!(matches!(
             scope.acknowledge(),
             Err(XlaDomainError::EffectScope { reason })
-                if reason == "effect failures are pending or unreported; call `effects_barrier()` and then `acknowledge_effect_errors()` again",
+                if reason == "effect failures are pending or unreported; call `effects_barrier()` and then \
+                              `acknowledge_effect_errors()` again",
         ));
         second.submission.completion.complete(Err(Arc::from("second effect failed")));
         assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { .. })));
@@ -16690,7 +16871,9 @@ mod tests {
         // preserves functional array semantics while supplying an initialized aliased writable result.
         let artifact = CudaKernelArtifact::new(
             CudaArtifactFormat::Ptx,
-            b".version 7.0\n.target sm_80\n.address_size 64\n.visible .entry increment(.param .u64 data) {\n.reg .b64 pointer;\n.reg .b32 value;\nld.param.u64 pointer, [data];\nld.global.u32 value, [pointer];\nadd.u32 value, value, 1;\nst.global.u32 [pointer], value;\nret;\n}\n"
+            b".version 7.0\n.target sm_80\n.address_size 64\n.visible .entry increment(.param .u64 data) {\n\
+              .reg .b64 pointer;\n.reg .b32 value;\nld.param.u64 pointer, [data];\nld.global.u32 value, [pointer];\n\
+              add.u32 value, value, 1;\nst.global.u32 [pointer], value;\nret;\n}\n"
                 .to_vec(),
             "increment",
             "compute_80",
@@ -16900,8 +17083,11 @@ mod tests {
         let session = XlaSession::new(&client);
         let signature = XlaExecutableSignature::new(&[], &[]).with_cuda_kernel_runtime(true);
         assert!(!signature.has_effects());
-        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "cuda artifact calls require a cuda platform"));
+        assert!(matches!(
+            session.domain().ensure_runtime_requirements(&signature, "cpu"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "cuda artifact calls require a cuda platform",
+        ));
         assert!(session.cuda_kernel_runtime.lock().unwrap().is_none());
     }
 
@@ -16912,11 +17098,17 @@ mod tests {
         let session = XlaSession::new(&client);
         let signature = XlaExecutableSignature::new(&[], &[]).with_rocm_kernel_runtime(true);
         assert!(!signature.has_effects());
-        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "rocm artifact calls require a rocm platform"));
+        assert!(matches!(
+            session.domain().ensure_runtime_requirements(&signature, "cpu"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "rocm artifact calls require a rocm platform",
+        ));
         #[cfg(not(feature = "rocm"))]
-        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "rocm"),
-            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "rocm artifact execution requires the `rocm` feature"));
+        assert!(matches!(
+            session.domain().ensure_runtime_requirements(&signature, "rocm"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "rocm artifact execution requires the `rocm` feature",
+        ));
         #[cfg(feature = "rocm")]
         assert!(session.rocm_kernel_runtime.lock().unwrap().is_none());
     }

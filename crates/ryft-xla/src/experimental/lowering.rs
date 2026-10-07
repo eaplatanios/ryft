@@ -29,14 +29,19 @@ use ryft_core::{
     Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME,
     RaggedDotMode, RaggedDotOperation, RandomAlgorithm, RealOperation, ReducePrecisionOperation, ReductionKind,
     RegionId, RegionRef, RemOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation,
-    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME,
-    ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, Sharding,
-    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
-    SortOrdering, SqrtOperation, SubOperation, TanOperation, TanhOperation, TransposeOperation, Type as RyftType,
-    TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME,
+    SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
+    ShardMap, ShardMapError, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation,
+    SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation, TanOperation, TanhOperation,
+    TracedShardMap, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
+    WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
+use ryft_mlir::dialects::shardy::{
+    DimensionShardingAttributeRef, ManualAxesAttributeRef, TensorShardingAttributeRef,
+    TensorShardingPerValueAttributeRef,
+};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -64,20 +69,13 @@ use crate::experimental::lowering::attention::{
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
-use crate::experimental::operations::SHARD_MAP_OPERATION_NAME;
-
-use super::shard_map::{ShardMap, ShardMapError};
-
 mod attention;
 mod composite;
 
-/// Error type for StableHLO/Shardy lowering.
+/// Error type for StableHLO/Shardy lowering. It is public because the general XLA tracing error
+/// ([`TraceError`](super::tracing::TraceError)) wraps it, and because [`to_mlir_module`] returns it.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum LoweringError {
-    /// Underlying shard-map error returned while building manual-computation attributes.
-    #[error("{0}")]
-    ShardMapError(#[from] ShardMapError),
-
+pub enum LoweringError {
     /// Underlying sharding error returned while building mesh or sharding attributes.
     #[error("{0}")]
     ShardingError(#[from] ShardingError),
@@ -117,11 +115,6 @@ pub(crate) enum LoweringError {
     /// Error returned when unresolved mutable state reaches ordinary XLA lowering before functionalization.
     #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
     UnresolvedState { construct: String },
-
-    /// Error returned when a shard-map body contains `OrderedIo`, whose order across devices cannot be provided by
-    /// independent per-device execution.
-    #[error("`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices")]
-    EffectfulShardMapBody,
 
     /// Error returned when lowering encounters a captured constant reference without a matching hidden argument.
     #[error("missing captured constant #{index} during XLA lowering")]
@@ -168,8 +161,10 @@ pub(crate) enum LoweringError {
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
-    /// Underlying tracing error returned while replaying a staged program through the generic
-    /// [`Program::interpret_with`] domain.
+    /// Underlying program error returned while replaying a staged program through the generic
+    /// [`Program::interpret_with`] domain, or raised directly by lowering for a program that it cannot lower (e.g., a
+    /// [`ShardMapError`] for a nested manual computation that Shardy cannot represent, which
+    /// [`ProgramError::downcast_custom`] recovers).
     #[error("{0}")]
     Tracing(#[from] ProgramError),
 }
@@ -644,11 +639,11 @@ where
 
 /// Returns the effect classes that have StableHLO token slots, in canonical token/result order.
 ///
-/// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the
-/// core [`EffectClass`] type — but the match is deliberately exhaustive so that adding a class forces an explicit
-/// token-slot decision in this backend instead of a silent omission. [`EffectClass::OrderedState`] has no slot: ordinary
-/// XLA lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn
-/// state into an ordinary token-threaded effect.
+/// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the core
+/// [`EffectClass`] type — but the match is deliberately exhaustive so that adding a class forces an explicit token-slot
+/// decision in this backend instead of a silent omission. [`EffectClass::OrderedState`] has no slot: ordinary XLA
+/// lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn state
+/// into an ordinary token-threaded effect.
 fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
     // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered-I/O slot,
     // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`.
@@ -4560,9 +4555,9 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Returns the XLA memory-kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
-/// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the lowering on purpose: core's
-/// [`Memory`] exposes no backend vocabulary (its `Display` rendering is diagnostics-only), mirroring how
-/// [`Sharding`] converts to MLIR through backend-owned conversions.
+/// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the
+/// lowering on purpose: core's [`Memory`] exposes no backend vocabulary (its `Display` rendering is diagnostics-only),
+/// mirroring how [`Sharding`] converts to MLIR through backend-owned conversions.
 fn memory_placement_kind(memory: Memory) -> &'static str {
     match memory {
         Memory::Device => "device",
@@ -5019,7 +5014,7 @@ fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
         "{axis}:{}:{}:{}",
         operation.edge_padding_low()[axis],
         operation.edge_padding_high()[axis],
-        operation.interior_padding()[axis]
+        operation.interior_padding()[axis],
     );
     let backend_config = context.dictionary_attribute(&[
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("pad")),
@@ -5312,8 +5307,8 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
 /// identity of the input data type (i.e., the lowest value for `argmax` and the highest one for `argmin`) paired with
 /// index zero, and its comparator (refer to [`build_index_reduction_body_region`]) is commutative and associative, so
 /// that the result does not depend on the order in which XLA combines elements. Narrow floating-point inputs compare in
-/// `f32`, into which they convert exactly (including their NaNs and signed zeros), and signed one-bit inputs and indices
-/// use a signed byte carrier, because StableHLO treats `i1` as a predicate.
+/// `f32`, into which they convert exactly (including their NaNs and signed zeros), and signed one-bit inputs and
+/// indices use a signed byte carrier, because StableHLO treats `i1` as a predicate.
 ///
 /// Bounded-dynamic inputs are supported as well: XLA's bounded-dynamic legalizer pads every input of a variadic
 /// `stablehlo.reduce` along a dynamic reduced axis with that input's own initial value, so padded positions hold the
@@ -7747,7 +7742,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
     pub(crate) fn lower_manual_computation<
-        'o,
         ProgramInput: Parameterized<XlaConstant>,
         ProgramOutput: Parameterized<XlaConstant>,
     >(
@@ -7773,23 +7767,32 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 }
 
-/// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module<
-    'o,
-    Input: Parameterized<ArrayType>,
-    Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
-    S: AsRef<str>,
->(
-    shard_map: &ShardMap,
-    program: &XlaProgram<ProgramInput, ProgramOutput>,
-    global_input_types: &Input,
-    local_input_types: &Input,
-    global_output_types: &Output,
-    _local_output_types: &Output,
+/// Lowers a [`TracedShardMap`] traced for [`XlaDomain`] (e.g., by [`ryft_core::trace_shard_map`]) to a textual
+/// StableHLO/Shardy MLIR module whose single function runs the traced body as one `sdy.manual_computation` over the
+/// boundary of the traced shard map. The function arguments and results carry the input and output shardings of the
+/// boundary as `sdy.sharding` attributes. The traced body is lowered as is, since tracing already simplified it.
+///
+/// # Parameters
+///
+///   - `traced_shard_map`: Traced shard map to lower.
+///   - `function_name`: Symbol name to use for the outer `func.func`.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] when the traced body contains
+/// undischarged references or state, and [`LoweringError::InvalidFunctionName`] for an invalid `function_name`. Nested
+/// manual computations that Shardy cannot represent are rejected with [`LoweringError::Tracing`] wrapping (as a
+/// [`ProgramError::Custom`] that [`ProgramError::downcast_custom`] recovers) a [`ShardMapError::AxisAlreadyManual`]
+/// when a nested shard map makes an axis manual that an enclosing manual computation already made manual, and a
+/// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when an input or output sharding of a nested shard map
+/// names such an axis. Other [`LoweringError`]s report failures to lower the traced body (e.g., for operations that
+/// the backend cannot lower or invalid tensor types).
+pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>, S: AsRef<str>>(
+    traced_shard_map: &TracedShardMap<XlaDomain<'static>, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError> {
+    let program = traced_shard_map.body();
+    let shard_map = traced_shard_map.operation().shard_map();
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
     if contains_unresolved_references(program) {
@@ -7798,10 +7801,27 @@ pub(crate) fn to_mlir_module<
     if contains_unresolved_state(program) {
         return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
     }
-    let function_name = normalize_function_name(function_name.as_ref())?;
-    let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
-    let local_input_types = local_input_types.parameters().cloned().collect::<Vec<_>>();
-    let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
+    lower_shard_map_module(
+        shard_map,
+        program,
+        traced_shard_map.global_input_types().parameters().cloned().collect(),
+        traced_shard_map.local_input_types().parameters().cloned().collect(),
+        traced_shard_map.global_output_types().parameters().cloned().collect(),
+        function_name.as_ref(),
+    )
+}
+
+/// Lowers the shard-map `program` over its flat boundary types to a textual StableHLO/Shardy MLIR module (refer to
+/// [`to_mlir_module`]).
+fn lower_shard_map_module(
+    shard_map: &ShardMap,
+    program: &FlatXlaProgram,
+    global_input_types: Vec<ArrayType>,
+    local_input_types: Vec<ArrayType>,
+    global_output_types: Vec<ArrayType>,
+    function_name: &str,
+) -> Result<String, LoweringError> {
+    let function_name = normalize_function_name(function_name)?;
 
     let context = MlirContext::new();
     let location = context.unknown_location();
@@ -7818,35 +7838,24 @@ pub(crate) fn to_mlir_module<
     let mesh_operation = shard_map.mesh().to_mlir(location)?;
     module.body()?.append_operation(mesh_operation)?;
 
+    // The global boundary types of a traced shard map carry no memory kind (refer to `ShardMap::global_input_type` and
+    // to the global output type derivation of `ShardMapOperation::from_program`), so the function signature carries
+    // only the boundary shardings.
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
-        .zip(&global_input_types)
-        .map(|((tensor_type, sharding), r#type)| {
+        .map(|(tensor_type, sharding)| {
             let sharding = sharding.to_mlir(location)?;
-            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
-            if r#type.memory() != Memory::Device {
-                attributes.insert(
-                    "mhlo.memory_kind".into(),
-                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
-                );
-            }
+            let attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
     let function_results = global_output_tensor_types
         .iter()
         .zip(shard_map.out_shardings().iter())
-        .zip(&global_output_types)
-        .map(|((tensor_type, sharding), r#type)| {
+        .map(|(tensor_type, sharding)| {
             let sharding = sharding.to_mlir(location)?;
-            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
-            if r#type.memory() != Memory::Device {
-                attributes.insert(
-                    "mhlo.memory_kind".into(),
-                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
-                );
-            }
+            let attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
             Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
@@ -7899,18 +7908,17 @@ pub(crate) fn to_mlir_module<
 
 /// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
 ///
-/// When `arg_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding`
-/// attribute is attached to each func argument or result, mirroring what the XLA SPMD partitioner
-/// expects to drive per-device boundary slicing (including uneven splits). When `None`, the func
-/// signature has no sharding attributes — the legacy behavior used by traced programs that don't
-/// participate in SPMD compilation.
+/// When `argument_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding` attribute is
+/// attached to each func argument or result, mirroring what the XLA SPMD partitioner expects to drive per-device
+/// boundary slicing (including uneven splits). When `None`, the func signature has no sharding attributes — the legacy
+/// behavior used by traced programs that don't participate in SPMD compilation.
 pub(crate) fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    arg_shardings: Option<&[Sharding]>,
+    argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
 ) -> Result<String, LoweringError>
 where
@@ -7926,7 +7934,7 @@ where
         global_input_types,
         global_output_types,
         function_name,
-        arg_shardings,
+        argument_shardings,
         result_shardings,
         None,
     )?
@@ -7940,7 +7948,7 @@ pub(crate) fn lower_mlir_module_for_program<'o, Input, Output, ProgramInput, Pro
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    arg_shardings: Option<&[Sharding]>,
+    argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
 ) -> Result<LoweredXlaModule, LoweringError>
@@ -7957,7 +7965,7 @@ where
         global_input_types,
         global_output_types,
         function_name,
-        arg_shardings,
+        argument_shardings,
         result_shardings,
         target_platform,
         &[],
@@ -7982,7 +7990,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Outp
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    arg_shardings: Option<&[Sharding]>,
+    argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
@@ -8001,7 +8009,7 @@ where
         global_input_types,
         global_output_types,
         function_name,
-        arg_shardings,
+        argument_shardings,
         result_shardings,
         target_platform,
         reference_states,
@@ -8017,7 +8025,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<'o, Input, Output, Program
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    arg_shardings: Option<&[Sharding]>,
+    argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
@@ -8051,7 +8059,7 @@ where
             effects.contains(EffectClass::OrderedAssertion),
             !effects.contains(EffectClass::OrderedIo),
         );
-    if let Some(shardings) = arg_shardings
+    if let Some(shardings) = argument_shardings
         && shardings.len() != logical_argument_types.len()
     {
         return Err(LoweringError::InvalidShardingCount {
@@ -8129,7 +8137,7 @@ where
                     ),
                 });
             }
-            match (arg_shardings, result_shardings) {
+            match (argument_shardings, result_shardings) {
                 (Some(argument_shardings), Some(result_shardings))
                     if argument_shardings[logical_input_index] != result_shardings[logical_output_index] =>
                 {
@@ -8169,7 +8177,7 @@ where
     // Emit `sdy.mesh` declarations for any sharding referenced either by inner ops or by the
     // optional signature shardings, so the func attributes can refer to `@mesh`.
     let mut signature_mesh = None;
-    for sharding in arg_shardings.into_iter().flatten().chain(result_shardings.into_iter().flatten()) {
+    for sharding in argument_shardings.into_iter().flatten().chain(result_shardings.into_iter().flatten()) {
         signature_mesh = Some(match signature_mesh.take() {
             Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
             None => sharding.mesh().clone(),
@@ -8241,7 +8249,7 @@ where
     if signature.has_ordered_io() {
         physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
     }
-    let mut arg_sharding_attributes = match arg_shardings {
+    let mut argument_sharding_attributes = match argument_shardings {
         Some(shardings) => {
             let physical_shardings = signature.physical_input_shardings(shardings);
             Some(
@@ -8273,7 +8281,7 @@ where
             &[],
             shardy::ReductionOperation::Sum,
         )?;
-        if let Some(shardings) = &mut arg_sharding_attributes {
+        if let Some(shardings) = &mut argument_sharding_attributes {
             shardings.push(token_sharding);
         }
         if let Some(shardings) = &mut result_sharding_attributes {
@@ -8287,7 +8295,7 @@ where
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(sharding) = arg_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
+            if let Some(sharding) = argument_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_argument_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
@@ -10922,8 +10930,10 @@ where
     )
 }
 
-/// Lowers one `sdy.manual_computation` operation, threading per-device ordered tokens across its boundary.
-/// Assertions remain local to an executable; ordered I/O must explicitly permit per-device ordering.
+/// Lowers one `sdy.manual_computation` operation, threading per-device effect tokens across its boundary. Assertions
+/// remain local to an executable, and the only ordered I/O that reaches this function is per-device
+/// (`DeviceOrderedIo`), because core shard-map boundary validation rejects bodies with the `OrderedIo` effect (refer to
+/// [`ShardMapError::OrderedIoNotSupported`]).
 fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
@@ -10940,12 +10950,44 @@ where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
 {
-    let effects = program.effects();
-    // `OrderedIo` promises one order across devices, which independent per-device execution cannot provide; only
-    // `DeviceOrderedIo` (and unordered I/O) may appear inside a manual computation.
-    if effects.classes().contains(EffectClass::OrderedIo) {
-        return Err(LoweringError::EffectfulShardMapBody);
+    // Shardy forbids a nested manual computation from listing an axis that an enclosing one already made manual. The
+    // closure entry points never construct such a nesting, and boundary validation rejects a nested map whose inputs
+    // vary along such an axis, but a checked or transformed program can still nest a map over invariant inputs this
+    // way, so it is rejected here instead of emitting an invalid manual computation.
+    if let Some(axis_name) =
+        shard_map.manual_axes().iter().find(|axis| collective_state.bound_manual_axes.contains(*axis))
+    {
+        return Err(ProgramError::from(ShardMapError::AxisAlreadyManual { axis_name: axis_name.clone() }).into());
     }
+    // For the same reason, an input or output sharding must not name such an axis (the closure entry points reject
+    // these specifications too), so it is rejected here rather than silently dropped from the Shardy shardings.
+    for (value_kind, shardings) in [("input", shard_map.in_shardings()), ("output", shard_map.out_shardings())] {
+        for (value_index, sharding) in shardings.iter().enumerate() {
+            let axis_name = sharding
+                .dimensions()
+                .iter()
+                .flat_map(|dimension| match dimension {
+                    ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
+                    ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
+                })
+                .chain(sharding.unreduced_axes())
+                .chain(sharding.reduced_axes())
+                .find(|axis_name| collective_state.bound_manual_axes.contains(*axis_name));
+            if let Some(axis_name) = axis_name {
+                let error = ShardMapError::SpecificationNamesEnclosingManualAxis {
+                    value_kind,
+                    value_index,
+                    axis_name: axis_name.clone(),
+                };
+                return Err(ProgramError::from(error).into());
+            }
+        }
+    }
+
+    // `OrderedIo` bodies never reach this point: shard-map boundary validation rejects them when a body is traced or
+    // attached (refer to `ShardMapError::OrderedIoNotSupported`), so only `DeviceOrderedIo` and unordered effects are
+    // threaded through the manual computation.
+    let effects = program.effects();
     let threaded_effects = token_threaded_effects(effects.classes()).collect::<Vec<_>>();
     let mut local_input_tensor_types = local_input_types
         .iter()
@@ -10957,9 +10999,9 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
     let mut input_shardings =
-        shard_map.to_shardy_in_shardings(&collective_state.bound_manual_axes, context)?.shardings();
+        to_shardy_in_shardings(shard_map, &collective_state.bound_manual_axes, context)?.shardings();
     let mut output_shardings =
-        shard_map.to_shardy_out_shardings(&collective_state.bound_manual_axes, context)?.shardings();
+        to_shardy_out_shardings(shard_map, &collective_state.bound_manual_axes, context)?.shardings();
     if !threaded_effects.is_empty() {
         let token_type = context.stable_hlo_token_type()?.as_ref();
         // Tokens have rank zero and no replicated/unreduced axes. Each device carries its own token, without
@@ -11013,7 +11055,7 @@ where
         global_output_tensor_types.as_slice(),
         context.shardy_tensor_sharding_per_value(&input_shardings)?,
         context.shardy_tensor_sharding_per_value(&output_shardings)?,
-        shard_map.to_shardy_manual_axes(context)?,
+        to_shardy_manual_axes(shard_map, context)?,
         body_region,
         location,
     )?)?;
@@ -11024,6 +11066,133 @@ where
         .results()
         .take(global_output_types.len())
         .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
+        .collect()
+}
+
+/// Builds the typed Shardy `in_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
+/// regions.
+fn to_shardy_in_shardings<'c, 't>(
+    shard_map: &ShardMap,
+    enclosing_manual_axes: &[String],
+    context: &'c MlirContext<'t>,
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+    shardy_tensor_sharding_per_value(shard_map.in_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
+}
+
+/// Builds the typed Shardy `out_shardings` attribute of `shard_map`, excluding axes already bound by enclosing manual
+/// regions.
+fn to_shardy_out_shardings<'c, 't>(
+    shard_map: &ShardMap,
+    enclosing_manual_axes: &[String],
+    context: &'c MlirContext<'t>,
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+    shardy_tensor_sharding_per_value(shard_map.out_shardings(), shard_map.manual_axes(), enclosing_manual_axes, context)
+}
+
+/// Builds the typed Shardy `manual_axes` attribute that `shard_map` attaches to `sdy.manual_computation`.
+fn to_shardy_manual_axes<'c, 't>(
+    shard_map: &ShardMap,
+    context: &'c MlirContext<'t>,
+) -> Result<ManualAxesAttributeRef<'c, 't>, ryft_mlir::Error> {
+    context.shardy_manual_axes(shard_map.manual_axes())
+}
+
+/// Builds the typed Shardy per-value tensor sharding attribute of a `sdy.manual_computation` boundary, with one tensor
+/// sharding per entry of `shardings` (refer to [`manual_computation_tensor_sharding`]).
+fn shardy_tensor_sharding_per_value<'c, 't>(
+    shardings: &[Sharding],
+    manual_axes: &[String],
+    enclosing_manual_axes: &[String],
+    context: &'c MlirContext<'t>,
+) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
+    let shardings = shardings
+        .iter()
+        .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, enclosing_manual_axes, context))
+        .collect::<Result<Vec<_>, _>>()?;
+    context.shardy_tensor_sharding_per_value(shardings.as_slice())
+}
+
+/// Builds the typed Shardy tensor sharding of one `sdy.manual_computation` boundary value placed by `sharding`. The
+/// axes of enclosing manual regions are omitted from the replicated axes, because they are already bound outside this
+/// manual computation, and the dimension shardings are built by [`manual_computation_dimension_shardings`]. `sharding`
+/// must not name such an axis in its dimension shardings or reduction state, which [`lower_manual_computation`] rejects
+/// with [`ShardMapError::SpecificationNamesEnclosingManualAxis`] before building these attributes.
+fn manual_computation_tensor_sharding<'c, 't>(
+    sharding: &Sharding,
+    manual_axes: &[String],
+    enclosing_manual_axes: &[String],
+    context: &'c MlirContext<'t>,
+) -> Result<TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
+    let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
+    let dimension_shardings =
+        manual_computation_dimension_shardings(sharding, manual_axes, enclosing_manual_axes, context)?;
+    let replicated_axis_names = sharding.replicated_axes();
+    let replicated_axes = replicated_axis_names
+        .iter()
+        .filter(|axis_name| !enclosing_manual_axes.iter().any(|axis| axis.as_str() == **axis_name))
+        .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unreduced_axes = sharding
+        .unreduced_axes()
+        .iter()
+        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+        .collect::<Result<Vec<_>, _>>()?;
+    context.shardy_tensor_sharding(
+        mesh_symbol_ref,
+        dimension_shardings.as_slice(),
+        replicated_axes.as_slice(),
+        unreduced_axes.as_slice(),
+        shardy::ReductionOperation::Sum,
+    )
+}
+
+/// Builds the typed Shardy dimension shardings of one `sdy.manual_computation` boundary value placed by `sharding`. A
+/// free axis is a mesh axis that is neither an active manual axis nor bound by an enclosing manual region. A dimension
+/// is open (i.e., the compiler may further shard it along free axes) when it is unconstrained, when it is sharded over
+/// a free axis, or when `sharding` leaves some free axis unused, and it is closed otherwise. `sharding` must not shard
+/// a dimension along an axis of an enclosing manual region (refer to [`manual_computation_tensor_sharding`]).
+fn manual_computation_dimension_shardings<'c, 't>(
+    sharding: &Sharding,
+    manual_axes: &[String],
+    enclosing_manual_axes: &[String],
+    context: &'c MlirContext<'t>,
+) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, ryft_mlir::Error> {
+    let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
+    let free_axis_names = sharding
+        .mesh()
+        .axes()
+        .iter()
+        .filter_map(|axis| {
+            (!manual_axis_names.contains(axis.name()) && !enclosing_manual_axes.iter().any(|name| name == axis.name()))
+                .then_some(axis.name())
+        })
+        .collect::<HashSet<_>>();
+    let mut used_axes = HashSet::new();
+    for partition_dimension in sharding.dimensions() {
+        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+            used_axes.extend(axis_names.iter().map(String::as_str));
+        }
+    }
+    used_axes.extend(sharding.unreduced_axes().iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_axes().iter().map(String::as_str));
+    let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
+
+    sharding
+        .dimensions()
+        .iter()
+        .map(|partition_dimension| match partition_dimension {
+            ShardingDimension::Replicated => context.shardy_dimension_sharding([], !has_unused_free_axes, None),
+            ShardingDimension::Sharded(axis_names) => {
+                let axes = axis_names
+                    .iter()
+                    .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let contains_free_axis =
+                    axis_names.iter().any(|axis_name| free_axis_names.contains(axis_name.as_str()));
+                context.shardy_dimension_sharding(axes, !(contains_free_axis || has_unused_free_axes), None)
+            }
+            ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
+        })
         .collect()
 }
 
@@ -11789,7 +11958,8 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         .map(|&device| {
             i64::try_from(device).map_err(|_| {
                 ProgramError::MalformedProgram(format!(
-                    "`parallel_ragged_all_to_all` replica id {device} cannot be represented as an i64 backend attribute",
+                    "`parallel_ragged_all_to_all` replica id {device} cannot be represented as an i64 backend \
+                     attribute",
                 ))
             })
         })
@@ -11857,7 +12027,8 @@ pub(super) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if operation.is_physical() {
         return Err(ProgramError::MalformedProgram(
-            "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand representation"
+            "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
+             representation"
                 .to_string(),
         )
         .into());
@@ -11973,8 +12144,8 @@ pub(super) fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
             for (position, &axis_index) in group.iter().enumerate() {
                 positions[axis_index] = i64::try_from(position).map_err(|_| {
                     ProgramError::MalformedProgram(format!(
-                        "`parallel_ragged_all_to_all` group position {position} cannot be represented as an i64 backend \
-                         attribute",
+                        "`parallel_ragged_all_to_all` group position {position} cannot be represented as an i64 \
+                         backend attribute",
                     ))
                 })?;
             }
@@ -12897,7 +13068,7 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         && (kind != ReductionKind::LogSumExp
             || matches!(
                 element_type,
-                DataType::BF16 | DataType::F16 | DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E5M2
+                DataType::BF16 | DataType::F16 | DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E5M2,
             ))
     {
         // Keep both accumulation and mean normalization in `f32`; rounding the sum or count first can overflow.
@@ -13088,9 +13259,9 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(result.result(0).expect("stablehlo.add should return one result").as_ref())
 }
 
-/// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is the
-/// identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change its
-/// prefix.
+/// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is
+/// the identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change
+/// its prefix.
 fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
     kind: CumulativeKind,
     element_type: DataType,
@@ -13704,7 +13875,8 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
             return Err(LoweringError::UnsupportedOp {
                 op: format!(
-                    "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently sized dynamic windows are unsupported by XLA",
+                    "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently \
+                     sized dynamic windows are unsupported by XLA",
                 ),
             });
         }
@@ -13941,8 +14113,8 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
     Ok(result.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
-/// Builds a dense-elements attribute holding the identity element of the given reduction kind at
-/// the given element type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
+/// Builds a dense-elements attribute holding the identity element of the given reduction kind at the given element
+/// type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
 /// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
 /// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
 /// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedDataType`].
@@ -14284,31 +14456,29 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
-    use crate::experimental::domains::{XlaDomain, XlaSession};
-    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{CompiledXlaFunction, FromPjrt, ToPjrt, XlaArray, compile};
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
     use ryft_core::{
         AndOperation, Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation,
-        Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BroadcastOperation,
-        CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos,
-        CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension, DimensionAddOperation,
-        DimensionBounds, DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType,
-        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicReshapeOperation,
-        DynamicSlice, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill,
-        GatherDimensionNumbers, IotaOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation,
-        OneOperation, OrOperation, PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder,
-        Provenance, ProvenanceScope, RaggedDot, RandomAlgorithm, ReduceOperation, ReshapeOperation,
+        Atan2Operation, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchedProgram, BatchingContext,
+        BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        Context, Cos, CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
+        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
+        ParallelRaggedAllToAll, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance,
+        ProvenanceScope, RaggedDot, RandomAlgorithm, Reduce, ReduceOperation, Reshape, ReshapeOperation,
         ReverseModeDifferentiate, RngBitGeneratorOperation, ScanOperation, ScatterDimensionNumbers, SelectOperation,
         Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
-        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
-        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, ValueProjection,
+        WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, batch, i1, i2, i4,
+        shard_map_with_options, trace_shard_map, trace_shard_map_with_options, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -14316,8 +14486,14 @@ mod tests {
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
         load_cpu_plugin,
     };
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
+    use crate::experimental::domains::{XlaDomain, XlaSession};
+    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
+    use crate::experimental::tracing::XlaArrayTracer;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::{CompiledXlaFunction, FromPjrt, ToPjrt, XlaArray, compile};
 
     use super::*;
 
@@ -14346,6 +14522,79 @@ mod tests {
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
+    }
+
+    /// Global array type of `data_type` with the static `global_shape`, placed by `sharding`.
+    pub(crate) fn static_sharded_array_type(
+        data_type: DataType,
+        global_shape: &[usize],
+        sharding: Sharding,
+    ) -> ArrayType {
+        ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(Dimension::Static).collect()))
+            .with_sharding(sharding)
+            .unwrap()
+    }
+
+    /// Sharding over `mesh` with the provided dimension shardings and unreduced axes.
+    pub(crate) fn test_sharding(
+        mesh: &LogicalMesh,
+        dimensions: Vec<ShardingDimension>,
+        unreduced_axes: Vec<String>,
+    ) -> Sharding {
+        Sharding::new(mesh.clone(), dimensions).unwrap().with_unreduced_axes(unreduced_axes).unwrap()
+    }
+
+    /// Compilation options for an SPMD executable with `partition_count` partitions, partitioned by Shardy.
+    pub(crate) fn test_spmd_compilation_options(partition_count: usize) -> ryft_pjrt::protos::CompilationOptions {
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+
+        CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: partition_count as i64,
+                use_spmd_partitioning: true,
+                use_shardy_partitioner: true,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        }
+    }
+
+    /// Four-device mesh with the manual axes `x` and `y`.
+    fn test_logical_mesh_2x2() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// Eight-device mesh with a manual `data` axis and an auto `model` axis.
+    fn test_logical_mesh_data_model() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("model", 4, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// Eight-device mesh with a manual `data` axis and an explicit `model` axis.
+    fn test_logical_mesh_data_model_explicit() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("model", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap()
     }
 
     /// Copies the exact raw storage bytes from the MLIR dense attribute built for `literal`.
@@ -14505,13 +14754,6 @@ mod tests {
         program.into_unprojected::<XlaConstant, XlaOperation>().unwrap()
     }
 
-    fn lower_traced_module(
-        traced: &TracedShardMap<ArrayType, ArrayType>,
-        function_name: &str,
-    ) -> Result<String, super::super::shard_map::ShardMapTraceError> {
-        traced.to_mlir_module(function_name)
-    }
-
     fn xla_elementwise_normalization_program() -> PlainXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
@@ -14660,7 +14902,7 @@ mod tests {
                 return %0 : tensor<?xi32>
               }
             }
-        "#}
+        "#},
         );
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
@@ -14679,7 +14921,7 @@ mod tests {
             to_mlir_module_for_plain_program(&program, "main"),
             Err(LoweringError::UnsupportedOp {
                 op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
-            })
+            }),
         );
     }
 
@@ -14711,7 +14953,7 @@ mod tests {
             return %2 : tensor<?xf32, #stablehlo.bounds<5>>
           }
         }
-        "#}
+        "#},
         );
     }
 
@@ -15085,7 +15327,7 @@ mod tests {
                 to_mlir_module_for_plain_program(&program, "main"),
                 Err(LoweringError::UnsupportedOp {
                     op: format!("dynamic constructor with {kind} output layout `{layout}`"),
-                })
+                }),
             );
         }
     }
@@ -15272,16 +15514,16 @@ mod tests {
                 return %0 : tensor<3xf64>
               }
             }
-        "#}
+        "#},
         );
         assert_eq!(
             execute_mixed_program(
                 &execution_client(),
                 &unproject_plain_program(program),
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
-                &[]
+                &[],
             ),
-            Ok(vec![MixedValue::Array(vec![3.0, 2.0, 1.0], vec![3])])
+            Ok(vec![MixedValue::Array(vec![3.0, 2.0, 1.0], vec![3])]),
         );
     }
 
@@ -15303,11 +15545,11 @@ mod tests {
         let client = execution_client();
         assert_eq!(
             execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[2]),
-            Ok(vec![MixedValue::Array(vec![2.0, 1.0], vec![2]), MixedValue::Dimension(2)])
+            Ok(vec![MixedValue::Array(vec![2.0, 1.0], vec![2]), MixedValue::Dimension(2)]),
         );
         assert_eq!(
             execute_mixed_program(&client, &program, &[MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0], vec![4])], &[0]),
-            Ok(vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)])
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)]),
         );
     }
 
@@ -15580,7 +15822,7 @@ mod tests {
                     if !static_output {
                         assert_eq!(
                             outputs[1].copy_to_host(None).unwrap().r#await().unwrap(),
-                            values_to_bytes(&[output_size])
+                            values_to_bytes(&[output_size]),
                         );
                     }
                 }
@@ -15617,11 +15859,14 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-        assert_eq!(to_mlir_module_for_program(
-            &program, &[], &vec![input_type], &vec![output_type], "main", None, None,
-        ), Err(LoweringError::UnsupportedOp {
-            op: "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must preserve the physical element count".to_string(),
-        }));
+        assert_eq!(
+            to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
+            Err(LoweringError::UnsupportedOp {
+                op: "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must preserve the \
+                     physical element count"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -16573,7 +16818,7 @@ mod tests {
                             return %result : {storage_type}
                         "#},
                             element = element,
-                            storage_type = storage_type
+                            storage_type = storage_type,
                         )
                     } else {
                         let result_type = format!("tensor<?x{element}, #stablehlo.bounds<{capacity}>>");
@@ -16589,7 +16834,7 @@ mod tests {
                             element = element,
                             result_type = result_type,
                             capacity = capacity,
-                            storage_type = storage_type
+                            storage_type = storage_type,
                         )
                     };
                     let prefix = module
@@ -16607,7 +16852,7 @@ mod tests {
                         prefix = prefix,
                         element = element,
                         storage_type = storage_type,
-                        body = body
+                        body = body,
                     );
                     let executable = client
                         .compile(
@@ -16888,14 +17133,12 @@ mod tests {
     fn test_broadcast_rejects_bound_manual_output_placement() {
         use ryft_core::Broadcast;
 
-        use crate::experimental::shard_map::ShardMapTraceError;
-
         let mesh = test_manual_mesh("x", 2);
         let boundary = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let local_output = test_vector_type(2)
             .with_sharding(boundary.clone().with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             |input| input.broadcast(local_output.clone(), &[0]).unwrap(),
             test_vector_type(4),
             mesh,
@@ -16904,8 +17147,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            lower_traced_module(&traced, "main"),
-            Err(ShardMapTraceError::LoweringFailure { message })
+            to_mlir_module(&traced, "main"),
+            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
                 if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
         ));
     }
@@ -17028,10 +17271,8 @@ mod tests {
 
     #[test]
     fn test_axis_index_rejects_missing_checked_mesh_metadata() {
-        use crate::experimental::shard_map::ShardMapTraceError;
-
         let mesh = test_manual_mesh("x", 2);
-        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             |input| input.domain().bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[]).unwrap().remove(0),
             test_vector_type(4),
             mesh.clone(),
@@ -17040,9 +17281,9 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            lower_traced_module(&traced, "main"),
-            Err(ShardMapTraceError::LoweringFailure { message })
-                if message == "encountered malformed program: `axis_index` requires mesh metadata inside a manual region",
+            to_mlir_module(&traced, "main"),
+            Err(LoweringError::Tracing(ProgramError::MalformedProgram(message)))
+                if message == "`axis_index` requires mesh metadata inside a manual region",
         ));
     }
 
@@ -17937,24 +18178,20 @@ mod tests {
         body_program: FlatXlaProgram,
         device_count: usize,
     ) -> Result<String, LoweringError> {
-        use crate::experimental::operations::ShardMapOperation;
-        use crate::experimental::shard_map::FlatTracedShardMap;
+        use ryft_core::ShardMapOperation;
 
         let vector_type = test_vector_type(4);
         let mesh = test_manual_mesh("x", device_count);
         let sharding = Sharding::replicated(mesh.clone(), 1);
-        let body = FlatTracedShardMap::from_parts(
-            ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]),
-            vec![vector_type.clone()],
-            vec![vector_type.clone()],
-            vec![vector_type.clone()],
-            vec![vector_type.clone()],
-            body_program,
-        );
+        let operation = ShardMapOperation::from_program(
+            &body_program,
+            vec![vector_type.clone().into()],
+            ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]).unwrap(),
+        )
+        .unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(vector_type.clone().into());
-        let (operation, body) = ShardMapOperation::from_body(body);
-        let body = builder.import_program(body);
+        let body = builder.import_program(body_program);
         let output =
             builder.add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![input], None)?[0];
         let program =
@@ -18218,29 +18455,6 @@ mod tests {
             let second = lines.iter().position(|line| line == &format!("second: {device}.0")).unwrap();
             assert!(first < second);
         }
-    }
-
-    #[test]
-    fn test_effectful_shard_map_body_is_rejected() {
-        use ryft_core::PrintOperation;
-
-        // A default print declares `OrderedIo`, whose order across devices cannot be provided by independent
-        // per-device execution, so it is rejected inside manual computations.
-        let vector_type = test_vector_type(4);
-        let effectful_body_program = {
-            let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(vector_type.clone().into());
-            let output = builder
-                .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        assert_eq!(
-            lower_replicated_shard_map_body(effectful_body_program, 1).unwrap_err().to_string(),
-            "`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices",
-        );
     }
 
     #[test]
@@ -18567,7 +18781,7 @@ mod tests {
             lower(
                 operation
                     .with_differentiated(true)
-                    .with_optimization_barrier(RematerializationOptimizationBarrier::None)
+                    .with_optimization_barrier(RematerializationOptimizationBarrier::None),
             ),
             unbarriered,
         );
@@ -19051,7 +19265,7 @@ mod tests {
     fn test_to_mlir_module_renders_a_full_add_module() {
         let global_input_type = test_vector_type(8);
         let mesh = test_manual_mesh("x", 4);
-        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             |x| x.clone() + x,
             global_input_type,
             mesh.clone(),
@@ -19061,7 +19275,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            lower_traced_module(&traced, "main").unwrap(),
+            to_mlir_module(&traced, "main").unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
@@ -19073,7 +19287,7 @@ mod tests {
                     return %0 : tensor<8xf32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -19081,7 +19295,7 @@ mod tests {
     fn test_to_mlir_module_renders_provenance_locations() {
         let global_input_type = test_vector_type(8);
         let mesh = test_manual_mesh("x", 4);
-        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             |x| {
                 let context = x.value().context().clone();
                 // One instruction staged under nested scopes, one under a fused origin, and one with unknown
@@ -19108,7 +19322,7 @@ mod tests {
         // module/function scaffolding keeps the base location. Locations render because provenance-carrying modules
         // serialize with debug information enabled (and the non-pretty, parsable form).
         assert_eq!(
-            lower_traced_module(&traced, "main").unwrap(),
+            to_mlir_module(&traced, "main").unwrap(),
             indoc! {r#"
                 #loc = loc(unknown)
                 module {
@@ -19128,7 +19342,7 @@ mod tests {
                 #loc3 = loc("b")
                 #loc4 = loc("outer"(#loc1))
                 #loc5 = loc(fused[#loc2, #loc3])
-            "#}
+            "#},
         );
     }
 
@@ -19136,7 +19350,7 @@ mod tests {
     fn test_to_mlir_module_renders_constants_and_supported_ops() {
         let global_input_type = test_matrix_type(4, 4);
         let mesh = test_manual_mesh("x", 2);
-        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
             |x| {
                 let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul()).unwrap();
                 let waveform = (-product).cos().unwrap().sin().unwrap();
@@ -19151,7 +19365,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            lower_traced_module(&traced, "kernel").unwrap(),
+            to_mlir_module(&traced, "kernel").unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -19175,8 +19389,1254 @@ mod tests {
                     return %0 : tensor<8x4xf32>
                   }
                 }
-            "#}
+            "#},
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_reshape_singleton_axis_sharding_propagation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let output_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x: XlaArrayTracer| {
+                x.reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(1)]))
+                    .unwrap()
+            },
+            global_input_type,
+            mesh.clone(),
+            input_sharding.clone(),
+            output_sharding.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{}, {"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.reshape %arg1 : (tensor<2xf32>) -> tensor<1x2x1xf32>
+                      sdy.return %1 : tensor<1x2x1xf32>
+                    } : (tensor<8xf32>) -> tensor<1x8x1xf32>
+                    return %0 : tensor<1x8x1xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_reshape_replicated_merge_sharding_propagation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let global_input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(8), Dimension::Static(2), Dimension::Static(3)]),
+        );
+        let input_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let output_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x: XlaArrayTracer| x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(6)])).unwrap(),
+            global_input_type,
+            mesh.clone(),
+            input_sharding.clone(),
+            output_sharding.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8x2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}, {}]>}) -> (tensor<8x6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x2x3xf32>) {
+                      %1 = stablehlo.reshape %arg1 : (tensor<2x2x3xf32>) -> tensor<2x6xf32>
+                      sdy.return %1 : tensor<2x6xf32>
+                    } : (tensor<8x2x3xf32>) -> tensor<8x6xf32>
+                    return %0 : tensor<8x6xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_reshape_replicated_split_sharding_propagation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let global_input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]));
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        let output_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+        )
+        .unwrap();
+
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x: XlaArrayTracer| {
+                x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]))
+                    .unwrap()
+            },
+            global_input_type,
+            mesh.clone(),
+            input_sharding.clone(),
+            output_sharding.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8x6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x2x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}, {}]>] manual_axes={"x"} (%arg1: tensor<2x6xf32>) {
+                      %1 = stablehlo.reshape %arg1 : (tensor<2x6xf32>) -> tensor<2x2x3xf32>
+                      sdy.return %1 : tensor<2x2x3xf32>
+                    } : (tensor<8x6xf32>) -> tensor<8x2x3xf32>
+                    return %0 : tensor<8x2x3xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_auto_axes_as_open_dimension_shardings() {
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)]));
+        let mesh = test_logical_mesh_data_model();
+        let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x| x.clone() + x,
+            global_input_type.clone(),
+            mesh.clone(),
+            input_sharding.clone(),
+            input_sharding,
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["data"=2, "model"=4]>
+                  func.func @main(%arg0: tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) -> (tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"data", ?}]>] out_shardings=[<@mesh, [{"data", ?}]>] manual_axes={"data"} (%arg1: tensor<8xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<8xf32>
+                      sdy.return %1 : tensor<8xf32>
+                    } : (tensor<16xf32>) -> tensor<16xf32>
+                    return %0 : tensor<16xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_nested_shard_maps() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let inner_mesh = mesh.clone();
+        let outer_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let inner_sharding = test_sharding(&inner_mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
+            {
+                let inner_mesh = inner_mesh.clone();
+                let inner_sharding = inner_sharding.clone();
+                move |x: XlaArrayTracer| {
+                    let nested: XlaArrayTracer = shard_map_with_options(
+                        |y: XlaArrayTracer| y.clone() + y,
+                        x.clone(),
+                        inner_mesh.clone(),
+                        inner_sharding.clone(),
+                        inner_sharding.clone(),
+                        vec!["y".to_string()],
+                    )
+                    .expect("nested shard_map should trace");
+                    nested + x
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+            mesh,
+            outer_sharding.clone(),
+            outer_sharding,
+            vec!["x".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}], replicated={"y"}>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}], replicated={"y"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x", ?}], replicated={"y"}>] out_shardings=[<@mesh, [{"x", ?}], replicated={"y"}>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %1 = sdy.manual_computation(%arg1) in_shardings=[<@mesh, [{"y"}]>] out_shardings=[<@mesh, [{"y"}]>] manual_axes={"y"} (%arg2: tensor<2xf32>) {
+                        %3 = stablehlo.add %arg2, %arg2 : tensor<2xf32>
+                        sdy.return %3 : tensor<2xf32>
+                      } : (tensor<4xf32>) -> tensor<4xf32>
+                      %2 = stablehlo.add %1, %arg1 : tensor<4xf32>
+                      sdy.return %2 : tensor<4xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_rejects_nested_manual_computations_over_already_manual_axes() {
+        // Descriptor-only tracing has no enclosing context, so it can trace a nested body that makes the axis `x` of
+        // the enclosing manual region manual again. The nested input is invariant along `x`, so boundary validation
+        // cannot detect the nesting, and lowering rejects the nested manual computation instead of emitting an invalid
+        // module.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x: XlaArrayTracer| {
+                let inner: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+                    |y: XlaArrayTracer| y.clone() + y,
+                    ArrayType::new_static(DataType::F32, [4]),
+                    mesh.clone(),
+                    replicated.clone(),
+                    replicated.clone(),
+                )
+                .unwrap();
+                let output = x
+                    .value()
+                    .context()
+                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])
+                    .unwrap()
+                    .remove(0);
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            ArrayType::new_static(DataType::F32, [4]),
+            mesh.clone(),
+            replicated.clone(),
+            replicated.clone(),
+        )
+        .unwrap();
+        let expected = ShardMapError::AxisAlreadyManual { axis_name: "x".to_string() };
+        assert!(matches!(
+            to_mlir_module(&traced, "main"),
+            Err(LoweringError::Tracing(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+    }
+
+    #[test]
+    fn test_to_mlir_module_rejects_specifications_naming_already_manual_axes() {
+        // Descriptor-only tracing has no enclosing context, so it can trace a nested body over `y` whose input and
+        // output shardings shard along the axis `x` of the enclosing manual region. Shardy cannot represent those
+        // shardings inside that region, so lowering rejects them instead of silently dropping `x` from them.
+        let mesh = test_logical_mesh_2x2();
+        let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
+        let sharded = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
+            |x: XlaArrayTracer| {
+                let inner: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_options(
+                    |y: XlaArrayTracer| y.clone() + y,
+                    ArrayType::new_static(DataType::F32, [4]),
+                    mesh.clone(),
+                    sharded.clone(),
+                    sharded.clone(),
+                    vec!["y".to_string()],
+                )
+                .unwrap();
+                let output = x
+                    .value()
+                    .context()
+                    .bind(inner.operation().clone(), vec![inner.body().clone()], &[x.value().clone()])
+                    .unwrap()
+                    .remove(0);
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            ArrayType::new_static(DataType::F32, [4]),
+            mesh.clone(),
+            replicated.clone(),
+            replicated.clone(),
+            vec!["x".to_string()],
+        )
+        .unwrap();
+        let expected = ShardMapError::SpecificationNamesEnclosingManualAxis {
+            value_kind: "input",
+            value_index: 0,
+            axis_name: "x".to_string(),
+        };
+        assert!(matches!(
+            to_mlir_module(&traced, "main"),
+            Err(LoweringError::Tracing(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
+        ));
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_parallel_ragged_all_to_all() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                inputs[0]
+                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [6]),
+                ArrayType::new_static(DataType::F32, [8]),
+                ArrayType::new_static(DataType::I32, [4]),
+                ArrayType::new_static(DataType::I32, [4]),
+                ArrayType::new_static(DataType::I32, [4]),
+                ArrayType::new_static(DataType::I32, [4]),
+            ],
+            mesh.clone(),
+            vec![sharding.clone(); 6],
+            sharding,
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<6xf32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg1: tensor<8xf32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg2: tensor<4xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg3: tensor<4xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg4: tensor<4xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}, %arg5: tensor<4xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                  (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) \
+                    in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, \
+                    <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>] \
+                    out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} \
+                    (%arg6: tensor<3xf32>, %arg7: tensor<4xf32>, %arg8: tensor<2xi32>, \
+                    %arg9: tensor<2xi32>, %arg10: tensor<2xi32>, %arg11: tensor<2xi32>) {
+                      %1 = stablehlo.custom_call @ragged_all_to_all\
+                      (%arg6, %arg7, %arg8, %arg9, %arg10, %arg11) \
+                      {api_version = 4 : i32, backend_config = {channel_id = 1 : i64, \
+                      replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>}} : \
+                      (tensor<3xf32>, tensor<4xf32>, tensor<2xi32>, tensor<2xi32>, \
+                      tensor<2xi32>, tensor<2xi32>) -> tensor<4xf32>
+                      sdy.return %1 : tensor<4xf32>
+                    } : (tensor<6xf32>, tensor<8xf32>, tensor<4xi32>, tensor<4xi32>, \
+                    tensor<4xi32>, tensor<4xi32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_parallel_ragged_all_to_all_batched_over_an_unrelated_axis() {
+        // A named batch over `y` inside a manual region over `x` merges its batch items into the packed exchange and
+        // rebases the varying metadata by offsets that share their variation, so the merged program lowers.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding =
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                batch(
+                    |inputs: Vec<_>| {
+                        inputs[0]
+                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    },
+                    inputs,
+                    vec![BatchAxis::new(0); 6],
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("y"),
+                )
+                .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [4, 3]),
+                ArrayType::new_static(DataType::F32, [4, 4]),
+                ArrayType::new_static(DataType::I32, [4, 2]),
+                ArrayType::new_static(DataType::I32, [4, 2]),
+                ArrayType::new_static(DataType::I32, [4, 2]),
+                ArrayType::new_static(DataType::I32, [4, 2]),
+            ],
+            mesh.clone(),
+            vec![sharding.clone(); 6],
+            sharding,
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]> loc(#loc)
+                  func.func @main(%arg0: tensor<4x3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown), %arg1: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown), %arg2: tensor<4x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown), %arg3: tensor<4x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown), %arg4: tensor<4x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown), %arg5: tensor<4x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>} \
+                  loc(unknown)) -> (tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) in_shardings=[<@mesh, \
+                    [{\"x\"}, {}]>, <@mesh, [{\"x\"}, {}]>, <@mesh, [{\"x\"}, {}]>, <@mesh, [{\"x\"}, {}]>, <@mesh, \
+                    [{\"x\"}, {}]>, <@mesh, [{\"x\"}, {}]>] out_shardings=[<@mesh, [{\"x\"}, {}]>] \
+                    manual_axes={\"x\"} (%arg6: tensor<2x3xf32> loc(unknown), %arg7: tensor<2x4xf32> loc(unknown), \
+                    %arg8: tensor<2x2xi32> loc(unknown), %arg9: tensor<2x2xi32> loc(unknown), %arg10: tensor<2x2xi32> \
+                    loc(unknown), %arg11: tensor<2x2xi32> loc(unknown)) {
+                      %1 = stablehlo.reshape %arg6 : (tensor<2x3xf32>) -> tensor<6xf32> loc(#loc3)
+                      %2 = stablehlo.reshape %arg7 : (tensor<2x4xf32>) -> tensor<8xf32> loc(#loc3)
+                      %3 = stablehlo.transpose %arg8, dims = [1, 0] : (tensor<2x2xi32>) -> tensor<2x2xi32> loc(#loc3)
+                      %4 = stablehlo.convert %3 : (tensor<2x2xi32>) -> tensor<2x2xui64> loc(#loc3)
+                      %5 = stablehlo.iota dim = 1 : tensor<2x2xui64> loc(#loc3)
+                      %c = stablehlo.constant dense<3> : tensor<ui64> loc(#loc3)
+                      %6 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<ui64>) -> tensor<2x2xui64> loc(#loc3)
+                      %7 = stablehlo.multiply %5, %6 : tensor<2x2xui64> loc(#loc3)
+                      %8 = stablehlo.add %4, %7 : tensor<2x2xui64> loc(#loc3)
+                      %9 = stablehlo.reshape %8 : (tensor<2x2xui64>) -> tensor<4xui64> loc(#loc3)
+                      %10 = stablehlo.transpose %arg9, dims = [1, 0] : (tensor<2x2xi32>) -> tensor<2x2xi32> loc(#loc3)
+                      %11 = stablehlo.convert %10 : (tensor<2x2xi32>) -> tensor<2x2xui64> loc(#loc3)
+                      %12 = stablehlo.reshape %11 : (tensor<2x2xui64>) -> tensor<4xui64> loc(#loc3)
+                      %13 = stablehlo.transpose %arg10, dims = [1, 0] : (tensor<2x2xi32>) -> tensor<2x2xi32> loc(#loc3)
+                      %14 = stablehlo.convert %13 : (tensor<2x2xi32>) -> tensor<2x2xui64> loc(#loc3)
+                      %15 = stablehlo.iota dim = 1 : tensor<2x2xui64> loc(#loc3)
+                      %c_0 = stablehlo.constant dense<4> : tensor<ui64> loc(#loc3)
+                      %16 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui64>) -> tensor<2x2xui64> loc(#loc3)
+                      %17 = stablehlo.multiply %15, %16 : tensor<2x2xui64> loc(#loc3)
+                      %18 = stablehlo.add %14, %17 : tensor<2x2xui64> loc(#loc3)
+                      %19 = stablehlo.reshape %18 : (tensor<2x2xui64>) -> tensor<4xui64> loc(#loc3)
+                      %20 = stablehlo.transpose %arg11, dims = [1, 0] : (tensor<2x2xi32>) -> tensor<2x2xi32> loc(#loc3)
+                      %21 = stablehlo.convert %20 : (tensor<2x2xi32>) -> tensor<2x2xui64> loc(#loc3)
+                      %22 = stablehlo.reshape %21 : (tensor<2x2xui64>) -> tensor<4xui64> loc(#loc3)
+                      %23 = stablehlo.custom_call @ragged_all_to_all(%1, %2, %9, %12, %19, %22) {api_version = 4 : \
+                      i32, backend_config = {channel_id = 1 : i64, replica_groups = dense<[[0, 1]]> : \
+                      tensor<1x2xi64>}} : (tensor<6xf32>, tensor<8xf32>, tensor<4xui64>, tensor<4xui64>, \
+                      tensor<4xui64>, tensor<4xui64>) -> tensor<8xf32> loc(#loc3)
+                      %24 = stablehlo.reshape %23 : (tensor<8xf32>) -> tensor<2x4xf32> loc(#loc3)
+                      %25 = sdy.sharding_constraint %24 <@mesh, [{}, {}]> : tensor<2x4xf32> loc(#loc3)
+                      sdy.return %25 : tensor<2x4xf32> loc(#loc)
+                    } : (tensor<4x3xf32>, tensor<4x4xf32>, tensor<4x2xi32>, tensor<4x2xi32>, tensor<4x2xi32>, \
+                    tensor<4x2xi32>) -> tensor<4x4xf32> loc(#loc)
+                    return %0 : tensor<4x4xf32> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc(\"parallel_ragged_all_to_all\")
+                #loc2 = loc(\"batching\"(#loc1))
+                #loc3 = loc(\"ryft\"(#loc2))
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_grouped_parallel_ragged_all_to_all_transpose_with_group_local_sources() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                let input_offsets = inputs[2].clone();
+                let send_sizes = inputs[3].clone();
+                let output_offsets = inputs[4].clone();
+                let receive_sizes = inputs[5].clone();
+                let (_, gradients) = inputs[0]
+                    .domain()
+                    .differentiate_at((inputs[0].clone(), inputs[1].clone()))
+                    .with_captures((input_offsets, send_sizes, output_offsets, receive_sizes))
+                    .value_and_gradient(
+                        |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                            Ok(operand
+                                .parallel_ragged_all_to_all_with_axis_index_groups(
+                                    "x",
+                                    &output,
+                                    &input_offsets,
+                                    &send_sizes,
+                                    &output_offsets,
+                                    &receive_sizes,
+                                    vec![vec![0, 2], vec![3, 1]],
+                                )?
+                                .reduce(&[0], ReductionKind::Sum)?)
+                        },
+                    )
+                    .unwrap();
+                gradients.0
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [12]),
+                ArrayType::new_static(DataType::F32, [16]),
+                ArrayType::new_static(DataType::I32, [16]),
+                ArrayType::new_static(DataType::I32, [16]),
+                ArrayType::new_static(DataType::I32, [16]),
+                ArrayType::new_static(DataType::I32, [16]),
+            ],
+            mesh.clone(),
+            vec![sharding.clone(); 6],
+            sharding,
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module(&traced, "main").unwrap(),
+            indoc! {"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <[\"x\"=4]> loc(#loc)
+                  func.func @main(%arg0: tensor<12xf32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg1: tensor<16xf32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg2: tensor<16xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg3: tensor<16xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg4: tensor<16xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown), %arg5: tensor<16xi32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>} loc(unknown)) -> \
+                  (tensor<12xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) \
+                    in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, \
+                    <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>] \
+                    out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} \
+                    (%arg6: tensor<3xf32> loc(unknown), %arg7: tensor<4xf32> loc(unknown), \
+                    %arg8: tensor<4xi32> loc(unknown), %arg9: tensor<4xi32> loc(unknown), \
+                    %arg10: tensor<4xi32> loc(unknown), %arg11: tensor<4xi32> loc(unknown)) {
+                      %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32> loc(#loc)
+                      %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32> loc(#loc)
+                      %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
+                      %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<3xf32> loc(#loc3)
+                      %3 = \"stablehlo.all_to_all\"(%arg10) \
+                      <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, \
+                      concat_dimension = 0 : i64, \
+                      replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
+                      split_dimension = 0 : i64}> {use_global_device_ids} : \
+                      (tensor<4xi32>) -> tensor<4xi32> loc(#loc3)
+                      %4 = \"stablehlo.all_to_all\"(%arg8) \
+                      <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, \
+                      concat_dimension = 0 : i64, \
+                      replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
+                      split_dimension = 0 : i64}> {use_global_device_ids} : \
+                      (tensor<4xi32>) -> tensor<4xi32> loc(#loc3)
+                      %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
+                      %5 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<12xf32> loc(#loc3)
+                      %6 = stablehlo.convert %3 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %7 = stablehlo.convert %arg11 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %8 = stablehlo.convert %4 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %9 = stablehlo.convert %arg9 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %10 = stablehlo.iota dim = 0 : tensor<4xui64> loc(#loc3)
+                      %c = stablehlo.constant dense<2> : tensor<ui64> loc(#loc3)
+                      %11 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
+                      %12 = stablehlo.remainder %10, %11 : tensor<4xui64> loc(#loc3)
+                      %13 = stablehlo.partition_id : tensor<ui32> loc(#loc3)
+                      %14 = stablehlo.convert %13 : (tensor<ui32>) -> tensor<ui64> loc(#loc3)
+                      %c_2 = stablehlo.constant dense<[0, 1, 1, 0]> : tensor<4xi64> loc(#loc3)
+                      %15 = stablehlo.dynamic_slice %c_2, %14, sizes = [1] : \
+                      (tensor<4xi64>, tensor<ui64>) -> tensor<1xi64> loc(#loc3)
+                      %16 = stablehlo.convert %15 : (tensor<1xi64>) -> tensor<1xui64> loc(#loc3)
+                      %17 = stablehlo.reshape %16 : (tensor<1xui64>) -> tensor<ui64> loc(#loc3)
+                      %18 = stablehlo.multiply %17, %c : tensor<ui64> loc(#loc3)
+                      %19 = stablehlo.broadcast_in_dim %18, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
+                      %20 = stablehlo.add %19, %12 : tensor<4xui64> loc(#loc3)
+                      %c_3 = stablehlo.constant dense<3> : tensor<4xui64> loc(#loc3)
+                      %21 = stablehlo.multiply %20, %c_3 : tensor<4xui64> loc(#loc3)
+                      %22 = stablehlo.add %8, %21 : tensor<4xui64> loc(#loc3)
+                      %23 = stablehlo.custom_call @ragged_all_to_all(%1, %5, %6, %7, %22, %9) \
+                      {api_version = 4 : i32, backend_config = {channel_id = 3 : i64, \
+                      replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>}} : \
+                      (tensor<4xf32>, tensor<12xf32>, tensor<4xui64>, tensor<4xui64>, \
+                      tensor<4xui64>, tensor<4xui64>) -> tensor<12xf32> loc(#loc3)
+                      %24 = stablehlo.reshape %23 : (tensor<12xf32>) -> tensor<4x3xf32> loc(#loc3)
+                      %cst_4 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
+                      %25 = stablehlo.reduce(%24 init: %cst_4) applies stablehlo.add across dimensions = [0] : \
+                      (tensor<4x3xf32>, tensor<f32>) -> tensor<3xf32> loc(#loc3)
+                      %26 = stablehlo.add %2, %25 : tensor<3xf32> loc(#loc3)
+                      sdy.return %26 : tensor<3xf32> loc(#loc)
+                    } : (tensor<12xf32>, tensor<16xf32>, tensor<16xi32>, tensor<16xi32>, \
+                    tensor<16xi32>, tensor<16xi32>) -> tensor<12xf32> loc(#loc)
+                    return %0 : tensor<12xf32> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc(\"parallel_ragged_all_to_all_transpose\")
+                #loc2 = loc(\"differentiation\"(#loc1))
+                #loc3 = loc(\"ryft\"(#loc2))
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_executes_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map(
+            |x| x.clone() + x,
+            global_input_type,
+            device_mesh.logical_mesh().clone(),
+            sharding.clone(),
+            sharding.clone(),
+        )
+        .unwrap();
+        let mlir_program = to_mlir_module(&traced, "main").unwrap();
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let input_array = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 4);
+        let expected_values_by_device = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                (device.id().unwrap(), [device_index as f32 * 4.0 + 2.0, device_index as f32 * 4.0 + 4.0])
+            })
+            .collect::<HashMap<_, _>>();
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+
+        let execute_arguments =
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_and_executes_matmul_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
+            .expect("failed to create 8-device CPU client");
+        let domain = XlaSession::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 8);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+
+        let lhs_sharding = Sharding::new(
+            device_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let rhs_sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 2);
+        let output_sharding = Sharding::new(
+            device_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let global_input_types = (
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
+        );
+        let traced: TracedShardMap<XlaDomain<'static>, (ArrayType, ArrayType), ArrayType> = trace_shard_map(
+            |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap(),
+            global_input_types,
+            device_mesh.logical_mesh().clone(),
+            (lhs_sharding.clone(), rhs_sharding.clone()),
+            output_sharding.clone(),
+        )
+        .unwrap();
+        let mlir_program = to_mlir_module(&traced, "main").unwrap();
+
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=8]>
+                  func.func @main(%arg0: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}, %arg1: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) -> (tensor<8x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1) in_shardings=[<@mesh, [{"x"}, {}]>, <@mesh, [{}, {}], replicated={"x"}>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg2: tensor<1x4xf32>, %arg3: tensor<4x2xf32>) {
+                      %1 = stablehlo.dot_general %arg2, %arg3, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<1x4xf32>, tensor<4x2xf32>) -> tensor<1x2xf32>
+                      sdy.return %1 : tensor<1x2xf32>
+                    } : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>
+                    return %0 : tensor<8x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        let lhs_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(row_index, device)| {
+                let row = row_index as f32;
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
+                        BufferType::F32,
+                        [1u64, 4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let rhs_values = [1.0f32, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0];
+        let rhs_buffers = client_devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(rhs_values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [4u64, 2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let lhs_array = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
+            device_mesh.clone(),
+            lhs_buffers,
+        )
+        .unwrap();
+        let rhs_array = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding),
+            device_mesh,
+            rhs_buffers,
+        )
+        .unwrap();
+        let program = PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(8)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 8);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let row_start_by_device = execution_device_ids
+            .iter()
+            .map(|device_id| {
+                let row_start = lhs_array.device_shard(*device_id).unwrap().slice()[0].start;
+                (*device_id, row_start)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let execute_arguments =
+            XlaArray::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            let row = *row_start_by_device.get(&device_id).unwrap() as f32;
+            assert_eq!(values[0], 4.0 * row + 8.0);
+            assert_eq!(values[1], 4.0 * row + 4.0);
+        }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_to_mlir_module_executes_parallel_ragged_all_to_all_u64_metadata_on_cuda() {
+        // XLA's GPU `ragged_all_to_all` receives `u64` metadata from three sources: inputs that are already `u64`, the
+        // widened metadata of an exchange merged with an unrelated batch axis, and the rebased metadata of the additive
+        // transpose. A single-participant axis exercises all three on one device.
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
+        let execute = |program: String, inputs: Vec<(Vec<u8>, BufferType, Vec<u64>)>| {
+            let inputs = inputs
+                .into_iter()
+                .map(|(bytes, buffer_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(bytes.as_slice(), buffer_type, shape, None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(1))
+                .unwrap();
+            let mut outputs = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap();
+            let bytes = outputs.remove(0).outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            values_from_bytes::<f32>(bytes.as_slice())
+        };
+        // Direct `u64` metadata: copy `operand` rows `1..3` into `output` rows `0..2`.
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                inputs[0]
+                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [3]),
+                ArrayType::new_static(DataType::F32, [4]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+                ArrayType::new_static(DataType::U64, [1]),
+            ],
+            mesh.clone(),
+            vec![sharding.clone(); 6],
+            sharding.clone(),
+        )
+        .unwrap();
+        let metadata = |value: u64| (values_to_bytes::<u64>(&[value]), BufferType::U64, vec![1]);
+        assert_eq!(
+            execute(
+                to_mlir_module(&traced, "main").unwrap(),
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0]), BufferType::F32, vec![3]),
+                    (values_to_bytes::<f32>(&[100.0, 101.0, 102.0, 103.0]), BufferType::F32, vec![4]),
+                    metadata(1),
+                    metadata(2),
+                    metadata(0),
+                    metadata(2),
+                ],
+            ),
+            vec![11.0, 12.0, 102.0, 103.0],
+        );
+
+        // Merged batching over `y` widens the `i32` metadata to `u64` and rebases the offsets of the second item.
+        let batched_sharding =
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![]);
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                batch(
+                    |inputs: Vec<_>| {
+                        inputs[0]
+                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    },
+                    inputs,
+                    vec![BatchAxis::new(0); 6],
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("y"),
+                )
+                .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                ArrayType::new_static(DataType::F32, [2, 4]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+            ],
+            mesh.clone(),
+            vec![batched_sharding.clone(); 6],
+            batched_sharding,
+        )
+        .unwrap();
+        let program = to_mlir_module(&traced, "main").unwrap();
+        assert!(program.contains("tensor<2xui64>"));
+        let metadata = |values: [i32; 2]| (values_to_bytes::<i32>(&values), BufferType::I32, vec![2, 1]);
+        assert_eq!(
+            execute(
+                program,
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0, 20.0, 21.0, 22.0]), BufferType::F32, vec![2, 3]),
+                    (
+                        values_to_bytes::<f32>(&[100.0, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
+                        BufferType::F32,
+                        vec![2, 4],
+                    ),
+                    metadata([1, 0]),
+                    metadata([2, 1]),
+                    metadata([0, 3]),
+                    metadata([2, 1]),
+                ],
+            ),
+            vec![11.0, 12.0, 102.0, 103.0, 200.0, 201.0, 202.0, 20.0],
+        );
+
+        // The gradient of the summed exchange with respect to `operand` lowers through the additive transpose, whose
+        // rebased metadata are `u64`. Only the sent rows `1..3` reach the sum.
+        let traced: TracedShardMap<XlaDomain<'static>, Vec<ArrayType>, ArrayType> = trace_shard_map(
+            |inputs: Vec<XlaArrayTracer>| {
+                inputs[0]
+                    .domain()
+                    .differentiate_at(inputs[0].clone())
+                    .with_captures((
+                        inputs[1].clone(),
+                        inputs[2].clone(),
+                        inputs[3].clone(),
+                        inputs[4].clone(),
+                        inputs[5].clone(),
+                    ))
+                    .gradient(|operand, (output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand
+                            .parallel_ragged_all_to_all(
+                                "x",
+                                &output,
+                                &input_offsets,
+                                &send_sizes,
+                                &output_offsets,
+                                &receive_sizes,
+                            )
+                            .map(|result| result.reduce(&[0], ReductionKind::Sum).unwrap())
+                    })
+                    .unwrap()
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [3]),
+                ArrayType::new_static(DataType::F32, [4]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+                ArrayType::new_static(DataType::I32, [1]),
+            ],
+            mesh,
+            vec![sharding.clone(); 6],
+            sharding,
+        )
+        .unwrap();
+        let program = to_mlir_module(&traced, "main").unwrap();
+        assert!(program.contains("tensor<1xui64>"));
+        let metadata = |value: i32| (values_to_bytes::<i32>(&[value]), BufferType::I32, vec![1]);
+        assert_eq!(
+            execute(
+                program,
+                vec![
+                    (values_to_bytes::<f32>(&[10.0, 11.0, 12.0]), BufferType::F32, vec![3]),
+                    (values_to_bytes::<f32>(&[0.0; 4]), BufferType::F32, vec![4]),
+                    metadata(1),
+                    metadata(2),
+                    metadata(0),
+                    metadata(2),
+                ],
+            ),
+            vec![0.0, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_in_shardings() {
+        let context = MlirContext::new();
+        let mesh = test_logical_mesh_2x2();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"x"}], replicated={"y"}>]>"#,
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_in_shardings_leaves_inactive_manual_axes_open() {
+        // Manual axes outside the selected subset are free axes of the manual computation, so they stay open, unless
+        // an enclosing manual region already bound them, in which case they are omitted.
+        let context = MlirContext::new();
+        let mesh = test_logical_mesh_2x2();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], Vec::new())],
+            Vec::new(),
+            vec!["x".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"x", "y", ?}]>]>"#,
+        );
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["y"])], Vec::new())],
+            Vec::new(),
+            vec!["y".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"y", ?}], replicated={"x"}>]>"#,
+        );
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &["x".to_string()], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"y"}]>]>"#,
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_in_shardings_renders_free_axes_as_open_dimension_shardings() {
+        let context = MlirContext::new();
+        let mesh = test_logical_mesh_data_model();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![
+                test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new()),
+                test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], Vec::new()),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"data", ?}]>, <@mesh, [{"data", ?}]>]>"#,
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_in_shardings_keeps_explicit_axes() {
+        let context = MlirContext::new();
+        let mesh = test_logical_mesh_data_model_explicit();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{"data", "model", ?}]>]>"#,
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_out_shardings() {
+        let context = MlirContext::new();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let shard_map = ShardMap::new(
+            mesh.clone(),
+            Vec::new(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], Vec::new())],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            to_shardy_out_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            r#"#sdy.sharding_per_value<[<@mesh, [{?}], replicated={"x"}>]>"#,
+        );
+
+        // Output shardings render exactly like input shardings.
+        let mesh = test_logical_mesh_data_model();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], Vec::new());
+        let shard_map = ShardMap::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
+        assert_eq!(
+            to_shardy_out_shardings(&shard_map, &[], &context).unwrap().to_string(),
+            to_shardy_in_shardings(&shard_map, &[], &context).unwrap().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_to_shardy_manual_axes() {
+        let context = MlirContext::new();
+        let shard_map = ShardMap::new(
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            ])
+            .unwrap(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"y"}>"#);
+        let shard_map = ShardMap::new(test_logical_mesh_2x2(), Vec::new(), Vec::new(), vec!["x".into()]).unwrap();
+        assert_eq!(to_shardy_manual_axes(&shard_map, &context).unwrap().to_string(), r#"#sdy<manual_axes{"x"}>"#);
+    }
+
+    #[test]
+    fn test_shard_map_manual_computation_executes_end_to_end_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .expect("failed to create 4-device CPU client");
+        let domain = XlaSession::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let shard_map =
+            ShardMap::new(device_mesh.logical_mesh().clone(), vec![sharding.clone()], vec![sharding.clone()], vec![])
+                .unwrap();
+        assert_eq!(
+            shard_map.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
+            &Shape::new(vec![Dimension::Static(2)]),
+        );
+
+        let context = MlirContext::new();
+        let input_sharding = shard_map.in_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let output_sharding = shard_map.out_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let manual_computation_attributes =
+            r#"in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"}"#;
+        let mesh_module = context.module(context.unknown_location()).unwrap();
+        let mesh_operation = mesh_module
+            .body()
+            .unwrap()
+            .append_operation(shard_map.mesh().to_mlir(context.unknown_location()).unwrap())
+            .unwrap()
+            .to_string();
+
+        let mlir_program = format!(
+            r#"
+                module {{
+                    {mesh_operation}
+                    func.func @main(
+                        %arg0: tensor<8xf32> {{sdy.sharding = {input_sharding}}}
+                    ) -> (tensor<8xf32> {{sdy.sharding = {output_sharding}}}) {{
+                        %0 = sdy.manual_computation(%arg0) {manual_computation_attributes} (%arg1: tensor<2xf32>) {{
+                            %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32>
+                            sdy.return %1 : tensor<2xf32>
+                        }} : (tensor<8xf32>) -> tensor<8xf32>
+                        return %0 : tensor<8xf32>
+                    }}
+                }}
+            "#,
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let input_array = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = PjrtProgram::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 4);
+        let expected_values_by_device = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                (device.id().unwrap(), [device_index as f32 * 4.0 + 2.0, device_index as f32 * 4.0 + 4.0])
+            })
+            .collect::<HashMap<_, _>>();
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+
+        let execute_arguments =
+            XlaArray::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
+        }
     }
 
     /// Builds a one-instruction program applying the given single-operand operation to an input of the given data
@@ -20303,7 +21763,7 @@ mod tests {
                     return %0 : tensor<2xf32>
                   }
                 }
-            "#}
+            "#},
         );
         assert_eq!(
             lowered_unary_module(
@@ -20319,13 +21779,13 @@ mod tests {
                     return %0 : tensor<2xf32>
                   }
                 }
-            "#}
+            "#},
         );
         let tolerance = ryft_core::Tolerance::new(1e-6, 0.0, 2).unwrap();
         assert_eq!(
             lowered_unary_module(
                 ArrayOperation::Exp(
-                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance))
+                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance)),
                 ),
                 DataType::F32,
                 vec![2],
@@ -20338,7 +21798,7 @@ mod tests {
                     return %0 : tensor<2xf32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -20374,7 +21834,7 @@ mod tests {
                     return %0 : tensor<2xbf16>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -20463,7 +21923,7 @@ mod tests {
                     return %2 : tensor<3xbf16>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -20481,7 +21941,7 @@ mod tests {
                     return %2 : tensor<3xbf16>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21053,7 +22513,7 @@ mod tests {
                     return %4 : tensor<2xbf16>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21071,7 +22531,7 @@ mod tests {
                     return %1 : tensor<f32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21096,7 +22556,7 @@ mod tests {
                     return %0 : tensor<f16>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21121,7 +22581,7 @@ mod tests {
                     return %0 : tensor<f8E5M2>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21146,7 +22606,7 @@ mod tests {
                     return %0 : tensor<f8E4M3FN>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21164,7 +22624,7 @@ mod tests {
                     return %2 : tensor<f8E4M3FN>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21189,7 +22649,7 @@ mod tests {
                     return %0 : tensor<f4E2M1FN>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21205,7 +22665,7 @@ mod tests {
                     return %0 : tensor<i32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21221,7 +22681,7 @@ mod tests {
                     return %0 : tensor<i64>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21237,7 +22697,7 @@ mod tests {
                     return %0 : tensor<i64>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21256,7 +22716,7 @@ mod tests {
                     return %2 : tensor<2xi32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21272,7 +22732,7 @@ mod tests {
                     return %0 : tensor<ui8>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21288,7 +22748,7 @@ mod tests {
                     return %0 : tensor<ui64>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -21643,7 +23103,7 @@ mod tests {
                 let axis = if negative { 0 } else { size as usize - 1 };
                 assert_eq!(
                     values_from_bytes::<i64>(&outputs[0].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![values[axis]]
+                    vec![values[axis]],
                 );
                 let mut expected = values[..size as usize].to_vec();
                 expected[axis] = 42;
@@ -21651,7 +23111,7 @@ mod tests {
                 assert_eq!(values_from_bytes::<i64>(&bytes[..size as usize * 8]), expected);
                 assert_eq!(
                     values_from_bytes::<i64>(&outputs[2].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![i64::from(size)]
+                    vec![i64::from(size)],
                 );
             }
         }
@@ -21743,11 +23203,11 @@ mod tests {
                 let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
                 assert_eq!(
                     values_from_bytes::<i64>(&bytes[..size as usize * 8]),
-                    &values[start as usize..(start + size) as usize]
+                    &values[start as usize..(start + size) as usize],
                 );
                 assert_eq!(
                     values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![size]
+                    vec![size],
                 );
             }
         }
@@ -21961,7 +23421,7 @@ mod tests {
                 assert_eq!(actual, &expected[..query_size as usize]);
                 assert_eq!(
                     values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![i64::from(query_size)]
+                    vec![i64::from(query_size)],
                 );
             }
         }
@@ -22120,7 +23580,7 @@ mod tests {
                 assert_eq!(
                     values_from_bytes::<i64>(&bytes[..expected.len() * 8]),
                     expected,
-                    "mode={mode}, unsigned={unsigned}, dynamic_input={dynamic_input}, dynamic_query={dynamic_query}"
+                    "mode={mode}, unsigned={unsigned}, dynamic_input={dynamic_input}, dynamic_query={dynamic_query}",
                 );
             }
         }
@@ -22255,7 +23715,7 @@ mod tests {
             .stable_hlo;
             assert_eq!(
                 module.matches("stablehlo.scatter").count() - module.matches("#stablehlo.scatter").count(),
-                scatter_count
+                scatter_count,
             );
             assert_eq!(module.matches("stablehlo.complex ").count(), usize::from(scatter_count == 2));
 
@@ -22378,9 +23838,14 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        assert_eq!(to_mlir_module_for_plain_program(&program, "main"), Err(LoweringError::UnsupportedOp {
-            op: "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic windows are unsupported by XLA".to_string(),
-        }));
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::UnsupportedOp {
+                op: "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
+                     windows are unsupported by XLA"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -24312,7 +25777,7 @@ mod tests {
                 &Vec::<ArrayType>::new(),
                 "main",
                 None,
-                None
+                None,
             )
             .unwrap(),
             indoc! {r#"
@@ -24839,7 +26304,8 @@ mod tests {
         .unwrap();
 
         assert!(module.contains(
-            "func.func private @xla.scaled_dot(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>, %arg2: tensor<2x1xf8E8M0FNU>, %arg3: tensor<1x2xf8E8M0FNU>)",
+            "func.func private @xla.scaled_dot(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>, \
+             %arg2: tensor<2x1xf8E8M0FNU>, %arg3: tensor<1x2xf8E8M0FNU>)",
         ));
         assert_eq!(module.matches("dense<1.000000e+00> : tensor<f8E8M0FNU>").count(), 2);
         assert!(module.contains("stablehlo.composite \"xla.scaled_dot\" %arg0, %arg1"));
@@ -24913,11 +26379,13 @@ mod tests {
                 .stable_hlo;
 
         assert!(module.contains(
-            "func.func private @xla.scaled_dot(%arg0: tensor<4x32xf8E4M3FN>, %arg1: tensor<1x32xf8E4M3FN>, %arg2: tensor<4x1xf8E8M0FNU>, %arg3: tensor<1x1xf8E8M0FNU>) -> tensor<4x1xf32>",
+            "func.func private @xla.scaled_dot(%arg0: tensor<4x32xf8E4M3FN>, %arg1: tensor<1x32xf8E4M3FN>, \
+             %arg2: tensor<4x1xf8E8M0FNU>, %arg3: tensor<1x1xf8E8M0FNU>) -> tensor<4x1xf32>",
         ));
         assert!(module.contains("stablehlo.composite \"xla.scaled_dot\"",));
         assert!(module.contains(
-            ": (tensor<4x32xf8E4M3FN>, tensor<1x32xf8E4M3FN>, tensor<4x1xf8E8M0FNU>, tensor<1x1xf8E8M0FNU>) -> tensor<4x1xf32>",
+            ": (tensor<4x32xf8E4M3FN>, tensor<1x32xf8E4M3FN>, tensor<4x1xf8E8M0FNU>, tensor<1x1xf8E8M0FNU>) \
+             -> tensor<4x1xf32>",
         ));
         assert!(module.contains("stablehlo.set_dimension_size"));
     }
@@ -24981,9 +26449,14 @@ mod tests {
                 Some("cuda"),
             );
             if block_bound == 3 {
-                assert_eq!(module.err().unwrap(), LoweringError::UnsupportedOp {
-                op: "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must preserve the physical element count".to_string(),
-            });
+                assert_eq!(
+                    module.err().unwrap(),
+                    LoweringError::UnsupportedOp {
+                        op: "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must \
+                             preserve the physical element count"
+                            .to_string(),
+                    },
+                );
                 continue;
             }
             let module = module.unwrap().stable_hlo;
@@ -26794,8 +28267,8 @@ mod tests {
     fn test_while_converts_a_partially_refined_state_input_preserving_its_dynamic_axes() {
         // The second state has the type `f64[rows, cols]` and is fed an `f64[rows, 3]` input, so only `cols` is refined
         // while `rows` stays dynamic. The input conversion keeps the runtime size of `rows` and gives `cols` its static
-        // extent, and the outputs take the type `f64[rows, 3]`, so the results are sliced along `cols` while keeping the
-        // runtime size of `rows`. One bounded iteration computes `[a, a + b]`.
+        // extent, and the outputs take the type `f64[rows, 3]`, so the results are sliced along `cols` while keeping
+        // the runtime size of `rows`. One bounded iteration computes `[a, a + b]`.
         let state_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![dynamic_dimension("rows", Some(5)), dynamic_dimension("cols", Some(5))]),
@@ -27339,7 +28812,7 @@ mod tests {
                     return %2 : tensor<f64>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -27450,7 +28923,7 @@ mod tests {
                     return %0, %1, %8, %15 : tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>
                   }
                 }
-            "#}
+            "#},
         );
 
         // Static `sizes` make the result exact even when an operand axis is dynamic; no first-class result extent or
@@ -27508,7 +28981,7 @@ mod tests {
                     return %0 : tensor<4x2xf32>
                   }
                 }
-            "#}
+            "#},
         );
 
         // Dynamic concatenation requires its derived result extent as an explicit operand rather than manufacturing
@@ -27523,7 +28996,7 @@ mod tests {
                 ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(),
                 Vec::new(),
                 vec![first, second],
-                None
+                None,
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`concatenate` dynamic axis 0 requires an explicit result-dimension input".to_string(),
@@ -27708,7 +29181,7 @@ mod tests {
                         return %result : {storage_type}
                     "#},
                         element = element,
-                        storage_type = storage_type
+                        storage_type = storage_type,
                     )
                 } else {
                     let result_type = format!("tensor<?x{element}, #stablehlo.bounds<{bound}>>");
@@ -27725,7 +29198,7 @@ mod tests {
                         element = element,
                         result_type = result_type,
                         bound = bound,
-                        storage_type = storage_type
+                        storage_type = storage_type,
                     )
                 };
                 let prefix = module
@@ -27744,7 +29217,7 @@ mod tests {
                     prefix = prefix,
                     element = element,
                     storage_type = storage_type,
-                    body = body
+                    body = body,
                 );
                 let executable = client
                     .compile(
@@ -27753,7 +29226,8 @@ mod tests {
                     )
                     .unwrap();
                 let device = executable.addressable_devices().unwrap().remove(0);
-                // Decode complex fixture bytes as opaque words so assertions compare exact signed-zero and imaginary bits.
+                // Decode complex fixture bytes as opaque words so assertions compare exact signed-zero and imaginary
+                // bits.
                 let left = if data_type == DataType::I64 {
                     vec![i64::MAX, 13, 14, 15]
                 } else {
@@ -28027,7 +29501,7 @@ mod tests {
                     return %0, %1 : tensor<3xf32>, tensor<8xf32>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -28089,7 +29563,7 @@ mod tests {
                 PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value],
-                None
+                None,
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`pad` dynamic axis 0 requires an explicit result-dimension input".to_string(),
@@ -28124,7 +29598,7 @@ mod tests {
                     return %1 : tensor<4xf64>
                   }
                 }
-            "#}
+            "#},
         );
 
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
@@ -28148,7 +29622,7 @@ mod tests {
                     return %0 : tensor<6xf64>
                   }
                 }
-            "#}
+            "#},
         );
 
         // The pad pullback first edge-unpads the cotangent and then slices it with the non-unit interior stride for the
@@ -28186,7 +29660,7 @@ mod tests {
                     return %1, %6 : tensor<3xf64>, tensor<f64>
                   }
                 }
-            "#}
+            "#},
         );
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
@@ -28223,7 +29697,7 @@ mod tests {
                     return %4 : tensor<4xf64>
                   }
                 }
-            "#}
+            "#},
         );
     }
 
@@ -28693,7 +30167,7 @@ mod tests {
                 to_mlir_module_for_plain_program(&program, "main"),
                 Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "{name} output dimension `size` needs a finite upper bound for physical buffer allocation"
+                        "{name} output dimension `size` needs a finite upper bound for physical buffer allocation",
                     ),
                 }),
             );
@@ -28814,11 +30288,11 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 &values_from_bytes::<f32>(outputs[0].as_slice())[..2 * extent as usize],
-                vec![0.0; 2 * extent as usize]
+                vec![0.0; 2 * extent as usize],
             );
             assert_eq!(
                 &values_from_bytes::<f32>(outputs[1].as_slice())[..2 * extent as usize],
-                [1.0, 0.0].repeat(extent as usize)
+                [1.0, 0.0].repeat(extent as usize),
             );
             assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![extent]);
             assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
