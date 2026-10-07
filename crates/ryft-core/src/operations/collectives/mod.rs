@@ -1,39 +1,145 @@
-//! Contains the named-axis collective operations, which exchange or reduce values across a named axis, together with
-//! their interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. These
-//! are the analogues of [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators).
+//! Operations that exchange or reduce values across the participants of a named axis (i.e., the batch items of a named
+//! `batch` level or the device shards of a manual mesh axis). Each operation is defined by an [`Operation`] type (e.g.,
+//! [`ParallelAllGatherOperation`]) together with a capability trait (e.g., [`ParallelAllGather`]) whose functions stage
+//! it on traced values, so the same code exchanges the batch items of a `batch` transform or lowers to cross-device
+//! communication inside a manual region. These are the Ryft analogues of JAX's
+//! [parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators).
 //!
-//! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], and
-//! named axis resolution), while each operation family lives in its own submodule: [`parallel_reduce`],
-//! [`parallel_vary`], [`parallel_all_gather`], [`parallel_sum_scatter`], [`parallel_permute`], [`parallel_all_to_all`],
-//! and [`parallel_ragged_all_to_all`]. The [`axis_index`] submodule holds the one named-axis operation that exchanges
-//! nothing; it reads the current batch item's or device shard's position along the axis. This module also owns the
-//! shared machinery of the single-input linear collectives ([`ParallelPermuteOperation`],
-//! [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]). Each carries
-//! the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment, consumes one
-//! array input, and has only degenerate single-participant semantics outside a binder. Its tangent rides the same
-//! collective, and its transpose is another collective over the same axis. The private
-//! `LinearCollectiveOperation` trait captures the hooks that their transformation rules need (e.g., the adjoint
-//! collective and the forwarding of a collective past an unrelated mapped batch axis) and provides those rules, to
-//! which each operation's explicit trait implementations delegate.
+//! The operations fall into four groups:
 //!
-//! The collectives that resize an array axis ([`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], and
-//! [`ParallelAllToAllOperation`]) share additional machinery. Their output shapes depend
-//! on the participant count and whether the named axis is materialized as a new array axis or tiled into an existing
-//! one, so they share:
+//!   - **Reading Positions:** [`AxisIndex`] returns the position of the current batch item or device shard along a
+//!     named axis. It exchanges nothing and is a context capability rather than a value capability, because the
+//!     position belongs to the enclosing binder rather than to any value.
+//!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with a
+//!     [`ReductionKind`](crate::ReductionKind), so that every participant receives the same result, and
+//!     [`ParallelVary`] marks a value that is invariant over a manual mesh axis as varying over it, which is the
+//!     transpose of a sum over that axis. [`ManualVariationAlignment`] aligns the manual variation of several inputs
+//!     before an operation combines them.
+//!   - **Resizing Array Axes:** [`ParallelAllGather`] gives every participant the values of all participants,
+//!     [`ParallelSumScatter`] sums them and gives every participant one chunk of the sum, and [`ParallelAllToAll`]
+//!     splits an axis into one chunk per participant and concatenates the chunks that it receives along another axis.
+//!     The [`CollectiveMode`] of their [`CollectiveOptions`] selects whether the participants get an array axis of
+//!     their own or are tiled into an existing one, and optional participant groups restrict every exchange to the
+//!     members of one group.
+//!   - **Routing Values:** [`ParallelPermute`] sends the value of every participant to another participant along
+//!     source-target pairs, and [`ParallelRaggedAllToAll`] exchanges variable-length segments of the leading axis
+//!     whose offsets and sizes are runtime metadata.
 //!
-//!   - `CollectiveArrayExtentBatchingPolicy`, the representation boundary that lets one batching kernel per
-//!     collective handle both homogeneous arrays with static extents and composite array/dimension programs with
-//!     first-class extents ([`ParallelRaggedAllToAllOperation`] reuses it as well),
-//!   - the first-class extent arithmetic that computes and validates result extents at staging time, and
-//!   - the [`ArrayIrType`] boundary, where the result extents are passed as additional dimension inputs, with
-//!     its type inference, interpretation, batching, and forward-mode differentiation rules, which the private
-//!     `ShapeChangingCollectiveOperation` trait provides on top of each collective's matching-axis batching kernel.
+//! A collective references its axis by name, and the enclosing binder determines how it executes. Staging resolves the
+//! name against the active [`NamedAxes`] environment and fails with [`AxisError::UnboundAxisName`] when no binder binds
+//! it. A named `batch` level consumes the collectives over its axis in its batching rules, which rearrange or reduce
+//! its batch items, while a `shard_map` manual region keeps them in the staged program, where they lower to
+//! cross-device communication over the manual mesh axis. There, the manual variation of every value (i.e., its
+//! [`Sharding::varying_manual_axes`]) records whether the devices along an axis may hold different values, and the
+//! collectives validate and update it. Only a collective whose participant groups each contain a single participant
+//! can be evaluated outside any binder.
 //!
-//! Collectives reference an enclosing named-axis binder by name, validated against the active
-//! [`NamedAxes`] environment at staging time. A name bound by an enclosing `batch` level is
-//! resolved at trace time by the operations' batching rules, which collapse or materialize the mapped batch axis at
-//! the binding level, while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged
-//! body and lowers to cross-device collectives over that mesh axis.
+//! The single-input exchanges ([`ParallelPermuteOperation`], [`ParallelAllGatherOperation`],
+//! [`ParallelSumScatterOperation`], and [`ParallelAllToAllOperation`]) are linear, so their tangents ride the same
+//! collective and their transposes are other collectives over the same axis (e.g., an all-gather transposes to a
+//! sum-scatter). This module owns the machinery that provides those rules: the private `LinearCollectiveOperation`
+//! trait captures the hooks that they need (e.g., the adjoint collective and the forwarding of a collective past an
+//! unrelated mapped batch axis), and each operation's explicit trait implementations delegate to it. The collectives
+//! that resize an array axis also share the private `ShapeChangingCollectiveOperation` trait, whose [`ArrayIrType`]
+//! form passes one explicit extent per output axis as an additional dimension input, so that result extents unknown at
+//! trace time remain available as values, and the private `CollectiveArrayExtentBatchingPolicy` boundary, which lets
+//! one batching kernel per collective serve both static and first-class extents ([`ParallelRaggedAllToAllOperation`]
+//! reuses it as well).
+//!
+//! # Examples
+//!
+//! The batch items of a named `batch` level are the participants of its axis, so collectives run eagerly on arrays:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayBatchingPolicy, ArrayOperation, BatchAxis, BatchAxisSpecification, BatchingTracer, Div,
+//! #     EagerContext, ParallelAllGather, ParallelReduce, ReductionKind, batch,
+//! # };
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let rows = Array::matrix(2, 2, vec![1.0f32, 2.0, 3.0, 6.0])?;
+//! let normalized = batch(
+//!     |row: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+//!         row.div(&row.parallel_reduce(ReductionKind::Sum, "rows")?)
+//!     },
+//!     rows.clone(),
+//!     BatchAxis::new(0),
+//!     BatchAxis::new(0),
+//!     BatchAxisSpecification::named("rows"),
+//! )?;
+//! assert_eq!(normalized, Array::matrix(2, 2, vec![0.25f32, 0.25, 0.75, 0.75])?);
+//! let gathered = batch(
+//!     |row: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
+//!         row.parallel_all_gather_tiled("rows", 0)
+//!     },
+//!     rows,
+//!     BatchAxis::new(0),
+//!     BatchAxis::replicated(),
+//!     BatchAxisSpecification::named("rows"),
+//! )?;
+//! assert_eq!(gathered, Array::vector(vec![1.0f32, 2.0, 3.0, 6.0])?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Inside a manual region, collectives are staged and their output types track manual variation. An input that is
+//! invariant over the gathered axis is made varying first, so that the copy of every device is gathered:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, NamedAxis, ParallelAllGather,
+//! #     Sharding, TracingContext,
+//! # };
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual)?])?;
+//! let invariant = ArrayType::new_static(DataType::F32, [3]).with_sharding(Sharding::replicated(mesh.clone(), 1))?;
+//! let axes = vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+//! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+//!     |input| input.parallel_all_gather_tiled("x", 0),
+//!     invariant,
+//!     axes,
+//! )?;
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:f32[3][sharding={mesh<['x'=2:manual]>, [{}]}] .
+//!         let %1:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+//!             parallel_vary [axis_name=\"x\"] %0
+//!             %2:f32[6][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_all_gather [
+//!                 axis_name=\"x\",
+//!                 axis_size=2,
+//!                 concatenation_axis=0,
+//!                 options=Tiled,
+//!                 output_variance=Varying,
+//!                 mesh=['x'=2:manual],
+//!             ] %1
+//!         in (%2)"},
+//! );
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Transposing a linear collective stages its adjoint collective over the same axis:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, NamedAxis, ParallelAllGather, TracingContext};
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+//!     |row| row.parallel_all_gather_tiled("rows", 0),
+//!     ArrayType::new_static(DataType::F32, [2]),
+//!     vec![("rows".to_string(), NamedAxis::Batched { size: Some(2) })],
+//! )?;
+//! assert_eq!(
+//!     program.transpose_with_respect_to(&[0], &[])?.to_string(),
+//!     indoc! {"
+//!         lambda %0:f32[4] .
+//!         let %1:f32[2] = parallel_sum_scatter [axis_name=\"rows\", axis_size=2, scatter_axis=0, options=Tiled] %0
+//!         in (%1)"},
+//! );
+//! # Ok(())
+//! # }
+//! ```
 
 // TODO(eaplatanios): Review this module's docstring.
 
