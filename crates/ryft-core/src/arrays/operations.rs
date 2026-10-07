@@ -637,187 +637,6 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> 
     }
 }
 
-// Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
-// `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family lifts
-// the type-generic add into the homogeneous array member that owns elementwise addition. The source payload is
-// stateless, so no input type survives the conversion, and member type inference rejects a dimension input.
-impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(_operation: AddOperation<ArrayIrType>) -> Self {
-        Self::Array(ArrayOperation::Add(AddOperation::new()))
-    }
-}
-
-// Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
-// can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
-impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
-        Self::Dimension(DimensionOperation::Constant(operation))
-    }
-}
-
-// The eager dispatch domain of `ArrayIrValue` binds only `ConstantOperation<ArrayIrValue<A>>`, so the same
-// family-neutral `From<ConstantOperation<DimensionValue>>` bound is satisfied there by wrapping the dimension payload
-// into the composite value. This is what lets `DimensionConstant` stage dimension literals against eager values too.
-impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ConstantOperation<ArrayIrValue<A>> {
-    #[inline]
-    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
-        ConstantOperation::new(ArrayIrValue::Dimension(operation.value().clone()))
-    }
-}
-
-/// Replicates the inputs of an implicitly broadcasting elementwise [`ArrayOperation`] into its result geometry, when
-/// that geometry carries a runtime extent, so that the projected member rule differentiates inputs that already have
-/// the result shape.
-///
-/// The member-family alignment ([`ElementwiseDerivativeAlignment`](crate::ElementwiseDerivativeAlignment)) cannot
-/// replicate into a runtime extent itself, because its [`BroadcastOperation`] carries the complete output geometry as
-/// payload metadata and program replay never refines a payload type. Such an extent is therefore only reachable through
-/// an input edge, which this composite arm supplies: it reads each runtime extent off the input that owns that axis as
-/// a first-class dimension value and replicates with [`DynamicBroadcastOperation`]. Linearization then keeps one scalar
-/// dimension value per runtime axis alive as a residual, instead of one result-shaped array per aligned input.
-///
-/// Returns `None` when the replication does not apply, in which case the caller differentiates the inputs as they are:
-/// the operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent space (so no
-/// input is ever aligned), its result geometry is fully static, or every input already has the result shape.
-///
-/// # Parameters
-///
-///   - `context`: Construction destinations for extent reads and primal and tangent replications.
-///   - `operation`: Elementwise [`ArrayOperation`] whose inputs are being replicated.
-///   - `inputs`: Input [`DifferentiationDual`]s that the rule received.
-fn replicated_elementwise_duals<A, C, P: DifferentiationPolicy<C>>(
-    context: &DifferentiationContext<C, P>,
-    operation: &ArrayOperation<A>,
-    inputs: &[DifferentiationDual<C::Value>],
-) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, DifferentiationError>
-where
-    A: Value<Type = ArrayType>,
-    C: Context<Type = ArrayIrType>,
-    C::Operation:
-        From<DynamicBroadcastOperation> + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
-    ArrayOperation<A>: Operation<Type = ArrayType>,
-{
-    // The variants whose type inference broadcasts several inputs into one result, and whose differentiation rules
-    // therefore align narrower inputs (both live tangents and primal coefficients) with that result type.
-    if !matches!(
-        operation,
-        ArrayOperation::Add(_)
-            | ArrayOperation::Sub(_)
-            | ArrayOperation::Mul(_)
-            | ArrayOperation::Div(_)
-            | ArrayOperation::Rem(_)
-            | ArrayOperation::Pow(_)
-            | ArrayOperation::Max(_)
-            | ArrayOperation::Min(_)
-            | ArrayOperation::Clamp(_)
-            | ArrayOperation::Atan2(_)
-            | ArrayOperation::LogAddExp(_)
-            | ArrayOperation::And(_)
-            | ArrayOperation::Or(_)
-            | ArrayOperation::Xor(_)
-            | ArrayOperation::Complex(_)
-            | ArrayOperation::Compare(_)
-            | ArrayOperation::Select(_),
-    ) {
-        return Ok(None);
-    }
-
-    let input_types = inputs
-        .iter()
-        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
-        .collect::<Result<Vec<_>, TypeError>>()?;
-    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
-    let [output_type] = output_types.as_slice() else {
-        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
-    };
-    let output_shape = output_type.shape();
-    if output_type.tangent()?.is_zero_space()
-        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
-        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
-    {
-        return Ok(None);
-    }
-
-    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated dimension denotes
-    // one runtime extent, so it is read once and shared by every axis that carries it.
-    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
-    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
-        if let Some(previous) = output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension) {
-            extents.push(extents[previous].clone());
-            continue;
-        }
-        let extent = match dimension {
-            Dimension::Static(extent) => {
-                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
-                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
-            }
-            Dimension::Dynamic(_) => {
-                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
-                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
-                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
-                });
-                let Some((index, input_axis)) = source else {
-                    return Err(TypeError::invalid(format!(
-                        "cannot replicate `{}` inputs into result shape {output_shape} because no input carries \
-                         its runtime axis {axis}",
-                        operation.name(),
-                    ))
-                    .into());
-                };
-                context
-                    .primal()
-                    .bind(
-                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
-                        Vec::new(),
-                        std::slice::from_ref(inputs[index].primal()),
-                    )?
-                    .remove(0)
-            }
-        };
-        extents.push(extent);
-    }
-
-    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the same mixed
-    // broadcast, and a structural-zero tangent stays structural at the replicated tangent type.
-    inputs
-        .iter()
-        .zip(input_types.iter())
-        .map(|(input, input_type)| {
-            if input_type.shape() == output_shape {
-                return Ok(input.clone());
-            }
-            let offset = output_shape.rank() - input_type.rank();
-            let replication =
-                DynamicBroadcastOperation::new((0..input_type.rank()).map(|axis| axis + offset).collect());
-            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
-            replication_inputs.push(input.primal().clone());
-            replication_inputs.extend(extents.iter().cloned());
-            let primal =
-                context.primal().bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?.remove(0);
-            let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                MaybeZero::Value(tangent) => {
-                    let mut tangent_inputs = vec![tangent.clone()];
-                    tangent_inputs.extend(
-                        extents
-                            .iter()
-                            .cloned()
-                            .map(|value| context.primal_to_tangent(value))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                    MaybeZero::Value(
-                        context.tangent().bind(replication, Vec::new(), tangent_inputs.as_slice())?.remove(0),
-                    )
-                }
-            };
-            DifferentiationDual::new(primal, tangent)
-        })
-        .collect::<Result<Vec<_>, DifferentiationError>>()
-        .map(Some)
-}
-
 impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
     A: Value<Type = ArrayType>,
@@ -895,7 +714,149 @@ impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
             Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
             Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
             operation => {
-                let replicated = replicated_elementwise_duals(context, operation, inputs)?;
+                // When the result geometry of an implicitly broadcasting elementwise operation carries a runtime
+                // extent, its inputs are first replicated into that geometry, so that the projected member rule
+                // differentiates inputs that already have the result shape. The member-family alignment (i.e.,
+                // `ElementwiseDerivativeAlignment`) cannot replicate into a runtime extent itself, because its
+                // `BroadcastOperation` carries the complete output geometry as payload metadata and program replay
+                // never refines a payload type. Such an extent is therefore only reachable through an input edge, which
+                // this arm supplies: it reads each runtime extent off the input that owns that axis as a first-class
+                // dimension value and replicates with a `DynamicBroadcastOperation`. Linearization then keeps one
+                // scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
+                // aligned input. The replication yields `None`, and the inputs are differentiated as they are, when the
+                // operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent
+                // space (so no input is ever aligned), its result geometry is fully static, or every input already has
+                // the result shape.
+                let replicated = 'replicated: {
+                    // The variants whose type inference broadcasts several inputs into one result, and whose
+                    // differentiation rules therefore align narrower inputs (both live tangents and primal
+                    // coefficients) with that result type.
+                    if !matches!(
+                        operation,
+                        Self::Add(_)
+                            | Self::Sub(_)
+                            | Self::Mul(_)
+                            | Self::Div(_)
+                            | Self::Rem(_)
+                            | Self::Pow(_)
+                            | Self::Max(_)
+                            | Self::Min(_)
+                            | Self::Clamp(_)
+                            | Self::Atan2(_)
+                            | Self::LogAddExp(_)
+                            | Self::And(_)
+                            | Self::Or(_)
+                            | Self::Xor(_)
+                            | Self::Complex(_)
+                            | Self::Compare(_)
+                            | Self::Select(_),
+                    ) {
+                        break 'replicated None;
+                    }
+
+                    let input_types = inputs
+                        .iter()
+                        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
+                        .collect::<Result<Vec<_>, TypeError>>()?;
+                    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+                    let [output_type] = output_types.as_slice() else {
+                        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+                    };
+                    let output_shape = output_type.shape();
+                    if output_type.tangent()?.is_zero_space()
+                        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+                        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
+                    {
+                        break 'replicated None;
+                    }
+
+                    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated
+                    // dimension denotes one runtime extent, so it is read once and shared by every axis that carries
+                    // it.
+                    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
+                    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
+                        if let Some(previous) =
+                            output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension)
+                        {
+                            extents.push(extents[previous].clone());
+                            continue;
+                        }
+                        let extent = match dimension {
+                            Dimension::Static(extent) => {
+                                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
+                                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+                            }
+                            Dimension::Dynamic(_) => {
+                                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
+                                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
+                                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
+                                });
+                                let Some((index, input_axis)) = source else {
+                                    return Err(TypeError::invalid(format!(
+                                        "cannot replicate `{}` inputs into result shape {output_shape} because no \
+                                         input carries its runtime axis {axis}",
+                                        operation.name(),
+                                    ))
+                                    .into());
+                                };
+                                context
+                                    .primal()
+                                    .bind(
+                                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
+                                        Vec::new(),
+                                        std::slice::from_ref(inputs[index].primal()),
+                                    )?
+                                    .remove(0)
+                            }
+                        };
+                        extents.push(extent);
+                    }
+
+                    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the
+                    // same mixed broadcast, and a structural-zero tangent stays structural at the replicated tangent
+                    // type.
+                    let replicated_inputs = inputs
+                        .iter()
+                        .zip(input_types.iter())
+                        .map(|(input, input_type)| {
+                            if input_type.shape() == output_shape {
+                                return Ok(input.clone());
+                            }
+                            let offset = output_shape.rank() - input_type.rank();
+                            let replication = DynamicBroadcastOperation::new(
+                                (0..input_type.rank()).map(|axis| axis + offset).collect(),
+                            );
+                            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
+                            replication_inputs.push(input.primal().clone());
+                            replication_inputs.extend(extents.iter().cloned());
+                            let primal = context
+                                .primal()
+                                .bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?
+                                .remove(0);
+                            let tangent = match input.tangent() {
+                                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                                MaybeZero::Value(tangent) => {
+                                    let mut tangent_inputs = vec![tangent.clone()];
+                                    tangent_inputs.extend(
+                                        extents
+                                            .iter()
+                                            .cloned()
+                                            .map(|value| context.primal_to_tangent(value))
+                                            .collect::<Result<Vec<_>, _>>()?,
+                                    );
+                                    MaybeZero::Value(
+                                        context
+                                            .tangent()
+                                            .bind(replication, Vec::new(), tangent_inputs.as_slice())?
+                                            .remove(0),
+                                    )
+                                }
+                            };
+                            DifferentiationDual::new(primal, tangent)
+                        })
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                    Some(replicated_inputs)
+                };
                 let inputs = replicated.as_deref().unwrap_or(inputs);
                 rule.apply_projected(context, operation, inputs)?
             }

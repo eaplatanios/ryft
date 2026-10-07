@@ -45,8 +45,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayElement, ArrayType, DataType, FloatingPointArrayElement, NumericArrayElement,
-    RealArrayElement,
+    Array, ArrayAddressing, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
+    FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
 };
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -63,7 +63,7 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
 use crate::operations::{Accuracy, Capability};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed};
+use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`NegOperation`].
@@ -191,6 +191,18 @@ impl_differentiable_elementwise_operation! {
     @linear
     AddOperation,
     rule = [@positive, @positive],
+}
+
+impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    // Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
+    // `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family
+    // lifts the type-generic add into the homogeneous array member that owns elementwise addition. The source payload
+    // is stateless, so no input type survives the conversion, and member type inference rejects a dimension input.
+
+    #[inline]
+    fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+        Self::Array(ArrayOperation::Add(AddOperation::new()))
+    }
 }
 
 define_elementwise_capability!(

@@ -2,7 +2,10 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
-use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DimensionValue};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayType,
+    DimensionOperation, DimensionValue,
+};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
     RecursiveBatchingPolicy,
@@ -172,6 +175,28 @@ impl<
 
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
+
+impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ConstantOperation<ArrayIrValue<A>> {
+    // The eager dispatch domain of `ArrayIrValue` binds only `ConstantOperation<ArrayIrValue<A>>`, so the same
+    // family-neutral `From<ConstantOperation<DimensionValue>>` bound is satisfied there by wrapping the dimension
+    // payload into the composite value. This is what lets `DimensionConstant` stage dimension literals against eager
+    // values too.
+
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        ConstantOperation::new(ArrayIrValue::Dimension(operation.value().clone()))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
+    // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
+    // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
+
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        Self::Dimension(DimensionOperation::Constant(operation))
+    }
+}
 
 /// Represents the ability to materialize a stored [`ConstantOperation`] payload and is typically implemented by
 /// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
