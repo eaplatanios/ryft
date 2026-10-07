@@ -25,7 +25,8 @@ use crate::programs::{
     EffectClasses, Effects, MaybeZero, NoReferent, Operation, OperationProvider, ProgramError, ProjectedValue,
     ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
-    ReferenceMemberType, ReferenceType, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    ReferenceMemberType, ReferenceType, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -328,9 +329,9 @@ impl<A: Value<Type = ArrayType>> ReferenceFreeze<Self, ArrayIrType> for ArrayIrV
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Type = ArrayIrType,
                 Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
             >,
@@ -338,15 +339,15 @@ impl<
 > ReferenceFreeze<V, ArrayIrType> for V
 {
     fn freeze(self) -> Result<V, ProgramError> {
-        let domain = self.dispatch_domain();
+        let domain = self.domain();
         Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Type = ArrayIrType,
                 Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
             >,
@@ -355,7 +356,7 @@ impl<
     for ProjectedValue<ReferenceType<ArrayType>, V>
 {
     fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
-        let domain = self.value().dispatch_domain();
+        let domain = self.value().domain();
         domain
             .bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0)

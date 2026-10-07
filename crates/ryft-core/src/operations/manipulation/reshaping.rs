@@ -33,7 +33,7 @@ use crate::partial::{
 };
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -598,9 +598,9 @@ impl Reshape for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Reshape<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch>> Reshape<ArrayType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ReshapeOperation>>,
+    V::Domain: Context<Type = ArrayType, Operation: From<ReshapeOperation>>,
 {
     #[inline]
     fn reshape_with_output_sharding<S: Into<Shape>>(
@@ -619,7 +619,7 @@ where
         if input_type == output_type {
             return Ok(self.clone());
         }
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -967,7 +967,7 @@ impl_differentiable_operation! {
                                 reshape_inputs.push(linear_inputs[0].clone());
                                 reshape_inputs
                                     .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                                linear_inputs[0].dispatch_domain().bind(
+                                linear_inputs[0].domain().bind(
                                     forward_operation.with_input_types(
                                         &reshape_inputs
                                             .iter()
@@ -979,7 +979,7 @@ impl_differentiable_operation! {
                                 )
                             },
                             move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let transpose_context = output_cotangents[0].domain();
                                 let bridge_sharding = match (
                                     transpose_target_type.sharding(),
                                     <&ArrayType>::try_from(output_cotangents[0].r#type().as_ref())?.sharding(),
@@ -1202,7 +1202,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///     exact extents rather than capacity bounds. Inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>,
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant>,
     {
         // Validate the requested geometry before staging any dimension constant, so that an invalid element count
         // leaves no dead dimension literals behind in a trace.
@@ -1212,7 +1212,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
         infer_dynamic_reshape_output_type(input_type, output_shape, None)?;
         let output_dimensions = output_sizes
             .iter()
-            .map(|extent| self.dispatch_domain().dimension_constant(*extent))
+            .map(|extent| self.domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_reshape(output_dimensions.as_slice())
     }
@@ -1222,7 +1222,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant>
             + DimensionSize
             + ValueProjection<DimensionType, Projected: Mul>,
     {
@@ -1262,7 +1262,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
     fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant> + DimensionSize,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -1278,11 +1278,11 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
             .iter()
             .enumerate()
             .map(|(axis, dimension)| match dimension {
-                Dimension::Static(extent) => self.dispatch_domain().dimension_constant(*extent),
+                Dimension::Static(extent) => self.domain().dimension_constant(*extent),
                 Dimension::Dynamic(_) => self.dimension_size(axis),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        dimensions.insert(axis, self.dispatch_domain().dimension_constant(1)?);
+        dimensions.insert(axis, self.domain().dimension_constant(1)?);
         self.dynamic_reshape(&dimensions)
     }
 }
@@ -1314,7 +1314,7 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for Array
 }
 
 impl<
-    V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>>,
+    V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>>,
 > DynamicReshape<ArrayIrType> for V
 {
     fn dynamic_reshape_with_output_sharding(
@@ -1340,7 +1340,7 @@ impl<
         inputs.extend_from_slice(output_dimensions);
         let operation =
             operation.with_input_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1713,7 +1713,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         BindingRegionDriver, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
-        Typed,
+        ValueDomainDispatch, Typed,
     };
     use crate::tracing::Trace;
 
@@ -1744,15 +1744,11 @@ mod tests {
     }
 
     impl<V: Value, O: Debug + Operation<Type = V::Type>> Value for DispatchValue<V, O> {
-        type DispatchDomain = InvalidOutputContext<V, O>;
-        type ExecutionDomain = InvalidOutputContext<V, O>;
+        type Dispatch = ValueDomainDispatch;
+        type Domain = InvalidOutputContext<V, O>;
 
-        fn dispatch_domain(&self) -> Self::DispatchDomain {
-            InvalidOutputContext(self.output_count, PhantomData)
-        }
-
-        fn execution_domain(&self) -> Self::ExecutionDomain {
-            self.dispatch_domain()
+        fn domain(&self) -> Self::Domain {
+            self.domain()
         }
     }
 
@@ -5205,7 +5201,7 @@ mod tests {
 
         let (staged_output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| {
-                let six = input.dispatch_domain().dimension_constant(6)?;
+                let six = input.domain().dimension_constant(6)?;
                 input.dynamic_reshape_with_output_sharding(&[six], Some(sharding.clone()))
             },
             ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])),

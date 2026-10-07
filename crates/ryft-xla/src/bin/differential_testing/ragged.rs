@@ -147,7 +147,7 @@ impl RaggedCase {
                 let (primal, tangent) = inputs[0]
                     .clone()
                     .into_value()
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(active)
                     .with_captures(captures)
                     .jvp(vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()], |active, captures| {
@@ -181,7 +181,7 @@ impl RaggedCase {
                 let (primal, pullback) = inputs[0]
                     .clone()
                     .into_value()
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(active)
                     .with_captures(captures)
                     .vjp(|active, captures| {

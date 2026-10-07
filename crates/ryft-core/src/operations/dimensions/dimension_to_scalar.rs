@@ -17,7 +17,7 @@ use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical element [`DataType`] used when first-class [`DimensionValue`]s become ordinary array data. Although
@@ -151,14 +151,14 @@ pub trait DimensionToScalar<Output = Self, T = <Self as Capability>::Universe>: 
     fn to_scalar(&self) -> Result<Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V, ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, ArrayIrType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
 {
     #[inline]
     fn to_scalar(&self) -> Result<V, ProgramError> {
         Ok(self
-            .dispatch_domain()
+            .domain()
             .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
@@ -181,14 +181,14 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V, DimensionType> for ProjectedValue<DimensionType, V>
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DimensionToScalar<V, DimensionType> for ProjectedValue<DimensionType, V>
 where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>,
 {
     fn to_scalar(&self) -> Result<V, ProgramError> {
         Ok(self
             .value()
-            .dispatch_domain()
+            .domain()
             .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
     }

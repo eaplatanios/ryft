@@ -76,7 +76,7 @@ where
         + Reduce
         + Reshape
         + Sub,
-    V::DispatchDomain: Fill<f64, V>,
+    V::Domain: Fill<f64, V>,
 {
     fn block_quantize(
         &self,
@@ -136,7 +136,7 @@ where
             compute_type,
             Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
-        let domain = self.dispatch_domain();
+        let domain = self.domain();
         let fill = |value: f64| domain.fill(&scale_value_type, value);
 
         // Per-block maximum magnitude along the trailing dimension.

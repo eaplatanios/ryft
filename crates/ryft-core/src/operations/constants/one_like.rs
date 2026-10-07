@@ -12,7 +12,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
+use crate::programs::{
+    Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
 
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
@@ -144,11 +146,11 @@ impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
     }
 }
 
-impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<OneLikeOperation<T>>>>> OneLike<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<OneLikeOperation<T>>>>> OneLike<T> for V {
     #[inline]
     fn one_like(&self) -> Result<Self, ProgramError> {
         let operation = OneLikeOperation::new();
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

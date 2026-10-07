@@ -4582,16 +4582,16 @@ mod tests {
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError>
     where
-        V::ExecutionDomain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
+        V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
     {
-        inputs[0].execution_domain().bind(TestOperation::Scan(operation), vec![body], inputs)
+        inputs[0].domain().bind(TestOperation::Scan(operation), vec![body], inputs)
     }
 
     /// Applies the three-iteration cumulative-product scan to `initial` and `values` in their execution domain and
     /// returns its final carry.
     fn apply_product_scan<V: Value<Type = ArrayType>>(initial: V, values: V) -> Result<V, ProgramError>
     where
-        V::ExecutionDomain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
+        V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
     {
         Ok(bind_scan(TestScanOperation::new(1, 3), product_body(), &[initial, values])?.remove(0))
     }
@@ -5162,7 +5162,7 @@ mod tests {
         assert_eq!(
             TracingContext::<TestIrValue, TestIrOperation>::trace(
                 |inputs: Vec<Tracer<TracingContext<TestIrValue, TestIrOperation>>>| {
-                    inputs[0].dispatch_domain().bind(ScanOperation::<ArrayIrType>::new(1, 1), vec![body], &inputs)
+                    inputs[0].domain().bind(ScanOperation::<ArrayIrType>::new(1, 1), vec![body], &inputs)
                 },
                 vec![ArrayIrType::Array(concrete_type.clone())],
             )
@@ -12111,7 +12111,7 @@ mod tests {
         /// Applies a cumulative-product scan and returns its final carry and stacked intermediate products.
         fn function<V: Value<Type = ArrayType>>((initial, values): (V, V)) -> Result<(V, V), ProgramError>
         where
-            V::ExecutionDomain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
+            V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
         {
             let mut outputs = bind_scan(TestScanOperation::new(1, 3), product_body(), &[initial, values])?;
             let stacked = outputs.remove(1);
@@ -12149,7 +12149,7 @@ mod tests {
         // Finite differences independently check the derivatives through every slice of the nonlinear recurrence.
         check_gradient!(
             |values| {
-                let initial = values.execution_domain().lift(Array::scalar(1f64).unwrap())?;
+                let initial = values.domain().lift(Array::scalar(1f64).unwrap())?;
                 apply_product_scan(initial, values)
             },
             at = Array::vector(vec![2f64, 3.0, 4.0]).unwrap(),
@@ -13055,7 +13055,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, TestOperation>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, TestOperation>>>| {
                 inputs[0]
-                    .dispatch_domain()
+                    .domain()
                     .bind(TestOperation::Scan(TestScanOperation::new(1, 2)), vec![body], &inputs)
             },
             vec![scalar_type.clone(), stacked_type.clone()],

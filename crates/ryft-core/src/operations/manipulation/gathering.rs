@@ -39,7 +39,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
-    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Determines how [`Gather`] handles windows extending outside its input. Negative indices are out of bounds and they
@@ -990,13 +990,13 @@ where
                     residuals.into_values(),
                     vec![input_tangent.clone()],
                     move |residuals, linear_inputs| {
-                        Ok(vec![linear_inputs[0].dispatch_domain().bind_array(
+                        Ok(vec![linear_inputs[0].domain().bind_array(
                             forward_operation,
                             &[linear_inputs[0].clone(), residuals[indices_index].clone()],
                         )?])
                     },
                     move |residuals, output_cotangents| {
-                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let transpose_context = output_cotangents[0].domain();
                         let zeros = transpose_context.bind_array(
                             ZeroOperation::new(input_cotangent_type.clone()),
                             input_shape.dynamic_dimensions(residuals).as_slice(),
@@ -1821,10 +1821,10 @@ impl Gather for Array {
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>>
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>>
     Gather<Stored, ArrayType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
+    V::Domain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
 {
     fn gather(
         &self,
@@ -1838,7 +1838,7 @@ where
         let operation = GatherOperation::new(dimensions.clone(), slice_sizes.to_vec()).with_options(options.clone());
         let inputs = [self.clone(), indices.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1907,7 +1907,7 @@ pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array, T = <Self as Ca
 
 impl<Stored: Value<Type = ArrayType>, A> DynamicGather<Stored, ArrayIrType> for ArrayIrValue<A>
 where
-    A: Value<Type = ArrayType, DispatchDomain: Zero<A>>
+    A: Value<Type = ArrayType, Domain: Zero<A>>
         + ManualVariationAlignment<ArrayType>
         + Gather<Stored>
         + Reshape,
@@ -1936,19 +1936,19 @@ where
                 axis,
                 mode,
             )?;
-            return Ok(Self::Array(inputs[0].dispatch_domain().zero(&output_type)?));
+            return Ok(Self::Array(inputs[0].domain().zero(&output_type)?));
         }
         Ok(Self::Array(input.gather_axis(indices, axis, mode)?))
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>> DynamicGather<Stored, ArrayIrType> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DynamicGather<Stored, ArrayIrType> for V
 where
     V: DimensionSize
         + DynamicBroadcast<ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
         + ValueProjection<ArrayType, Projected: Gather<Stored>>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,
+    V::Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,
 {
     fn dynamic_gather_axis<A: Into<Axis>>(
         &self,
@@ -1977,7 +1977,7 @@ where
                 dimensions.push(input.dimension_size(input_axis)?);
             }
         }
-        dimensions.push(input.dispatch_domain().dimension_constant(1)?);
+        dimensions.push(input.domain().dimension_constant(1)?);
 
         // Broadcast each scalar query over the untouched input coordinates. Those coordinates select matching
         // input/indices batches, so no symbolic extent is encoded as a host-sized gather window.
@@ -2015,7 +2015,7 @@ where
                 .zip(&dimensions)
                 .filter_map(|(dimension, value)| matches!(dimension, Dimension::Dynamic(_)).then_some(value.clone()))
                 .collect::<Vec<_>>();
-            return input.dispatch_domain().dynamic_zero(&output_type, &dynamic_dimensions);
+            return input.domain().dynamic_zero(&output_type, &dynamic_dimensions);
         }
 
         Ok(V::from_projected(input.clone().into_projected()?.gather(
@@ -2100,7 +2100,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
+        ValueDirectDispatch, EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
         ReferenceDischargeValue, ReferenceDischargeableOperation,
     };
     use crate::tests::hash_of;
@@ -2604,14 +2604,10 @@ mod tests {
         }
 
         impl Value for NonLiteralFill {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
+            fn domain(&self) -> Self::Domain {
                 EagerContext::new()
             }
 
@@ -3980,7 +3976,7 @@ mod tests {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let jacobian = differentiate_at(Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap())
             .jacobian_forward(|input| {
-                let indices = input.dispatch_domain().lift(Array::matrix(2, 1, vec![0_i32, 2]).unwrap())?;
+                let indices = input.domain().lift(Array::matrix(2, 1, vec![0_i32, 2]).unwrap())?;
                 input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
             })
             .unwrap();
@@ -4003,7 +3999,7 @@ mod tests {
             .with_mode(GatherMode::Fill { value: None });
         let jacobian = differentiate_at(Array::vector(vec![10_f64, 20.]).unwrap())
             .jacobian_forward(|input| {
-                let indices = input.dispatch_domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
+                let indices = input.domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
                 input.gather(&indices, filling.dimensions(), filling.slice_sizes(), filling.options())
             })
             .unwrap();
@@ -4012,7 +4008,7 @@ mod tests {
             filling.with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(99_f64).unwrap())) });
         let jacobian = differentiate_at(Array::vector(vec![10_f64, 20.]).unwrap())
             .jacobian_forward(|input| {
-                let indices = input.dispatch_domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
+                let indices = input.domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
                 input.gather(
                     &indices,
                     explicitly_filling.dimensions(),

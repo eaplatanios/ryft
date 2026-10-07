@@ -70,7 +70,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, EmptyRegionDriver, MemberOperation, Operation, OperationFormatter,
     OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value, ValueProjection,
+    Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
@@ -2759,9 +2759,9 @@ impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<
     }
 }
 
-impl<T: Type, V: Value<Type = T>> CustomCall<T> for V
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch>> CustomCall<T> for V
 where
-    V::DispatchDomain: Context<Operation: From<CustomCallOperation>>,
+    V::Domain: Context<Operation: From<CustomCallOperation>>,
 {
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
         operation: &CustomCallOperation,
@@ -2785,7 +2785,7 @@ where
                 ),
             });
         };
-        first.dispatch_domain().bind(operation.clone(), Vec::new(), inputs.as_slice())
+        first.domain().bind(operation.clone(), Vec::new(), inputs.as_slice())
     }
 }
 
@@ -2814,7 +2814,9 @@ mod tests {
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{BindingRegionDriver, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope};
+    use crate::programs::{
+        BindingRegionDriver, ValueDirectDispatch, MaybeZero, ProgramBuilder, Provenance, ProvenanceScope, ValueDomainDispatch,
+    };
     use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -4320,14 +4322,10 @@ mod tests {
         }
 
         impl Value for IdentityKernelArray {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
+            fn domain(&self) -> Self::Domain {
                 EagerContext::new()
             }
         }
@@ -4588,14 +4586,10 @@ mod tests {
         }
 
         impl Value for TypeReadCountingArray {
-            type DispatchDomain = TypeReadCountingContext;
-            type ExecutionDomain = TypeReadCountingContext;
+            type Dispatch = ValueDomainDispatch;
+            type Domain = TypeReadCountingContext;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                TypeReadCountingContext
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
+            fn domain(&self) -> Self::Domain {
                 TypeReadCountingContext
             }
         }

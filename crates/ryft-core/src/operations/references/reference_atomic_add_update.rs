@@ -25,7 +25,7 @@ use crate::programs::{
     ReferenceAccessMode, ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
     ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection, batch_reference_transforms, infer_reference_view_type,
+    ValueDomainDispatch, ValueProjection, batch_reference_transforms, infer_reference_view_type,
 };
 
 /// Canonical operation name for [`ReferenceAtomicAddUpdateOperation`].
@@ -526,13 +526,13 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + 
 impl<U: ReferenceMemberType, Transform, V> ReferenceAtomicAddUpdate<Transform, V, V, U> for V
 where
     Transform: ReferenceTransform<Type = U, Referent = U::Referent>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = U,
-            DispatchDomain: Context<
+            Domain: Context<
                 Operation: OperationProvider<
                     U,
                     ReferenceAtomicAddUpdateOperation<U::Referent, U, Transform>,
-                    Operation = <V::DispatchDomain as Domain>::Operation,
+                    Operation = <V::Domain as Domain>::Operation,
                 >,
             >,
         >,
@@ -550,11 +550,11 @@ where
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend_from_slice(bindings);
         let input_types = inputs.iter().map(Typed::r#type).collect::<Vec<_>>();
-        let operation = <V::DispatchDomain as Domain>::Operation::provide(
+        let operation = <V::Domain as Domain>::Operation::provide(
             ReferenceAtomicAddUpdateOperation::new().with_transforms(transforms.to_vec()),
             &input_types.iter().map(|r#type| r#type.as_ref()).collect::<Vec<_>>(),
         )?;
-        self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        self.domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
@@ -563,9 +563,9 @@ impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, ProjectedValue<ArrayTy
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>>,
             >,
         >,
@@ -579,7 +579,7 @@ where
         let mut inputs = vec![self.value().clone(), update.value().clone()];
         inputs.extend_from_slice(bindings);
         let operation = ReferenceAtomicAddUpdateOperation::new().with_transforms(transforms.to_vec());
-        self.value().dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        self.value().domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }

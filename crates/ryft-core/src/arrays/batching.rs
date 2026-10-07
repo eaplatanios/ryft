@@ -43,9 +43,9 @@ use crate::operations::{
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    Operation, OperationProjection, Program, ProgramError, ProjectedValue, ProvenanceScope, ReferenceType, Region,
-    RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed, Value,
-    ValueProjection,
+    ValueDirectDispatch, Operation, OperationProjection, Program, ProgramError, ProjectedValue, ProvenanceScope, ReferenceType,
+    Region, RegionRef, RegionReplayMappings, ReplayRegionDriver, Transform, TransformArtifact, Type, TypeError, Typed,
+    Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -692,16 +692,11 @@ impl<V: Typed<Type = ArrayType>> Typed for ArrayBatch<V> {
 }
 
 impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
 
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> EagerContext<Self> {
+    fn domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 }
@@ -4467,8 +4462,8 @@ mod tests {
 
         // A batch is itself a `Value` whose domains are the eager context over batches, so batches can flow through
         // generic value code (e.g., as batching-context values) without a backend-owned context.
-        assert!(replicated.dispatch_domain().is_eager());
-        assert!(replicated.execution_domain().is_eager());
+        assert!(replicated.domain().is_eager());
+        assert!(replicated.domain().is_eager());
         assert_eq!(replicated.into_value(), vector);
     }
 
@@ -9186,7 +9181,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, Array::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0]).unwrap());
 
-        // The free `batch` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a
+        // The free `batch` serves top-level concrete values through their `Value::Domain` declarations: a
         // plain `Array` input recovers the test backend's rich eager domain, mirroring how JAX's `vmap` falls back
         // to the default eager interpreter for concrete arrays.
         let output: Array = batch(

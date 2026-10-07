@@ -19,8 +19,8 @@ use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
 };
 
 /// Name of [`ParallelVaryOperation`].
@@ -400,7 +400,7 @@ impl ParallelVary for Array {
 // through `OperationProvider` rather than converted through `From`, so that operation families without them can
 // still provide the request with an error instead of losing every capability that aligns manual variation.
 impl<
-    V: Value<Type = ArrayType, DispatchDomain = C>,
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain = C>,
     C: Context<
             Value = V,
             Operation: OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>
@@ -409,7 +409,7 @@ impl<
 > ParallelVary<ArrayType> for V
 {
     fn parallel_vary(&self, axis_name: &str) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let named_axis = context.named_axis(axis_name);
         let Some(NamedAxis::Mesh { mesh, size: 1.., .. }) = named_axis else {
             let message =
@@ -431,7 +431,7 @@ impl<
             .into());
         }
 
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let mut input = self.clone();
         let input_type = input.r#type().into_owned();
         if let Some(sharding) = input_type.sharding()
@@ -517,7 +517,7 @@ impl<V: Value<Type = DataType>> ManualVariationAlignment<DataType> for V {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context + NamedAxes> + ParallelVary> ManualVariationAlignment<ArrayType>
+impl<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary> ManualVariationAlignment<ArrayType>
     for V
 {
     fn align_manual_variation(inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
@@ -575,14 +575,14 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Manual
 /// [`ParallelVaryOperation`] per missing axis. Each input resolves an axis name against its own context: a name that a
 /// `batch` level binds shadows the mesh axis and is skipped, and a name that the context does not bind uses the mesh
 /// recorded for it in `axes` (refer to [`ParallelVary::parallel_vary_on_mesh`]).
-fn vary_over_manual_axes<V: Value<Type = ArrayType, DispatchDomain: Context + NamedAxes> + ParallelVary>(
+fn vary_over_manual_axes<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary>(
     inputs: &[V],
     axes: &BTreeMap<String, LogicalMesh>,
 ) -> Result<Vec<V>, ProgramError> {
     inputs
         .iter()
         .map(|input| {
-            let context = input.dispatch_domain();
+            let context = input.domain();
             let input_type = input.r#type().into_owned();
             axes.iter()
                 .filter(|(axis, _)| {

@@ -711,14 +711,14 @@ pub struct WithoutContext;
 
 impl private::Sealed for WithoutContext {}
 
-impl<V: Value<ExecutionDomain: Context<Type = V::Type, Value = V>>, Input: Parameterized<V>>
+impl<V: Value<Domain: Context<Type = V::Type, Value = V>>, Input: Parameterized<V>>
     DifferentiationBuilderContext<V, Input> for WithoutContext
 {
-    type Context = V::ExecutionDomain;
+    type Context = V::Domain;
 
     #[inline]
-    fn resolve(self, primal: &Input) -> Result<V::ExecutionDomain, DifferentiationError> {
-        primal.parameters().next().map(Value::execution_domain).ok_or(DifferentiationError::EmptyInput)
+    fn resolve(self, primal: &Input) -> Result<V::Domain, DifferentiationError> {
+        primal.parameters().next().map(Value::domain).ok_or(DifferentiationError::EmptyInput)
     }
 }
 
@@ -3064,7 +3064,7 @@ mod tests {
             }
         }
 
-        // The selected context may differ from `Array::ExecutionDomain`; its type drives all tracer and transform
+        // The selected context may differ from `Array::Domain`; its type drives all tracer and transform
         // machinery when the builder is context-bound.
         let context = ExplicitContext(EagerContext::new());
         let (_, gradient) = context

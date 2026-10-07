@@ -15,7 +15,7 @@ use crate::{XlaArray, XlaArrayShard};
 ///
 /// This is the JAX-style op-by-op dispatch shape behind every eager value capability of [`XlaArray`]. The blanket
 /// capability implementations in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...)
-/// already follow it through [`Value::dispatch_domain`], which for a concrete [`XlaArray`] recovers the PJRT-backed
+/// already follow it through [`Value::domain`], which for a concrete [`XlaArray`] recovers the PJRT-backed
 /// [`XlaDomain`](crate::XlaDomain) that the array belongs to. That domain executes the operation through a
 /// single-operation program that its session caches per operation application, so a repeated eager operation skips
 /// tracing and lowering. This module therefore only implements the capabilities those blankets cannot cover: the
@@ -29,7 +29,7 @@ fn bind_single_output<'o, P: Into<ArrayOperation<XlaArrayConstant>>>(
     operation: P,
     inputs: &[XlaArray<'o>],
 ) -> Result<XlaArray<'o>, ProgramError> {
-    let domain = inputs.first().unwrap().execution_domain();
+    let domain = inputs.first().unwrap().domain();
     let mut outputs = domain.bind(operation, Vec::new(), inputs)?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
@@ -755,7 +755,7 @@ mod tests {
         )
         .unwrap();
         let (_, tangent) = input
-            .execution_domain()
+            .domain()
             .jvp(
                 |(left, right), ()| left.atan2(&right),
                 (input.clone(), input.clone()),
@@ -2524,10 +2524,10 @@ mod tests {
         .unwrap();
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
-            input.execution_domain(),
+            input.domain(),
             crate::XlaValue::Dimension(crate::XlaDimension::new(
                 DimensionValue::constant(3).unwrap(),
-                input.domain().clone(),
+                input.xla_domain().clone(),
             )),
         );
         let data = ArrayBatch::new(input, BatchAxis::new(0))
@@ -2577,7 +2577,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let input = f32_vector(&domain, &mesh, &[1.5, 2.5]);
         let output_type = replicated_type(&mesh, DataType::F32, &[2]);
-        let domain = input.execution_domain();
+        let domain = input.domain();
 
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
 
@@ -2618,7 +2618,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let input = f32_vector(&domain, &mesh, &[1.5, 2.5]);
         let output_type = replicated_type(&mesh, DataType::F32, &[2]);
-        let domain = input.execution_domain();
+        let domain = input.domain();
 
         type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
 
@@ -3676,7 +3676,7 @@ mod tests {
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
         let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(configuration);
         let inputs = AttentionInputs::new(device(), device(), device());
-        let domain = inputs.query.execution_domain();
+        let domain = inputs.query.domain();
         let (loss, gradients) = domain
             .differentiate_at(inputs)
             .value_and_gradient(|inputs| {
@@ -3968,7 +3968,7 @@ mod tests {
         for kind in [ScatterReductionKind::Min, ScatterReductionKind::Max] {
             let (value, (input_gradient, updates_gradient)) = differentiate_at((input.clone(), updates.clone()))
                 .with_captures(indices.clone())
-                .in_context(&input.execution_domain())
+                .in_context(&input.domain())
                 .value_and_gradient(|(input, updates), indices| {
                     input
                         .scatter(
@@ -3993,7 +3993,7 @@ mod tests {
         let updates = f32_vector(&domain, &mesh, &[7.0, 8.0]);
         let (value, (input_gradient, updates_gradient)) = differentiate_at((input.clone(), updates))
             .with_captures(indices)
-            .in_context(&input.execution_domain())
+            .in_context(&input.domain())
             .value_and_gradient(|(input, updates), indices| {
                 input
                     .scatter(
@@ -4034,7 +4034,7 @@ mod tests {
         // accumulate their cotangents through the inverse scatter on the selected execution device.
         let (value, gradient) = differentiate_at(input.clone())
             .with_captures(indices)
-            .in_context(&input.execution_domain())
+            .in_context(&input.domain())
             .value_and_gradient(|input, indices| {
                 input
                     .gather(&indices, &GatherDimensionNumbers::new(vec![], vec![0], vec![0]), &[1], &options)
@@ -4188,21 +4188,21 @@ mod tests {
         // operations, and it shares that domain's session and compile cache.
         let sum = a.add(&b).unwrap();
         assert!(std::ptr::eq(sum.client(), &client));
-        assert!(Arc::ptr_eq(sum.domain().session(), domain.session()));
-        assert_eq!(sum.execution_domain().parent().cache_size(), 1);
+        assert!(Arc::ptr_eq(sum.xla_domain().session(), domain.session()));
+        assert_eq!(sum.domain().parent().cache_size(), 1);
 
         let product = sum.mul(&b).unwrap();
         assert_eq!(read_f32s(&product), vec![12.0, 24.0]);
         assert!(std::ptr::eq(product.client(), &client));
-        assert!(Arc::ptr_eq(product.domain().session(), domain.session()));
+        assert!(Arc::ptr_eq(product.xla_domain().session(), domain.session()));
 
         // All values derived from `a` share one dispatch cache: `add` and `mul` each compiled once, and repeating
         // `add` at the same input signature is a cache hit.
-        assert_eq!(product.execution_domain().parent().cache_size(), 2);
-        assert_eq!(a.execution_domain().parent().cache_size(), 2);
+        assert_eq!(product.domain().parent().cache_size(), 2);
+        assert_eq!(a.domain().parent().cache_size(), 2);
         let repeated = a.add(&b).unwrap();
         assert_eq!(read_f32s(&repeated), vec![4.0, 6.0]);
-        assert_eq!(a.execution_domain().parent().cache_size(), 2);
+        assert_eq!(a.domain().parent().cache_size(), 2);
         assert_eq!(domain.cache_size(), 2);
     }
 
@@ -4217,7 +4217,7 @@ mod tests {
 
         // Arrays recover the domain they were constructed in, together with its session and client.
         let array = f32_vector(&domain, &mesh, &[1.0, 2.0]);
-        let recovered = array.execution_domain();
+        let recovered = array.domain();
         assert!(std::ptr::eq(recovered.parent().client(), &client));
         assert!(Arc::ptr_eq(recovered.parent().session(), domain.session()));
 
@@ -4225,7 +4225,7 @@ mod tests {
         // so subsequent receiver-based eager operations compile and execute in that session instead.
         let other_domain = XlaSession::new(&client).domain();
         let associated = array.associate(&other_domain).unwrap();
-        let recovered = associated.execution_domain();
+        let recovered = associated.domain();
         assert!(Arc::ptr_eq(recovered.parent().session(), other_domain.session()));
         assert_eq!(read_f32s(&associated.neg().unwrap()), vec![-1.0, -2.0]);
         assert_eq!(other_domain.cache_size(), 1);
@@ -4244,7 +4244,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
         let tangents = f32_vector(&domain, &mesh, &[1.0, 1.0, 1.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let (value, tangent): (XlaArray<'_>, XlaArray<'_>) =
             domain.jvp(|x, ()| Mul::mul(&x, &x), x.clone(), tangents, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![1.0, 4.0, 9.0]);
@@ -4265,14 +4265,14 @@ mod tests {
         let tangent = f32_scalar(&domain, &mesh, 3.0);
 
         let (value, tangent) =
-            primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
+            primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![3.0]);
 
         let primal = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 0.0));
         let tangent = c64_scalar(&domain, &mesh, num_complex::Complex::new(1.0, 2.0));
         let (value, tangent) =
-            primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
+            primal.domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![0.0]);
     }
@@ -4322,7 +4322,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let (value, gradient) = domain
             .differentiate_at(x.clone())
             .value_and_gradient(|x| {
@@ -4345,7 +4345,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let gradient = domain
             .differentiate_at(x.clone())
             .gradient(|x| {
@@ -4368,7 +4368,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let context = x.execution_domain();
+        let context = x.domain();
         let (value, pullback) = context.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
@@ -4397,7 +4397,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let z = num_complex::Complex::new(0.7f32, -0.3f32);
         let x = c64_scalar(&domain, &mesh, z);
-        let context = x.execution_domain();
+        let context = x.domain();
 
         // Holomorphic gradient of z² through the XLA eager domain: the `one` cotangent seed lowers through the
         // composed complex constant, and the pullback recovers ∂(z²)/∂z = 2z on device.
@@ -4444,7 +4444,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let ((value, aux), gradient): ((XlaArray<'_>, XlaArray<'_>), XlaArray<'_>) = domain
             .differentiate_at(x.clone())
             .with_auxiliary_output()
@@ -4489,7 +4489,7 @@ mod tests {
 
         let (value, gradient) = differentiate_at(primal.clone())
             .with_captures(capture.clone())
-            .in_context(&primal.execution_domain())
+            .in_context(&primal.domain())
             .value_and_gradient(|input, capture| {
                 Mul::mul(&input, &capture).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
             })
@@ -4497,11 +4497,11 @@ mod tests {
         assert_eq!(read_f32s(&value), vec![60.0]);
         assert_eq!(read_f64_coordinates(&gradient), vec![4.0, 5.0, 6.0, 7.0]);
         assert_eq!(gradient.sharding(), &sharding);
-        assert!(Arc::ptr_eq(gradient.domain().session(), domain.session()));
+        assert!(Arc::ptr_eq(gradient.xla_domain().session(), domain.session()));
 
         let (_, pushforward) = differentiate_at(primal.clone())
             .with_captures(capture)
-            .in_context(&primal.execution_domain())
+            .in_context(&primal.domain())
             .linearize(|input, capture| Mul::mul(&input, &capture))
             .unwrap();
         let capture_residual = pushforward
@@ -4510,7 +4510,7 @@ mod tests {
             .find(|residual| read_f64_coordinates(residual) == vec![4.0, 5.0, 6.0, 7.0])
             .expect("capture should survive as a pushforward residual");
         assert_eq!(capture_residual.sharding(), &sharding);
-        assert!(Arc::ptr_eq(capture_residual.domain().session(), domain.session()));
+        assert!(Arc::ptr_eq(capture_residual.xla_domain().session(), domain.session()));
     }
 
     /// Nested transform composition over concrete arrays: `grad` of a function that internally maps its per-item
@@ -4525,7 +4525,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let gradient = domain
             .differentiate_at(x.clone())
             .gradient(|x| {
@@ -4549,14 +4549,14 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
         assert!(
-            Arc::ptr_eq(block.value().domain().session(), domain.parent().session()),
+            Arc::ptr_eq(block.value().xla_domain().session(), domain.parent().session()),
             "the derivative block must remain in the session of its input",
         );
         assert_eq!(block.value().shape(), StaticShape::new(vec![3, 3]));
@@ -4586,7 +4586,7 @@ mod tests {
 
             let r#type = array.r#type().into_owned();
             let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
-                &array.execution_domain(),
+                &array.domain(),
                 &r#type,
                 &r#type,
                 0,
@@ -4610,7 +4610,7 @@ mod tests {
         .unwrap();
         let matrix_type = matrix.r#type().into_owned();
         let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
-            &matrix.execution_domain(),
+            &matrix.domain(),
             &matrix_type,
             &matrix_type,
             1,
@@ -4630,7 +4630,7 @@ mod tests {
             XlaArray::from_host_buffer(&domain, complex_type, mesh.clone(), values_to_bytes(&complex_values)).unwrap();
         let complex_type = complex.r#type().into_owned();
         let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
-            &complex.execution_domain(),
+            &complex.domain(),
             &complex_type,
             &complex_type,
             0,
@@ -4663,7 +4663,7 @@ mod tests {
         let r#type = replicated_type(&mesh, DataType::F16, &[3]);
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
         let x = XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
@@ -4682,7 +4682,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let value = num_complex::Complex::new(1.0f32, 2.0);
         let input = c64_scalar(&domain, &mesh, value);
-        let context = input.execution_domain();
+        let context = input.domain();
 
         let forward = context
             .differentiate_at(input.clone())
@@ -4722,7 +4722,7 @@ mod tests {
             .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), bytes.as_slice()).unwrap();
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
@@ -4794,7 +4794,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
+        let domain = x.domain();
         let hessian = domain
             .differentiate_at(x)
             .hessian(|x| {
@@ -4822,7 +4822,7 @@ mod tests {
         let domain = XlaSession::new(&client).domain();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let context = x.execution_domain();
+        let context = x.domain();
         let (value, pullback) = context.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x, ()).unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 

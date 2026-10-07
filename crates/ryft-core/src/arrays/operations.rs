@@ -2160,7 +2160,7 @@ mod tests {
         let array = context.input(ArrayType::scalar(DataType::F32).into());
         let array_atom = array.atom_id().unwrap();
         let array = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(array).unwrap();
-        array.dispatch_domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array]).unwrap();
+        array.domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array]).unwrap();
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let left_type = DimensionType::new("left", bounds);
@@ -2171,7 +2171,7 @@ mod tests {
         let right_atom = right.atom_id().unwrap();
         let left = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(left).unwrap();
         let right = <Tracer<TestContext> as ValueProjection<DimensionType>>::into_projected(right).unwrap();
-        left.dispatch_domain()
+        left.domain()
             .bind(DimensionAddOperation::new(&left_type, &right_type).unwrap(), Vec::new(), &[left, right])
             .unwrap();
 

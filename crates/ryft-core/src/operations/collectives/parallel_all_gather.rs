@@ -49,7 +49,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1213,7 +1213,7 @@ impl<
                         let mut collective_inputs = Vec::with_capacity(1 + forward_output_extents.len());
                         collective_inputs.push(linear_inputs[0].clone());
                         collective_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                        linear_inputs[0].dispatch_domain().bind(
+                        linear_inputs[0].domain().bind(
                             forward_operation,
                             Vec::new(),
                             collective_inputs.as_slice(),
@@ -1228,7 +1228,7 @@ impl<
 
                         // Rebuild the exact input dimensions from the retained shape, staging static extents as
                         // dimension constants in the transpose context.
-                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let transpose_context = output_cotangents[0].domain();
                         let input_dimensions = input_shape.dimensions(&transpose_context, residuals)?;
                         let output_cotangent_type = output_cotangents[0].r#type();
                         let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
@@ -1542,7 +1542,7 @@ impl<V: ParallelAllGather<ArrayIrType> + ValueProjection<ArrayType, Projected = 
 
 impl<
     V: ShapeChangingCollectiveValue<
-            DispatchDomain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
+            Domain: Context<Value = V, Operation: From<ParallelAllGatherOperation>> + NamedAxes,
         > + ParallelVary,
 > ParallelAllGather<ArrayType> for V
 {
@@ -1558,7 +1558,7 @@ impl<
         // copy is gathered, while reduction state over the axis is rejected first, so that it is reported as an
         // all-gather error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its
         // concatenation axis is a position in the result, whose rank is one more than the rank of the input.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let result_rank = self.r#type().rank() + usize::from(options.mode == CollectiveMode::Untiled);
         let concatenation_axis = concatenation_axis.into().normalize(result_rank)?;
@@ -1585,9 +1585,9 @@ impl<
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ParallelAllGatherOperation>>
+            Domain: Context<Type = ArrayIrType, Operation: From<ParallelAllGatherOperation>>
                                 + DimensionConstant
                                 + NamedAxes,
         > + DimensionSize<V>
@@ -1609,7 +1609,7 @@ impl<
         // error rather than as a `parallel_vary` error. An untiled gather inserts an axis, so its concatenation axis
         // is a position in the result, whose rank is one more than the rank of the input. The axis is normalized
         // before the explicit result extents are derived from the input extents.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
@@ -2962,7 +2962,7 @@ mod tests {
             .unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelAllGatherOperation::new(

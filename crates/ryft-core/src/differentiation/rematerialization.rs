@@ -266,7 +266,7 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     }
 
     /// Stages one call of this [`RematerializedFunction`] on the provided `input` value and returns its output value.
-    /// The [`Context`] `C` that the call is staged into is the [`DispatchDomain`](Value::DispatchDomain) of the values
+    /// The [`Context`] `C` that the call is staged into is the [`Domain`](Value::Domain) of the values
     /// in `input`, so it is never named at a construction or call site. The body is traced in a fresh trace that is
     /// seeded with the [named axes](NamedAxes::named_axes) in scope in `C`, so that it resolves the axes of enclosing
     /// transforms as it would if it were inlined.
@@ -277,7 +277,7 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     /// must be used instead), when tracing the body fails, or when the staged [`RematerializeOperation`] rejects the
     /// call.
     pub fn call<
-        V: Value<Type = C::Type, DispatchDomain = C>,
+        V: Value<Type = C::Type, Domain = C>,
         C: Context<Type: 'static, Value = V, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
@@ -309,7 +309,7 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
             )
             .into());
         };
-        self.call_impl(&first.dispatch_domain(), input_types, input_values.as_slice())
+        self.call_impl(&first.domain(), input_types, input_values.as_slice())
     }
 
     /// Stages one call of this function on the provided `input` value in the provided `context` and returns its output

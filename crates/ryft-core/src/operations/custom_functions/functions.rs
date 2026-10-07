@@ -1975,7 +1975,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// documentation of the [`custom_function`] function for the tracing semantics and for how the transforms treat
     /// the staged call.
     ///
-    /// The [`Context`] `C` whose universe the rules are traced into is the [`DispatchDomain`](Value::DispatchDomain)
+    /// The [`Context`] `C` whose universe the rules are traced into is the [`Domain`](Value::Domain)
     /// of the values in `input`, which is exactly the context the call is staged into. It is therefore never named at
     /// a construction or call site, while the stored closures still pin the tracers that this universe must produce.
     ///
@@ -1992,7 +1992,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// the call (e.g., because the call violates the reference contract). The rules are validated when they are first
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
-        V: Value<Type = C::Type, DispatchDomain = C>,
+        V: Value<Type = C::Type, Domain = C>,
         C: Context<Type: DifferentiableType + BatchableType + Eq + Hash, Value = V> + NamedAxes,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
@@ -2033,7 +2033,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         // the function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names
         // as the function would if it were inlined. Rules traced under different bindings may differ, so the named
         // axes are part of the registration key.
-        let named_axes = first.dispatch_domain().named_axes();
+        let named_axes = first.domain().named_axes();
         let (output_types, primal) =
             DomainTracingContext::<C>::trace_with_named_axes(&self.primal, input_types.clone(), named_axes.clone())?;
         let input_structure = input_types.parameter_structure();
@@ -2072,7 +2072,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         let operation =
             CustomFunctionOperation::new(rules).with_non_differentiated_count(self.non_differentiated_count)?;
         let outputs =
-            first.dispatch_domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
+            first.domain().bind(operation, vec![primal.into_flat_program()], input_values.as_slice())?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -2267,19 +2267,19 @@ pub fn check_batching_rule_consistency<V, F, I, O, Specification, Equivalent>(
     equivalent: Equivalent,
 ) -> Result<(), BatchingRuleConsistencyError>
 where
-    V: Value<ExecutionDomain: Batch>,
-    F: Fn(I::To<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>) -> Result<O, ProgramError>,
+    V: Value<Domain: Batch>,
+    F: Fn(I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             Family: ParameterizedFamily<BatchAxis>
-                        + ParameterizedFamily<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>,
+                        + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
         >,
     O: Parameterized<
-            BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>,
+            BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
     Specification: Into<
-        BatchAxisSpecification<<<V::ExecutionDomain as Batch>::Policy as BatchingPolicy<V::ExecutionDomain>>::Extent>,
+        BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>,
     >,
     Equivalent: Fn(&V, &V) -> bool,
 {
@@ -2305,7 +2305,7 @@ where
         let axes =
             I::To::<BatchAxis>::from_parameters(structure.clone(), input_axes.clone()).map_err(BatchingError::from)?;
         let broadcast: V = batch(
-            |tracers: I::To<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>| {
+            |tracers: I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>| {
                 Ok(tracers.into_parameters().nth(input).unwrap())
             },
             input_value,

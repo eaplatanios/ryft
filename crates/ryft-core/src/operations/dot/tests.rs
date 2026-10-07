@@ -987,7 +987,7 @@ fn test_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError>
         |(row, vector)| {
             let row = ValueProjection::<ArrayType>::into_projected(row)?;
             let vector = ValueProjection::<ArrayType>::into_projected(vector)?;
-            let mut outputs = row.dispatch_domain().bind(
+            let mut outputs = row.domain().bind(
                 DotOperation::new(DotDimensionNumbers::inner_product()),
                 Vec::new(),
                 &[row, vector],
@@ -1877,7 +1877,7 @@ fn test_dot_batching_ragged_dynamic_prefix() -> Result<(), ProgramError> {
             let extent = extent.to_dimension(variable.clone())?;
             let repeated = value.dynamic_broadcast_to(&[extent])?;
             let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
-            let mut outputs = repeated.dispatch_domain().bind(
+            let mut outputs = repeated.domain().bind(
                 DotOperation::new(DotDimensionNumbers::inner_product()),
                 Vec::new(),
                 &[repeated.clone(), repeated],

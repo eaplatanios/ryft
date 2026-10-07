@@ -59,7 +59,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, EmptyRegionDriver, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -461,12 +461,12 @@ where
                     move |_, linear_inputs| {
                         Ok(vec![
                             linear_inputs[0]
-                                .dispatch_domain()
+                                .domain()
                                 .bind_array(forward_operation, std::slice::from_ref(&linear_inputs[0]))?,
                         ])
                     },
                     move |residuals, output_cotangents| {
-                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let transpose_context = output_cotangents[0].domain();
                         let mut output_cotangent = output_cotangents[0].clone();
                         let zero_extents = transpose_shape.dynamic_dimensions(residuals);
                         let zeros = transpose_context
@@ -811,7 +811,7 @@ impl Slice for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<SliceOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<SliceOperation>>>>
     Slice<ArrayType> for V
 {
     fn slice<L: Clone + Into<Dimension>>(
@@ -829,7 +829,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
             return Ok(self.clone());
         }
         let operation = SliceOperation::new(start_indices.to_vec(), limits.to_vec()).with_strides(strides.to_vec())?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1113,13 +1113,13 @@ where
             residuals.into_values(),
             vec![update_tangent.clone()],
             move |residuals, linear_inputs| {
-                let context = linear_inputs[0].dispatch_domain();
+                let context = linear_inputs[0].domain();
                 let dimensions = input_shape.dynamic_dimensions(residuals);
                 let zeros = context.bind_array(ZeroOperation::new(tangent_type), &dimensions)?;
                 Ok(vec![context.bind_array(forward_operation, &[zeros, linear_inputs[0].clone()])?])
             },
             move |_, output_cotangents| {
-                Ok(vec![output_cotangents[0].dispatch_domain().bind_array(transpose_operation, output_cotangents)?])
+                Ok(vec![output_cotangents[0].domain().bind_array(transpose_operation, output_cotangents)?])
             },
         )?;
 
@@ -1248,7 +1248,7 @@ impl UpdateSlice for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
         + ManualVariationAlignment<ArrayType>,
 > UpdateSlice<ArrayType> for V
 {
@@ -1260,7 +1260,7 @@ impl<
         let inputs = [self.clone(), update.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs =
-            self.dispatch_domain()
+            self.domain()
                 .bind(UpdateSliceOperation::new(start_indices.to_vec()), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -1481,7 +1481,7 @@ impl DynamicSliceOperation<ArrayIrType> {
     /// logical coordinates unique. Physical padding and inactive updates remain the responsibility of the existing
     /// bounded scatter lowering, rather than becoming extra logical updates here.
     fn apply_adjoint<
-        V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
+        V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
@@ -1493,7 +1493,7 @@ impl DynamicSliceOperation<ArrayIrType> {
         starts: &[V],
         dimensions: &[V],
     ) -> Result<V, ProgramError> {
-        let context = cotangent.dispatch_domain();
+        let context = cotangent.domain();
         let cotangent_type = cotangent.r#type();
         let cotangent_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
         let rank = cotangent_type.rank();
@@ -1998,12 +1998,12 @@ where
                         slice_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
                         Ok(vec![
                             linear_inputs[0]
-                                .dispatch_domain()
+                                .domain()
                                 .bind_array(forward_operation, slice_inputs.as_slice())?,
                         ])
                     },
                     move |residuals, output_cotangents| {
-                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let transpose_context = output_cotangents[0].domain();
                         let zero_extents = transpose_shape.dynamic_dimensions(residuals);
                         let zeros = transpose_context
                             .bind_array(ZeroOperation::new(transpose_input_type.clone()), zero_extents.as_slice())?;
@@ -2313,7 +2313,7 @@ impl_differentiable_operation! {
         C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
-        Tracer<NestedTracingContext<C>>: Value<Type = ArrayIrType, DispatchDomain = NestedTracingContext<C>>
+        Tracer<NestedTracingContext<C>>: Value<Type = ArrayIrType, Domain = NestedTracingContext<C>>
             + DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
@@ -2363,10 +2363,10 @@ impl_differentiable_operation! {
                 move |residuals, inputs| {
                     let mut arguments = vec![inputs[0].clone()];
                     arguments.extend(forward_bounds.iter().map(|index| residuals[*index].clone()));
-                    inputs[0].dispatch_domain().bind(forward, Vec::new(), &arguments)
+                    inputs[0].domain().bind(forward, Vec::new(), &arguments)
                 },
                 move |residuals, cotangents| {
-                    let context = cotangents[0].dispatch_domain();
+                    let context = cotangents[0].domain();
                     let zeros = context.dynamic_zero(&input_type, &input_shape.dynamic_dimensions(residuals))?;
                     let starts = bounds[..transpose.strides.len()].iter().map(|index| residuals[*index].clone())
                         .collect::<Vec<_>>();
@@ -2382,7 +2382,7 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
-        Tracer<TracingContext<V, O>>: Value<Type = ArrayIrType, DispatchDomain = TracingContext<V, O>>
+        Tracer<TracingContext<V, O>>: Value<Type = ArrayIrType, Domain = TracingContext<V, O>>
             + DimensionSize + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
             + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
@@ -2747,14 +2747,14 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
 
 impl<
     T: Type,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = T,
-            DispatchDomain: Context<
+            Domain: Context<
                 Operation: From<DynamicSliceOperation<T>>
                                + OperationProvider<
                     T,
                     DynamicSliceOperation,
-                    Operation = <V::DispatchDomain as Domain>::Operation,
+                    Operation = <V::Domain as Domain>::Operation,
                 >,
             >,
         > + ManualVariationAlignment<T>,
@@ -2771,7 +2771,7 @@ impl<
         inputs.extend_from_slice(start_indices);
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-        let operation = <V::DispatchDomain as Domain>::Operation::provide(
+        let operation = <V::Domain as Domain>::Operation::provide(
             DynamicSliceOperation::new(sizes.to_vec()).with_allow_negative_indices(allow_negative_indices),
             &input_types.iter().collect::<Vec<_>>(),
         )?;
@@ -2781,7 +2781,7 @@ impl<
             return Ok(self.clone());
         }
 
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -2954,7 +2954,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
         stride: usize,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DimensionToScalar
             + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
@@ -2983,7 +2983,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
 
         let count = (limit - start).div_ceil(stride);
         let query_type = ArrayType::new_static(DataType::I64, [count]).with_memory(input_type.memory());
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let mut queries = context.dynamic_iota(&query_type, 0, &[])?.into_projected()?;
 
         // Scalar dimension literals are available in every mixed context, including compiled contexts whose array
@@ -3046,7 +3046,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
     ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
     fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DynamicReshape
             + DimensionSize
@@ -3153,14 +3153,14 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Operation: From<DynamicSliceOperation<V::Type>>
                                + OperationProvider<
                     V::Type,
                     DynamicSliceOperation,
-                    Operation = <V::DispatchDomain as Domain>::Operation,
+                    Operation = <V::Domain as Domain>::Operation,
                 >,
             >,
         > + ManualVariationAlignment<ArrayIrType>,
@@ -3184,7 +3184,7 @@ impl<
         inputs.extend_from_slice(sizes);
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let operation = operation.with_input_types(&input_types)?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -3637,7 +3637,7 @@ impl<
             residuals.into_values(),
             linear_values,
             move |residuals, linear_inputs| {
-                let forward_context = linear_inputs[0].dispatch_domain();
+                let forward_context = linear_inputs[0].domain();
                 let mut linear_index = 0;
 
                 let input_tangent = if input_is_live {
@@ -3664,7 +3664,7 @@ impl<
                 )?])
             },
             move |residuals, output_cotangents| {
-                let transpose_context = output_cotangents[0].dispatch_domain();
+                let transpose_context = output_cotangents[0].domain();
                 let mut cotangents = Vec::with_capacity(usize::from(input_is_live) + usize::from(update_is_live));
 
                 if input_is_live {
@@ -3989,7 +3989,7 @@ impl DynamicUpdateSlice for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>
         + ManualVariationAlignment<ArrayType>,
 > DynamicUpdateSlice<ArrayType> for V
 {
@@ -4007,7 +4007,7 @@ impl<
         inputs.extend(start_indices.iter().cloned());
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation = DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices);
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -4457,9 +4457,9 @@ mod tests {
     fn index_constant<V>(exemplar: &V, value: i32) -> V
     where
         V: Value<Type = ArrayType>,
-        V::DispatchDomain: Context<Constant = Array>,
+        V::Domain: Context<Constant = Array>,
     {
-        exemplar.dispatch_domain().lift(Array::scalar(value).unwrap()).unwrap()
+        exemplar.domain().lift(Array::scalar(value).unwrap()).unwrap()
     }
 
     /// Traces `batch(|(input, start)| input.dynamic_slice(&[start], &[2]), ...)` over a source of `input_type` mapped
@@ -6779,7 +6779,7 @@ mod tests {
         let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.dispatch_domain(), 2);
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);
                 let outputs = DynamicSliceOperation::new(vec![2])
                     .batch(
                         &context,
@@ -6827,7 +6827,7 @@ mod tests {
         );
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.dispatch_domain(), 2);
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);
                 let outputs = DynamicSliceOperation::new(vec![2])
                     .batch(
                         &context,

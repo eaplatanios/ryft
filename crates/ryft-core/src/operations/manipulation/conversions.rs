@@ -84,6 +84,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+    ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -578,7 +579,7 @@ pub trait ConvertElementType<T = <Self as Capability>::Universe>: Capability + S
     }
 }
 
-impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation<T>>>>>
+impl<T: ElementType, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ConvertElementTypeOperation<T>>>>>
     ConvertElementType<T> for V
 {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
@@ -588,7 +589,7 @@ impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<
         if input_type.element_type() == data_type {
             return Ok(self.clone());
         }
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -596,7 +597,7 @@ impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<
     fn bitcast_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         // Even an identity bitcast must be staged. Its declared derivative is zero rather than the identity.
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, true);
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -884,12 +885,12 @@ pub trait ReducePrecision<T = <Self as Capability>::Universe>: Capability + Size
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError>;
 }
 
-impl<T: ElementType, V: Value<Type = T, DispatchDomain: Context<Operation: From<ReducePrecisionOperation<T>>>>>
+impl<T: ElementType, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ReducePrecisionOperation<T>>>>>
     ReducePrecision<T> for V
 {
     fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError> {
         let operation = ReducePrecisionOperation::<V::Type>::new(exponent_bits, mantissa_bits);
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

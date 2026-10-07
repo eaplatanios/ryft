@@ -24,7 +24,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection,
     ProgramBuilder, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
@@ -262,15 +262,15 @@ pub trait DimensionFromScalar<Output = Self, T = <Self as Capability>::Universe>
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,
 > DimensionFromScalar<V, ArrayIrType> for V
 {
     fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self
-            .dispatch_domain()
+            .domain()
             .bind(DimensionFromScalarOperation::new(output), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
@@ -294,16 +294,16 @@ impl<A: Value<Type = ArrayType> + DimensionFromScalar<DimensionValue>> Dimension
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>,
         >,
 > DimensionFromScalar<V, ArrayType> for ProjectedValue<ArrayType, V>
 {
     fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self
             .value()
-            .dispatch_domain()
+            .domain()
             .bind(DimensionFromScalarOperation::new(output), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
     }

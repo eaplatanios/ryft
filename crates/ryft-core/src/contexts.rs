@@ -1224,7 +1224,7 @@ mod tests {
         let input_atom = input.atom_id().unwrap();
         let input =
             <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<0>>>::into_projected(input).unwrap();
-        let context = input.dispatch_domain();
+        let context = input.domain();
         let output = context.bind(ProjectedMemberOperation::Identity, Vec::new(), &[input]).unwrap().remove(0);
 
         assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
@@ -1259,11 +1259,7 @@ mod tests {
         let input = parent.input(ProjectedProgramType::Second(ProjectedMemberType));
         let input =
             <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<1>>>::into_projected(input).unwrap();
-        let output = input
-            .dispatch_domain()
-            .bind(ProjectedMemberOperation::Identity, Vec::new(), &[input])
-            .unwrap()
-            .remove(0);
+        let output = input.domain().bind(ProjectedMemberOperation::Identity, Vec::new(), &[input]).unwrap().remove(0);
         assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
         assert!(matches!(
             parent.builder().borrow().instructions()[0].operation(),

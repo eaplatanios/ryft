@@ -38,7 +38,7 @@ use crate::partial::{
 };
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
-    Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer};
 
@@ -674,7 +674,7 @@ impl Broadcast for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
     Broadcast<ArrayType> for V
 {
     #[inline]
@@ -683,7 +683,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         if self.r#type().as_ref() == &output_type && output_axes.iter().copied().eq(0..output_type.rank()) {
             return Ok(self.clone());
         }
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             BroadcastOperation::new(output_type, output_axes.to_vec()),
             Vec::new(),
             std::slice::from_ref(self),
@@ -1210,14 +1210,14 @@ impl_differentiable_operation! {
                                 broadcast_inputs.push(linear_inputs[0].clone());
                                 broadcast_inputs
                                     .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                                linear_inputs[0].dispatch_domain().bind(
+                                linear_inputs[0].domain().bind(
                                     forward_operation,
                                     Vec::new(),
                                     broadcast_inputs.as_slice(),
                                 )
                             },
                             move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let transpose_context = output_cotangents[0].domain();
                                 let cotangent =
                                     <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
                                         output_cotangents[0].clone(),
@@ -1508,7 +1508,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
     {
         self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
     }
@@ -1527,7 +1527,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
     {
         let r#type = self.r#type();
         let input_type = r#type.as_array_type()?;
@@ -1554,7 +1554,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
         output_dimensions.extend_from_slice(leading_dimensions);
         for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
             output_dimensions.push(match dimension {
-                Dimension::Static(extent) => self.dispatch_domain().dimension_constant(*extent)?,
+                Dimension::Static(extent) => self.domain().dimension_constant(*extent)?,
                 Dimension::Dynamic(_) => self.dimension_size(axis)?,
             });
         }
@@ -1579,11 +1579,11 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant>,
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant>,
     {
         let output_dimensions = output_sizes
             .iter()
-            .map(|extent| self.dispatch_domain().dimension_constant(*extent))
+            .map(|extent| self.domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_broadcast_to(output_dimensions.as_slice())
     }
@@ -1600,9 +1600,9 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant> + DimensionSize,
     {
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let leading_dimensions = leading_sizes
             .iter()
             .map(|extent| context.dimension_constant(*extent))
@@ -1640,7 +1640,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     identities; distinct unknown dimensions are not assumed to have equal runtime values.
     fn dynamic_broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Value<Type: AsArrayType, DispatchDomain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: AsArrayType, Domain: DimensionConstant> + DimensionSize,
     {
         let Some(first) = inputs.first() else {
             return Ok(Vec::new());
@@ -1655,7 +1655,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
             .dimensions()
             .iter()
             .map(|dimension| match dimension {
-                Dimension::Static(extent) => first.dispatch_domain().dimension_constant(*extent),
+                Dimension::Static(extent) => first.domain().dimension_constant(*extent),
                 Dimension::Dynamic(_) => {
                     // A common dynamic dimension always originates in at least one input. Read its runtime size
                     // instead of replacing the dimension by a bound or a metadata-only shape.
@@ -1704,9 +1704,9 @@ impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast<ArrayIrType> for A
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicBroadcast<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DynamicBroadcast<ArrayIrType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
     fn dynamic_broadcast_with_output_sharding(
         &self,
@@ -1726,7 +1726,7 @@ where
         let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
         inputs.push(self.clone());
         inputs.extend_from_slice(output_dimensions);
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1980,7 +1980,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         BindingRegionDriver, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance,
-        ProvenanceScope, Typed,
+        ProvenanceScope, ValueDomainDispatch, Typed,
     };
     use crate::tracing::TracingContext;
 
@@ -2011,15 +2011,11 @@ mod tests {
     }
 
     impl<V: Value, O: Debug + Operation<Type = V::Type>> Value for DispatchValue<V, O> {
-        type DispatchDomain = InvalidOutputContext<V, O>;
-        type ExecutionDomain = InvalidOutputContext<V, O>;
+        type Dispatch = ValueDomainDispatch;
+        type Domain = InvalidOutputContext<V, O>;
 
-        fn dispatch_domain(&self) -> Self::DispatchDomain {
-            InvalidOutputContext(self.output_count, PhantomData)
-        }
-
-        fn execution_domain(&self) -> Self::ExecutionDomain {
-            self.dispatch_domain()
+        fn domain(&self) -> Self::Domain {
+            self.domain()
         }
     }
 
@@ -4403,7 +4399,7 @@ mod tests {
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[1f32]).unwrap());
         let (output, tangent) = differentiate_at(input)
             .jvp(tangent, |value| {
-                let context = value.dispatch_domain();
+                let context = value.domain();
                 let extent = context.dimension_constant(2)?;
                 Ok(context
                     .bind(

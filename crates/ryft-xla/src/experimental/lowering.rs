@@ -17044,7 +17044,7 @@ mod tests {
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |input| {
                 input
-                    .dispatch_domain()
+                    .domain()
                     .bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[])
                     .unwrap()
                     .remove(0)

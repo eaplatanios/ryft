@@ -739,7 +739,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                 let (value, gradients) = inputs[0]
                     .clone()
                     .into_value()
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                     .value_and_gradient(|(weight, values)| {
                         let weight = ValueProjection::<ArrayType>::into_projected(weight)?;

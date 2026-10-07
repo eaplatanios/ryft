@@ -450,7 +450,7 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Value: OneLike + Sub + Mul + Logistic,
-        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
+        <C::Value as Value>::Domain: Fill<f64, C::Value>,
     {
         |operation, inputs| {
             let input_tangent = inputs.input_tangent()?;
@@ -459,7 +459,7 @@ impl_differentiable_elementwise_operation! {
                 // stays accurate where `tanh(x)` saturates and `1 - tanh(x)²` cancels catastrophically.
                 let input = inputs.input_primal()?;
                 let input_type = input.r#type().into_owned();
-                let domain = input.dispatch_domain();
+                let domain = input.domain();
                 let positive = domain.fill(&input_type, 2.0)?.mul(&input)?.logistic_with_accuracy(Accuracy::Highest)?;
                 let negative =
                     domain.fill(&input_type, -2.0)?.mul(&input)?.logistic_with_accuracy(Accuracy::Highest)?;

@@ -24,7 +24,7 @@ use crate::programs::{
     OperationFormatter, ProgramError, ProjectedValue, ReferenceAccessDescriptor, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceTransform, ReferenceType,
-    RegionInterface, Type, TypeError, Typed, Value, ValueProjection, batch_reference_transforms,
+    RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection, batch_reference_transforms,
     infer_reference_view_type,
 };
 
@@ -451,9 +451,9 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + Update
 impl<Transform, V> ReferenceWrite<Transform, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
+            Domain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
 {
     fn write_through(
@@ -465,7 +465,7 @@ where
         let mut inputs = vec![self.clone(), replacement.clone()];
         inputs.extend_from_slice(bindings);
         let operation = ReferenceWriteOperation::new().with_transforms(transforms.to_vec());
-        self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        self.domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
@@ -474,9 +474,9 @@ impl<Transform, V> ReferenceWrite<Transform, V, ProjectedValue<ArrayType, V>, Re
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
+            Domain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
 {
     fn write_through(
@@ -488,7 +488,7 @@ where
         let mut inputs = vec![self.value().clone(), replacement.value().clone()];
         inputs.extend_from_slice(bindings);
         let operation = ReferenceWriteOperation::new().with_transforms(transforms.to_vec());
-        self.value().dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        self.value().domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }

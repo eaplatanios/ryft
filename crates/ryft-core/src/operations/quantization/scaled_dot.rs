@@ -3,6 +3,7 @@ use ryft_macros::capability;
 use crate::arrays::AsArrayType;
 use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::operations::Capability;
+use crate::programs::ValueDomainDispatch;
 
 use super::*;
 
@@ -390,9 +391,9 @@ impl ScaledDot for Array {
 // context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
 // context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
 // transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> ScaledDot<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> ScaledDot<ArrayType> for V
 where
-    V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
+    V::Domain: Context<Operation: From<ScaledDotOperation>>,
 {
     fn scaled_dot(
         &self,
@@ -411,7 +412,7 @@ where
         inputs.extend(lhs_scale.cloned());
         inputs.extend(rhs_scale.cloned());
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             ScaledDotOperation::new(dimensions, preferred_element_type, lhs_scale.is_some(), rhs_scale.is_some()),
             Vec::new(),
             inputs.as_slice(),
@@ -445,6 +446,7 @@ where
         + Dot
         + Mul
         + Reshape,
+    <ArrayIrValue<V> as Value>::Domain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     let lhs = ArrayIrValue::from(lhs.clone());
     let rhs = ArrayIrValue::from(rhs.clone());
@@ -478,8 +480,8 @@ where
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Dot + Mul,
     <V as ValueProjection<DimensionType>>::Projected:
         Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
     let array_type = |value: &V| -> Result<ArrayType, ProgramError> {
         let r#type = value.r#type();
@@ -518,10 +520,10 @@ where
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Mul,
     <V as ValueProjection<DimensionType>>::Projected:
         Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
-    let context = elements.dispatch_domain();
+    let context = elements.domain();
     let element_type = elements.r#type();
     let element_type = <&ArrayType>::try_from(element_type.as_ref())?;
     let element_dimensions =

@@ -65,8 +65,8 @@ use ryft_core::{
     ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewOverlap, ReferenceWrite,
     ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation,
     ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer, TracingContext, TransposableOperation,
-    TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
-    ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
+    TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueDomainDispatch,
+    ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
     discharge_reference_free_operation, infer_reference_view_type, jvp_projected_operation,
     transpose_projected_operation, validate_reference_boundary,
 };
@@ -303,14 +303,10 @@ impl Typed for RegisterValue {
 }
 
 impl Value for RegisterValue {
-    type DispatchDomain = RegisterDestination;
-    type ExecutionDomain = RegisterDestination;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = RegisterDestination;
 
-    fn dispatch_domain(&self) -> RegisterDestination {
-        EagerContext::new()
-    }
-
-    fn execution_domain(&self) -> RegisterDestination {
+    fn domain(&self) -> RegisterDestination {
         EagerContext::new()
     }
 
@@ -1949,9 +1945,9 @@ fn test_downstream_access_descriptors_record_distinct_paths() {
 /// values dispatch to so that one closure serves the forward-mode, reverse-mode, and batching tracers alike.
 fn read_modify_write<V: Value<Type = RegisterIrType>>((reference, x): (V, V)) -> Result<V, ProgramError>
 where
-    V::DispatchDomain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
+    V::Domain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
 {
-    let context = reference.dispatch_domain();
+    let context = reference.domain();
     context.bind(RegisterOperation::AddUpdate(Vec::new()), Vec::new(), &[reference.clone(), x])?;
     bind_register_output(&context, RegisterOperation::Read(ReferenceReadOperation::new()), &[reference])
 }
@@ -1961,9 +1957,9 @@ fn write_read_folded_bit<V: Value<Type = RegisterIrType>>(
     (reference, value, index): (V, V, V),
 ) -> Result<V, ProgramError>
 where
-    V::DispatchDomain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
+    V::Domain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
 {
-    let context = reference.dispatch_domain();
+    let context = reference.domain();
     let transforms = vec![RegisterTransform::Bit];
     context.bind(
         RegisterOperation::Write(ReferenceWriteOperation::new().with_transforms(transforms.clone())),

@@ -2448,7 +2448,7 @@ mod tests {
         let scalar = |value: f32| TestIrValue::Array(Array::scalar(value).unwrap());
         let reference = ArrayReference::new(Array::scalar(1.0f32).unwrap());
         let (value, pullback) = differentiate_at((TestIrValue::Reference(reference.clone()), scalar(2.0)))
-            .vjp(|(reference, x)| Ok(program.interpret_in_context(&x.dispatch_domain(), vec![reference, x])?.remove(0)))
+            .vjp(|(reference, x)| Ok(program.interpret_in_context(&x.domain(), vec![reference, x])?.remove(0)))
             .unwrap();
         assert_eq!(value, scalar(10.0));
         assert_eq!(reference.read(), Ok(Array::scalar(5.0f32).unwrap()));
@@ -2684,7 +2684,7 @@ mod tests {
 
         // Reverse mode over the call itself recomputes the lifecycle in the pullback too.
         let (value, pullback) = differentiate_at(scalar(2.0))
-            .vjp(|x| Ok(program.interpret_in_context(&x.dispatch_domain(), vec![x])?.remove(0)))
+            .vjp(|x| Ok(program.interpret_in_context(&x.domain(), vec![x])?.remove(0)))
             .unwrap();
         assert_eq!(value, scalar(12.0));
         assert_eq!(pullback.apply(scalar(1.0)), Ok(scalar(16.0)));

@@ -59,7 +59,7 @@ use crate::partial::{
 };
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Direction of the pairwise comparison performed by a [`CompareOperation`].
@@ -635,9 +635,9 @@ where
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Type = ArrayIrType,
                 Constant: TryFrom<bool, Error = ProgramError>
                               + ValueProjection<DimensionType, Projected = DimensionValue>,
@@ -650,7 +650,7 @@ impl<
         // Immediate extents override nominal identity, just as in partial evaluation. Captures remain runtime data.
         let mut exact = [None, None];
         for (value, extent) in [self.value(), other.value()].into_iter().zip(exact.iter_mut()) {
-            if let ValueResolution::Constant(value) = value.dispatch_domain().resolve(value)
+            if let ValueResolution::Constant(value) = value.domain().resolve(value)
                 && value.capture_index().is_none()
             {
                 *extent = Some(value.into_projected()?.extent());
@@ -658,12 +658,12 @@ impl<
         }
 
         if let Some(output) = direction.prove_for_dimensions(self.r#type().as_ref(), other.r#type().as_ref(), exact)? {
-            return self.value().dispatch_domain().lift(<V::DispatchDomain as Domain>::Constant::try_from(output)?);
+            return self.value().domain().lift(<V::Domain as Domain>::Constant::try_from(output)?);
         }
 
         Ok(self
             .value()
-            .dispatch_domain()
+            .domain()
             .bind(CompareOperation::new(direction), Vec::new(), &[self.value().clone(), other.value().clone()])?
             .remove(0))
     }
@@ -673,7 +673,7 @@ impl<
 // input types, so that composite families can select a member operation (see the composite provider above).
 impl<
     T: Type,
-    V: Value<Type = T, DispatchDomain = C> + ManualVariationAlignment<T>,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain = C> + ManualVariationAlignment<T>,
     C: Context<Value = V, Operation: OperationProvider<T, CompareOperation<T>, Operation = C::Operation>>,
 > Compare<V, T> for V
 {
@@ -687,7 +687,7 @@ impl<
             CompareOperation::new(direction),
             &[left_type.as_ref(), right_type.as_ref()],
         )?;
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), &inputs)?.remove(0))
+        Ok(self.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 }
 

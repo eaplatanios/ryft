@@ -12,7 +12,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
+use crate::programs::{
+    Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
@@ -150,11 +152,11 @@ impl<A: Value<Type = ArrayType> + ZeroLike> ZeroLike for ArrayIrValue<A> {
     }
 }
 
-impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<ZeroLikeOperation<T>>>>> ZeroLike<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ZeroLikeOperation<T>>>>> ZeroLike<T> for V {
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
         let operation = ZeroLikeOperation::new();
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

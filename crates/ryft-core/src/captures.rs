@@ -70,7 +70,7 @@ use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, TracingContext};
 
@@ -132,16 +132,11 @@ impl<T: Type> Typed for CaptureReference<T> {
 }
 
 impl<T: Type> Value for CaptureReference<T> {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
 
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> EagerContext<Self> {
+    fn domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 
@@ -672,7 +667,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
-        ValueProjection,
+        ValueDirectDispatch, ValueProjection,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -1132,14 +1127,10 @@ mod tests {
         }
 
         impl Value for TestConstant {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> EagerContext<Self> {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> EagerContext<Self> {
+            fn domain(&self) -> EagerContext<Self> {
                 EagerContext::new()
             }
 

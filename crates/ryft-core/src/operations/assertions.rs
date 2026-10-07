@@ -114,7 +114,7 @@ use crate::partial::{
 };
 use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface,
-    Type, TypeError, Typed, Value, ValueProjection,
+    Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Failure of a correctness assertion, including the named values observed at that assertion.
@@ -1064,7 +1064,7 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
 
 impl<
     T: Type + Into<ArrayIrType>,
-    V: Value<Type = T, DispatchDomain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<T>>>>,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<T>>>>,
 > Assert<T> for V
 {
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
@@ -1075,7 +1075,7 @@ impl<
             .collect::<Vec<_>>();
         operation
             .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let context = self.dispatch_domain();
+        let context = self.domain();
 
         // A validated success has no observable effect. False or unresolved conditions must reach normal binding
         // so batching can handle empty batches and partial evaluation can preserve effect ordering.
@@ -1105,7 +1105,7 @@ impl<
             .collect::<Vec<_>>();
         operation
             .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let context = self.dispatch_domain();
+        let context = self.domain();
 
         // A validated success has no observable effect. False or unresolved conditions must reach normal binding
         // so batching can handle empty batches and partial evaluation can preserve effect ordering.
@@ -1868,7 +1868,7 @@ mod tests {
         let shape = Shape::new(vec![extent_type.to_dimension()]);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition, observation)| {
-                let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                let batching = BatchingContext::new(extent.domain(), extent);
                 AssertOperation::new("dynamic").with_labels(vec!["value".to_owned()]).batch(
                     &batching,
                     &EmptyRegionDriver,
@@ -1964,7 +1964,7 @@ mod tests {
         };
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
             |(extent, condition, observation)| {
-                let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                let batching = BatchingContext::new(extent.domain(), extent);
                 AssertOperation::new("dynamic").with_labels(vec!["value".to_owned()]).batch(
                     &batching,
                     &EmptyRegionDriver,
@@ -2021,7 +2021,7 @@ mod tests {
             |(extent, condition, observation)| {
                 batch(
                     |(extent, condition, observation)| {
-                        let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                        let batching = BatchingContext::new(extent.domain(), extent);
                         AssertOperation::new("nested dynamic").with_labels(vec!["value".to_owned()]).batch(
                             &batching,
                             &EmptyRegionDriver,
@@ -2079,7 +2079,7 @@ mod tests {
         let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition)| {
-                let batching = BatchingContext::new(extent.dispatch_domain(), extent.clone());
+                let batching = BatchingContext::new(extent.domain(), extent.clone());
                 AssertOperation::new("replicated").with_labels(vec!["size".to_owned()]).batch(
                     &batching,
                     &EmptyRegionDriver,
@@ -2124,7 +2124,7 @@ mod tests {
         let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition, observation)| {
-                let batching = BatchingContext::new(extent.dispatch_domain(), extent.clone());
+                let batching = BatchingContext::new(extent.domain(), extent.clone());
                 AssertOperation::new("mixed mapping")
                     .with_labels(vec!["value".to_owned(), "size".to_owned()])
                     .batch(
@@ -2290,7 +2290,7 @@ mod tests {
             .unwrap();
         let (_, program) = ArrayTrace::trace_with_named_axes(
             |(condition, observation): (Tracer<ArrayTrace>, Tracer<ArrayTrace>)| {
-                let batching = BatchingContext::<_, ArrayBatchingPolicy>::new(condition.dispatch_domain(), 2);
+                let batching = BatchingContext::<_, ArrayBatchingPolicy>::new(condition.domain(), 2);
                 AssertOperation::new("valid")
                     .with_labels(vec!["value".to_owned()])
                     .with_failure_limit(NonZeroUsize::MIN)
@@ -2364,7 +2364,7 @@ mod tests {
         let shape = Shape::new(vec![extent_type.to_dimension()]);
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(extent, condition, observation)| {
-                let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                let batching = BatchingContext::new(extent.domain(), extent);
                 AssertOperation::new("dynamic")
                     .with_labels(vec!["value".to_owned()])
                     .with_failure_limit(NonZeroUsize::new(2).unwrap())
@@ -2463,7 +2463,7 @@ mod tests {
         // A known success disappears during tracing.
         let (_, folded) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
-                let condition = input.dispatch_domain().lift(Array::scalar(true).unwrap())?;
+                let condition = input.domain().lift(Array::scalar(true).unwrap())?;
                 condition.assert("always true", &[])
             },
             ArrayType::scalar(DataType::Boolean),
@@ -2474,7 +2474,7 @@ mod tests {
         // A known failure is staged and reported only when the program executes.
         let (_, failing) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
-                let condition = input.dispatch_domain().lift(Array::scalar(false).unwrap())?;
+                let condition = input.domain().lift(Array::scalar(false).unwrap())?;
                 condition.assert("always false", &[])
             },
             ArrayType::scalar(DataType::Boolean),
@@ -2550,7 +2550,7 @@ mod tests {
     fn test_assert_staging_conditional() {
         let (_, failing) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
-                let condition = input.dispatch_domain().lift(Array::scalar(false).unwrap())?;
+                let condition = input.domain().lift(Array::scalar(false).unwrap())?;
                 condition.assert("selected failure", &[])
             },
             ArrayType::scalar(DataType::Boolean),

@@ -89,7 +89,7 @@ use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -531,12 +531,12 @@ impl<A: Value<Type = ArrayType> + Select> Select for ArrayIrValue<A> {
 // whose dispatch context operation is a `ConstantOperation`.
 impl<
     T: Type,
-    V: Value<Type = T, DispatchDomain: Context<Operation: From<SelectOperation<T>>>> + ManualVariationAlignment<T>,
+    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<SelectOperation<T>>>> + ManualVariationAlignment<T>,
 > Select<T> for V
 {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let inputs = V::align_manual_variation(&[condition.clone(), on_true.clone(), on_false.clone()])?;
-        let mut outputs = condition.dispatch_domain().bind(SelectOperation::new(), Vec::new(), &inputs)?;
+        let mut outputs = condition.domain().bind(SelectOperation::new(), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

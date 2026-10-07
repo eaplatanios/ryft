@@ -60,7 +60,7 @@ use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, OperationPayloadProjection, ProgramError, RegionInterface, Type, TypeError, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`TagOperation`].
@@ -225,11 +225,11 @@ impl<A: Value<Type = ArrayType> + Tag<ArrayType>> Tag<ArrayIrType> for ArrayIrVa
     }
 }
 
-impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<TagOperation<T>>>>> Tag<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<TagOperation<T>>>>> Tag<T> for V {
     #[inline]
     fn tag(self, key: &str) -> Result<Self, ProgramError> {
         let mut outputs =
-            self.dispatch_domain().bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))?;
+            self.domain().bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

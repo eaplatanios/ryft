@@ -14824,8 +14824,8 @@ mod tests {
         let second = f32_vector(&domain, &mesh, &[3.0, 4.0]);
         let first_sum = ryft_core::Add::add(&first, &first).unwrap();
         let second_sum = ryft_core::Add::add(&second, &second).unwrap();
-        let first_domain = first_sum.execution_domain();
-        let second_domain = second_sum.execution_domain();
+        let first_domain = first_sum.domain();
+        let second_domain = second_sum.domain();
         assert!(std::ptr::eq(
             first_domain.parent().compilation_context(),
             second_domain.parent().compilation_context(),

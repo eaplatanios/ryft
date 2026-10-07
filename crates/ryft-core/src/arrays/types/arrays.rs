@@ -21,7 +21,7 @@ use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
 use crate::programs::{
     NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value,
+    TypeRefinements, Typed, Value, ValueDirectDispatch,
 };
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
@@ -691,16 +691,11 @@ impl Typed for ArrayType {
 // It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program storage, lowering, and
 // transformation. Refer to the comment above the `Typed` implementation for `ArrayType` for more information.
 impl Value for ArrayType {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
 
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> EagerContext<Self> {
+    fn domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 

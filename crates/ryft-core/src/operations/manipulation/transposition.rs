@@ -21,6 +21,7 @@ use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -578,7 +579,7 @@ impl Transpose for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
     Transpose<ArrayType> for V
 {
     #[inline]
@@ -588,7 +589,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             TransposeOperation::new(permutation),
             Vec::new(),
             std::slice::from_ref(self),
@@ -646,7 +647,8 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Typed,
+        BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
+        ValueDomainDispatch, Typed,
     };
 
     use super::*;
@@ -1368,15 +1370,11 @@ mod tests {
         }
 
         impl Value for DispatchArray {
-            type DispatchDomain = InvalidOutputContext;
-            type ExecutionDomain = InvalidOutputContext;
+            type Dispatch = ValueDomainDispatch;
+            type Domain = InvalidOutputContext;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                InvalidOutputContext(self.output_count)
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
-                self.dispatch_domain()
+            fn domain(&self) -> Self::Domain {
+                self.domain()
             }
         }
 

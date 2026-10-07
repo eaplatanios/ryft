@@ -10,6 +10,7 @@ use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::{
     Concretizable, LiteralIdentity, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueDirectDispatch,
 };
 
 /// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
@@ -77,16 +78,11 @@ impl Typed for DimensionValue {
 }
 
 impl Value for DimensionValue {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self, DimensionOperation<Self>>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self, DimensionOperation<Self>>;
 
     #[inline]
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> Self::ExecutionDomain {
+    fn domain(&self) -> Self::Domain {
         EagerContext::new()
     }
 

@@ -38,7 +38,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -685,7 +685,7 @@ impl_differentiable_operation! {
                         move |residuals, linear_inputs| {
                             let mut concatenate_inputs = linear_inputs.to_vec();
                             concatenate_inputs.push(residuals[result_extent_index].clone());
-                            let outputs = linear_inputs[0].dispatch_domain().bind(
+                            let outputs = linear_inputs[0].domain().bind(
                                 forward_operation,
                                 Vec::new(),
                                 concatenate_inputs.as_slice(),
@@ -694,7 +694,7 @@ impl_differentiable_operation! {
                             Ok(outputs)
                         },
                         move |residuals, output_cotangents| {
-                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let transpose_context = output_cotangents[0].domain();
                             let mut outputs = transpose_context.bind(
                                 DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
                                 Vec::new(),
@@ -1093,9 +1093,9 @@ impl Concatenate for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Concatenate<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Concatenate<ArrayType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
+    V::Domain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
@@ -1123,7 +1123,7 @@ where
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation = ConcatenateOperation::<ArrayType>::new(axis, rank)?;
         let first = &inputs[0];
-        let mut outputs = first.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
+        let mut outputs = first.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1312,9 +1312,9 @@ impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicCon
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate<ArrayIrType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
 {
     fn concatenate_with_known_extent<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
@@ -1328,7 +1328,7 @@ where
         let mut inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         inputs.push(extent.clone());
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let mut outputs = inputs[0].dispatch_domain().bind(
+        let mut outputs = inputs[0].domain().bind(
             ConcatenateOperation::<ArrayIrType>::new(axis, &input_types)?,
             Vec::new(),
             &inputs,

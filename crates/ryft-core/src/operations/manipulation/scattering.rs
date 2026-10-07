@@ -44,7 +44,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueProjection,
+    Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -2086,9 +2086,9 @@ impl Scatter for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Scatter<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Scatter<ArrayType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
+    V::Domain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
 {
     fn scatter(
         &self,
@@ -2104,7 +2104,7 @@ where
         // implementations.
         let inputs = [self.clone(), indices.clone(), updates.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             ScatterOperation::new(dimensions.clone(), kind).with_options(options.clone()),
             Vec::new(),
             &inputs,
@@ -2285,7 +2285,7 @@ pub trait DynamicScatter<T = <Self as Capability>::Universe>: Capability + Sized
 impl<V: Value<Type = ArrayIrType>> DynamicScatter<ArrayIrType> for V
 where
     V: DimensionSize + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType, Projected: Scatter>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     fn dynamic_scatter_axis<A: Into<Axis>>(
         &self,
@@ -2379,10 +2379,10 @@ mod tests {
     fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<i32>) -> V
     where
         V: Value<Type = ArrayType>,
-        V::DispatchDomain: Context<Constant = Array>,
+        V::Domain: Context<Constant = Array>,
     {
         let r#type = ArrayType::new_static(DataType::I32, shape);
-        exemplar.dispatch_domain().lift(Array::from_elements::<i32>(r#type, &values).unwrap()).unwrap()
+        exemplar.domain().lift(Array::from_elements::<i32>(r#type, &values).unwrap()).unwrap()
     }
 
     /// Builds the mixed program with the input and the updates as its two inputs that scatters the updates into the

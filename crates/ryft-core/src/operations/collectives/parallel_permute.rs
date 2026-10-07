@@ -27,7 +27,8 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::reshard::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -537,7 +538,7 @@ impl ParallelPermute<ArrayType> for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ParallelPermuteOperation>> + NamedAxes>
         + ParallelVary,
 > ParallelPermute<ArrayType> for V
 {
@@ -550,7 +551,7 @@ impl<
         // binding a `ParallelPermuteOperation` through its own context. Over a manual mesh axis, the operation records
         // the mesh, and an input that is still invariant over the axis is first made varying, exactly as JAX's
         // `ppermute` does, so that the output type records that the participants hold different values.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let mut operation = ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs);
         let mut input = self.clone();
@@ -710,7 +711,7 @@ mod tests {
     ) -> (ArrayType, Program<Array, ArrayOperation<Array>, Array, Array>) {
         TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let input = BatchingTracer::new(context, ArrayBatch::new(input, BatchAxis::new(0))?);
                 Ok(input.parallel_permute("x", source_target_pairs)?.into_batch().into_value())

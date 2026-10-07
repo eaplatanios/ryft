@@ -1,5 +1,7 @@
 use ryft_macros::capability;
 
+use crate::programs::ValueDomainDispatch;
+
 use super::*;
 
 /// Value-level scaled dot-product attention capability. Refer to the documentation of
@@ -105,16 +107,16 @@ impl DotProductAttentionBackward for Array {
 /// context. The `From<DotProductAttentionOperation>` bound makes this disjoint from the eager reference value types
 /// (whose context operation is [`ConstantOperation`]), so it covers
 /// the transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttention<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> DotProductAttention<ArrayType> for V
 where
-    V::DispatchDomain: Context<Operation: From<DotProductAttentionOperation>>,
+    V::Domain: Context<Operation: From<DotProductAttentionOperation>>,
 {
     fn dot_product_attention(
         inputs: AttentionInputs<Self>,
         configuration: AttentionConfiguration,
     ) -> Result<(Self, Option<Self>), ProgramError> {
         let signature = inputs.signature();
-        let context = inputs.query.dispatch_domain();
+        let context = inputs.query.domain();
         let input_values = inputs.into_values();
         let input_values = ManualVariationAlignment::align_manual_variation(&input_values)?;
         let mut outputs = context.bind(
@@ -151,9 +153,9 @@ where
 /// Any context-carrying value computes the attention backward pass by binding a
 /// [`DotProductAttentionBackwardOperation`] through its own context; refer to the [`DotProductAttention`] blanket
 /// implementation for the disjointness argument.
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttentionBackward for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> DotProductAttentionBackward for V
 where
-    V::DispatchDomain: Context<Operation: From<DotProductAttentionBackwardOperation>>,
+    V::Domain: Context<Operation: From<DotProductAttentionBackwardOperation>>,
 {
     fn dot_product_attention_backward(
         inputs: AttentionInputs<Self>,
@@ -163,7 +165,7 @@ where
         configuration: AttentionConfiguration,
     ) -> Result<Vec<Self>, ProgramError> {
         let signature = inputs.signature();
-        let context = inputs.query.dispatch_domain();
+        let context = inputs.query.domain();
         let mut backward_inputs = inputs.into_values();
         backward_inputs.extend([output, residual, output_cotangent]);
         let backward_inputs = ManualVariationAlignment::align_manual_variation(&backward_inputs)?;

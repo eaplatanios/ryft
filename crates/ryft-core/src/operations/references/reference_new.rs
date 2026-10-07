@@ -22,7 +22,7 @@ use crate::programs::{
     EffectClasses, Effects, MaybeZero, NoReferent, Operation, OperationProvider, ProgramError, ProjectedValue,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection,
+    ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`ReferenceNewOperation`].
@@ -314,31 +314,31 @@ impl<A: Value<Type = ArrayType>> ReferenceNew<Self, ArrayIrType> for ArrayIrValu
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         >,
 > ReferenceNew<V, ArrayIrType> for V
 {
     fn reference_new(&self) -> Result<V, ProgramError> {
         Ok(self
-            .dispatch_domain()
+            .domain()
             .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         > + ValueProjection<ReferenceType<ArrayType>>,
 > ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ArrayType>
     for ProjectedValue<ArrayType, V>
 {
     fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
         self.value()
-            .dispatch_domain()
+            .domain()
             .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0)
             .into_projected()

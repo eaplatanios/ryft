@@ -14,7 +14,9 @@ use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_tra
 use crate::operations::Capability;
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value, ValueProjection};
+use crate::programs::{
+    Operation, ProgramError, RegionInterface, Type, TypeError, Value, ValueDomainDispatch, ValueProjection,
+};
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
@@ -141,7 +143,7 @@ pub trait StopGradient<T = <Self as Capability>::Universe>: Capability + Sized {
     fn stop_gradient(&self) -> Result<Self, ProgramError>;
 }
 
-impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<StopGradientOperation<T>>>>> StopGradient<T>
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<StopGradientOperation<T>>>>> StopGradient<T>
     for V
 {
     #[inline]
@@ -152,7 +154,7 @@ impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<StopGra
         // concrete eager value types (whose context operation is `ConstantOperation`), which implement `StopGradient`
         // directly.
         let mut outputs =
-            self.dispatch_domain().bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))?;
+            self.domain().bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

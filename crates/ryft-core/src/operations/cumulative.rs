@@ -87,7 +87,7 @@ use crate::parameters::Parameterized;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProvenanceScope, RegionInterface,
-    TypeError, Typed, Value,
+    TypeError, Typed, Value, ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -415,7 +415,7 @@ impl_differentiable_operation! {
             let input_type = primal_input.r#type().into_owned();
             let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
                 |value: Tracer<TracingContext<C::Constant, C::Operation>>| {
-                    let domain = value.dispatch_domain();
+                    let domain = value.domain();
                     domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                         domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
                             let output = associative_scan(&value, axis, reverse, &combine_fn)?;
@@ -696,7 +696,7 @@ impl Cumulative for Array {
 // Any context-carrying value scans by binding a `CumulativeOperation` through its context. The
 // `From<CumulativeOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>>>
     Cumulative<ArrayType> for V
 {
     fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
@@ -705,7 +705,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         let axis = axis.normalize(rank).map_err(|_| {
             TypeError::invalid(format!("`{CUMULATIVE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
         })?;
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             CumulativeOperation::new(axis, kind).with_reverse(reverse),
             Vec::new(),
             std::slice::from_ref(self),
@@ -952,7 +952,7 @@ impl Array {
 /// static, if the arrays have different extents along `axis`, if `combine_fn` returns a different number of arrays,
 /// or if staging any of the primitives of the construction (including those that `combine_fn` stages) fails.
 pub fn associative_scan<
-    V: Value<Type = ArrayType, DispatchDomain: Context + Zero<V>> + Add + Or + Concatenate + Pad + Slice,
+    V: Value<Type = ArrayType, Domain: Context + Zero<V>> + Add + Or + Concatenate + Pad + Slice,
     P: Parameterized<V>,
     A: Into<Axis>,
     F: Fn(&P, &P) -> Result<P, ProgramError>,
@@ -1019,7 +1019,7 @@ pub fn associative_scan<
 
     // The scopes below are purely diagnostic: they attribute every instruction the decomposition stages,
     // and they are a no-op under an eager context, which records no instructions at all.
-    let domain = first.dispatch_domain();
+    let domain = first.domain();
     let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
         domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
             associative_scan_impl(&arrays, extent, axis, reverse, &flat_combine)
@@ -1044,7 +1044,7 @@ pub fn associative_scan<
 ///   - `reverse`: Whether to accumulate from the end of `axis` toward its start.
 ///   - `combine_fn`: Flattened combining operator, which receives and returns one array per array in `values`.
 fn associative_scan_impl<
-    V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice,
+    V: Value<Type = ArrayType, Domain: Zero<V>> + Add + Or + Concatenate + Pad + Slice,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
 >(
     values: &[V],
@@ -1176,7 +1176,7 @@ fn associative_scan_impl<
 ///
 /// [`DataType::F8E8M0FNU`] has no representable zero, so it instead interleaves whole element encodings through
 /// slices and concatenation, appending the extra left element when the lengths differ.
-fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice>(
+fn scan_interleave<V: Value<Type = ArrayType, Domain: Zero<V>> + Add + Or + Concatenate + Pad + Slice>(
     left: &[V],
     right: &[V],
     axis: usize,
@@ -1205,7 +1205,7 @@ fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + O
                 return slices[0].concatenate_with(slices.iter().skip(1), axis);
             }
             let rank = left.r#type().rank();
-            let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
+            let padding_value = left.domain().zero(&left.r#type().scalar_like()?)?;
             let mut edge_padding_low = vec![0; rank];
             let mut edge_padding_high = vec![0; rank];
             let mut interior_padding = vec![0; rank];

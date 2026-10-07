@@ -19,6 +19,7 @@ use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -253,7 +254,7 @@ impl Reverse for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReverseOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReverseOperation>>>>
     Reverse<ArrayType> for V
 {
     fn reverse<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError> {
@@ -264,7 +265,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
             return Ok(self.clone());
         }
         let mut outputs =
-            self.dispatch_domain().bind(ReverseOperation::new(axes), Vec::new(), std::slice::from_ref(self))?;
+            self.domain().bind(ReverseOperation::new(axes), Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

@@ -72,7 +72,7 @@ use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
@@ -653,9 +653,9 @@ impl RngBitGenerator for Array {
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayType,
-            DispatchDomain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
+            Domain: Context<Type = ArrayType, Operation: From<RngBitGeneratorOperation<ArrayType>>>,
         >,
 > RngBitGenerator<ArrayType> for V
 {
@@ -664,7 +664,7 @@ impl<
         algorithm: RandomAlgorithm,
         output_type: &ArrayType,
     ) -> Result<(Self, Self), ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             RngBitGeneratorOperation::<ArrayType>::new(algorithm, output_type.clone()),
             Vec::new(),
             std::slice::from_ref(self),
@@ -770,9 +770,9 @@ impl<A: Value<Type = ArrayType> + RngBitGenerator> DynamicRngBitGenerator<ArrayI
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<RngBitGeneratorOperation<ArrayIrType>>>,
         >,
 > DynamicRngBitGenerator<ArrayIrType> for V
 {
@@ -783,7 +783,7 @@ impl<
         output_dimensions: &[Self],
     ) -> Result<(Self, Self), ProgramError> {
         let inputs = std::iter::once(self).chain(output_dimensions).cloned().collect::<Vec<_>>();
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             RngBitGeneratorOperation::<ArrayIrType>::new(algorithm, output_type.clone()),
             Vec::new(),
             &inputs,
@@ -921,7 +921,7 @@ pub trait Random<T = <Self as Capability>::Universe>: Capability + Sized {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Fill<f64, V>>
+    V: Value<Type = ArrayType, Domain: Fill<f64, V>>
         + ZeroLike
         + Neg
         + Add
@@ -993,7 +993,7 @@ impl<
         } else {
             r#type.clone().with_layout(None).with_data_type(compute_data_type)
         };
-        let domain = self.dispatch_domain();
+        let domain = self.domain();
         let divisor: Self = domain.fill(&bits_type, 2.0f64.powi(bit_count - precision))?;
         let scale: Self = domain.fill(&compute_type, 2.0f64.powi(-precision))?;
         let samples = bits.div(&divisor)?.convert_element_type(compute_data_type)?.mul(&scale)?;
@@ -1011,7 +1011,7 @@ impl<
             });
             let (state, real) = self.random_normal(&part_type)?;
             let (state, imaginary) = state.random_normal(&part_type)?;
-            let scale: Self = self.dispatch_domain().fill(&part_type, std::f64::consts::FRAC_1_SQRT_2)?;
+            let scale: Self = self.domain().fill(&part_type, std::f64::consts::FRAC_1_SQRT_2)?;
             return Ok((state, real.mul(&scale)?.complex(&imaginary.mul(&scale)?)?));
         }
 
@@ -1023,7 +1023,7 @@ impl<
 
         let (state, first) = self.random_uniform(r#type)?;
         let (state, second) = state.random_uniform(r#type)?;
-        let domain = self.dispatch_domain();
+        let domain = self.domain();
         let one: Self = domain.fill(r#type, 1.0)?;
         let minus_two: Self = domain.fill(r#type, -2.0)?;
         let two_pi: Self = domain.fill(r#type, std::f64::consts::TAU)?;
@@ -1056,7 +1056,7 @@ impl<
 
         let compute_type = logits.r#type().into_owned();
         let (state, uniform) = self.random_uniform(&compute_type)?;
-        let domain = self.dispatch_domain();
+        let domain = self.domain();
         let (state, gumbel) = match mode {
             CategoricalSamplingMode::LowPrecision => {
                 // The shift changes only zero samples and keeps the noise finite, including for masked logits.

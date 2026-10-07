@@ -630,8 +630,8 @@ where
     Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
     Leaf: Value<Type = ArrayType>,
-    Leaf::DispatchDomain: Context<Type = ArrayType>,
-    <Leaf::DispatchDomain as Domain>::Operation: From<O>,
+    Leaf::Domain: Context<Type = ArrayType>,
+    <Leaf::Domain as Domain>::Operation: From<O>,
     O: Operation<Type = ArrayType>,
 {
     fn bind_leaf<Leaf, O>(
@@ -641,8 +641,8 @@ where
     ) -> Result<Leaf, ShardMapTraceError>
     where
         Leaf: Value<Type = ArrayType>,
-        Leaf::DispatchDomain: Context<Type = ArrayType>,
-        <Leaf::DispatchDomain as Domain>::Operation: From<O>,
+        Leaf::Domain: Context<Type = ArrayType>,
+        <Leaf::Domain as Domain>::Operation: From<O>,
         O: Operation<Type = ArrayType>,
     {
         let input_type = input.r#type();
@@ -654,7 +654,7 @@ where
             .into());
         }
         Ok(input
-            .dispatch_domain()
+            .domain()
             .bind(make_operation(sharding), Vec::new(), std::slice::from_ref(&input))?
             .into_iter()
             .next()
@@ -693,8 +693,8 @@ where
     Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
     Leaf: Value<Type = ArrayType>,
-    Leaf::DispatchDomain: Context<Type = ArrayType>,
-    <Leaf::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
+    Leaf::Domain: Context<Type = ArrayType>,
+    <Leaf::Domain as Domain>::Operation: From<ReshardOperation>,
 {
     bind_sharding_control_per_leaf(input, shardings, ReshardOperation::new)
 }
@@ -722,8 +722,8 @@ where
     Input: Parameterized<Leaf, To<Leaf> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
     Leaf: Value<Type = ArrayType>,
-    Leaf::DispatchDomain: Context<Type = ArrayType>,
-    <Leaf::DispatchDomain as Domain>::Operation: From<ConstrainShardingOperation>,
+    Leaf::Domain: Context<Type = ArrayType>,
+    <Leaf::Domain as Domain>::Operation: From<ConstrainShardingOperation>,
 {
     bind_sharding_control_per_leaf(input, shardings, ConstrainShardingOperation::new)
 }
@@ -3263,7 +3263,7 @@ mod tests {
                 let output_offsets = inputs[4].clone();
                 let receive_sizes = inputs[5].clone();
                 let (_, gradients) = inputs[0]
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at((inputs[0].clone(), inputs[1].clone()))
                     .with_captures((input_offsets, send_sizes, output_offsets, receive_sizes))
                     .value_and_gradient(
@@ -3519,7 +3519,7 @@ mod tests {
                 move |inputs: Vec<ShardMapTracer>| {
                     shard_map::<_, _, ArrayType, _>(
                         |inputs: Vec<ShardMapTracer>| {
-                            let context = inputs[0].dispatch_domain();
+                            let context = inputs[0].domain();
                             context
                                 .differentiate_at(inputs[0].clone())
                                 .with_captures((
@@ -3780,7 +3780,7 @@ mod tests {
         let traced: TracedShardMap<Vec<ArrayType>, ArrayType> = shard_map(
             |inputs: Vec<ShardMapTracer>| {
                 inputs[0]
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(inputs[0].clone())
                     .with_captures((
                         inputs[1].clone(),
@@ -4618,7 +4618,7 @@ mod tests {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(x.into_value())
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -4727,7 +4727,7 @@ mod tests {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(x.into_value())
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -4841,7 +4841,7 @@ mod tests {
                         let (value, gradient) = inputs[0]
                             .clone()
                             .into_value()
-                            .dispatch_domain()
+                            .domain()
                             .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                             .value_and_gradient(|(shared, weights)| {
                                 let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
@@ -4866,7 +4866,7 @@ mod tests {
                         let varying_gradient = inputs[1]
                             .clone()
                             .into_value()
-                            .dispatch_domain()
+                            .domain()
                             .differentiate_at(inputs[1].clone().into_value())
                             .gradient(|varying| {
                                 let varying = ValueProjection::<ArrayType>::into_projected(varying)?;
@@ -4890,12 +4890,12 @@ mod tests {
                         let second_derivative = inputs[0]
                             .clone()
                             .into_value()
-                            .dispatch_domain()
+                            .domain()
                             .differentiate_at(inputs[0].clone().into_value())
                             .with_captures(inputs[1].clone().into_value())
                             .gradient(|shared, weights| {
                                 Ok(shared
-                                    .dispatch_domain()
+                                    .domain()
                                     .differentiate_at(shared.clone())
                                     .with_captures(weights)
                                     .gradient(|shared, weights| {
@@ -4923,7 +4923,7 @@ mod tests {
                         let (_, pullback) = inputs[0]
                             .clone()
                             .into_value()
-                            .dispatch_domain()
+                            .domain()
                             .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                             .vjp(|(shared, weights)| {
                                 let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
@@ -4945,7 +4945,7 @@ mod tests {
                         let (_, directional_derivative) = inputs[0]
                             .clone()
                             .into_value()
-                            .dispatch_domain()
+                            .domain()
                             .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                             .jvp(
                                 (inputs[0].clone().into_value(), inputs[1].clone().into_value()),
@@ -4971,7 +4971,7 @@ mod tests {
                                 let derivative = shared
                                     .clone()
                                     .into_value()
-                                    .dispatch_domain()
+                                    .domain()
                                     .differentiate_at(shared.into_value())
                                     .with_captures(weights.into_value())
                                     .gradient(|shared, weights| {
@@ -4994,7 +4994,7 @@ mod tests {
                         let constant_sum = shard_map::<_, _, ArrayType, _>(
                             |input: ShardMapTracer| {
                                 let constant: ShardMapTracer =
-                                    input.dispatch_domain().fill(&input.r#type(), 3.0_f32).unwrap();
+                                    input.domain().fill(&input.r#type(), 3.0_f32).unwrap();
                                 constant.parallel_reduce(ReductionKind::Sum, "x").unwrap()
                             },
                             inputs[0].clone(),
@@ -5165,7 +5165,7 @@ mod tests {
                     let (output, pullback) = inputs[0]
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(inputs[0].clone().into_value())
                         .with_captures(inputs[1].clone().into_value())
                         .vjp(|data, indices| {
@@ -5336,7 +5336,7 @@ mod tests {
                     let (output, tangent) = inputs[0]
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(inputs[0].clone().into_value())
                         .with_captures(inputs[1].clone().into_value())
                         .jvp(inputs[2].clone().into_value(), |data, indices| {
@@ -5517,7 +5517,7 @@ mod tests {
                     AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
                 );
                 let (output, pullback) = inputs[0]
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))
                     .vjp(|inputs| function.call(inputs))
                     .unwrap();
@@ -5544,7 +5544,7 @@ mod tests {
             move |inputs: Vec<ShardMapTracer>| {
                 let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 inputs[0]
-                    .dispatch_domain()
+                    .domain()
                     .bind(XlaOperation::ShardMap(Box::new(operation.clone())), vec![body.clone()], &inputs)
                     .unwrap()
                     .into_iter()
@@ -5634,7 +5634,7 @@ mod tests {
                     let (value, gradient) = inputs[0]
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                         .value_and_gradient(|(shared, weights)| {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
@@ -5781,7 +5781,7 @@ mod tests {
                     let (value, gradient) = inputs[0]
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
                         .value_and_gradient(|(shared, weights)| {
                             let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
@@ -5918,7 +5918,7 @@ mod tests {
                     let (value, gradient) = x
                         .clone()
                         .into_value()
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(x.into_value())
                         .value_and_gradient(|x| {
                             let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -6284,7 +6284,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            let context = local_x.dispatch_domain();
+                            let context = local_x.domain();
                             let summed: ShardMapTracer = Batch::batch(
                                 &context,
                                 |item| item.parallel_reduce(ReductionKind::Sum, "x"),
@@ -6558,7 +6558,7 @@ mod tests {
                             // `axis_index` is a scalar per device; broadcast it to the shard shape so the add has
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.dispatch_domain().axis_index("x").unwrap();
+                            let index = local_x.domain().axis_index("x").unwrap();
                             let index_sharding = index
                                 .r#type()
                                 .sharding()
@@ -6669,7 +6669,7 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             let local_type = local_x.r#type().into_owned();
-                            let index = local_x.dispatch_domain().axis_index("x").unwrap();
+                            let index = local_x.domain().axis_index("x").unwrap();
                             let index_sharding = index
                                 .r#type()
                                 .sharding()
@@ -7559,7 +7559,7 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_input: ShardMapTracer| {
                             local_input
-                                .dispatch_domain()
+                                .domain()
                                 .bind(
                                     ParallelPermuteOperation::new("x".to_string(), axis_size, pairs.clone()),
                                     Vec::new(),

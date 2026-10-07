@@ -45,7 +45,7 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -875,7 +875,7 @@ impl ParallelSumScatter<ArrayType> for Array {
 
 impl<
     V: ShapeChangingCollectiveValue<
-            DispatchDomain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
+            Domain: Context<Value = V, Operation: From<ParallelSumScatterOperation>> + NamedAxes,
         > + ParallelVary,
 > ParallelSumScatter<ArrayType> for V
 {
@@ -886,7 +886,7 @@ impl<
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
         let scatter_axis = scatter_axis.into().normalize(self.r#type().rank())?;
@@ -924,9 +924,9 @@ impl<A: Value<Type = ArrayType> + ParallelSumScatter<ArrayType>> ParallelSumScat
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ParallelSumScatterOperation>>
+            Domain: Context<Type = ArrayIrType, Operation: From<ParallelSumScatterOperation>>
                                 + NamedAxes
                                 + DimensionConstant,
         > + Assert
@@ -945,7 +945,7 @@ impl<
         // extent value per output axis, which also asserts at runtime that dynamic extents fit the tiling mode. Over a
         // manual mesh axis, an input that neither varies over the axis nor is unreduced over it is first made varying
         // through its array view, exactly as JAX's `psum_scatter` does, so that every device's copy is counted.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
         let self_type = self.r#type();
@@ -1872,7 +1872,7 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
@@ -1942,7 +1942,7 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
@@ -2101,7 +2101,7 @@ mod tests {
                     |item| {
                         let operation =
                             ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled());
-                        let mut outputs = item.dispatch_domain().bind(operation, Vec::new(), &[item])?;
+                        let mut outputs = item.domain().bind(operation, Vec::new(), &[item])?;
                         Ok::<_, ProgramError>(outputs.remove(0))
                     },
                     inputs,
@@ -2138,7 +2138,7 @@ mod tests {
         let (differentiated_output_type, program) =
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                         .with_axis_name("x".to_string());
                     let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
                     let context = DifferentiationContext::fused(batch_context);
@@ -2178,7 +2178,7 @@ mod tests {
         let (differentiated_output_type, program) =
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                    let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                         .with_axis_name("x".to_string());
                     let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
                     let context = DifferentiationContext::fused(batch_context);

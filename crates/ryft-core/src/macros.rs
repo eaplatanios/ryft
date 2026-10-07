@@ -648,8 +648,9 @@ macro_rules! define_arithmetic_dimension_capability {
         impl<__V: $crate::programs::values::Value<Type = $crate::arrays::DimensionType>>
             $capability<$crate::arrays::DimensionType> for __V
         where
-            __V::DispatchDomain: $crate::contexts::Context<Type = $crate::arrays::DimensionType>,
-            <__V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
+            __V: $crate::programs::values::Value<Dispatch = $crate::programs::values::ValueDomainDispatch>,
+            __V::Domain: $crate::contexts::Context<Type = $crate::arrays::DimensionType>,
+            <__V::Domain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError> {
@@ -657,7 +658,7 @@ macro_rules! define_arithmetic_dimension_capability {
                 let right_type = $crate::programs::types::Typed::r#type($argument);
                 let operation = $operation::new(left_type.as_ref(), right_type.as_ref())?;
                 Ok($crate::contexts::Context::bind(
-                    &$crate::programs::values::Value::dispatch_domain(self),
+                    &$crate::programs::values::Value::domain(self),
                     operation,
                     Vec::new(),
                     &[self.clone(), $argument.clone()],
@@ -1256,10 +1257,11 @@ macro_rules! define_elementwise_capability {
             fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__T: $crate::Type, __V: $crate::Value<Type = __T>> $capability<__T> for __V
+        impl<__T: $crate::Type, __V: $crate::Value<Type = __T, Dispatch = $crate::ValueDomainDispatch>>
+            $capability<__T> for __V
         where
             $operation<__T>: $crate::Operation<Type = __T>,
-            __V::DispatchDomain: $crate::Context<
+            __V::Domain: $crate::Context<
                     Type = __T,
                     Value = __V,
                     Operation: ::std::convert::From<$operation<__T>>,
@@ -1268,7 +1270,7 @@ macro_rules! define_elementwise_capability {
             #[inline]
             fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError> {
                 Ok($crate::Context::bind(
-                    &$crate::Value::dispatch_domain(self),
+                    &$crate::Value::domain(self),
                     $operation::<__T>::new().with_accuracy(accuracy),
                     Vec::new(),
                     ::std::slice::from_ref(self),
@@ -1317,7 +1319,8 @@ macro_rules! define_elementwise_capability {
             __T: $crate::Type,
             __V: $crate::Value<
                 Type = __T,
-                DispatchDomain: $crate::Context<
+                Dispatch = $crate::ValueDomainDispatch,
+                Domain: $crate::Context<
                     Type = __T,
                     Value = __V,
                     Operation: ::std::convert::From<
@@ -1337,7 +1340,7 @@ macro_rules! define_elementwise_capability {
                     &[input_type.as_ref()],
                 )?;
                 Ok($crate::Context::bind(
-                    &$crate::Value::dispatch_domain(self),
+                    &$crate::Value::domain(self),
                     operation,
                     Vec::new(),
                     ::std::slice::from_ref(self),
@@ -1387,7 +1390,8 @@ macro_rules! define_elementwise_capability {
             __T: $crate::Type,
             __V: $crate::Value<
                 Type = __T,
-                DispatchDomain: $crate::Context<
+                Dispatch = $crate::ValueDomainDispatch,
+                Domain: $crate::Context<
                     Type = __T,
                     Value = __V,
                     Operation: ::std::convert::From<
@@ -1410,7 +1414,7 @@ macro_rules! define_elementwise_capability {
                     &[left_type.as_ref(), right_type.as_ref()],
                 )?;
                 Ok($crate::Context::bind(
-                    &$crate::Value::dispatch_domain(self),
+                    &$crate::Value::domain(self),
                     operation,
                     Vec::new(),
                     &inputs,
@@ -5220,7 +5224,7 @@ macro_rules! check_gradient {
         // plain `let` with no expected type and every call site fails with "type annotations needed". `pin_traced` is
         // belt-and-braces today as the `gradient` bounds let inference recover the signature from the concretely typed
         // input, but it pins the canonical eager reference context explicitly instead of leaving that choice to
-        // inference through `Input::To<LinearizationTracer<V::ExecutionDomain>>`, and it keeps closure-shape errors
+        // inference through `Input::To<LinearizationTracer<V::Domain>>`, and it keeps closure-shape errors
         // anchored to one concrete expected signature.
         //
         // Both pins leave the function's output type generic so that `$function` may return its value either directly

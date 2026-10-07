@@ -53,13 +53,13 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Value: Neg + Mul + Exp,
-        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
+        <C::Value as Value>::Domain: Fill<f64, C::Value>,
     {
         // `d(erf(x)) = (2/√π) · exp(-x²) · dx`, with the coefficient `2/√π` rounded to the aligned input's element
         // data type. Filling that type stages a scalar constant and broadcasts it when needed.
         |(input, input_tangent)| {
             let input_type = input.r#type().into_owned();
-            let coefficient = input.dispatch_domain().fill(&input_type, FRAC_2_SQRT_PI)?;
+            let coefficient = input.domain().fill(&input_type, FRAC_2_SQRT_PI)?;
             coefficient.mul(&input.mul(&input)?.neg()?.exp()?)?.mul(&input_tangent)?
         }
     },

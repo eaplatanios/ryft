@@ -20,6 +20,38 @@ use crate::programs::regions::RegionId;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
 
+/// Kind of a [`Value`]'s [`Dispatch`](Value::Dispatch) marker, which decides whether the blanket capability
+/// implementations that bind operations through a value's [`Domain`](Value::Domain) apply to that value. The
+/// trait is sealed, so [`ValueDomainDispatch`] and [`ValueDirectDispatch`] are its only implementors.
+pub trait ValueDispatch: sealed::Sealed {}
+
+/// [`ValueDispatch`] of values whose capability functions bind their operations through the value's
+/// [`Domain`](Value::Domain) via the blanket capability implementations (e.g., staged [`Tracer`]s,
+/// transform tracers, and backend values whose domain executes operations eagerly).
+pub struct ValueDomainDispatch;
+
+/// [`ValueDispatch`] of values that implement the domain-binding capabilities directly (e.g., the host
+/// [`Array`](crate::Array), whose direct implementations are the eager computations that interpretation bottoms out
+/// in). It excludes the value only from the blanket capability implementations that bind operations through its domain:
+/// blanket implementations that compose other capabilities or project onto another type universe still apply, so it
+/// does not mean that every capability has a direct implementation. Values defined in downstream crates can use it
+/// as well, because the marker keeps their direct implementations disjoint from the blanket ones.
+pub struct ValueDirectDispatch;
+
+impl ValueDispatch for ValueDomainDispatch {}
+
+impl ValueDispatch for ValueDirectDispatch {}
+
+/// Seals [`ValueDispatch`] to [`ValueDomainDispatch`] and [`ValueDirectDispatch`].
+mod sealed {
+    /// Super-trait of [`ValueDispatch`](super::ValueDispatch) that only this module implements.
+    pub trait Sealed {}
+
+    impl Sealed for super::ValueDomainDispatch {}
+
+    impl Sealed for super::ValueDirectDispatch {}
+}
+
 /// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`](crate::Program), identified by
 /// its containing [`Region`](crate::Region) and its region-local [`AtomId`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,49 +100,41 @@ impl ValueId {
 /// represented by a compact semantic reference such as [`CaptureReference`], whose displayed table index and type
 /// identify the program-level constant without reading back its runtime payload.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
-    /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
-    /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work
-    /// executes in the [`ExecutionDomain`](Self::ExecutionDomain). The two domains coincide for every transform and
-    /// staged value (e.g., a staged [`Tracer`]'s trace, a [`BatchingTracer`]'s batching level, etc.): dispatch and
-    /// execution both happen in the live context such a value flows through. Concrete backend values (e.g., concrete
-    /// arrays) follow one of two strategies:
+    /// [`ValueDispatch`] marker that decides whether the blanket capability implementations that bind operations
+    /// through this value's [`Domain`](Self::Domain) apply to it. Blanket capability implementations (e.g., the
+    /// value-level arithmetic sugar) require [`ValueDomainDispatch`] and bind their operation through
+    /// [`domain`](Self::domain), using the domain's operation universe only to decide whether that
+    /// operation can be bound. Values follow one of two strategies:
     ///
-    ///   - **Direct Implementations:** Concrete values defined in this crate (e.g., [`Array`](crate::Array) and
-    ///     [`ArrayIrValue`](crate::ArrayIrValue)) use the constant-only [`EagerContext`](crate::EagerContext) as
-    ///     their [`DispatchDomain`](Self::DispatchDomain), so that capability calls dispatch to direct implementations
-    ///     instead of a context, while their [`ExecutionDomain`](Self::ExecutionDomain) names a _rich_,
-    ///     operation-executing eager domain. A value whose rich domain requires state that cannot be derived from the
-    ///     value (e.g., a client handle) keeps the constant-only domain there too, which means free transform entry
-    ///     points do not serve it and an explicit context must be used instead.
-    ///   - **Rich Dispatch:** Concrete values defined in downstream backend crates cannot provide direct capability
-    ///     implementations next to the blanket ones (see below), so both of their domains are their backend's rich
-    ///     domain, and every capability binds an operation that the backend executes eagerly. Such values must carry
-    ///     the state that their domain requires in every member and in every projected representation (e.g., the XLA
-    ///     backend's composite values carry their session in their array, dimension, and reference members), because
-    ///     [`ValueProjection::from_projected`] is infallible and receives no state.
-    ///
-    /// Blanket capability implementations (e.g., the value-level arithmetic sugar) bind through this domain and use its
-    /// operation universe as their coherence discriminator: the sugar applies when `V::DispatchDomain::Operation` can
-    /// accept the operation being bound. A staged [`Tracer`]'s dispatch domain is its live trace, so the sugar records
-    /// instructions there, and a rich-dispatch backend value's dispatch domain executes the operation eagerly. A
-    /// direct-implementation value's dispatch domain is the constant-only [`EagerContext`](crate::EagerContext),
-    /// whose [`ConstantOperation`](crate::ConstantOperation) universe accepts nothing. This is precisely what keeps
-    /// the blanket implementations coherent with (i.e., disjoint from) the direct capability implementations of those
-    /// values.
-    type DispatchDomain: Domain<Type = Self::Type, Value = Self>;
+    ///   - **Through the Domain (i.e., [`ValueDomainDispatch`]):** Staged and transform values (e.g., a staged
+    ///     [`Tracer`] or a [`BatchingTracer`]) bind every capability into the live context that they flow through,
+    ///     and concrete values of downstream backend crates that execute eagerly (e.g., the XLA backend's arrays)
+    ///     bind every capability into their backend's domain, which executes it op by op. Such backend values must
+    ///     carry the state that their domain requires in every member and in every projected representation (e.g.,
+    ///     the XLA backend's composite values carry their session in their array, dimension, and reference members),
+    ///     because [`ValueProjection::from_projected`] is infallible and receives no state.
+    ///   - **Direct Implementations (i.e., [`ValueDirectDispatch`]):** Concrete values that implement
+    ///     capabilities directly (e.g., [`Array`](crate::Array), [`ArrayIrValue`](crate::ArrayIrValue), and
+    ///     [`DimensionValue`](crate::DimensionValue), whose direct implementations are the eager computations that
+    ///     interpretation bottoms out in) are excluded from the domain-binding blanket implementations, which is
+    ///     what keeps those blanket implementations coherent with (i.e., disjoint from) the direct ones. Blanket
+    ///     implementations that compose other capabilities or project onto another type universe still apply.
+    ///     Values of downstream crates can use this strategy as well. Constant and metadata values that cannot
+    ///     bind operations at all (e.g., [`CaptureReference`]) are also [`ValueDirectDispatch`].
+    type Dispatch: ValueDispatch;
 
-    /// [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the documentation of
-    /// [`DispatchDomain`](Self::DispatchDomain) for information on the two types of [`Domain`]s that each value
-    /// provides.
-    type ExecutionDomain: Domain<Type = Self::Type, Value = Self>;
+    /// [`Domain`] in which operations involving this [`Value`] bind and execute. For staged and transform values,
+    /// it is the live context that the value flows through (e.g., a staged [`Tracer`]'s trace or a [`BatchingTracer`]'s
+    /// batching level). For concrete values, it is an operation-executing eager domain (e.g., the reference
+    /// backend's [`EagerContext`](crate::EagerContext) over [`ArrayOperation`](crate::ArrayOperation) for
+    /// [`Array`](crate::Array)), so free entry points such as [`batch`](crate::batching::batch) serve top-level
+    /// concrete values. A value whose operation-executing domain requires state that cannot be derived from the
+    /// value (e.g., a client handle) uses the constant-only [`EagerContext`](crate::EagerContext) instead,
+    /// which means that free entry points do not serve it and an explicit context must be used.
+    type Domain: Domain<Type = Self::Type, Value = Self>;
 
-    /// Returns the [`Domain`] that operations involving this [`Value`] *dispatch* through. Refer to the
-    /// documentation of [`DispatchDomain`](Self::DispatchDomain) for more information.
-    fn dispatch_domain(&self) -> Self::DispatchDomain;
-
-    /// Returns the [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the
-    /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
-    fn execution_domain(&self) -> Self::ExecutionDomain;
+    /// Returns the [`Domain`](Self::Domain) in which operations involving this [`Value`] bind and execute.
+    fn domain(&self) -> Self::Domain;
 
     /// Returns an equivalent value whose type-identity metadata has been simultaneously renamed according to
     /// `renaming`. [`Value`] represents every kind of leaf that can participate in a [`Program`](crate::Program), not
@@ -451,30 +475,22 @@ impl<T: Type, V> Typed for ProjectedValue<T, V> {
     }
 }
 
-// The dispatch domains are bounded by the parts of `DomainProjection<T>` that this implementation needs rather than
-// by the trait itself: 1DomainProjection<T>` also requires that the domain's values project onto a `Value`, and that
+// The projected domain is bounded by the parts of `DomainProjection<T>` that this implementation needs rather than by
+// the trait itself: `DomainProjection<T>` also requires that the domain's values project onto a `Value`, and that
 // projected value is this `ProjectedValue`, so proving it would require this very implementation (i.e., the trait
-// solver overflows).
+// solver overflows). The capability-dispatch marker is forwarded from the projected value.
 impl<T: Type, V: ValueProjection<T, Projected = Self>> Value for ProjectedValue<T, V>
 where
-    <V::DispatchDomain as Domain>::Type: From<T>,
-    <V::DispatchDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    <V::DispatchDomain as Domain>::Operation: OperationProjection<T>,
-    <V::ExecutionDomain as Domain>::Type: From<T>,
-    <V::ExecutionDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    <V::ExecutionDomain as Domain>::Operation: OperationProjection<T>,
+    <V::Domain as Domain>::Type: From<T>,
+    <V::Domain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
+    <V::Domain as Domain>::Operation: OperationProjection<T>,
 {
-    type DispatchDomain = ProjectedContext<V::DispatchDomain, T>;
-    type ExecutionDomain = ProjectedContext<V::ExecutionDomain, T>;
+    type Dispatch = V::Dispatch;
+    type Domain = ProjectedContext<V::Domain, T>;
 
     #[inline]
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        ProjectedContext::new(self.value.dispatch_domain())
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> Self::ExecutionDomain {
-        ProjectedContext::new(self.value.execution_domain())
+    fn domain(&self) -> Self::Domain {
+        ProjectedContext::new(self.value.domain())
     }
 
     #[inline]
@@ -576,14 +592,10 @@ mod tests {
         }
 
         impl Value for TestValue {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
+            fn domain(&self) -> Self::Domain {
                 EagerContext::new()
             }
         }

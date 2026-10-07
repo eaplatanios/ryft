@@ -21,25 +21,25 @@ use ryft_core::{
     Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
     DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, ImaginaryOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation,
-    LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
-    OperationBoundaryPruning, OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation,
-    ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Parameter, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation,
-    PrintOperation, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue,
-    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness, RegionSlot, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
-    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation,
-    SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation,
+    DimensionType, DimensionValue, ValueDirectDispatch, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, ImaginaryOperation, InputRegionProvenance, IotaOperation,
+    LiftedCustomRules, LinearCallOperation, LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, Operation, OperationBoundaryPruning, OperationFormatter, OperationProvider,
+    OrOperation, OutputRegionProvenance, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
+    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
+    ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, RealOperation, ReduceOperation,
+    ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness,
+    RegionSlot, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation,
+    RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation,
+    SinOperation, SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation,
+    TagOperation, TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation,
     TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
     UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
     ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
@@ -95,14 +95,10 @@ impl Typed for XlaArrayConstant {
 }
 
 impl Value for XlaArrayConstant {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
 
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        EagerContext::new()
-    }
-
-    fn execution_domain(&self) -> Self::ExecutionDomain {
+    fn domain(&self) -> Self::Domain {
         EagerContext::new()
     }
 
@@ -225,16 +221,11 @@ impl Typed for XlaConstant {
 }
 
 impl Value for XlaConstant {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self>;
 
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> EagerContext<Self> {
+    fn domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 

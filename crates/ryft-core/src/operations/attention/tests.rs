@@ -470,7 +470,7 @@ fn test_dot_product_attention_batching_manual_variation() {
     let signature = AttentionInputSignature::new(true, false, false, false);
     let (output_type, _) = ArrayTrace::trace_with_named_axes(
         |inputs: Vec<Tracer<ArrayTrace>>| {
-            let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2);
+            let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].domain(), 2);
             let inputs = inputs
                 .into_iter()
                 .map(|input| ArrayBatch::new(input, BatchAxis::new(0)))

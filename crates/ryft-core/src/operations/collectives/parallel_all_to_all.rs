@@ -41,7 +41,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1068,9 +1068,9 @@ impl<A: Value<Type = ArrayType> + ParallelAllToAll<ArrayType>> ParallelAllToAll<
 
 impl<V> ParallelAllToAll<ArrayIrType> for V
 where
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ParallelAllToAllOperation>>
+            Domain: Context<Type = ArrayIrType, Operation: From<ParallelAllToAllOperation>>
                                 + NamedAxes
                                 + DimensionConstant,
         > + Assert
@@ -1088,7 +1088,7 @@ where
         // Composite values stage the array followed by one result extent per axis. Only a manual mesh binder records
         // its mesh on the operation and introduces variation; a named batch that shadows the same mesh-axis name
         // performs its own local exchange.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let effective_axis_size = options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
         let self_type = self.r#type();
@@ -1208,7 +1208,7 @@ impl<V: ParallelAllToAll<ArrayIrType> + ValueProjection<ArrayType, Projected = P
 
 impl<
     V: ShapeChangingCollectiveValue<
-            DispatchDomain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
+            Domain: Context<Value = V, Operation: From<ParallelAllToAllOperation>> + NamedAxes,
         > + ParallelVary,
 > ParallelAllToAll<ArrayType> for V
 {
@@ -1220,7 +1220,7 @@ impl<
         options: CollectiveOptions,
     ) -> Result<Self, ProgramError> {
         // Homogeneous values opt into direct staging, while projected values retain composite extent delegation.
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, axis_size)?;
         let rank = self.r#type().rank();
@@ -2243,7 +2243,7 @@ mod tests {
         let forward = |input_sharding: Sharding| {
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let parent = input.dispatch_domain();
+                    let parent = input.domain();
                     let context =
                         BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), parent.dimension_constant(2)?)
                             .with_axis_name("y".to_string());
@@ -2294,7 +2294,7 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let input = ArrayBatch::new(input, BatchAxis::new(0))?;
                 let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
@@ -2622,7 +2622,7 @@ mod tests {
                     |item| {
                         let operation =
                             ParallelAllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled());
-                        let mut outputs = item.dispatch_domain().bind(operation, Vec::new(), &[item])?;
+                        let mut outputs = item.domain().bind(operation, Vec::new(), &[item])?;
                         Ok::<_, ProgramError>(outputs.remove(0))
                     },
                     inputs,
@@ -2667,7 +2667,7 @@ mod tests {
         let expected_type = ArrayType::new_static(DataType::F32, [2, 1, 6]).with_sharding(sharding).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 2)
+                let batch_context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 2)
                     .with_axis_name("x".to_string());
                 let item = BatchingTracer::new(batch_context.clone(), ArrayBatch::new(input, BatchAxis::new(0))?);
                 let context = DifferentiationContext::fused(batch_context);
@@ -2706,9 +2706,9 @@ mod tests {
         let (output_type, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |input| {
-                    let axis_extent = input.dispatch_domain().dimension_constant(2)?;
+                    let axis_extent = input.domain().dimension_constant(2)?;
                     let batch_context =
-                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.dispatch_domain(), axis_extent)
+                        BatchingContext::<_, ArrayIrBatchingPolicy>::new(input.domain(), axis_extent)
                             .with_axis_name("x".to_string());
                     let item = BatchingTracer::new(batch_context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?);
                     let context = DifferentiationContext::fused(batch_context);

@@ -18,7 +18,7 @@ use crate::programs::{
     AtomId, BindingRegionDriver, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
     Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
     ReferenceAnalysis, ReferenceIdentity, RegionRef, RegionReplayMappings, RegionRole, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -1397,16 +1397,11 @@ impl<C: Context> Typed for PartialTracer<C> {
 impl<C: Context> Parameter for PartialTracer<C> {}
 
 impl<C: Context> Value for PartialTracer<C> {
-    type DispatchDomain = PartialEvaluationContext<C>;
-    type ExecutionDomain = PartialEvaluationContext<C>;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = PartialEvaluationContext<C>;
 
     #[inline]
-    fn dispatch_domain(&self) -> PartialEvaluationContext<C> {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> PartialEvaluationContext<C> {
+    fn domain(&self) -> PartialEvaluationContext<C> {
         self.context().clone()
     }
 }

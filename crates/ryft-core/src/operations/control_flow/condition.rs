@@ -1250,7 +1250,7 @@ impl ConditionType for ArrayIrType {
 /// Stages a [`ConditionOperation`] that applies `true_function` to `inputs` when `predicate` is `true` and
 /// `false_function` otherwise, returning the outputs of the selected branch. This is the value-level analogue of
 /// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). Like other free entry points,
-/// it binds the condition in the [`execution_domain`](Value::execution_domain) of its values (i.e., the live trace of a
+/// it binds the condition in the [`domain`](Value::domain) of its values (i.e., the live trace of a
 /// staged value or the operation-executing eager domain of a concrete value): each function is traced into a branch
 /// [`Program`] through a [`NestedTracingContext`] over the execution domain of `predicate`, and both branches must
 /// return values of the same types. An output that both branches forward from the same input equals that input
@@ -1291,24 +1291,24 @@ pub fn condition<V, True, False>(
     false_function: False,
 ) -> Result<Vec<V>, ProgramError>
 where
-    V: Value<Type: ConditionType, ExecutionDomain: Context<Operation: From<ConditionOperation<V::Type>>>>
+    V: Value<Type: ConditionType, Domain: Context<Operation: From<ConditionOperation<V::Type>>>>
         + ManualVariationAlignment,
-    Tracer<NestedTracingContext<V::ExecutionDomain>>: ManualVariationAlignment,
+    Tracer<NestedTracingContext<V::Domain>>: ManualVariationAlignment,
     True: FnOnce(
-        Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>,
-    ) -> Result<Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>, ProgramError>,
+        Vec<Tracer<NestedTracingContext<V::Domain>>>,
+    ) -> Result<Vec<Tracer<NestedTracingContext<V::Domain>>>, ProgramError>,
     False: FnOnce(
-        Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>,
-    ) -> Result<Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>, ProgramError>,
+        Vec<Tracer<NestedTracingContext<V::Domain>>>,
+    ) -> Result<Vec<Tracer<NestedTracingContext<V::Domain>>>, ProgramError>,
 {
-    let context = predicate.execution_domain();
+    let context = predicate.domain();
     let predicate_sharding = predicate.r#type().predicate_sharding().cloned();
     let aligned_inputs = match &predicate_sharding {
         Some(sharding) => V::align_manual_variation_to(&inputs, sharding)?,
         None => inputs.clone(),
     };
     let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>| match &predicate_sharding {
+    let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<V::Domain>>>| match &predicate_sharding {
         Some(sharding) => Tracer::align_manual_variation_to(&outputs, sharding),
         None => Ok(outputs),
     };
@@ -2327,9 +2327,9 @@ mod tests {
     /// Applies a condition whose predicate is computed from `input`, retaining both attached regions during replay.
     fn stage_runtime_predicate_condition<V: Value<Type = ArrayType>>(input: V) -> Result<V, ProgramError>
     where
-        V::ExecutionDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+        V::Domain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
-        let context = input.execution_domain();
+        let context = input.domain();
         let zero = context.lift(Array::scalar(0.0).unwrap())?;
         let mut predicates = context.bind(
             ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
@@ -6283,7 +6283,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2);
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].domain(), 2);
                 let predicate =
                     BatchingTracer::new(context.clone(), ArrayBatch::new(inputs[0].clone(), BatchAxis::new(0))?);
                 let value =
@@ -7041,7 +7041,7 @@ mod tests {
             .unwrap();
         let (output_type, program) = TracingContext::<TestValue, TestOperation>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
-                let parent = inputs[0].dispatch_domain();
+                let parent = inputs[0].domain();
                 let extent = parent.constant(TestValue::Dimension(DimensionValue::constant(2).unwrap()));
                 let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, extent);
                 let predicate =
@@ -7201,9 +7201,9 @@ mod tests {
             branches: &[Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>],
         ) -> Result<V, ProgramError>
         where
-            V::ExecutionDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+            V::Domain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
         {
-            let context = input.execution_domain();
+            let context = input.domain();
             let zero = context.lift(Array::scalar(0f64).unwrap())?;
             let predicate = context
                 .bind(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), &[input.clone(), zero])?

@@ -236,7 +236,7 @@ where
                             ArrayIrType::from(array_type(down_shape)),
                         ),
                     )?;
-                    let context = up.dispatch_domain();
+                    let context = up.domain();
                     let output = apply.into_flat_program().interpret_in_context(&context, vec![hidden, up, down])?;
                     let output = ValueProjection::<ArrayType>::into_projected(output.into_iter().next().unwrap())?;
                     Ok(output.reduce(&[0, 1], ReductionKind::Sum)?.into_value())

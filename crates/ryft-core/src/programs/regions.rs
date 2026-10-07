@@ -2006,6 +2006,7 @@ mod tests {
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
     use crate::programs::references::ReferenceType;
+    use crate::programs::values::ValueDirectDispatch;
     use crate::tests::{TestRegionOperation, hash_of};
 
     use super::*;
@@ -2131,14 +2132,10 @@ mod tests {
     }
 
     impl Value for StructuralType {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
 
-        fn dispatch_domain(&self) -> Self::DispatchDomain {
-            EagerContext::new()
-        }
-
-        fn execution_domain(&self) -> Self::ExecutionDomain {
+        fn domain(&self) -> Self::Domain {
             EagerContext::new()
         }
 

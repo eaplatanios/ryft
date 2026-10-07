@@ -1913,7 +1913,7 @@ impl<V> ShardMapInvocationLeaf for ProjectedValue<ArrayType, V>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
     ProjectedValue<ArrayType, V>: Value<Type = ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation> + NamedAxes,
+    V::Domain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation> + NamedAxes,
 {
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
         = Output::To<Self>
@@ -1964,7 +1964,7 @@ where
         >(in_specs, global_input_types.parameter_structure())?;
         let traced_inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
         let context = match traced_inputs.first() {
-            Some(input) => input.dispatch_domain(),
+            Some(input) => input.domain(),
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<Self>::from_parameters(output_structure, Vec::new())?);
             }

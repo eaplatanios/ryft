@@ -24,7 +24,7 @@ use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
 use crate::operations::ElementType;
 use crate::parameters::Parameter;
-use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, Typed, Value};
+use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, Typed, Value, ValueDirectDispatch};
 
 /// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
 /// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
@@ -742,20 +742,15 @@ impl Typed for Array {
 }
 
 impl Value for Array {
-    type DispatchDomain = EagerContext<Self>;
+    type Dispatch = ValueDirectDispatch;
 
     // A concrete `Array`'s active context is the reference backend's rich eager domain (unlike the constant-only
-    // `EagerContext<Array>` it declares as its `Value::DispatchDomain`, which cannot bind operations), so free
-    // transform entry points such as `crate::batching::batch` serve top-level concrete values.
-    type ExecutionDomain = EagerContext<Self, ArrayOperation<Self>>;
+    // `EagerContext<Array>` it declares as its `Value::Domain`, which cannot bind operations), so free transform
+    // entry points such as `crate::batching::batch` serve top-level concrete values.
+    type Domain = EagerContext<Self, ArrayOperation<Self>>;
 
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> EagerContext<Self, ArrayOperation<Self>> {
+    fn domain(&self) -> EagerContext<Self, ArrayOperation<Self>> {
         EagerContext::new()
     }
 
@@ -2120,16 +2115,9 @@ mod tests {
     }
 
     #[test]
-    fn test_array_dispatch_domain() {
-        // Constant dispatch uses the minimal eager family rather than the richer execution operation family.
-        let context: EagerContext<Array> = Array::scalar(1i32).unwrap().dispatch_domain();
-        assert!(context.is_eager());
-    }
-
-    #[test]
-    fn test_array_execution_domain() {
-        // Execution uses the reference backend's rich eager domain, which can bind array operations.
-        let context: EagerContext<Array, ArrayOperation<Array>> = Array::scalar(1i32).unwrap().execution_domain();
+    fn test_array_domain() {
+        // An array's domain is the reference backend's rich eager domain, which can bind array operations.
+        let context: EagerContext<Array, ArrayOperation<Array>> = Array::scalar(1i32).unwrap().domain();
         assert!(context.is_eager());
     }
 

@@ -107,7 +107,7 @@ use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
-    TypeError, Typed, Value, ValueProjection,
+    TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Name of [`ReduceOperation`]. The reduction's [`ReductionKind`] is rendered as its `kind` attribute.
@@ -1021,14 +1021,14 @@ where
                 residuals.into_values(),
                 vec![input_tangent],
                 move |residuals, linear_inputs| {
-                    let context = linear_inputs[0].dispatch_domain();
+                    let context = linear_inputs[0].domain();
                     let masked = context
                         .bind_array(MulOperation::new(), &[residuals[mask_index].clone(), linear_inputs[0].clone()])?;
                     let sum = context.bind_array(ReduceOperation::new(axes, ReductionKind::Sum), &[masked])?;
                     Ok(vec![context.bind_array(DivOperation::new(), &[sum, residuals[tie_count_index].clone()])?])
                 },
                 move |residuals, output_cotangents| {
-                    let context = output_cotangents[0].dispatch_domain();
+                    let context = output_cotangents[0].domain();
                     let input_extents = input_shape.dimensions(&context, residuals)?;
                     let cotangent = context.bind_array(
                         DivOperation::new(),
@@ -1055,10 +1055,10 @@ where
                 residuals.into_values(),
                 vec![input_tangent],
                 move |_, linear_inputs| {
-                    Ok(vec![linear_inputs[0].dispatch_domain().bind_array(forward_operation, linear_inputs)?])
+                    Ok(vec![linear_inputs[0].domain().bind_array(forward_operation, linear_inputs)?])
                 },
                 move |residuals, output_cotangents| {
-                    let context = output_cotangents[0].dispatch_domain();
+                    let context = output_cotangents[0].domain();
                     let input_extents = input_shape.dimensions(&context, residuals)?;
                     let cotangent = output_cotangents[0].dynamic_broadcast_with_output_sharding(
                         input_extents.as_slice(),
@@ -1399,7 +1399,7 @@ impl Reduce for Array {
 // Any context-carrying value reduces by binding a `ReduceOperation` through its context. The `From<ReduceOperation>`
 // bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
 // the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>>
     Reduce<ArrayType> for V
 {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
@@ -1407,7 +1407,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
             return Ok(self.clone());
         }
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             ReduceOperation::new(axes.to_vec(), kind),
             Vec::new(),
             std::slice::from_ref(self),
@@ -1422,7 +1422,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         if output_sharding.is_none() {
             return self.reduce(axes, ReductionKind::Sum);
         }
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             ReduceOperation::new(axes.to_vec(), ReductionKind::Sum).with_output_sharding(output_sharding)?,
             Vec::new(),
             std::slice::from_ref(self),
@@ -1945,7 +1945,7 @@ impl ArgMax for Array {
 // Any context-carrying value computes the index by binding an `ArgMaxOperation` through its context. The
 // `From<ArgMaxOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ArgMaxOperation>>>>
     ArgMax<ArrayType> for V
 {
     fn argmax_with_index_data_type<A: Into<Axis>>(
@@ -1954,7 +1954,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         index_data_type: DataType,
     ) -> Result<Self, ProgramError> {
         let operation = ArgMaxOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -2158,7 +2158,7 @@ impl ArgMin for Array {
 // Any context-carrying value computes the index by binding an `ArgMinOperation` through its context. The
 // `From<ArgMinOperation>` bound makes this disjoint from the eager value types (whose context operation is
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ArgMinOperation>>>>
     ArgMin<ArrayType> for V
 {
     fn argmin_with_index_data_type<A: Into<Axis>>(
@@ -2167,7 +2167,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         index_data_type: DataType,
     ) -> Result<Self, ProgramError> {
         let operation = ArgMinOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

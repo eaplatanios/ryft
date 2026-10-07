@@ -65,6 +65,7 @@ use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+    ValueDomainDispatch,
 };
 
 /// Canonical operation name for [`MinOperation`].
@@ -554,9 +555,9 @@ pub trait Clamp<T = <Self as Capability>::Universe>: Capability + Sized {
 
 impl<
     T: Type,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = T,
-            DispatchDomain: Context<
+            Domain: Context<
                 Type = T,
                 Value = V,
                 Operation: From<<ClampOperation<T> as OperationProvider<T>>::Operation>,
@@ -575,7 +576,7 @@ where
             (),
             &input_types.iter().map(|input_type| input_type.as_ref()).collect::<Vec<_>>(),
         )?;
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), &inputs)?.remove(0))
+        Ok(self.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 }
 

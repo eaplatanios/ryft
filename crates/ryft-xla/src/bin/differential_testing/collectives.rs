@@ -182,7 +182,7 @@ impl CollectiveCase {
     fn transformed(&self, input: ShardMapTracer, seed: ShardMapTracer) -> Result<Vec<ShardMapTracer>, ProgramError> {
         match self.transform.as_str() {
             "primal" if self.operation == "axis_index" => {
-                let index = input.dispatch_domain().axis_index(&self.axis_name)?;
+                let index = input.domain().axis_index(&self.axis_name)?;
                 let index = index.convert_element_type(ryft_core::DataType::F32)?;
                 let index_sharding = index
                     .r#type()
@@ -203,7 +203,7 @@ impl CollectiveCase {
             }
             "jvp" => {
                 let (primal, tangent) =
-                    input.clone().into_value().dispatch_domain().differentiate_at(input.into_value()).jvp(
+                    input.clone().into_value().domain().differentiate_at(input.into_value()).jvp(
                         seed.into_value(),
                         |input| {
                             let input = ValueProjection::<ArrayType>::into_projected(input)?;
@@ -217,7 +217,7 @@ impl CollectiveCase {
             }
             "vjp" => {
                 let (primal, pullback) =
-                    input.clone().into_value().dispatch_domain().differentiate_at(input.into_value()).vjp(|input| {
+                    input.clone().into_value().domain().differentiate_at(input.into_value()).vjp(|input| {
                         let input = ValueProjection::<ArrayType>::into_projected(input)?;
                         Ok(self.apply(input)?.into_value())
                     })?;

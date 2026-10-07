@@ -52,7 +52,7 @@ use crate::operations::reductions::{ReduceOperation, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -1074,7 +1074,7 @@ impl_differentiable_operation! {
                             check_count!("input", linear_inputs, 2, ProgramError);
                             let mut pad_inputs = linear_inputs.to_vec();
                             pad_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                            linear_inputs[0].dispatch_domain().bind(
+                            linear_inputs[0].domain().bind(
                                 forward_operation,
                                 Vec::new(),
                                 pad_inputs.as_slice(),
@@ -1082,7 +1082,7 @@ impl_differentiable_operation! {
                         },
                         move |residuals, output_cotangents| {
                             check_count!("output", output_cotangents, 1, ProgramError);
-                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let transpose_context = output_cotangents[0].domain();
                             let output_cotangent = output_cotangents[0].clone();
                             let input_extents = input_shape.dimensions(&transpose_context, residuals)?;
                             let all_cropped = transpose_input_type.shape().dimensions().iter().enumerate().any(
@@ -1629,9 +1629,9 @@ impl Pad for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Pad<ArrayType> for V
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayType>> Pad<ArrayType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
+    V::Domain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
 {
     fn pad(
         &self,
@@ -1648,7 +1648,7 @@ where
         if is_effective_identity(input_type.as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
             return Ok(inputs[0].clone());
         }
-        let mut outputs = inputs[0].dispatch_domain().bind(
+        let mut outputs = inputs[0].domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
             Vec::new(),
             &inputs,
@@ -1752,7 +1752,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
         extent: &Self,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: AsArrayType + AsDimensionType, DispatchDomain: DimensionConstant + DynamicIota<Self>>
+        Self: Value<Type: AsArrayType + AsDimensionType, Domain: DimensionConstant + DynamicIota<Self>>
             + DimensionSize
             + Assert
             + DimensionToScalar
@@ -1814,7 +1814,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
         // cannot create a dynamic axis.
         let query_type = ArrayType::new(DataType::I64, Shape::new(vec![input_type.dimension(axis)]))
             .with_memory(input_type.memory());
-        let context = input.dispatch_domain();
+        let context = input.domain();
         let queries = context.dynamic_iota(
             &query_type,
             0,
@@ -1905,9 +1905,9 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIr
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicPad<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<ArrayIrType>> DynamicPad<ArrayIrType> for V
 where
-    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<PadOperation<ArrayIrType>>>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<PadOperation<ArrayIrType>>>,
 {
     fn dynamic_pad(
         &self,
@@ -1926,7 +1926,7 @@ where
         inputs.extend_from_slice(output_dimensions);
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = operation.with_input_types(&input_types)?;
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
+        let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

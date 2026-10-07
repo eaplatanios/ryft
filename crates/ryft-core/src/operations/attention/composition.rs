@@ -6,7 +6,7 @@ use crate::operations::constants::iota::IotaOperation;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::DimensionSize;
 use crate::operations::manipulation::{DynamicBroadcast, DynamicReshape};
-use crate::programs::ValueProjection;
+use crate::programs::{ValueDomainDispatch, ValueProjection};
 
 use super::*;
 
@@ -20,9 +20,9 @@ pub trait AttentionIota: Value<Type = ArrayIrType> {
 }
 
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<IotaOperation<ArrayType>>>,
+            Domain: Context<Type = ArrayIrType, Operation: From<IotaOperation<ArrayType>>>,
         > + DimensionSize
         + ValueProjection<ArrayType>,
 > AttentionIota for V
@@ -41,7 +41,7 @@ impl<
                 matches!(dimension, Dimension::Dynamic(_)).then(|| dimensions[axis].clone())
             })
             .collect::<Vec<_>>();
-        let mut outputs = target.dispatch_domain().bind(
+        let mut outputs = target.domain().bind(
             IotaOperation::new(output_type, axis)?,
             Vec::new(),
             dynamic_dimensions.as_slice(),
@@ -54,7 +54,7 @@ impl<
 impl<A> AttentionIota for ArrayIrValue<A>
 where
     A: Value<Type = ArrayType> + DimensionSize<usize>,
-    A::DispatchDomain: Iota<A>,
+    A::Domain: Iota<A>,
 {
     fn attention_iota(target: &Self, axis: usize) -> Result<Self, ProgramError> {
         let target = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(target)?;
@@ -66,7 +66,7 @@ where
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         );
-        Ok(Self::Array(target.dispatch_domain().iota(&output_type, axis)?))
+        Ok(Self::Array(target.domain().iota(&output_type, axis)?))
     }
 }
 
@@ -100,12 +100,12 @@ fn fill_like<V>(target: &V, value: f64) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
     ArrayProjection<V>: Value<Type = ArrayType>,
-    <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
+    <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {
     let target_type = target.r#type();
     let target_type = <&ArrayType>::try_from(target_type.as_ref())?;
     let scalar = project_array::<V>(target.clone())?
-        .dispatch_domain()
+        .domain()
         .fill(&ArrayType::scalar(target_type.data_type()), value)?;
     broadcast_like::<V>(scalar, target, &[])
 }
@@ -114,13 +114,13 @@ where
 fn expand_key_value_heads_ir<V>(key_or_value: &V, dimensions: &AttentionDimensions) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
     if dimensions.key_value_heads == dimensions.query_heads {
         return Ok(key_or_value.clone());
     }
-    let context = key_or_value.dispatch_domain();
+    let context = key_or_value.domain();
     let group = dimensions.query_heads / dimensions.key_value_heads;
     let key_or_value_dimensions = array_dimensions(key_or_value)?;
     let key_value_heads = context.dimension_constant(dimensions.key_value_heads)?;
@@ -149,15 +149,15 @@ where
 fn normalize_attention_input_ir<V>(input: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
     let r#type = input.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 4 {
         return Ok(input.clone());
     }
-    let batch = input.dispatch_domain().dimension_constant(1)?;
+    let batch = input.domain().dimension_constant(1)?;
     let mut dimensions = array_dimensions(input)?;
     dimensions.insert(0, batch);
     input.clone().dynamic_reshape(dimensions.as_slice())
@@ -167,15 +167,15 @@ where
 fn normalize_attention_score_input_ir<V>(input: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
     let r#type = input.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 4 {
         return Ok(input.clone());
     }
-    let context = input.dispatch_domain();
+    let context = input.domain();
     let singleton = context.dimension_constant(1)?;
     let mut dimensions = vec![singleton; 4 - r#type.rank()];
     dimensions.extend(array_dimensions(input)?);
@@ -203,15 +203,15 @@ where
 fn normalize_attention_residual_ir<V>(residual: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
 {
     let r#type = residual.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 3 {
         return Ok(residual.clone());
     }
-    let batch = residual.dispatch_domain().dimension_constant(1)?;
+    let batch = residual.domain().dimension_constant(1)?;
     let mut dimensions = array_dimensions(residual)?;
     dimensions.insert(0, batch);
     residual.clone().dynamic_reshape(dimensions.as_slice())
@@ -232,9 +232,9 @@ where
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Add + And + Compare + Select + Sub>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
-    <<V as ValueProjection<ArrayType>>::Projected as Value>::DispatchDomain:
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
+    <<V as ValueProjection<ArrayType>>::Projected as Value>::Domain:
         Fill<f64, <V as ValueProjection<ArrayType>>::Projected>,
 {
     if mask.is_none()
@@ -366,9 +366,9 @@ where
         + Reshape
         + Select
         + Sub,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
-    <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
+    <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {
     let query = normalize_attention_input_ir(&inputs.query)?;
     let key = normalize_attention_input_ir(&inputs.key)?;
@@ -446,9 +446,9 @@ where
         + StopGradient
         + Sub
         + Transpose,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
-    <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
+    <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {
     if configuration.dropout().is_some() {
         return Err(ProgramError::UnsupportedOperation {
@@ -537,8 +537,8 @@ where
         + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Compare + Select>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
+    V::Domain: Context<Type = ArrayIrType>,
+    <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {
     let value = <V as ValueProjection<ArrayType>>::from_projected(value);
     let rows = V::attention_iota(&value, row_axis)?;
@@ -579,9 +579,9 @@ where
         + Select
         + Sub
         + Transpose,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    V::DispatchDomain: DimensionConstant,
-    <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
+    V::Domain: Context<Type = ArrayIrType>,
+    V::Domain: DimensionConstant,
+    <ArrayProjection<V> as Value>::Domain: Fill<f64, ArrayProjection<V>>,
 {
     if configuration.dropout().is_some() {
         return Err(ProgramError::UnsupportedOperation {
@@ -682,7 +682,7 @@ where
     let (key_cotangent, value_cotangent) = if dimensions.key_value_heads == dimensions.query_heads {
         (key_cotangent, value_cotangent)
     } else {
-        let context = prepared.query.dispatch_domain();
+        let context = prepared.query.domain();
         let group = dimensions.query_heads / dimensions.key_value_heads;
         let key_dimensions = array_dimensions(&prepared.key)?;
         let key_value_heads = context.dimension_constant(dimensions.key_value_heads)?;

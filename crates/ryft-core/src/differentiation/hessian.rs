@@ -331,7 +331,7 @@ where
             let nested_context = outer_primals
                 .parameters()
                 .next()
-                .map(Value::execution_domain)
+                .map(Value::domain)
                 .ok_or(DifferentiationError::EmptyInput)?;
             jacobian_reverse_in_context(&nested_context, function, outer_primals, outer_capture, holomorphic)
                 .map_err(ProgramError::from)

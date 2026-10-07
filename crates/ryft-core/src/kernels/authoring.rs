@@ -20,7 +20,7 @@ use crate::operations::{
     DotOperation, ReferenceWriteOperation, WhileOperation, ZeroOperation,
 };
 use crate::parameters::Placeholder;
-use crate::programs::{ProgramBuilder, ProgramError, ProjectedValue, TypeError, Typed, Value};
+use crate::programs::{ProgramBuilder, ProgramError, ProjectedValue, TypeError, Typed, Value, ValueDomainDispatch};
 use crate::tracing::{NestedTracingContext, Tracer};
 
 /// Functional kernel invocation capability for array values. Concrete host arrays use the qualified reference
@@ -38,9 +38,9 @@ impl KernelCall for Array {
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> KernelCall for ProjectedValue<ArrayType, V>
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> KernelCall for ProjectedValue<ArrayType, V>
 where
-    V::DispatchDomain: Context<Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
+    V::Domain: Context<Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
 {
     fn call_kernel(definition: &KernelDefinition, inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
         let first = inputs.first().ok_or_else(|| {
@@ -50,7 +50,7 @@ where
         })?;
         first
             .value()
-            .dispatch_domain()
+            .domain()
             .bind(
                 definition.operation().clone(),
                 vec![definition.body().clone()],
@@ -343,12 +343,12 @@ where
 /// sharding, and numerical contracts. Incompatible tiles return the existing type diagnostic rather than panicking.
 pub fn dot<V: Value<Type = ArrayIrType>>(left: &V, right: &V) -> Result<V, ProgramError>
 where
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<ArrayIrOperation<Array>>,
+    V::Domain: Context,
+    <V::Domain as Domain>::Operation: From<ArrayIrOperation<Array>>,
 {
     let operation = ArrayIrOperation::<Array>::from(ArrayOperation::Dot(DotOperation::matmul()));
     Ok(left
-        .dispatch_domain()
+        .domain()
         .bind(operation, Vec::new(), &[left.clone(), right.clone()])?
         .into_iter()
         .next()

@@ -95,7 +95,7 @@ where
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
 {
     let signature = inputs.signature();
-    let context = inputs.query.dispatch_domain();
+    let context = inputs.query.domain();
     let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
     let mut backward_inputs = inputs.into_values();
     backward_inputs.extend([output, statistic, output_cotangent]);
@@ -171,7 +171,7 @@ where
     where
         C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
         C::Operation: From<CustomFunctionOperation<C::Constant, C::Operation>>,
-        V: Value<Type = ArrayType, DispatchDomain = C> + ManualVariationAlignment<ArrayType>,
+        V: Value<Type = ArrayType, Domain = C> + ManualVariationAlignment<ArrayType>,
         <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
             + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
         CustomRuleRegistration<C::Constant, C::Operation>: Send,

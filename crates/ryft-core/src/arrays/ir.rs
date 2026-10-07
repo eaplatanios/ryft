@@ -15,7 +15,7 @@ use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::{
     Concretizable, LiteralIdentity, OperationProjection, ProgramError, ReferenceId, ReferenceType, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
 };
 
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
@@ -75,16 +75,11 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
 }
 
 impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self, ArrayIrOperation<A>>;
+    type Dispatch = ValueDirectDispatch;
+    type Domain = EagerContext<Self, ArrayIrOperation<A>>;
 
     #[inline]
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        EagerContext::new()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> Self::ExecutionDomain {
+    fn domain(&self) -> Self::Domain {
         EagerContext::new()
     }
 

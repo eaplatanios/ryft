@@ -20,6 +20,7 @@ use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATIO
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch,
 };
 
 #[cfg(doc)]
@@ -288,7 +289,7 @@ pub trait Reshard<T = <Self as Capability>::Universe>: Capability + Clone {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>>
     Reshard<ArrayType> for V
 {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
@@ -296,7 +297,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         // `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation
         // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             ReshardOperation::new(sharding.clone()),
             Vec::new(),
             std::slice::from_ref(self),

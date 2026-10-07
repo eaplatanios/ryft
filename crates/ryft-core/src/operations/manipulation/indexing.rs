@@ -454,7 +454,7 @@ pub struct Indexed<'v, 's, 'i, V: Value, T: Type = <V as Typed>::Type> {
 }
 
 impl<
-    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+    V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
         + Reshape
         + Concatenate
@@ -630,7 +630,7 @@ impl<
 }
 
 impl<
-    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+    V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
         + Reshape
         + Concatenate
@@ -767,7 +767,7 @@ impl<
     }
 }
 
-impl<V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>>
+impl<V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>>
     Indexed<'_, '_, '_, V, ArrayType>
 {
     /// Lifts a host coordinate literal into the input's execution domain, placed in the input's memory space.
@@ -775,7 +775,7 @@ impl<V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<Constan
     /// constant operation payload instead, which compiled contexts lower directly.
     fn constant(&self, value: Array) -> Result<V, ProgramError> {
         let r#type = value.r#type().into_owned().with_memory(self.input.r#type().memory());
-        let mut outputs = self.input.execution_domain().bind(
+        let mut outputs = self.input.domain().bind(
             ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
             Vec::new(),
             &[],
@@ -786,7 +786,7 @@ impl<V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<Constan
 }
 
 impl<
-    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+    V: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
         + Reshape
         + Concatenate
@@ -1137,10 +1137,10 @@ impl<
 }
 
 impl<
-    V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant>
+    V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<
             ArrayType,
-            Projected: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
                            + Broadcast
                            + Reshape
                            + Concatenate
@@ -1211,10 +1211,10 @@ impl<
 }
 
 impl<
-    V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant>
+    V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<
             ArrayType,
-            Projected: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
                            + Broadcast
                            + Reshape
                            + Concatenate
@@ -1328,7 +1328,7 @@ impl<
 
         let mut selected_dimensions = dimensions.clone();
         for &axis in &plan.inserted_axes {
-            selected_dimensions.insert(axis, self.input.dispatch_domain().dimension_constant(1)?);
+            selected_dimensions.insert(axis, self.input.domain().dimension_constant(1)?);
         }
 
         let updates = updates.dynamic_broadcast_to(&selected_dimensions)?;
@@ -1655,7 +1655,7 @@ impl<
         + DimensionToScalar
         + ValueProjection<
             ArrayType,
-            Projected: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+            Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
                            + ConvertElementType
                            + Compare
                            + Add
@@ -2507,7 +2507,7 @@ mod tests {
         // Duplicate queries select the same tangent twice in forward mode.
         let (value, tangent) = differentiate_at(Array::vector(vec![10_f64, 20., 30.]).unwrap())
             .jvp(Array::vector(vec![2_f64, 3., 5.]).unwrap(), |input| {
-                let indices = input.dispatch_domain().lift(Array::vector(vec![2_i32, 0, 2]).unwrap())?;
+                let indices = input.domain().lift(Array::vector(vec![2_i32, 0, 2]).unwrap())?;
                 input.at(&index![&indices]).get(&GatherOptions::new())
             })
             .unwrap();
@@ -2517,7 +2517,7 @@ mod tests {
         // Reverse mode sums contributions from every occurrence of a repeated query.
         let (value, pullback) = differentiate_at(Array::vector(vec![10_f64, 20., 30.]).unwrap())
             .vjp(|input| {
-                let indices = input.dispatch_domain().lift(Array::vector(vec![2_i32, 0, 2]).unwrap())?;
+                let indices = input.domain().lift(Array::vector(vec![2_i32, 0, 2]).unwrap())?;
                 input.at(&index![&indices]).get(&GatherOptions::new())
             })
             .unwrap();
@@ -2724,7 +2724,7 @@ mod tests {
             |matrix| {
                 batch(
                     |row| {
-                        let indices = row.dispatch_domain().lift(Array::vector(vec![2_i32, 0]).unwrap())?;
+                        let indices = row.domain().lift(Array::vector(vec![2_i32, 0]).unwrap())?;
                         row.at(&index![&indices]).get(&GatherOptions::new())
                     },
                     matrix,
@@ -2862,8 +2862,8 @@ mod tests {
         // Differentiating only the updates keeps the source constant and sums tangents for duplicate destinations.
         let (value, tangent) = differentiate_at(Array::vector(vec![2_f64, 3.]).unwrap())
             .jvp(Array::vector(vec![5_f64, 7.]).unwrap(), |updates| {
-                let input = updates.dispatch_domain().lift(Array::vector(vec![10_f64, 20., 30.]).unwrap())?;
-                let indices = updates.dispatch_domain().lift(Array::vector(vec![1_i32, 1]).unwrap())?;
+                let input = updates.domain().lift(Array::vector(vec![10_f64, 20., 30.]).unwrap())?;
+                let indices = updates.domain().lift(Array::vector(vec![1_i32, 1]).unwrap())?;
                 input.at(&index![&indices]).add(&updates, &ScatterOptions::new())
             })
             .unwrap();

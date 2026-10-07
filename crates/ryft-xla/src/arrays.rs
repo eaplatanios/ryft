@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Memory, Parameter, Parameterized, ProjectedContext,
-    Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
+    Sharding, ShardingDimension, ShardingError, StaticShape, ValueDomainDispatch, Typed, Value, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -157,7 +157,7 @@ impl<'o> XlaArray<'o> {
     /// # Parameters
     ///
     ///   - `domain`: [`XlaDomain`] the new [`XlaArray`] belongs to. Its client must own every provided buffer, and it
-    ///     is what eager execution and free transforms recover through [`Value::execution_domain`]. Metadata-only
+    ///     is what eager execution and free transforms recover through [`Value::domain`]. Metadata-only
     ///     arrays whose shards all live on other processes pass the local domain with no buffers.
     ///   - `r#type`: Global [`ArrayType`] for the new [`XlaArray`].
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`XlaArrayShard`] placement.
@@ -583,7 +583,7 @@ impl<'o> XlaArray<'o> {
 
     /// Returns the [`XlaDomain`] this [`XlaArray`] belongs to.
     #[inline]
-    pub fn domain(&self) -> &XlaDomain<'o> {
+    pub fn xla_domain(&self) -> &XlaDomain<'o> {
         &self.domain
     }
 
@@ -903,27 +903,23 @@ impl Typed for XlaArray<'_> {
 impl<'o> Value for XlaArray<'o> {
     // A concrete `XlaArray` dispatches AND executes through the rich, PJRT-backed `XlaDomain`: the blanket value
     // capabilities in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...) bind their
-    // operations through `dispatch_domain()`, which is what makes every operation on concrete arrays execute
+    // operations through `domain()`, which is what makes every operation on concrete arrays execute
     // eagerly, op by op, through the domain recovered below, while free transform entry points (e.g.,
-    // `ryft_core::batching::batch`) recover the same domain through `execution_domain()`. `ryft-core`'s own
+    // `ryft_core::batching::batch`) recover the same domain through `domain()`. `ryft-core`'s own
     // `ryft_core::arrays::Array` instead keeps the constant-only `EagerContext` dispatch domain and provides direct
     // host kernels for each capability, relying on in-crate coherence between those direct impls and the blankets; a
     // downstream backend crate cannot take that route because the coherence check cannot rule out future
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
     // capability surface and only capabilities without operation-binding blankets (`Concretizable<bool>`,
     // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
-    type DispatchDomain = ProjectedContext<XlaDomain<'o>, ArrayType>;
-    type ExecutionDomain = ProjectedContext<XlaDomain<'o>, ArrayType>;
-
-    fn dispatch_domain(&self) -> Self::DispatchDomain {
-        self.execution_domain()
-    }
+    type Dispatch = ValueDomainDispatch;
+    type Domain = ProjectedContext<XlaDomain<'o>, ArrayType>;
 
     /// Recovers the eager [`XlaDomain`] this [`XlaArray`] belongs to (see [`XlaArray::domain`]), and with it the
     /// session, compilation cache, effect scope, and compilation options that receiver-based operations execute with.
     /// Association is per value: receiver-based `x + y` and `y + x` may choose different scopes even when their
     /// numerical values match. Fork scopes at task boundaries rather than inside expressions.
-    fn execution_domain(&self) -> Self::ExecutionDomain {
+    fn domain(&self) -> Self::Domain {
         ProjectedContext::new(self.domain.clone())
     }
 }
@@ -1846,7 +1842,7 @@ mod tests {
         assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
         assert_eq!(recovered_client.addressable_devices().unwrap().len(), client_devices.len());
         assert!(std::ptr::eq(array.clone().client(), &client));
-        assert!(Arc::ptr_eq(array.clone().domain().session(), &session));
+        assert!(Arc::ptr_eq(array.clone().xla_domain().session(), &session));
 
         // Arrays constructed via `XlaArray::from_addressable_buffers` belong to the provided domain, whose client is
         // validated to own every addressable shard buffer.
@@ -1862,7 +1858,7 @@ mod tests {
         let array =
             XlaArray::from_addressable_buffers(&domain, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
         assert!(std::ptr::eq(array.client(), &client));
-        assert!(Arc::ptr_eq(array.domain().session(), &session));
+        assert!(Arc::ptr_eq(array.xla_domain().session(), &session));
 
         // A domain whose client does not own the addressable shard buffers is rejected, even when that client was
         // created from the same plugin with identical options.
@@ -1908,22 +1904,22 @@ mod tests {
         compilation_options.matrix_unit_operand_precision = Precision::Highest as i32;
         let sibling = session.domain().with_compilation_options(compilation_options);
         let reassociated = array.clone().associate(&sibling).unwrap();
-        assert!(Arc::ptr_eq(reassociated.domain().session(), &session));
-        assert!(std::ptr::eq(reassociated.domain().compilation_options(), sibling.compilation_options()));
-        assert!(!std::ptr::eq(reassociated.domain().compilation_options(), original.domain().compilation_options()));
+        assert!(Arc::ptr_eq(reassociated.xla_domain().session(), &session));
+        assert!(std::ptr::eq(reassociated.xla_domain().compilation_options(), sibling.compilation_options()));
+        assert!(!std::ptr::eq(reassociated.xla_domain().compilation_options(), original.xla_domain().compilation_options()));
         assert_eq!(reassociated, original);
 
         // Associating with a domain of another session on the same client switches the session (and therefore its
         // compilation cache and default effect scope) while keeping the array's storage.
         let other_session = XlaSession::new(&client);
         let reassociated = array.associate(&other_session.domain().fork_effect_scope()).unwrap();
-        assert!(Arc::ptr_eq(reassociated.domain().session(), &other_session));
+        assert!(Arc::ptr_eq(reassociated.xla_domain().session(), &other_session));
         assert!(std::ptr::eq(reassociated.client(), &client));
         assert_eq!(reassociated, original);
 
         // Re-association never affects the clones that existed beforehand, which keep their original domain.
-        assert!(Arc::ptr_eq(original.domain().session(), &session));
-        assert!(std::ptr::eq(original.domain().compilation_options(), session.domain().compilation_options()));
+        assert!(Arc::ptr_eq(original.xla_domain().session(), &session));
+        assert!(std::ptr::eq(original.xla_domain().compilation_options(), session.domain().compilation_options()));
 
         // Association rejects a domain of a different client, even when no numerical buffer could establish
         // ownership (as is the case for bufferless zero-space arrays).

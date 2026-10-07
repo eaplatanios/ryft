@@ -94,7 +94,8 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -751,7 +752,7 @@ impl Sort for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<SortOperation>>>
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<SortOperation>>>
         + ManualVariationAlignment<ArrayType>,
 > Sort<ArrayType> for V
 {
@@ -767,7 +768,7 @@ impl<
         // reference arrays, whose dispatch domain does not provide a sort operation.
         let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let aligned_inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
-        inputs[0].dispatch_domain().bind(operation, Vec::new(), &aligned_inputs)
+        inputs[0].domain().bind(operation, Vec::new(), &aligned_inputs)
     }
 }
 
@@ -843,7 +844,7 @@ pub trait TopK<T = <Self as Capability>::Universe>: Capability + Sized {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshape> TopK<ArrayType> for V {
+impl<V: Value<Type = ArrayType, Domain: Iota<V>> + Sort + Slice + Reshape> TopK<ArrayType> for V {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
         // Complex values have no total order, and the index passenger and the slices below need static extents,
         // so both are rejected before the axis is normalized and `k` is checked against its extent.
@@ -911,7 +912,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshap
         let index_type = ArrayType::new(DataType::I32, value_type.shape().clone())
             .with_sharding(value_type.sharding().cloned())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let indices = self.dispatch_domain().iota(&index_type, axis)?;
+        let indices = self.domain().iota(&index_type, axis)?;
         let mut sorted = Self::sort_with_ordering(
             &[self.clone(), indices],
             axis,

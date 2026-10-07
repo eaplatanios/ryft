@@ -2537,6 +2537,7 @@ mod tests {
     use crate::programs::references::ReferenceType;
     use crate::programs::regions::{InputRegionProvenance, RegionInterface, RegionLiveness, RegionSlot};
     use crate::programs::types::TypeError;
+    use crate::programs::values::ValueDirectDispatch;
     use crate::tests::{TestArrayOperation, TestOrderedStateOperation, TestRegionOperation};
 
     use super::*;
@@ -3957,14 +3958,10 @@ mod tests {
         }
 
         impl Value for CloneCountingValue {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> EagerContext<Self> {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> EagerContext<Self> {
+            fn domain(&self) -> EagerContext<Self> {
                 EagerContext::new()
             }
         }

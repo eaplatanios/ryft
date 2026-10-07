@@ -16,7 +16,7 @@ use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
-    TypeError, Typed, Value,
+    TypeError, Typed, Value, ValueDomainDispatch,
 };
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
@@ -249,13 +249,13 @@ pub trait TransferToMemory<T = <Self as Capability>::Universe>: Capability + Siz
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>>>
+impl<V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>>>
     TransferToMemory<ArrayType> for V
 {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
         // Context-carrying values bind through their owning context. The operation conversion bound keeps this disjoint
         // from reference arrays, whose dispatch domain does not provide a memory transfer operation.
-        let outputs = self.dispatch_domain().bind(
+        let outputs = self.domain().bind(
             TransferToMemoryOperation::new(destination),
             Vec::new(),
             std::slice::from_ref(self),
@@ -341,7 +341,9 @@ mod tests {
     use crate::macros::{check_operation_partial_evaluation, dispatch_on_array_element_type};
     use crate::parameters::Parameter;
     use crate::partial::PartialValue;
-    use crate::programs::{BindingRegionDriver, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, Typed};
+    use crate::programs::{
+        BindingRegionDriver, EffectClasses, EmptyRegionDriver, Provenance, ProvenanceScope, ValueDomainDispatch, Typed,
+    };
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -506,15 +508,11 @@ mod tests {
         }
 
         impl Value for DispatchArray {
-            type DispatchDomain = InvalidOutputContext;
-            type ExecutionDomain = InvalidOutputContext;
+            type Dispatch = ValueDomainDispatch;
+            type Domain = InvalidOutputContext;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                InvalidOutputContext(self.output_count)
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
-                self.dispatch_domain()
+            fn domain(&self) -> Self::Domain {
+                self.domain()
             }
         }
 

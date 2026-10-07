@@ -66,7 +66,7 @@ use crate::operations::{Capability, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
-    Value, ValueProjection,
+    Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Canonical operation name for [`PrintOperation`].
@@ -267,14 +267,14 @@ impl<A: Value<Type = ArrayType> + Print<ArrayType>> Print<ArrayIrType> for Array
     }
 }
 
-impl<T: Type, V: Value<Type = T, DispatchDomain: Context<Operation: From<PrintOperation<T>>>>> Print<T> for V {
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<PrintOperation<T>>>>> Print<T> for V {
     #[inline]
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
         // Any context-carrying value prints by binding a `PrintOperation` through its own context. The
         // `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context
         // operation is `ConstantOperation`), so it covers the transform tracers without conflicting with
         // concrete implementations.
-        let mut outputs = self.dispatch_domain().bind(
+        let mut outputs = self.domain().bind(
             PrintOperation::new(label).with_effect_class(effect_class),
             Vec::new(),
             std::slice::from_ref(&self),

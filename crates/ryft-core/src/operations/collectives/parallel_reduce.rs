@@ -29,7 +29,9 @@ use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Value};
+use crate::programs::{
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Value, ValueDomainDispatch,
+};
 
 /// Name of [`ParallelReduceOperation`]. The operation's [`ReductionKind`] is rendered as its `kind` attribute.
 pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
@@ -660,9 +662,9 @@ impl ParallelReduce for Array {
 // a `ParallelReduceOperation` through its own context (i.e., a staged tracer records the operation, a batching tracer
 // resolves the named axis against the batching context stack, and a JVP dual forwards to the primal-side resolution).
 impl<
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayType,
-            DispatchDomain: Context<
+            Domain: Context<
                 Operation: From<ConstantOperation<Array>>
                                + From<DivOperation<ArrayType>>
                                + From<ParallelReduceOperation>,
@@ -682,7 +684,7 @@ impl<
 > ParallelReduce<ArrayType> for V
 {
     fn parallel_reduce(&self, kind: ReductionKind, axis_name: &str) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let named_axis = context
             .named_axis(axis_name)
             .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
@@ -758,7 +760,7 @@ impl<
         axis_name: &str,
         axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
+        let context = self.domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let operation = ParallelReduceOperation::grouped(kind, axis_name.to_string(), axis_size, axis_index_groups)?;
         let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
@@ -1627,7 +1629,7 @@ mod tests {
         let (mesh, _, varying) = mesh_scalar_types();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.dispatch_domain(), 3)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(input.domain(), 3)
                     .with_axis_name("i".to_string());
                 let input = BatchingTracer::new(context, ArrayBatch::replicated(input));
                 Ok(input.parallel_reduce(ReductionKind::Sum, "i")?.into_batch().into_value())

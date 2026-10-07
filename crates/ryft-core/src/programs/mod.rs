@@ -160,7 +160,8 @@ pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatisti
 pub use transforms::{Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{
-    Concretizable, LiteralIdentity, ParameterProjection, ProjectedValue, Value, ValueId, ValueProjection,
+    Concretizable, LiteralIdentity, ParameterProjection, ProjectedValue, Value, ValueDirectDispatch, ValueDispatch,
+    ValueDomainDispatch, ValueId, ValueProjection,
 };
 
 /// Represents errors related to [`Program`]s in `ryft-core`.

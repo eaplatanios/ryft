@@ -4322,10 +4322,10 @@ pub(crate) mod tests {
     /// Squares a value in the composite reference test family, preserving the active transform context.
     fn reference_test_square<V: Value<Type = ArrayIrType>>(value: V) -> Result<V, ProgramError>
     where
-        V::DispatchDomain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
+        V::Domain: Context<Value = V, Operation: From<ArrayOperation<Array>>>,
     {
         Ok(value
-            .dispatch_domain()
+            .domain()
             .bind(ArrayOperation::from(MulOperation::<ArrayType>::new()), Vec::new(), &[value.clone(), value.clone()])?
             .remove(0))
     }
@@ -7606,7 +7606,7 @@ pub(crate) mod tests {
             epsilon = 1e-9
         );
 
-        // The builder's `vjp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // The builder's `vjp` terminal serves top-level concrete values through their `Value::Domain`
         // declarations: a rank-zero `Array` input recovers the eager array domain.
         let (value, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);

@@ -586,7 +586,7 @@ mod tests {
             .unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| {
-                let output: Tracer<_> = input.dispatch_domain().fill(&input.r#type(), 2.5f64)?;
+                let output: Tracer<_> = input.domain().fill(&input.r#type(), 2.5f64)?;
                 Ok(output)
             },
             varying_type.clone(),

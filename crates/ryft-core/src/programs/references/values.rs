@@ -1980,6 +1980,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Add;
+    use crate::programs::values::ValueDirectDispatch;
     use crate::tracing::{Tracer, TracerState, TracingContext};
 
     use super::*;
@@ -2080,14 +2081,10 @@ mod tests {
     }
 
     impl Value for DetachedValue {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
 
-        fn dispatch_domain(&self) -> EagerContext<Self> {
-            EagerContext::new()
-        }
-
-        fn execution_domain(&self) -> EagerContext<Self> {
+        fn domain(&self) -> EagerContext<Self> {
             EagerContext::new()
         }
 

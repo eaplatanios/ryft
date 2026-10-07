@@ -3211,8 +3211,8 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Parameter;
     use crate::programs::{
-        BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
-        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
+        BindingRegionDriver, ValueDirectDispatch, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance,
+        ProvenanceScope, ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -6022,14 +6022,10 @@ mod tests {
     }
 
     impl Value for TestValue {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
 
-        fn dispatch_domain(&self) -> EagerContext<Self> {
-            EagerContext::new()
-        }
-
-        fn execution_domain(&self) -> EagerContext<Self> {
+        fn domain(&self) -> EagerContext<Self> {
             EagerContext::new()
         }
     }
@@ -8518,18 +8514,18 @@ mod tests {
             V: Value<Type = ArrayType>
                 + crate::operations::manipulation::Broadcast
                 + crate::operations::manipulation::Transpose,
-            V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
-            TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatchingPolicy>
+            V::Domain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
+            TestDomainOperation: BatchableOperation<V::Domain, ArrayBatchingPolicy>
                 + crate::batching::BatchableOperation<
-                    TracingContext<<V::DispatchDomain as Domain>::Constant, <V::DispatchDomain as Domain>::Operation>,
+                    TracingContext<<V::Domain as Domain>::Constant, <V::Domain as Domain>::Operation>,
                     ArrayBatchingPolicy,
                 > + From<crate::operations::manipulation::TransposeOperation>
                 + From<crate::operations::manipulation::BroadcastOperation>,
         {
-            let context = x.dispatch_domain();
+            let context = x.domain();
             let mapped = Batch::batch(
                 &context,
-                |item: BatchingTracer<V::DispatchDomain, ArrayBatchingPolicy>| {
+                |item: BatchingTracer<V::Domain, ArrayBatchingPolicy>| {
                     let batching_context = item.context().clone();
                     let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
                     let mut outputs = batching_context.bind(while_operation, while_regions, &[item])?;
@@ -8807,7 +8803,7 @@ mod tests {
             .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
-                inputs[0].dispatch_domain().bind(
+                inputs[0].domain().bind(
                     ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
                     vec![condition, body],
                     &inputs,
@@ -8926,7 +8922,7 @@ mod tests {
             .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
-                inputs[0].dispatch_domain().bind(
+                inputs[0].domain().bind(
                     ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
                     vec![condition, body],
                     &inputs,
@@ -9103,7 +9099,7 @@ mod tests {
             .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<Tracer<TracingContext<Array, ArrayOperation<Array>>>>| {
-                inputs[0].dispatch_domain().bind(
+                inputs[0].domain().bind(
                     ArrayOperation::While(WhileOperation::new().with_iteration_bound(3)?),
                     vec![condition, body],
                     &inputs,

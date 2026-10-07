@@ -50,8 +50,8 @@ use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError,
-    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch,
+    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -324,13 +324,13 @@ impl ParallelRaggedAllToAllOperation {
     fn stage<
         V: Value<
                 Type = ArrayType,
-                DispatchDomain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes,
+                Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes,
             > + ParallelVary,
     >(
         mut self,
         inputs: [&V; 6],
     ) -> Result<V, ProgramError> {
-        let context = inputs[0].dispatch_domain();
+        let context = inputs[0].domain();
         let mut inputs = inputs.map(Clone::clone);
         let axis_name = self.axis_name.clone();
         if let Some(NamedAxis::Mesh { mesh, .. }) = context.named_axis(&axis_name) {
@@ -1702,7 +1702,7 @@ impl ParallelRaggedAllToAll<ArrayType> for Array {
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ParallelRaggedAllToAllOperation>> + NamedAxes>
         + ParallelVary,
 > ParallelRaggedAllToAll<ArrayType> for V
 {
@@ -1716,7 +1716,7 @@ impl<
         output_offsets: &Self,
         receive_sizes: &Self,
     ) -> Result<Self, ProgramError> {
-        let axis_size = resolve_named_axis_size(&self.dispatch_domain(), axis_name)?;
+        let axis_size = resolve_named_axis_size(&self.domain(), axis_name)?;
         ParallelRaggedAllToAllOperation::new(axis_name.to_string(), axis_size).stage([
             self,
             output,
@@ -1738,7 +1738,7 @@ impl<
         receive_sizes: &Self,
         axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, ProgramError> {
-        let axis_size = resolve_named_axis_size(&self.dispatch_domain(), axis_name)?;
+        let axis_size = resolve_named_axis_size(&self.domain(), axis_name)?;
         ParallelRaggedAllToAllOperation::grouped(axis_name.to_string(), axis_size, axis_index_groups)?.stage([
             self,
             output,
@@ -1884,7 +1884,7 @@ mod tests {
         ($operand:expr, $output:expr $(,)?) => {{
             let operand = $operand;
             let output = $output;
-            let context = operand.dispatch_domain();
+            let context = operand.domain();
             let input_offsets = context.lift(Array::matrix(2, 2, vec![0i32, 0, 0, 2]).unwrap())?;
             let send_sizes = context.lift(Array::matrix(2, 2, vec![0i32, 1, 1, 0]).unwrap())?;
             let output_offsets = context.lift(Array::matrix(2, 2, vec![1i32, 1, 2, 3]).unwrap())?;
@@ -3039,7 +3039,7 @@ mod tests {
         };
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
-                let domain = inputs[0].dispatch_domain();
+                let domain = inputs[0].domain();
                 let context =
                     BatchingContext::<_, ArrayBatchingPolicy>::new(domain.clone(), 2).with_axis_name("x".to_string());
                 let item = |value| -> Result<_, ProgramError> {
@@ -3306,7 +3306,7 @@ mod tests {
         };
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |inputs: Vec<_>| {
-                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].dispatch_domain(), 2)
+                let context = BatchingContext::<_, ArrayBatchingPolicy>::new(inputs[0].domain(), 2)
                     .with_axis_name("y".to_string());
                 let inputs = inputs
                     .into_iter()
@@ -4412,7 +4412,7 @@ mod tests {
         let cotangent = operand.clone();
         let (value, gradient) = differentiate_at((operand.clone(), output.clone()))
             .value_and_gradient(|(operand, output)| {
-                let context = operand.dispatch_domain();
+                let context = operand.domain();
                 let input_offsets = context.lift(Array::matrix(4, 2, vec![0i32, 0, 1, 4, 4, 1, 0, 0]).unwrap())?;
                 let send_sizes = context.lift(Array::matrix(4, 2, vec![2i32, 1, 1, 0, 0, 1, 1, 2]).unwrap())?;
                 let output_offsets = context.lift(Array::matrix(4, 2, vec![0i32, 2, 2, 4, 4, 0, 0, 0]).unwrap())?;

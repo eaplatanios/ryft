@@ -24,10 +24,10 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation,
-    OperationPayloadProjection, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType,
-    ReferenceRoot, ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation, OperationPayloadProjection,
+    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+    ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot,
+    ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, ValueDomainDispatch, Type,
     TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
@@ -1537,16 +1537,11 @@ impl<C: Context, P: DifferentiationPolicy<C>> Typed for DifferentiationTracer<C,
 }
 
 impl<C: Context, P: DifferentiationPolicy<C>> Value for DifferentiationTracer<C, P> {
-    type DispatchDomain = DifferentiationContext<C, P>;
-    type ExecutionDomain = DifferentiationContext<C, P>;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = DifferentiationContext<C, P>;
 
     #[inline]
-    fn dispatch_domain(&self) -> DifferentiationContext<C, P> {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> DifferentiationContext<C, P> {
+    fn domain(&self) -> DifferentiationContext<C, P> {
         self.context().clone()
     }
 }
@@ -5672,7 +5667,7 @@ pub(crate) mod tests {
             let (_, pullback) = differentiate_at(Value::Array(xs))
                 .in_context(&context)
                 .vjp(|xs| {
-                    let domain = xs.dispatch_domain();
+                    let domain = xs.domain();
                     let mut inputs = vec![domain.lift(Value::Dimension(DimensionValue::constant(2).unwrap()))?];
                     for value in &replicated {
                         inputs.push(domain.lift(Value::Array(value.clone()))?);
@@ -7304,7 +7299,7 @@ pub(crate) mod tests {
                 )?;
                 let selected = viewed.read()?;
                 Ok(input
-                    .dispatch_domain()
+                    .domain()
                     .bind(
                         TestOperation::Array(ArrayOperation::Add(AddOperation::new())),
                         Vec::new(),
@@ -7453,7 +7448,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_forward_mode_differentiate_jvp_in_execution_domain() {
-        // The builder's `jvp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // The builder's `jvp` terminal serves top-level concrete values through their `Value::Domain`
         // declarations. A concrete array input recovers the eager array domain, so both dual halves are concrete.
         let (value, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
             .jvp(Array::scalar(3.0).unwrap(), |x| Ok(x.clone() * x))
@@ -7612,7 +7607,7 @@ pub(crate) mod tests {
                 )?;
                 let selected = viewed.read()?;
                 Ok(input
-                    .dispatch_domain()
+                    .domain()
                     .bind(
                         TestOperation::Array(ArrayOperation::Add(AddOperation::new())),
                         Vec::new(),
@@ -7648,7 +7643,7 @@ pub(crate) mod tests {
     fn test_forward_mode_differentiate_linearize_with_local_tangent_accumulator() {
         let (primal, pushforward) = differentiate_at(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()))
             .linearize(|input: LinearizationTracer<EagerContext<TestValue, TestOperation>>| {
-                let zero = input.dispatch_domain().lift(Array::scalar(0.0_f32).unwrap().into())?;
+                let zero = input.domain().lift(Array::scalar(0.0_f32).unwrap().into())?;
                 let reference = zero.reference_new()?;
                 reference.add_update(&input)?;
                 reference.read()
@@ -7757,7 +7752,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_forward_mode_differentiate_linearize_in_execution_domain() {
-        // The builder's `linearize` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // The builder's `linearize` terminal serves top-level concrete values through their `Value::Domain`
         // declarations. Primal work executes eagerly at the concrete linearization point while the pushforward program
         // accumulates.
         let (value, pushforward) =

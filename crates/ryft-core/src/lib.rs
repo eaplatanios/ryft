@@ -212,11 +212,11 @@ pub use programs::{
     RegionInterface, RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
     RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
     TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
-    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, batch_reference_transforms,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
-    infer_reference_view_type, rewrite_reference_access_transforms, validate_reference_boundary,
-    validated_reference_access_descriptors,
+    ValidatedPendingReplacementTransaction, Value, ValueDirectDispatch, ValueDispatch, ValueDomainDispatch, ValueId,
+    ValueProjection, batch_reference_transforms, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation, fold_projected_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types, infer_reference_view_type,
+    rewrite_reference_access_transforms, validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -265,7 +265,7 @@ pub(crate) mod tests {
         EffectClass, EffectClasses, Effects, LiteralIdentity, MaybeZero, NoIdentity, NoReferenceTransform, NoReferent,
         Operation, OperationProjection, OperationProvider, Program, ProgramError, ReferenceAccessDescriptor,
         ReferenceAccessOperation, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
-        TypeError, Typed, Value, ValueProjection,
+        TypeError, Typed, Value, ValueDirectDispatch, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{Tracer, TracingContext};
@@ -460,14 +460,10 @@ pub(crate) mod tests {
     }
 
     impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
 
-        fn dispatch_domain(&self) -> Self::DispatchDomain {
-            EagerContext::new()
-        }
-
-        fn execution_domain(&self) -> Self::ExecutionDomain {
+        fn domain(&self) -> Self::Domain {
             EagerContext::new()
         }
     }
@@ -570,14 +566,10 @@ pub(crate) mod tests {
     }
 
     impl Value for ProjectedProgramValue {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
+        type Dispatch = ValueDirectDispatch;
+        type Domain = EagerContext<Self>;
 
-        fn dispatch_domain(&self) -> Self::DispatchDomain {
-            EagerContext::new()
-        }
-
-        fn execution_domain(&self) -> Self::ExecutionDomain {
+        fn domain(&self) -> Self::Domain {
             EagerContext::new()
         }
     }

@@ -21,11 +21,11 @@ use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceTransform, Concretizable, EffectClasses, Effects, MaybeZero, NoReferenceTransform, Operation,
-    OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
-    ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
-    ValueProjection, batch_reference_transforms, infer_reference_view_type,
+    OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceTransform,
+    ReferenceType, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+    batch_reference_transforms, infer_reference_view_type,
 };
 
 /// Canonical operation name for [`ReferenceSwapOperation`].
@@ -464,9 +464,9 @@ impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + Update
 impl<Transform, V> ReferenceSwap<Transform, V, V, V, ArrayIrType> for V
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType, Transform>>>,
+            Domain: Context<Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
 {
     fn swap_through(
@@ -478,7 +478,7 @@ where
         let mut inputs = vec![self.clone(), replacement.clone()];
         inputs.extend_from_slice(bindings);
         let operation = ReferenceSwapOperation::new().with_transforms(transforms.to_vec());
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), &inputs)?.remove(0))
+        Ok(self.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 }
 
@@ -492,9 +492,9 @@ impl<Transform, V>
     > for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
-    V: Value<
+    V: Value<Dispatch = ValueDomainDispatch, 
             Type = ArrayIrType,
-            DispatchDomain: Context<Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType, Transform>>>,
+            Domain: Context<Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType, Transform>>>,
         > + ValueProjection<ArrayType>,
 {
     fn swap_through(
@@ -507,7 +507,7 @@ where
         inputs.extend_from_slice(bindings);
         let operation = ReferenceSwapOperation::new().with_transforms(transforms.to_vec());
         self.value()
-            .dispatch_domain()
+            .domain()
             .bind(operation, Vec::new(), &inputs)?
             .remove(0)
             .into_projected()

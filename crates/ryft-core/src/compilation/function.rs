@@ -581,7 +581,7 @@ where
     where
         D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
-        V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>
+        V::Domain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>
             + CapturingContext<Capture = D::Value>
             + Constant<V, D::Constant>,
         Input: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
@@ -593,7 +593,7 @@ where
             .parameters()
             .next()
             .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?
-            .dispatch_domain();
+            .domain();
         self.call_in_context(&context, inputs)
     }
 
@@ -641,12 +641,11 @@ where
     where
         D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
-        V::DispatchDomain:
-            Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation> + Constant<V, D::Constant>,
+        V::Domain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation> + Constant<V, D::Constant>,
     {
         let context = inputs
             .first()
-            .map(|input| input.dispatch_domain())
+            .map(|input| input.domain())
             .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         self.call_with_flat_capture_references_in_context(&context, capture_references, inputs)
     }

@@ -80,7 +80,8 @@ use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, Typed, Value, ValueProjection,
+    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, Typed, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -227,16 +228,11 @@ impl<C: Context> Typed for Tracer<C> {
 }
 
 impl<C: StagingContext> Value for Tracer<C> {
-    type DispatchDomain = C;
-    type ExecutionDomain = C;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = C;
 
     #[inline]
-    fn dispatch_domain(&self) -> C {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> C {
+    fn domain(&self) -> C {
         self.context().clone()
     }
 }
@@ -934,27 +930,25 @@ impl<D: Domain> Trace for D {}
 
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
-/// contribute only their abstract [`Type`]s; no runtime computation is performed on them, and they are not
-/// captured by the resulting program. The trace runs in the input value type's statically known
-/// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batch) and the differentiation entry
-/// points, no context instance needs to be recovered from the input leaves and inputs with no leaf values are still
-/// traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for the input types through
-/// a fresh [`DomainTracingContext`], and returns the inferred output types together with the finalized program.
-/// [`Trace::trace`] exposes the same trace with the tracing universe named explicitly and the abstract input types
-/// supplied directly.
+/// contribute only their abstract [`Type`]s; no runtime computation is performed on them, and they are not captured
+/// by the resulting program. The trace runs in the input value type's statically known [`Domain`](Value::Domain), and
+/// so, unlike [`batch`](crate::batch) and the differentiation entry points, no context instance needs to be recovered
+/// from the input leaves and inputs with no leaf values are still traceable. The trace invokes `function` once over
+/// [`DomainTracer`] inputs standing in for the input types through a fresh [`DomainTracingContext`], and returns the
+/// inferred output types together with the finalized program. [`Trace::trace`] exposes the same trace with the tracing
+/// universe named explicitly and the abstract input types supplied directly.
 #[inline]
 pub fn trace<
     V: Value,
-    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    F: FnOnce(InputType::To<DomainTracer<V::Domain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
     InputType: Parameterized<
             V::Type,
-            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
-                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+            Family: ParameterizedFamily<<V::Domain as Domain>::Constant> + ParameterizedFamily<DomainTracer<V::Domain>>,
         >,
     Output: Parameterized<
-            DomainTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+            DomainTracer<V::Domain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::Domain as Domain>::Constant>,
         >,
 >(
     function: F,
@@ -963,15 +957,15 @@ pub fn trace<
     (
         Output::To<V::Type>,
         Program<
-            <V::ExecutionDomain as Domain>::Constant,
-            <V::ExecutionDomain as Domain>::Operation,
-            InputType::To<<V::ExecutionDomain as Domain>::Constant>,
-            Output::To<<V::ExecutionDomain as Domain>::Constant>,
+            <V::Domain as Domain>::Constant,
+            <V::Domain as Domain>::Operation,
+            InputType::To<<V::Domain as Domain>::Constant>,
+            Output::To<<V::Domain as Domain>::Constant>,
         >,
     ),
     ProgramError,
 > {
-    V::ExecutionDomain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
+    V::Domain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
 /// Traces `function` at the abstract signature of the provided `input` values and returns only the inferred
@@ -982,22 +976,21 @@ pub fn trace<
 #[inline]
 pub fn infer_output_type<
     V: Value,
-    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    F: FnOnce(InputType::To<DomainTracer<V::Domain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
     InputType: Parameterized<
             V::Type,
-            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
-                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+            Family: ParameterizedFamily<<V::Domain as Domain>::Constant> + ParameterizedFamily<DomainTracer<V::Domain>>,
         >,
     Output: Parameterized<
-            DomainTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+            DomainTracer<V::Domain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::Domain as Domain>::Constant>,
         >,
 >(
     function: F,
     input: Input,
 ) -> Result<Output::To<V::Type>, ProgramError> {
-    V::ExecutionDomain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
+    V::Domain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
 impl<

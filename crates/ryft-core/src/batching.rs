@@ -98,7 +98,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{
     BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
-    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1950,16 +1950,11 @@ impl<C: Context, P: BatchingPolicy<C>> Typed for BatchingTracer<C, P> {
 }
 
 impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Value for BatchingTracer<C, P> {
-    type DispatchDomain = BatchingContext<C, P>;
-    type ExecutionDomain = BatchingContext<C, P>;
+    type Dispatch = ValueDomainDispatch;
+    type Domain = BatchingContext<C, P>;
 
     #[inline]
-    fn dispatch_domain(&self) -> BatchingContext<C, P> {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> BatchingContext<C, P> {
+    fn domain(&self) -> BatchingContext<C, P> {
         self.context().clone()
     }
 }
@@ -2047,7 +2042,7 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 /// per batch item. This is the batching (i.e., vectorization) transform and the analogue of
 /// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html).
 ///
-/// The transform recovers a [`Context`] from the input's leaf values through [`Value::ExecutionDomain`], wraps it in
+/// The transform recovers a [`Context`] from the input's leaf values through [`Value::Domain`], wraps it in
 /// a [`BatchingContext`], and invokes `function` using [`BatchingTracer`] values, so that every operation inside the
 /// closure is lifted through its [`BatchableOperation`] implementation against the recovered context. This composes
 /// uniformly across the whole stack: an eager backend context interprets each batched operation immediately, an active
@@ -2086,20 +2081,20 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 ///     batch axis name.
 #[inline]
 pub fn batch<
-    V: Value<ExecutionDomain: Batch>,
-    F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>) -> Result<O, ProgramError>,
+    V: Value<Domain: Batch>,
+    F: FnOnce(I::To<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             Family: ParameterizedFamily<BatchAxis>
-                        + ParameterizedFamily<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>,
+                        + ParameterizedFamily<BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>>,
         >,
     O: Parameterized<
-            BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>,
+            BatchingTracer<V::Domain, <V::Domain as Batch>::Policy>,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
     InputBatchAxes: Parameterized<BatchAxis>,
     OutputBatchAxes: Parameterized<BatchAxis>,
-    Specification: Into<BatchAxisSpecification<<<V::ExecutionDomain as Batch>::Policy as BatchingPolicy<V::ExecutionDomain>>::Extent>>,
+    Specification: Into<BatchAxisSpecification<<<V::Domain as Batch>::Policy as BatchingPolicy<V::Domain>>::Extent>>,
 >(
     function: F,
     input: I,
@@ -2107,7 +2102,7 @@ pub fn batch<
     output_batch_axes: OutputBatchAxes,
     batch_axis: Specification,
 ) -> Result<O::To<V>, BatchingError> {
-    let Some(context) = input.parameters().next().map(Value::execution_domain) else {
+    let Some(context) = input.parameters().next().map(Value::domain) else {
         return Err(BatchingError::EmptyBatch);
     };
     context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)

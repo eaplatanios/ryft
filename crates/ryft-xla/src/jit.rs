@@ -812,7 +812,7 @@ where
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
         V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
+        V::Domain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = XlaStatefulValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -1211,7 +1211,7 @@ where
     ) -> Result<Out::To<ProjectedValue<ArrayType, V>>, ProgramError>
     where
         V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-        V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
+        V::Domain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = XlaStatefulValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -3914,7 +3914,7 @@ mod tests {
         )));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
-                let context = reference.dispatch_domain();
+                let context = reference.domain();
                 let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
                 Ok(outputs.pop().unwrap())
             },
@@ -4016,7 +4016,7 @@ mod tests {
         )));
         let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
             |(reference, update)| {
-                let context = reference.dispatch_domain();
+                let context = reference.domain();
                 let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
                 Ok(outputs.pop().unwrap())
             },
@@ -4643,7 +4643,7 @@ mod tests {
             compile(
                 |input| {
                     input
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(input)
                         .jacobian_forward(|value| Mul::mul(&value, &value))
                         .expect("forward Jacobian should stage")
@@ -4657,7 +4657,7 @@ mod tests {
             compile(
                 |input| {
                     input
-                        .dispatch_domain()
+                        .domain()
                         .differentiate_at(input)
                         .jacobian_reverse(|value| Mul::mul(&value, &value))
                         .expect("reverse Jacobian should stage")
@@ -4670,7 +4670,7 @@ mod tests {
         let second: CompiledXlaFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| {
                 input
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(input)
                     .hessian(|value| Mul::mul(&value, &value))
                     .expect("Hessian should stage")
@@ -4685,7 +4685,7 @@ mod tests {
         let _: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
             |input| {
                 input
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(input)
                     .jacobian_forward(|value| Mul::mul(&value, &value))
                     .expect("forward Jacobian should stage")
@@ -4759,7 +4759,7 @@ mod tests {
             |inputs| {
                 inputs
                     .0
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(inputs)
                     .jacobian_forward(|(scalar, vector)| scalar.atan2(&vector))
                     .expect("forward Jacobian should stage")
@@ -4999,7 +4999,7 @@ mod tests {
         // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
         let variadic: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(first, second)| {
-                let context = first.dispatch_domain();
+                let context = first.domain();
                 let mut outputs = context.bind(StopGradientOperation::new(), Vec::new(), &[first, second]).unwrap();
                 let second = outputs.pop().unwrap();
                 let first = outputs.pop().unwrap();
@@ -6853,7 +6853,7 @@ mod tests {
         let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
             |_, input: XlaCompileTracer<'_>| {
                 input
-                    .dispatch_domain()
+                    .domain()
                     .differentiate_at(input)
                     .gradient(|value| Mul::mul(&value, &value))
                     .expect("the eager gradient should stage inside the jit boundary")
@@ -7319,7 +7319,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let position = &state[0];
-                let limit = position.dispatch_domain().fill(&position.r#type().into_owned(), steps as i32)?;
+                let limit = position.domain().fill(&position.r#type().into_owned(), steps as i32)?;
                 Ok(vec![position.compare(&limit, ComparisonDirection::LessThan)?.into_value()])
             },
             carry_types.clone(),
@@ -7334,7 +7334,7 @@ mod tests {
                             .expect("decode body state should remain array-valued")
                     })
                     .collect::<Vec<_>>();
-                let context = state[0].dispatch_domain();
+                let context = state[0].domain();
                 Ok(decode_step(&context, &state, configuration, sampling, attention)?
                     .into_iter()
                     .map(ProjectedValue::into_value)

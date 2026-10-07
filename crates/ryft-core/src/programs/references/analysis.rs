@@ -2422,7 +2422,7 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError};
-    use crate::programs::values::ValueId;
+    use crate::programs::values::{ValueDirectDispatch, ValueId};
 
     use super::*;
 
@@ -5022,14 +5022,10 @@ mod tests {
         }
 
         impl Value for ReferenceConstant {
-            type DispatchDomain = EagerContext<Self>;
-            type ExecutionDomain = EagerContext<Self>;
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                EagerContext::new()
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
+            fn domain(&self) -> Self::Domain {
                 EagerContext::new()
             }
 
