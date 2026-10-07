@@ -74,7 +74,7 @@ pub use constants::{
 pub use control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, ConditionType, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
     ScanOperation, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType,
-    transpose_primal_condition,
+    condition, transpose_primal_condition,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_call::{

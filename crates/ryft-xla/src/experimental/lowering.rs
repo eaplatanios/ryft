@@ -23087,11 +23087,38 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
                 .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> (tensor<f32>, tensor<3xf32>) {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3xf32>
+                    %1:4 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %arg1, %iterArg_2 = %0) \
+                : tensor<i64>, tensor<f32>, tensor<3xf32>, tensor<3xf32>
+                    cond {
+                      %c_3 = stablehlo.constant dense<3> : tensor<i64>
+                      %2 = stablehlo.compare LT, %iterArg, %c_3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %2 : tensor<i1>
+                    } do {
+                      %2 = stablehlo.dynamic_slice %iterArg_1, %iterArg, sizes = [1] : (tensor<3xf32>, tensor<i64>) \
+                -> tensor<1xf32>
+                      %3 = stablehlo.reshape %2 : (tensor<1xf32>) -> tensor<f32>
+                      %4 = stablehlo.multiply %iterArg_0, %3 : tensor<f32>
+                      %5 = stablehlo.reshape %4 : (tensor<f32>) -> tensor<1xf32>
+                      %6 = stablehlo.dynamic_update_slice %iterArg_2, %5, %iterArg : (tensor<3xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<3xf32>
+                      %c_3 = stablehlo.constant dense<1> : tensor<i64>
+                      %7 = stablehlo.add %iterArg, %c_3 : tensor<i64>
+                      stablehlo.return %7, %4, %iterArg_1, %6 : tensor<i64>, tensor<f32>, tensor<3xf32>, \
+                tensor<3xf32>
+                    }
+                    return %1#1, %1#3 : tensor<f32>, tensor<3xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23147,10 +23174,38 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.get_dimension_size"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<?xf32, #stablehlo.bounds<8>>"), "{stablehlo}");
-        assert!(!stablehlo.contains("dimension_from_scalar"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, \
+                #stablehlo.bounds<8>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<8xf32>, tensor<i32>) -> \
+                tensor<?xf32, #stablehlo.bounds<8>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> \
+                tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %3:3 = stablehlo.while(%iterArg = %c, %iterArg_0 = %2, %iterArg_1 = %0) : tensor<i64>, \
+                tensor<i64>, tensor<?xf32, #stablehlo.bounds<8>>
+                    cond {
+                      %c_2 = stablehlo.constant dense<3> : tensor<i64>
+                      %6 = stablehlo.compare LT, %iterArg, %c_2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %6 : tensor<i1>
+                    } do {
+                      %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                      %6 = stablehlo.add %iterArg, %c_2 : tensor<i64>
+                      stablehlo.return %6, %iterArg_0, %iterArg_1 : tensor<i64>, tensor<i64>, tensor<?xf32, \
+                #stablehlo.bounds<8>>
+                    }
+                    %4 = stablehlo.get_dimension_size %3#2, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> \
+                tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    return %3#2, %5 : tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23203,10 +23258,40 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.set_dimension_size"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<?xf32, #stablehlo.bounds<8>>"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<i64>) -> (tensor<f32>, tensor<?xf32, \
+                #stablehlo.bounds<8>>, tensor<i64>) {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                    %1 = stablehlo.convert %arg1 : (tensor<i64>) -> tensor<i32>
+                    %2 = stablehlo.set_dimension_size %0, %1, dim = 0 : (tensor<8xf32>, tensor<i32>) -> \
+                tensor<?xf32, #stablehlo.bounds<8>>
+                    %3:3 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %2) : tensor<i64>, \
+                tensor<f32>, tensor<?xf32, #stablehlo.bounds<8>>
+                    cond {
+                      %6 = stablehlo.compare LT, %iterArg, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %6 : tensor<i1>
+                    } do {
+                      %6 = stablehlo.reshape %iterArg_0 : (tensor<f32>) -> tensor<1xf32>
+                      %7 = stablehlo.dynamic_update_slice %iterArg_1, %6, %iterArg : (tensor<?xf32, \
+                #stablehlo.bounds<8>>, tensor<1xf32>, tensor<i64>) -> tensor<?xf32, #stablehlo.bounds<8>>
+                      %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                      %8 = stablehlo.add %iterArg, %c_2 : tensor<i64>
+                      stablehlo.return %8, %iterArg_0, %7 : tensor<i64>, tensor<f32>, tensor<?xf32, \
+                #stablehlo.bounds<8>>
+                    }
+                    %4 = stablehlo.get_dimension_size %3#2, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> \
+                tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    return %3#1, %3#2, %5 : tensor<f32>, tensor<?xf32, #stablehlo.bounds<8>>, tensor<i64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23341,11 +23426,65 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.rng_bit_generator"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.set_dimension_size").count(), 3, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<8x2xui64>, %arg1: tensor<i64>, %arg2: tensor<i32>) -> \
+                (tensor<?x2xui64, #stablehlo.bounds<8, ?>>, tensor<?x2xui32, #stablehlo.bounds<8, ?>>, tensor<i64>, \
+                tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<8x2xui64>, tensor<i32>) -> \
+                tensor<?x2xui64, #stablehlo.bounds<8, ?>>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %c_0 = stablehlo.constant dense<0> : tensor<ui64>
+                    %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui64>) -> tensor<8x2xui64>
+                    %2 = stablehlo.convert %arg1 : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<8x2xui64>, tensor<i32>) -> \
+                tensor<?x2xui64, #stablehlo.bounds<8, ?>>
+                    %c_1 = stablehlo.constant dense<0> : tensor<ui32>
+                    %4 = stablehlo.broadcast_in_dim %c_1, dims = [] : (tensor<ui32>) -> tensor<8x2xui32>
+                    %5 = stablehlo.convert %arg1 : (tensor<i64>) -> tensor<i32>
+                    %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<8x2xui32>, tensor<i32>) -> \
+                tensor<?x2xui32, #stablehlo.bounds<8, ?>>
+                    %7:4 = stablehlo.while(%iterArg = %c, %iterArg_2 = %0, %iterArg_3 = %3, %iterArg_4 = %6) : \
+                tensor<i64>, tensor<?x2xui64, #stablehlo.bounds<8, ?>>, tensor<?x2xui64, #stablehlo.bounds<8, ?>>, \
+                tensor<?x2xui32, #stablehlo.bounds<8, ?>>
+                    cond {
+                      %12 = stablehlo.compare LT, %iterArg, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %12 : tensor<i1>
+                    } do {
+                      %c_5 = stablehlo.constant dense<0> : tensor<i64>
+                      %12 = stablehlo.dynamic_slice %iterArg_2, %iterArg, %c_5, sizes = [1, 2] : (tensor<?x2xui64, \
+                #stablehlo.bounds<8, ?>>, tensor<i64>, tensor<i64>) -> tensor<1x2xui64>
+                      %13 = stablehlo.reshape %12 : (tensor<1x2xui64>) -> tensor<2xui64>
+                      %output_state, %output = stablehlo.rng_bit_generator %13, algorithm = THREE_FRY : \
+                (tensor<2xui64>) -> (tensor<2xui64>, tensor<2xui32>)
+                      %14 = stablehlo.reshape %output_state : (tensor<2xui64>) -> tensor<1x2xui64>
+                      %15 = stablehlo.dynamic_update_slice %iterArg_3, %14, %iterArg, %c_5 : (tensor<?x2xui64, \
+                #stablehlo.bounds<8, ?>>, tensor<1x2xui64>, tensor<i64>, tensor<i64>) -> tensor<?x2xui64, \
+                #stablehlo.bounds<8, ?>>
+                      %16 = stablehlo.reshape %output : (tensor<2xui32>) -> tensor<1x2xui32>
+                      %17 = stablehlo.dynamic_update_slice %iterArg_4, %16, %iterArg, %c_5 : (tensor<?x2xui32, \
+                #stablehlo.bounds<8, ?>>, tensor<1x2xui32>, tensor<i64>, tensor<i64>) -> tensor<?x2xui32, \
+                #stablehlo.bounds<8, ?>>
+                      %c_6 = stablehlo.constant dense<1> : tensor<i64>
+                      %18 = stablehlo.add %iterArg, %c_6 : tensor<i64>
+                      stablehlo.return %18, %iterArg_2, %15, %17 : tensor<i64>, tensor<?x2xui64, \
+                #stablehlo.bounds<8, ?>>, tensor<?x2xui64, #stablehlo.bounds<8, ?>>, tensor<?x2xui32, \
+                #stablehlo.bounds<8, ?>>
+                    }
+                    %8 = stablehlo.get_dimension_size %7#2, dim = 0 : (tensor<?x2xui64, #stablehlo.bounds<8, ?>>) \
+                -> tensor<i32>
+                    %9 = stablehlo.convert %8 : (tensor<i32>) -> tensor<i64>
+                    %10 = stablehlo.get_dimension_size %7#3, dim = 0 : (tensor<?x2xui32, #stablehlo.bounds<8, ?>>) \
+                -> tensor<i32>
+                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
+                    return %7#2, %7#3, %9, %11 : tensor<?x2xui64, #stablehlo.bounds<8, ?>>, tensor<?x2xui32, \
+                #stablehlo.bounds<8, ?>>, tensor<i64>, tensor<i64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23390,10 +23529,42 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
                 .unwrap();
 
-        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 3, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> (tensor<f32>, tensor<3xf32>) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3xf32>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %1 = stablehlo.dynamic_slice %arg1, %c, sizes = [1] : (tensor<3xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                    %2 = stablehlo.reshape %1 : (tensor<1xf32>) -> tensor<f32>
+                    %3 = stablehlo.multiply %arg0, %2 : tensor<f32>
+                    %4 = stablehlo.reshape %3 : (tensor<f32>) -> tensor<1xf32>
+                    %5 = stablehlo.dynamic_update_slice %0, %4, %c : (tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> \
+                tensor<3xf32>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                    %6 = stablehlo.dynamic_slice %arg1, %c_0, sizes = [1] : (tensor<3xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                    %7 = stablehlo.reshape %6 : (tensor<1xf32>) -> tensor<f32>
+                    %8 = stablehlo.multiply %3, %7 : tensor<f32>
+                    %9 = stablehlo.reshape %8 : (tensor<f32>) -> tensor<1xf32>
+                    %10 = stablehlo.dynamic_update_slice %5, %9, %c_0 : (tensor<3xf32>, tensor<1xf32>, tensor<i64>) \
+                -> tensor<3xf32>
+                    %c_1 = stablehlo.constant dense<2> : tensor<i64>
+                    %11 = stablehlo.dynamic_slice %arg1, %c_1, sizes = [1] : (tensor<3xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                    %12 = stablehlo.reshape %11 : (tensor<1xf32>) -> tensor<f32>
+                    %13 = stablehlo.multiply %8, %12 : tensor<f32>
+                    %14 = stablehlo.reshape %13 : (tensor<f32>) -> tensor<1xf32>
+                    %15 = stablehlo.dynamic_update_slice %10, %14, %c_1 : (tensor<3xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<3xf32>
+                    return %13, %15 : tensor<f32>, tensor<3xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23439,10 +23610,49 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
                 .unwrap();
 
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<4xf32>) -> (tensor<f32>, tensor<4xf32>) {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %1:4 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %arg1, %iterArg_2 = %0) \
+                : tensor<i64>, tensor<f32>, tensor<4xf32>, tensor<4xf32>
+                    cond {
+                      %c_3 = stablehlo.constant dense<4> : tensor<i64>
+                      %c_4 = stablehlo.constant dense<1> : tensor<i64>
+                      %2 = stablehlo.subtract %c_3, %c_4 : tensor<i64>
+                      %3 = stablehlo.compare LT, %iterArg, %2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %3 : tensor<i1>
+                    } do {
+                      %2 = stablehlo.dynamic_slice %iterArg_1, %iterArg, sizes = [1] : (tensor<4xf32>, tensor<i64>) \
+                -> tensor<1xf32>
+                      %3 = stablehlo.reshape %2 : (tensor<1xf32>) -> tensor<f32>
+                      %4 = stablehlo.multiply %iterArg_0, %3 : tensor<f32>
+                      %5 = stablehlo.reshape %4 : (tensor<f32>) -> tensor<1xf32>
+                      %6 = stablehlo.dynamic_update_slice %iterArg_2, %5, %iterArg : (tensor<4xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<4xf32>
+                      %c_3 = stablehlo.constant dense<1> : tensor<i64>
+                      %7 = stablehlo.add %iterArg, %c_3 : tensor<i64>
+                      %8 = stablehlo.dynamic_slice %iterArg_1, %7, sizes = [1] : (tensor<4xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                      %9 = stablehlo.reshape %8 : (tensor<1xf32>) -> tensor<f32>
+                      %10 = stablehlo.multiply %4, %9 : tensor<f32>
+                      %11 = stablehlo.reshape %10 : (tensor<f32>) -> tensor<1xf32>
+                      %12 = stablehlo.dynamic_update_slice %6, %11, %7 : (tensor<4xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<4xf32>
+                      %c_4 = stablehlo.constant dense<2> : tensor<i64>
+                      %13 = stablehlo.add %iterArg, %c_4 : tensor<i64>
+                      stablehlo.return %13, %10, %iterArg_1, %12 : tensor<i64>, tensor<f32>, tensor<4xf32>, \
+                tensor<4xf32>
+                    }
+                    return %1#1, %1#3 : tensor<f32>, tensor<4xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23479,18 +23689,33 @@ mod tests {
             None,
         )
         .unwrap();
-        let condition = stablehlo.split_once("cond {").unwrap().1.split_once("} do {").unwrap().0;
-        let condition = condition.trim().lines().map(str::trim).collect::<Vec<_>>().join("\n");
         assert_eq!(
-            condition,
-            indoc! {r#"
-                %c_2 = stablehlo.constant dense<9223372036854775807> : tensor<i64>
-                %c_3 = stablehlo.constant dense<2> : tensor<i64>
-                %1 = stablehlo.subtract %c_2, %c_3 : tensor<i64>
-                %2 = stablehlo.compare LT, %iterArg, %1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                stablehlo.return %2 : tensor<i1>
-            "#}
-            .trim(),
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0:2 = stablehlo.while(%iterArg = %c, %iterArg_1 = %arg0) : tensor<i64>, tensor<i64>
+                    cond {
+                      %c_2 = stablehlo.constant dense<9223372036854775807> : tensor<i64>
+                      %c_3 = stablehlo.constant dense<2> : tensor<i64>
+                      %1 = stablehlo.subtract %c_2, %c_3 : tensor<i64>
+                      %2 = stablehlo.compare LT, %iterArg, %1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %2 : tensor<i1>
+                    } do {
+                      %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                      %1 = stablehlo.add %iterArg, %c_2 : tensor<i64>
+                      %c_3 = stablehlo.constant dense<2> : tensor<i64>
+                      %2 = stablehlo.add %iterArg, %c_3 : tensor<i64>
+                      %c_4 = stablehlo.constant dense<3> : tensor<i64>
+                      %3 = stablehlo.add %iterArg, %c_4 : tensor<i64>
+                      stablehlo.return %3, %2 : tensor<i64>, tensor<i64>
+                    }
+                    %c_0 = stablehlo.constant dense<9223372036854775806> : tensor<i64>
+                    return %c_0 : tensor<i64>
+                  }
+                }
+            "},
         );
     }
 
@@ -23537,10 +23762,57 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
                 .unwrap();
 
-        assert_eq!(stablehlo.matches("stablehlo.while").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 3, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<5xf32>) -> (tensor<f32>, tensor<5xf32>) {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<5xf32>
+                    %1:4 = stablehlo.while(%iterArg = %c, %iterArg_1 = %arg0, %iterArg_2 = %arg1, %iterArg_3 = %0) \
+                : tensor<i64>, tensor<f32>, tensor<5xf32>, tensor<5xf32>
+                    cond {
+                      %c_4 = stablehlo.constant dense<5> : tensor<i64>
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %7 = stablehlo.subtract %c_4, %c_5 : tensor<i64>
+                      %8 = stablehlo.compare LT, %iterArg, %7, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %8 : tensor<i1>
+                    } do {
+                      %7 = stablehlo.dynamic_slice %iterArg_2, %iterArg, sizes = [1] : (tensor<5xf32>, tensor<i64>) \
+                -> tensor<1xf32>
+                      %8 = stablehlo.reshape %7 : (tensor<1xf32>) -> tensor<f32>
+                      %9 = stablehlo.multiply %iterArg_1, %8 : tensor<f32>
+                      %10 = stablehlo.reshape %9 : (tensor<f32>) -> tensor<1xf32>
+                      %11 = stablehlo.dynamic_update_slice %iterArg_3, %10, %iterArg : (tensor<5xf32>, \
+                tensor<1xf32>, tensor<i64>) -> tensor<5xf32>
+                      %c_4 = stablehlo.constant dense<1> : tensor<i64>
+                      %12 = stablehlo.add %iterArg, %c_4 : tensor<i64>
+                      %13 = stablehlo.dynamic_slice %iterArg_2, %12, sizes = [1] : (tensor<5xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                      %14 = stablehlo.reshape %13 : (tensor<1xf32>) -> tensor<f32>
+                      %15 = stablehlo.multiply %9, %14 : tensor<f32>
+                      %16 = stablehlo.reshape %15 : (tensor<f32>) -> tensor<1xf32>
+                      %17 = stablehlo.dynamic_update_slice %11, %16, %12 : (tensor<5xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<5xf32>
+                      %c_5 = stablehlo.constant dense<2> : tensor<i64>
+                      %18 = stablehlo.add %iterArg, %c_5 : tensor<i64>
+                      stablehlo.return %18, %15, %iterArg_2, %17 : tensor<i64>, tensor<f32>, tensor<5xf32>, \
+                tensor<5xf32>
+                    }
+                    %c_0 = stablehlo.constant dense<4> : tensor<i64>
+                    %2 = stablehlo.dynamic_slice %1#2, %c_0, sizes = [1] : (tensor<5xf32>, tensor<i64>) -> \
+                tensor<1xf32>
+                    %3 = stablehlo.reshape %2 : (tensor<1xf32>) -> tensor<f32>
+                    %4 = stablehlo.multiply %1#1, %3 : tensor<f32>
+                    %5 = stablehlo.reshape %4 : (tensor<f32>) -> tensor<1xf32>
+                    %6 = stablehlo.dynamic_update_slice %1#3, %5, %c_0 : (tensor<5xf32>, tensor<1xf32>, \
+                tensor<i64>) -> tensor<5xf32>
+                    return %4, %6 : tensor<f32>, tensor<5xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23585,8 +23857,18 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &(scalar_f32, stacked_type), &output_types, "main", None, None)
                 .unwrap();
 
-        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(!stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<0xf32>) -> (tensor<f32>, tensor<0xf32>) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<0xf32>
+                    return %arg0, %0 : tensor<f32>, tensor<0xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -23925,16 +24207,9 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module =
+            to_mlir_module_for_program(&program, &[], &vec![array_type.clone()], &vec![array_type], "main", None, None)
+                .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -25736,11 +26011,42 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.assert").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.print").count(), 1, "{stablehlo}");
-        let while_header = stablehlo.lines().find(|line| line.contains("stablehlo.while(")).unwrap();
-        assert_eq!(while_header.matches("!stablehlo.token").count(), 2, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i64>, %arg1: tensor<3xi64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2:5 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %arg1, %iterArg_2 = %0, \
+                %iterArg_3 = %1) : tensor<i64>, tensor<i64>, tensor<3xi64>, !stablehlo.token, !stablehlo.token
+                    cond {
+                      %c_4 = stablehlo.constant dense<3> : tensor<i64>
+                      %3 = stablehlo.compare LT, %iterArg, %c_4, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %3 : tensor<i1>
+                    } do {
+                      %3 = stablehlo.dynamic_slice %iterArg_1, %iterArg, sizes = [1] : (tensor<3xi64>, tensor<i64>) \
+                -> tensor<1xi64>
+                      %4 = stablehlo.reshape %3 : (tensor<1xi64>) -> tensor<i64>
+                      %5 = stablehlo.compare EQ, %iterArg_0, %4, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %6 = stablehlo.custom_call @ryft.assert(%5, %4, %iterArg_0, %iterArg_2) {api_version = 4 : \
+                i32, backend_config = {actor = \"assert\", kind = \"generic\", label_0 = \"value\", label_1 = \
+                \"carry\", label_count = \"2\", message = \"scan value must equal carry\"}, has_side_effect = true} \
+                : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                      %7 = stablehlo.custom_call @ryft.print(%4, %iterArg_3) {api_version = 4 : i32, backend_config \
+                = {label = \"iteration\"}, has_side_effect = true} : (tensor<i64>, !stablehlo.token) -> \
+                !stablehlo.token
+                      %c_4 = stablehlo.constant dense<1> : tensor<i64>
+                      %8 = stablehlo.add %iterArg, %c_4 : tensor<i64>
+                      stablehlo.return %8, %iterArg_0, %iterArg_1, %6, %7 : tensor<i64>, tensor<i64>, \
+                tensor<3xi64>, !stablehlo.token, !stablehlo.token
+                    }
+                    return %2#1 : tensor<i64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -26752,7 +27058,24 @@ mod tests {
                     .to_string(),
             }),
         );
-        assert!(scan_program(0).is_ok());
+        let empty_module = scan_program(0).unwrap();
+        assert_eq!(
+            empty_module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<0x3xf64>) -> tensor<0x3xf64> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<0x?xf64, \
+                #stablehlo.bounds<?, 4>>
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %1 = stablehlo.set_dimension_size %0, %c, dim = 1 : (tensor<0x?xf64, #stablehlo.bounds<?, 4>>, \
+                tensor<i32>) -> tensor<0x4xf64>
+                    %2 = stablehlo.slice %1 [0:0, 0:3] : (tensor<0x4xf64>) -> tensor<0x3xf64>
+                    return %2 : tensor<0x3xf64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]

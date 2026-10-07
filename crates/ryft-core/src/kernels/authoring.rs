@@ -16,8 +16,8 @@ use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
 use crate::kernels::operations::KernelOperation;
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::{
-    AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
-    DimensionMulOperation, DotOperation, ReferenceWriteOperation, WhileOperation, ZeroOperation,
+    AddOperation, CompareOperation, ComparisonDirection, DimensionFromScalarOperation, DimensionMulOperation,
+    DotOperation, ReferenceWriteOperation, WhileOperation, ZeroOperation,
 };
 use crate::parameters::Placeholder;
 use crate::programs::{ProgramBuilder, ProgramError, ProjectedValue, TypeError, Typed, Value};
@@ -314,28 +314,6 @@ where
     Ok(outputs)
 }
 
-/// Stages both branches of a value-dependent condition with explicit carried values. Branches must return the same
-/// types and preserve reference identities according to the canonical conditional operation's contract.
-pub fn condition<C, Then, Else>(
-    context: &C,
-    predicate: &C::Value,
-    inputs: Vec<C::Value>,
-    then_function: Then,
-    else_function: Else,
-) -> Result<Vec<C::Value>, ProgramError>
-where
-    C: StagingContext<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = KernelOperation>,
-    Then: FnOnce(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
-    Else: FnOnce(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
-{
-    let types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-    let (_, then_program) = NestedTracingContext::trace(context.clone(), then_function, types.clone())?;
-    let (_, else_program) = NestedTracingContext::trace(context.clone(), else_function, types)?;
-    let mut arguments = vec![predicate.clone()];
-    arguments.extend(inputs);
-    context.bind(ArrayIrOperation::Condition(ConditionOperation::new()), vec![then_program, else_program], &arguments)
-}
-
 /// Checked ceiling division used only for static kernel shape metadata.
 pub fn shape_div_ceil(extent: usize, divisor: usize) -> Result<usize, KernelError> {
     if divisor == 0 {
@@ -384,7 +362,7 @@ mod tests {
     use crate::arrays::{ArrayReference, DataType};
     use crate::kernels::calls::KernelCallOperation;
     use crate::kernels::grids::Grid;
-    use crate::operations::{NegOperation, ReferenceRead, ReferenceWrite};
+    use crate::operations::{ReferenceRead, ReferenceWrite};
     use crate::programs::{Operation, ReferenceType};
     use crate::tracing::TracingContext;
 
@@ -528,58 +506,6 @@ mod tests {
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Array(Array::scalar(5i64).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::scalar(5i64).unwrap())])
-        );
-    }
-
-    #[test]
-    fn test_condition() {
-        let then_calls = std::cell::Cell::new(0);
-        let else_calls = std::cell::Cell::new(0);
-        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
-            |inputs: Vec<_>| {
-                let context = inputs[0].context();
-                condition(
-                    context,
-                    &inputs[0],
-                    vec![inputs[1].clone()],
-                    |inputs| {
-                        then_calls.set(then_calls.get() + 1);
-                        inputs[0].context().bind(
-                            ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new())),
-                            vec![],
-                            &[inputs[0].clone(), inputs[0].clone()],
-                        )
-                    },
-                    |inputs| {
-                        else_calls.set(else_calls.get() + 1);
-                        inputs[0].context().bind(
-                            ArrayIrOperation::from(ArrayOperation::Neg(NegOperation::new())),
-                            vec![],
-                            &inputs,
-                        )
-                    },
-                )
-            },
-            vec![
-                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
-                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
-            ],
-        )
-        .unwrap();
-        assert_eq!((then_calls.get(), else_calls.get()), (1, 1));
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(true).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3i64).unwrap())
-            ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(6i64).unwrap())])
-        );
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(false).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3i64).unwrap())
-            ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(-3i64).unwrap())])
         );
     }
 

@@ -2004,11 +2004,9 @@ mod tests {
         )
         .unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
-            let context = references[0].context().clone();
             let predicate = references[0].read()?;
             let value = references[1].read()?;
-            let result = ryft_core::kernels::condition(
-                &context,
+            let result = ryft_core::condition(
                 &predicate,
                 vec![value],
                 |inputs| {

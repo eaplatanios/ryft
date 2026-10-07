@@ -22,9 +22,9 @@ use crate::kernels::memory::{
 };
 use crate::kernels::validation::KernelReferenceOperation;
 use crate::operations::{
-    ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation,
+    ConditionOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
 };
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -641,6 +641,7 @@ macro_rules! kernel_operation_from {
 kernel_operation_from!(
     ArrayIrOperation<Array>,
     ArrayOperation<Array>,
+    ConditionOperation<ArrayIrType>,
     DimensionOperation<DimensionValue>,
     ConstantOperation<DimensionValue>,
     DimensionSizeOperation,

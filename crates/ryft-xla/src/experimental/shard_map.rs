@@ -51,11 +51,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
 #[cfg(test)]
+use ryft_core::StagingContext;
 use ryft_core::{
     ArrayIrType, ArrayType, Atom, AtomId, ConstrainShardingOperation, Context, Dimension, Domain, DomainTracingContext,
     Instruction, LogicalMesh, MeshAxisType, NamedAxis, Operation, ParallelVary, Parameter, ParameterError,
     Parameterized, ParameterizedFamily, Placeholder, ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation,
-    Shape, Sharding, ShardingDimension, ShardingError, StagingContext, Type, Typed, Value, ValueProjection,
+    Shape, Sharding, ShardingDimension, ShardingError, Type, Typed, Value, ValueProjection,
 };
 #[cfg(test)]
 use ryft_mlir::Block;

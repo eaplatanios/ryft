@@ -1,9 +1,10 @@
 //! Contains the `condition` control-flow operation: [`ConditionOperation`], which evaluates one of its two attached
 //! branch [`Region`](crate::Region)s depending on a scalar Boolean predicate, together with its reference-discharge,
 //! interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. The
-//! [`ConditionType`] trait defines the predicate and manual-variation semantics of each type universe, and
-//! [`transpose_primal_condition`] exposes the shared transposition rule to operation families that implement
-//! [`TransposableOperation`] for conditions themselves. This is the analogue of
+//! [`ConditionType`] trait defines the predicate and manual-variation semantics of each type universe, the
+//! [`condition`] function stages a condition from two branch functions while aligning its boundary with a varying
+//! predicate, and [`transpose_primal_condition`] exposes the shared transposition rule to operation families that
+//! implement [`TransposableOperation`] for conditions themselves. This is the analogue of
 //! [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) and lowers to
 //! [StableHLO's `if`](https://openxla.org/stablehlo/spec#if).
 
@@ -69,7 +70,9 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
 /// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
 /// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions
-/// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`].
+/// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`]. The
+/// [`condition`] function stages a condition from two branch functions instead, and aligns its inputs and branch
+/// outputs with a predicate that varies over manual mesh axes (refer to [`ConditionType`]).
 ///
 /// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
@@ -1246,9 +1249,11 @@ impl ConditionType for ArrayIrType {
 
 /// Stages a [`ConditionOperation`] that applies `true_function` to `inputs` when `predicate` is `true` and
 /// `false_function` otherwise, returning the outputs of the selected branch. This is the value-level analogue of
-/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html): each function is traced into a
-/// branch [`Program`] through a [`NestedTracingContext`] over `context`, and both branches must return values of the
-/// same types.
+/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html). Like other free entry points,
+/// it binds the condition in the [`execution_domain`](Value::execution_domain) of its values (i.e., the live trace of a
+/// staged value or the operation-executing eager domain of a concrete value): each function is traced into a branch
+/// [`Program`] through a [`NestedTracingContext`] over the execution domain of `predicate`, and both branches must
+/// return values of the same types.
 ///
 /// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches. This
 /// function then aligns the condition boundary with the predicate. It varies every input over each manual axis of the
@@ -1256,16 +1261,15 @@ impl ConditionType for ArrayIrType {
 /// the same way at the end of its branch (refer to [`ManualVariationAlignment::align_manual_variation_to`]). The
 /// branches therefore compute on varying values, so their outputs and partial-evaluation residuals are typed as the
 /// per-device values that they are, and the gradient of an input that was invariant is summed across devices by the
-/// transpose of its boundary `parallel_vary`, outside of the branches. JAX instead types such values as invariant and
-/// sums the gradients of invariant inputs inside the branches, with collectives in branches that devices may take
-/// differently. As a consequence, an output that a branch forwards from an invariant input is typed as varying even
-/// though it is equal on every device. With an invariant predicate, or outside of manual regions, no alignment is
+/// transpose of its boundary `parallel_vary`, outside of the branches. JAX instead types such values as invariant, and
+/// a branch that varies an invariant input sums that input's gradient inside the branch, with a collective that
+/// devices taking different branches reach differently. As a consequence, an output that a branch forwards from an
+/// invariant input is typed as varying even though it is equal on every device. With an invariant predicate, or outside of manual regions, no alignment is
 /// staged. Values that the functions capture from the enclosing trace instead of receiving through `inputs` are not
 /// aligned at the boundary, so differentiable values should be passed through `inputs`.
 ///
 /// # Parameters
 ///
-///   - `context`: [`Context`] in which the condition is bound.
 ///   - `predicate`: Scalar Boolean predicate that selects the branch.
 ///   - `inputs`: Values that both branches receive, in order.
 ///   - `true_function`: Function that computes the outputs of the `true` branch from its inputs.
@@ -1276,27 +1280,31 @@ impl ConditionType for ArrayIrType {
 /// Returns a [`ProgramError`] if aligning the manual variation of a value fails, if tracing either function fails, or
 /// if binding the condition fails (e.g., because the predicate is not a scalar Boolean or the branches return
 /// different types).
-pub fn condition<C, True, False>(
-    context: &C,
-    predicate: &C::Value,
-    inputs: Vec<C::Value>,
+pub fn condition<V, True, False>(
+    predicate: &V,
+    inputs: Vec<V>,
     true_function: True,
     false_function: False,
-) -> Result<Vec<C::Value>, ProgramError>
+) -> Result<Vec<V>, ProgramError>
 where
-    C: Context<Type: ConditionType, Operation: From<ConditionOperation<C::Type>>>,
-    C::Value: ManualVariationAlignment,
-    Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
-    True: FnOnce(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
-    False: FnOnce(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Vec<Tracer<NestedTracingContext<C>>>, ProgramError>,
+    V: Value<Type: ConditionType, ExecutionDomain: Context<Operation: From<ConditionOperation<V::Type>>>>
+        + ManualVariationAlignment,
+    Tracer<NestedTracingContext<V::ExecutionDomain>>: ManualVariationAlignment,
+    True: FnOnce(
+        Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>,
+    ) -> Result<Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>, ProgramError>,
+    False: FnOnce(
+        Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>,
+    ) -> Result<Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>, ProgramError>,
 {
+    let context = predicate.execution_domain();
     let predicate_sharding = predicate.r#type().predicate_sharding().cloned();
     let inputs = match &predicate_sharding {
-        Some(sharding) => C::Value::align_manual_variation_to(&inputs, sharding)?,
+        Some(sharding) => V::align_manual_variation_to(&inputs, sharding)?,
         None => inputs,
     };
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<C>>>| match &predicate_sharding {
+    let align_outputs = |outputs: Vec<Tracer<NestedTracingContext<V::ExecutionDomain>>>| match &predicate_sharding {
         Some(sharding) => Tracer::align_manual_variation_to(&outputs, sharding),
         None => Ok(outputs),
     };
@@ -1313,7 +1321,7 @@ where
     let mut condition_inputs = Vec::with_capacity(inputs.len() + 1);
     condition_inputs.push(predicate.clone());
     condition_inputs.extend(inputs);
-    context.bind(ConditionOperation::<C::Type>::new(), vec![true_branch, false_branch], &condition_inputs)
+    context.bind(ConditionOperation::<V::Type>::new(), vec![true_branch, false_branch], &condition_inputs)
 }
 
 /// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
@@ -1970,6 +1978,26 @@ where
         .map(read_known)
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Devices whose predicates differ take different branches, so the cotangent of a linear input differs across them.
+    // An input that does not vary over the predicate's manual axes would need that cotangent summed across devices
+    // inside the branches, with collectives that devices reach differently, so such a condition is not transposed.
+    // Staging the condition through `condition` varies its inputs before the branches instead.
+    let predicate_type = predicate.r#type().into_owned();
+    for index in branch_input_indices.iter().map(|&index| index + 1) {
+        let input_type = inputs[index].r#type();
+        if !matches!(cotangents.kind(index), CotangentDestinationKind::Ignore)
+            && input_type.cotangent()?.validate_condition_output(&predicate_type).is_err()
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{CONDITION_OPERATION_NAME}` transposition cannot produce the cotangent of input {index} of type \
+                     `{input_type}`, which does not vary over every manual axis that the predicate `{predicate_type}` \
+                     varies over; vary the input before the condition",
+                ),
+            });
+        }
+    }
+
     // Transpose each branch with the branch tangents marked linear and the residual inputs marked known, through each
     // branch region's retained transform cache so that a branch shared by several programs is transposed once per
     // selection of linear inputs. A live reference-typed branch tangent is transposed with a `Reference` destination
@@ -2067,8 +2095,9 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::kernels::KernelOperation;
     use crate::macros::check_gradient;
-    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SqrtOperation};
+    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SqrtOperation};
     use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
@@ -9845,6 +9874,64 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_transposition_rejects_invariant_inputs_under_varying_predicates() {
+        // A condition staged directly with an invariant weight under a predicate that varies over `devices` linearizes,
+        // because its branches vary the weight before using it. The cotangent of the weight, however, differs across
+        // devices that take different branches, and summing it would place collectives inside the branches, so
+        // transposition rejects the condition with a diagnostic instead of a mistyped transposed condition.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding.clone()).unwrap();
+        let invariant_type =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
+        let branch = |multiplies: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let weight = builder.add_input(invariant_type.clone());
+            let input = builder.add_input(varying_type.clone());
+            let varied = builder
+                .add_instruction(ParallelVaryOperation::new("devices".to_string()), Vec::new(), vec![weight], None)
+                .unwrap()[0];
+            let output = if multiplies {
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![varied, input], None).unwrap()[0]
+            } else {
+                varied
+            };
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(predicate_type.clone());
+        let weight = builder.add_input(invariant_type.clone());
+        let input = builder.add_input(varying_type.clone());
+        let true_region = builder.import_program(branch(true));
+        let false_region = builder.import_program(branch(false));
+        let output = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_region, false_region],
+                vec![predicate, weight, input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.pullback().err(),
+            Some(DifferentiationError::from(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`condition` transposition cannot produce the cotangent of input 1 of type `{invariant_type}`, \
+                     which does not vary over every manual axis that the predicate `{predicate_type}` varies over; \
+                     vary the input before the condition",
+                ),
+            })),
+        );
+    }
+
+    #[test]
     fn test_condition_type_is_condition_predicate() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant =
@@ -9863,6 +9950,21 @@ mod tests {
                 .is_condition_predicate()
         );
         assert!(!ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::Boolean))).is_condition_predicate());
+    }
+
+    #[test]
+    fn test_condition_type_predicate_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate = ArrayType::scalar(DataType::Boolean).with_sharding(sharding.clone()).unwrap();
+        assert_eq!(predicate.predicate_sharding(), Some(&sharding));
+        assert_eq!(ArrayType::scalar(DataType::Boolean).predicate_sharding(), None);
+        assert_eq!(ArrayIrType::Array(predicate).predicate_sharding(), Some(&sharding));
+        assert_eq!(
+            ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()))
+                .predicate_sharding(),
+            None,
+        );
     }
 
     #[test]
@@ -9903,6 +10005,310 @@ mod tests {
                  produced under the varying predicate \
                  `bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]`",
             )),
+        );
+    }
+
+    #[test]
+    fn test_condition_condition() {
+        // Outside of manual regions, `condition` traces both functions into branches over the provided inputs and
+        // stages one condition without any manual-variation alignment, both in a trace and eagerly.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone()],
+                    |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
+                    |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                )
+            },
+            vec![ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        for (predicate, expected) in [(true, 9.0), (false, 6.0)] {
+            assert_eq!(
+                program.interpret(vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0).unwrap()]),
+                Ok(vec![Array::scalar(expected).unwrap()]),
+            );
+            assert_eq!(
+                condition(
+                    &Array::scalar(predicate).unwrap(),
+                    vec![Array::scalar(3.0).unwrap()],
+                    |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
+                    |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                ),
+                Ok(vec![Array::scalar(expected).unwrap()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_condition_kernel_operations() {
+        // `condition` serves the kernel operation family that the `#[kernel]` macro lowers Rust `if` statements to,
+        // tracing each branch function exactly once and selecting its result at runtime.
+        let true_calls = std::cell::Cell::new(0);
+        let false_calls = std::cell::Cell::new(0);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, KernelOperation>::trace(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone()],
+                    |inputs| {
+                        true_calls.set(true_calls.get() + 1);
+                        inputs[0].context().bind(
+                            ArrayIrOperation::from(ArrayOperation::Add(AddOperation::new())),
+                            Vec::new(),
+                            &[inputs[0].clone(), inputs[0].clone()],
+                        )
+                    },
+                    |inputs| {
+                        false_calls.set(false_calls.get() + 1);
+                        inputs[0].context().bind(
+                            ArrayIrOperation::from(ArrayOperation::Neg(NegOperation::new())),
+                            Vec::new(),
+                            &inputs,
+                        )
+                    },
+                )
+            },
+            vec![
+                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I64)),
+            ],
+        )
+        .unwrap();
+        assert_eq!((true_calls.get(), false_calls.get()), (1, 1));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:i64[] .
+                let %2:i64[] = condition %0 %1 [
+                    true={
+                        lambda %0:i64[] .
+                        let %1:i64[] = add %0 %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:i64[] .
+                        let %1:i64[] = neg %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        for (predicate, expected) in [(true, 6i64), (false, -3i64)] {
+            assert_eq!(
+                program.interpret(vec![
+                    ArrayIrValue::Array(Array::scalar(predicate).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(3i64).unwrap()),
+                ]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected).unwrap())]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_condition_aligns_manual_variation() {
+        // With a predicate that varies over `devices`, `condition` varies the invariant input before the branches and
+        // the constant output of the `false` branch at its end, so every branch value is typed as the per-device value
+        // that it is, while the input that already varies passes through unchanged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding.clone()).unwrap();
+        let invariant_type =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
+        let named_axes = vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })];
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone(), inputs[2].clone()],
+                    |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
+                    |inputs| Ok(vec![StagingContext::constant(inputs[0].context(), Array::scalar(1.0f32).unwrap())]),
+                )
+            },
+            vec![predicate_type.clone(), invariant_type.clone(), varying_type.clone()],
+            named_axes.clone(),
+        )
+        .unwrap();
+        let predicate = "bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        let invariant = "f32[][sharding={mesh<['devices'=2:manual]>, []}]";
+        let varying = "f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{predicate}, %1:{invariant}, %2:{varying} .
+                let %3:{varying} = parallel_vary [axis_name=\"devices\"] %1
+                    %4:{varying} = condition %0 %3 %2 [
+                        true={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:{varying} = mul %0 %1
+                            in (%2)
+                        }},
+                        false={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:f32[] = const 1.0
+                                %3:{invariant} = broadcast [output_type={invariant}, output_axes=[]] %2
+                                %4:{varying} = parallel_vary [axis_name=\"devices\"] %3
+                            in (%4)
+                        }},
+                    ]
+                in (%4)"},
+        );
+
+        // An invariant predicate keeps every device on the same branch, so nothing is aligned.
+        let invariant_predicate_type = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(invariant_type.sharding().unwrap().clone())
+            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone()],
+                    |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
+                    |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+                )
+            },
+            vec![invariant_predicate_type, invariant_type],
+            named_axes,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:bool[][sharding={{mesh<['devices'=2:manual]>, []}}], %1:{invariant} .
+                let %2:{invariant} = condition %0 %1 [
+                    true={{
+                        lambda %0:{invariant} .
+                        let %1:{invariant} = mul %0 %0
+                        in (%1)
+                    }},
+                    false={{
+                        lambda %0:{invariant} .
+                        let %1:{invariant} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_condition_condition_differentiates_invariant_inputs_outside_of_branches() {
+        // Under a predicate that varies over `devices`, the condition that `condition` stages computes on the varied
+        // weight, so linearization splits it with varying residuals, and the pullback sums the weight's per-device
+        // cotangent across devices after the transposed condition, through the transpose of the boundary
+        // `parallel_vary`, rather than inside the branches.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_sharding = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(varying_sharding.clone()).unwrap();
+        let invariant_type =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32).with_sharding(varying_sharding).unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<Tracer<_>>| {
+                condition(
+                    &inputs[0],
+                    vec![inputs[1].clone(), inputs[2].clone()],
+                    |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone()]),
+                    |inputs| Ok(vec![inputs[0].clone()]),
+                )
+            },
+            vec![predicate_type, invariant_type, varying_type],
+            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        let predicate = "bool[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        let invariant = "f32[][sharding={mesh<['devices'=2:manual]>, []}]";
+        let varying = "f32[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}]";
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:{predicate}, %1:{invariant}, %2:{varying} .
+                let %3:{varying} = parallel_vary [axis_name=\"devices\"] %1
+                    %4:{varying}, %5:{varying} = condition %0 %3 %2 [
+                        true={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:{varying} = mul %0 %1
+                            in (%2, %1)
+                        }},
+                        false={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:{varying} = zero [
+                                type={varying},
+                            ]
+                            in (%0, %2)
+                        }},
+                    ]
+                    %6:{varying} = condition %0 %5 [
+                        true={{
+                            lambda %0:{varying} .
+                            in (%0)
+                        }},
+                        false={{
+                            lambda %0:{varying} .
+                            let %1:{varying} = zero [
+                                type={varying},
+                            ]
+                            in (%1)
+                        }},
+                    ]
+                in (%4, %0, %6)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{invariant}, %1:{predicate}, %2:{varying} .
+                let %3:{varying} = parallel_vary [axis_name=\"devices\"] %0
+                    %4:{varying} = condition %1 %3 %2 [
+                        true={{
+                            lambda %0:{varying}, %1:{varying} .
+                            let %2:{varying} = mul %1 %0
+                            in (%2)
+                        }},
+                        false={{
+                            lambda %0:{varying}, %1:{varying} .
+                            in (%0)
+                        }},
+                    ]
+                in (%4)"},
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().to_string(),
+            formatdoc! {"
+                lambda %0:{varying}, %1:{predicate}, %2:{varying} .
+                let %3:{varying} = condition %1 %0 %2 [
+                    true={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{varying} = mul %1 %0
+                        in (%2)
+                    }},
+                    false={{
+                        lambda %0:{varying}, %1:{varying} .
+                        in (%0)
+                    }},
+                ]
+                    %4:{invariant} = parallel_reduce [kind=sum, axis_name=\"devices\", mesh=['devices'=2:manual]] %3
+                in (%4)"},
         );
     }
 }

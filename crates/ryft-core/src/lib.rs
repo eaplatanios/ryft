@@ -170,7 +170,7 @@ pub use operations::{
     WhilePredicate, WhileType, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
     WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
     ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    check_batching_rule_consistency, custom_function, transpose_primal_condition,
+    check_batching_rule_consistency, condition, custom_function, transpose_primal_condition,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

@@ -709,7 +709,7 @@ fn body(
                 quote! {
                     let __kernel_predicate = #predicate;
                     let __kernel_carried = __kernel_context.invoke_with_provenance_scope(#source_scope,
-                        || #core::kernels::condition(&__kernel_context, &__kernel_predicate,
+                        || #core::condition(&__kernel_predicate,
                         vec![#(#names.clone()),*],
                         |__kernel_values| {
                             let __kernel_context = __kernel_values[0].context().clone();

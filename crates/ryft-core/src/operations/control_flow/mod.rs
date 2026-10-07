@@ -11,7 +11,9 @@ pub mod scan;
 pub mod select;
 pub mod r#while;
 
-pub use condition::{CONDITION_OPERATION_NAME, ConditionOperation, ConditionType, transpose_primal_condition};
+pub use condition::{
+    CONDITION_OPERATION_NAME, ConditionOperation, ConditionType, condition, transpose_primal_condition,
+};
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation, ScanType};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType};
