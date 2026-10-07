@@ -2745,17 +2745,12 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
     }
 }
 
-impl<
-    T: Type,
-    V: Value<
-            Dispatch = ValueDomainDispatch,
-            Type = T,
-            Domain: Context<
-                Operation: From<DynamicSliceOperation<T>>
-                               + OperationProvider<T, DynamicSliceOperation, Operation = <V::Domain as Domain>::Operation>,
-            >,
-        > + ManualVariationAlignment<T>,
-> DynamicSlice<T> for V
+impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch> + ManualVariationAlignment<T>> DynamicSlice<T> for V
+where
+    V::Domain: Context<
+        Operation: From<DynamicSliceOperation<T>>
+                       + OperationProvider<T, DynamicSliceOperation, Operation = <V::Domain as Domain>::Operation>,
+    >,
 {
     fn dynamic_slice_with_negative_indices(
         &self,

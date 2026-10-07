@@ -579,10 +579,9 @@ pub trait ConvertElementType<T = <Self as Capability>::Universe>: Capability + S
     }
 }
 
-impl<
-    T: ElementType,
-    V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ConvertElementTypeOperation<T>>>>,
-> ConvertElementType<T> for V
+impl<T: ElementType, V: Value<Type = T, Dispatch = ValueDomainDispatch>> ConvertElementType<T> for V
+where
+    V::Domain: Context<Operation: From<ConvertElementTypeOperation<T>>>,
 {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, false);
