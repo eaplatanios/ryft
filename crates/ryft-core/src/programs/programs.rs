@@ -1727,18 +1727,17 @@ pub type FlatProgram<D> = Program<
     Vec<<D as Domain>::Constant>,
 >;
 
-/// Liveness masks for a [`Program`]'s entry [`Region`]. The masks are indexed by entry-region [`Atom`] and
-/// [`Instruction`] positions. Nested regions are not part of this analysis because their inputs and outputs are their
-/// boundary contract (i.e., a referenced region is live exactly when a live instruction references it, which the
-/// region-aware rebuild paths such as [`Program::simplified`] handle directly).
+/// Flat liveness masks indexed by the original [`Atom`] and [`Instruction`] positions of one [`Region`]. The query
+/// producing these masks determines its roots and retention policy. [`Program::live_sets`] and its variants compute
+/// entry-region dependencies of their requested roots. Boundary-pruning analysis can query any source region and
+/// additionally retain instructions for observable effects or deferred work, accounting for nested boundary pruning.
+/// Each mask still describes only that source region; nested regions have their own masks and local positions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramLiveSets {
-    /// Contains a boolean value per atom in the [`Program`], indicating whether it contributes
-    /// to at least one program output.
+    /// Whether each original atom is needed by the query's requested roots or retained work.
     atoms: Vec<bool>,
 
-    /// Contains a boolean value per instruction in the [`Program`], indicating whether it contributes
-    /// to at least one program output.
+    /// Whether each original instruction is needed by the query's requested roots or retained work.
     instructions: Vec<bool>,
 }
 
@@ -1749,15 +1748,13 @@ impl ProgramLiveSets {
         Self { atoms, instructions }
     }
 
-    /// Returns a slice that contains a boolean value per atom in the [`Program`], indicating whether it contributes
-    /// to at least one program output.
+    /// Returns whether each original atom is needed by the query's requested roots or retained work.
     #[inline]
     pub fn atoms(&self) -> &[bool] {
         self.atoms.as_slice()
     }
 
-    /// Returns a slice that contains a boolean value per instruction in the [`Program`], indicating whether it
-    /// contributes to at least one program output.
+    /// Returns whether each original instruction is needed by the query's requested roots or retained work.
     #[inline]
     pub fn instructions(&self) -> &[bool] {
         self.instructions.as_slice()
@@ -2142,12 +2139,13 @@ fn adopt_transform_caches_for_identity_rebuilds<V: Typed + Parameter, O>(
     }
 }
 
+// TODO(eaplatanios): Move this to right after `impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O>`.
 /// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following [`Instruction`] attached-region
 /// references), compacts the surviving regions' identifiers while preserving their relative order, and rewrites every
 /// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
 /// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
 /// remains valid for ascending-order recursive metadata derivation by [`RegionArena`].
-fn compact_regions<V: Typed + Parameter, O>(
+pub(super) fn compact_regions<V: Typed + Parameter, O>(
     regions: Vec<Region<V, O>>,
     entry: RegionId,
 ) -> (Vec<Region<V, O>>, RegionId) {
@@ -2175,36 +2173,57 @@ fn compact_regions<V: Typed + Parameter, O>(
     (compacted, remapping[entry.index()].unwrap())
 }
 
-/// State of [`Program::into_pruned`], which determines the pruning of regions under sets of used outputs and emits
-/// pruned copies of regions for kept boundaries.
-struct BoundaryPruner<'p, V: Value, O: Operation<Type = V::Type>> {
-    /// Arena of the program that is pruned.
-    arena: &'p RegionArena<V, O>,
+// TODO(eaplatanios): Move this and its impl block to right after `impl ProgramLiveSets`.
+/// Demand-specific boundary-pruning analysis of one borrowed [`RegionArena`]. Queries account for nested boundary
+/// pruning and instructions retained for their effects or deferred work, and keep the original region, atom, and
+/// instruction identifiers. Each region's pruning plan is memoized by its demanded-output mask, so one instance can
+/// serve a complete traversal, including repeated queries and loop-feedback iterations. The arena is immutable for
+/// the lifetime of the analysis and its cache is local to this instance and cannot mix results from different arenas.
+///
+/// [`Program::into_pruned`] uses the private pruning plans to rebuild regions, while transforms that only inspect
+/// demand use [`Self::live_sets`]. This analysis neither emits regions nor changes their boundaries.
+pub(crate) struct RegionPruningAnalysis<'o, V: Value, O: Operation<Type = V::Type>> {
+    /// Immutable source arena whose original identifiers index every query and result.
+    arena: &'o RegionArena<V, O>,
 
-    /// Pruning of each region under each set of used outputs that was queried so far.
+    /// Pruning of each region under each demanded-output mask queried so far.
     prunings: HashMap<(RegionId, Vec<bool>), Rc<RegionPruning<O>>>,
-
-    /// Pruned copy of each region for each kept boundary that was emitted so far, keyed by the source region, its kept
-    /// inputs, and its kept outputs.
-    copies: HashMap<(RegionId, Vec<bool>, Vec<bool>), RegionId>,
-
-    /// Emitted regions, in sealing order (i.e., attached regions before the regions that attach them).
-    regions: Vec<Region<V, O>>,
-
-    /// Positions of the emitted instructions whose boundaries were pruned.
-    pruned_instructions: Vec<InstructionId>,
 }
 
-impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O> {
-    /// Creates a new [`BoundaryPruner`] for the program whose arena is `arena`.
-    fn new(arena: &'p RegionArena<V, O>) -> Self {
-        Self {
-            arena,
-            prunings: HashMap::new(),
-            copies: HashMap::new(),
-            regions: Vec::new(),
-            pruned_instructions: Vec::new(),
+impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O> {
+    /// Creates an analysis with an empty query cache for the borrowed `arena`.
+    #[inline]
+    pub(crate) fn new(arena: &'o RegionArena<V, O>) -> Self {
+        Self { arena, prunings: HashMap::new() }
+    }
+
+    /// Returns liveness of `region` for the output positions in `outputs`, accounting for nested boundary pruning
+    /// and instructions retained for their effects or deferred work. Atom and instruction positions refer to the
+    /// original region, so callers can inspect shared descendants without rebuilding or renumbering their arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] for an out-of-range output position, and errors from region lookup
+    /// or boundary-pruning analysis.
+    pub(crate) fn live_sets(&mut self, region: RegionId, outputs: &[usize]) -> Result<ProgramLiveSets, ProgramError> {
+        let source = RegionRef::new(self.arena, region)?;
+        let output_count = source.output_ids().len();
+        let mut used_outputs = vec![false; output_count];
+        for &output in outputs {
+            let Some(used) = used_outputs.get_mut(output) else {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("output index {output} is out of range for a program with {output_count} outputs"),
+                });
+            };
+            *used = true;
         }
+        let pruning = self.region_pruning(region, &used_outputs)?;
+        let instructions = pruning
+            .instructions
+            .iter()
+            .map(|instruction| !matches!(instruction, InstructionPruning::Removed))
+            .collect();
+        Ok(ProgramLiveSets::new(pruning.live_atoms.clone(), instructions))
     }
 
     /// Returns the pruning of `region` when only the outputs of it that `used_outputs` marks are used.
@@ -2242,7 +2261,7 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O
             let pruning = if instruction.regions().is_empty() {
                 None
             } else {
-                let mut liveness = AttachedRegionLiveness { pruner: self, regions: instruction.regions() };
+                let mut liveness = AttachedRegionLiveness { analysis: self, regions: instruction.regions() };
                 instruction.operation().prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
             };
 
@@ -2329,9 +2348,39 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O
         instructions.reverse();
 
         let used_inputs = source.input_ids().iter().map(|input| live[input.index()]).collect();
-        let region_pruning = Rc::new(RegionPruning { used_inputs, instructions });
+        let region_pruning = Rc::new(RegionPruning { used_inputs, live_atoms: live, instructions });
         self.prunings.insert(key, region_pruning.clone());
         Ok(region_pruning)
+    }
+}
+
+/// State of [`Program::into_pruned`], which determines the pruning of regions under sets of used outputs and emits
+/// pruned copies of regions for kept boundaries.
+struct BoundaryPruner<'o, V: Value, O: Operation<Type = V::Type>> {
+    /// Reusable analysis of the original arena and its demanded region boundaries.
+    analysis: RegionPruningAnalysis<'o, V, O>,
+
+    /// Pruned copy of each region for each kept boundary that was emitted so far, keyed by the source region, its kept
+    /// inputs, and its kept outputs.
+    copies: HashMap<(RegionId, Vec<bool>, Vec<bool>), RegionId>,
+
+    /// Emitted regions, in sealing order (i.e., attached regions before the regions that attach them).
+    regions: Vec<Region<V, O>>,
+
+    /// Positions of the emitted instructions whose boundaries were pruned.
+    pruned_instructions: Vec<InstructionId>,
+}
+
+impl<'o, V: Value, O: Clone + Operation<Type = V::Type>> BoundaryPruner<'o, V, O> {
+    /// Creates a new [`BoundaryPruner`] for the program whose arena is `arena`.
+    #[inline]
+    fn new(arena: &'o RegionArena<V, O>) -> Self {
+        Self {
+            analysis: RegionPruningAnalysis::new(arena),
+            copies: HashMap::new(),
+            regions: Vec::new(),
+            pruned_instructions: Vec::new(),
+        }
     }
 
     /// Emits the pruned copy of `region` whose boundary keeps the inputs and outputs that `kept_inputs` and
@@ -2347,13 +2396,13 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O
             return Ok(*copy);
         }
 
-        let arena = self.arena;
+        let arena = self.analysis.arena;
         let source = RegionRef::new(arena, region)?;
         check_count!("input", kept_inputs, source.input_ids().len(), ProgramError);
 
         // The instructions of the copy are those that the kept outputs use, and a pruned boundary may keep region
         // inputs that are not live but must keep every live one.
-        let region_pruning = self.region_pruning(region, kept_outputs)?;
+        let region_pruning = self.analysis.region_pruning(region, kept_outputs)?;
         if region_pruning.used_inputs.iter().zip(kept_inputs).any(|(used, kept)| *used && !*kept) {
             return Err(ProgramError::MalformedProgram(format!(
                 "boundary pruning drops a live input of region {region}",
@@ -2455,17 +2504,20 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O
     }
 }
 
-/// Pruning of one [`Region`] under one set of used outputs, as determined by [`Program::into_pruned`],
+/// Pruning of one [`Region`] under one set of used outputs, as determined by [`RegionPruningAnalysis`],
 /// which specifies which of its inputs are live and what happens to each of its instructions.
 struct RegionPruning<O> {
     /// Whether each input of the region is live.
-    used_inputs: Vec<bool>,
+    used_inputs: Vec<bool>, // TODO(eaplatanios): Now that we have `live_atoms` do we also need this or is it derivable?
+
+    /// Whether each original atom is live, including inputs needed by retained effects or deferred work.
+    live_atoms: Vec<bool>,
 
     /// Pruning of each instruction of the region, in instruction order.
     instructions: Vec<InstructionPruning<O>>,
 }
 
-/// What [`Program::into_pruned`] does to one [`Instruction`] of a [`Region`] under one set of used region outputs.
+/// Pruning decision for one [`Instruction`] of a [`Region`] under one set of used region outputs.
 enum InstructionPruning<O> {
     /// The instruction is removed, because no used value and no retained work depends on it.
     Removed,
@@ -2486,22 +2538,23 @@ enum InstructionPruning<O> {
     },
 }
 
-/// [`RegionLiveness`] of the regions attached to one [`Instruction`] during [`Program::into_pruned`].
-struct AttachedRegionLiveness<'s, 'p, V: Value, O: Operation<Type = V::Type>> {
-    /// Pruner that determines the liveness of the attached regions.
-    pruner: &'s mut BoundaryPruner<'p, V, O>,
+// TODO(eaplatanios): Rename `'s` to `'a`.
+/// [`RegionLiveness`] of the regions attached to one [`Instruction`] during [`RegionPruningAnalysis`].
+struct AttachedRegionLiveness<'s, 'o, V: Value, O: Operation<Type = V::Type>> {
+    /// Analysis that determines the liveness of the attached regions.
+    analysis: &'s mut RegionPruningAnalysis<'o, V, O>,
 
     /// Regions attached to the instruction, in [`Instruction::regions`] order.
-    regions: &'p [RegionId],
+    regions: &'o [RegionId],
 }
 
-impl<V: Value, O: Operation<Type = V::Type> + Clone> RegionLiveness for AttachedRegionLiveness<'_, '_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLiveness<'_, '_, V, O> {
     #[inline]
     fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError> {
         let region = *self.regions.get(region_index).ok_or_else(|| {
             ProgramError::MalformedProgram(format!("the instruction has no attached region {region_index}"))
         })?;
-        Ok(self.pruner.region_pruning(region, used_outputs)?.used_inputs.clone())
+        Ok(self.analysis.region_pruning(region, used_outputs)?.used_inputs.clone())
     }
 }
 
@@ -5043,5 +5096,194 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_region_pruning_analysis_new() {
+        let program = pruning_branch(false);
+        let analysis = RegionPruningAnalysis::new(&program.regions);
+        assert!(std::ptr::eq(analysis.arena, &program.regions));
+        assert!(analysis.prunings.is_empty());
+    }
+
+    #[test]
+    fn test_region_pruning_analysis_live_sets() {
+        // Only the first condition output is demanded. Its branches do not read their second input, so neither
+        // that input's producer nor its dependency is live. The independent print remains solely for its effect.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let selected = builder.add_input(ArrayType::scalar(DataType::F64));
+        let unused = builder.add_input(ArrayType::scalar(DataType::F64));
+        let printed = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![unused], None).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("effect"), Vec::new(), vec![printed], None).unwrap();
+        let branch = builder.import_program(pruning_branch(false));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![branch, branch],
+                vec![predicate, selected, negated],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+        let mut analysis = RegionPruningAnalysis::new(&program.regions);
+        let live = analysis.live_sets(program.entry(), &[0]).unwrap();
+        assert_eq!(
+            live.atoms(),
+            &[
+                true,  // `predicate`
+                true,  // `selected`
+                false, // `unused`
+                true,  // `printed`
+                false, // `negated`
+                false, // The unused print output is not live merely because the instruction is retained.
+                true,  // The first condition output.
+                false, // The second condition output.
+            ],
+        );
+        assert_eq!(live.instructions(), &[false, true, true]);
+        assert_eq!(
+            program.with_outputs(&[0]).unwrap().into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[] = print [label=effect] %3
+                    %5:f64[] = condition %0 %1 [
+                        true=^0={
+                            lambda %0:f64[] .
+                            let %1:f64[] = neg %0
+                            in (%1)
+                        },
+                        false=^0,
+                    ]
+                in (%5)"},
+        );
+
+        // Attached-region queries retain their original atom and instruction positions too.
+        let live = analysis.live_sets(branch, &[0]).unwrap();
+        assert_eq!(live.atoms(), &[true, false, true, false]);
+        assert_eq!(live.instructions(), &[true, false]);
+
+        // With no demanded outputs, only the print and its input remain live.
+        let live = analysis.live_sets(program.entry(), &[]).unwrap();
+        assert_eq!(live.atoms(), &[false, false, false, true, false, false, false, false]);
+        assert_eq!(live.instructions(), &[false, true, false]);
+        assert_eq!(
+            analysis.live_sets(program.entry(), &[2]),
+            Err(ProgramError::InvalidArgument {
+                message: "output index 2 is out of range for a program with 2 outputs".to_string(),
+            }),
+        );
+        assert_eq!(
+            analysis.live_sets(RegionId::new(42), &[0]),
+            Err(ProgramError::MalformedProgram("region ^42 is out of range".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_region_pruning_analysis_live_sets_reuses_nested_queries() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let first = builder.add_input(ArrayType::scalar(DataType::F64));
+        let second = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(false));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![branch, branch],
+                vec![predicate, first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[] = condition %0 %1 %2 [
+                    true=^0={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = neg %0
+                            %3:f64[] = mul %1 %1
+                        in (%2, %3)
+                    },
+                    false=^0,
+                ]
+                in (%3, %4)"},
+        );
+        let mut analysis = RegionPruningAnalysis::new(&program.regions);
+
+        // A parent query must reuse the child's existing plan for both attachments of that child.
+        let live = analysis.live_sets(branch, &[0]).unwrap();
+        assert_eq!(live.atoms(), &[true, false, true, false]);
+        assert_eq!(live.instructions(), &[true, false]);
+        let first_branch_key = (branch, vec![true, false]);
+        let first_branch = analysis.prunings[&first_branch_key].clone();
+        let first = analysis.live_sets(program.entry(), &[0]).unwrap();
+        assert_eq!(first.atoms(), &[true, true, false, true, false]);
+        assert_eq!(first.instructions(), &[true]);
+        assert_eq!(analysis.prunings.len(), 2);
+        assert!(Rc::ptr_eq(&first_branch, &analysis.prunings[&first_branch_key]));
+        let first_key = (program.entry(), vec![true, false]);
+        let first_plan = analysis.prunings[&first_key].clone();
+
+        // Repeating an output position does not create another demand key or replace either cached plan.
+        assert_eq!(analysis.live_sets(program.entry(), &[0, 0]), Ok(first));
+        assert_eq!(analysis.prunings.len(), 2);
+        assert!(Rc::ptr_eq(&first_plan, &analysis.prunings[&first_key]));
+        assert!(Rc::ptr_eq(&first_branch, &analysis.prunings[&first_branch_key]));
+
+        // Selecting the other output creates distinct plans and follows the other input in both regions.
+        let second = analysis.live_sets(program.entry(), &[1]).unwrap();
+        assert_eq!(second.atoms(), &[true, false, true, false, true]);
+        assert_eq!(second.instructions(), &[true]);
+        let second_branch = analysis.live_sets(branch, &[1]).unwrap();
+        assert_eq!(second_branch.atoms(), &[false, true, false, true]);
+        assert_eq!(second_branch.instructions(), &[false, true]);
+        assert_eq!(analysis.prunings.len(), 4);
+        assert!(!Rc::ptr_eq(&first_plan, &analysis.prunings[&(program.entry(), vec![false, true])]));
+        assert!(!Rc::ptr_eq(&first_branch, &analysis.prunings[&(branch, vec![false, true])]));
+
+        // Demand order and multiplicity are irrelevant: all equivalent selections reuse the all-output plans.
+        let both = analysis.live_sets(program.entry(), &[1, 0, 1]).unwrap();
+        assert_eq!(both.atoms(), &[true; 5]);
+        assert_eq!(both.instructions(), &[true]);
+        let both_key = (program.entry(), vec![true, true]);
+        let both_branch_key = (branch, vec![true, true]);
+        let both_plan = analysis.prunings[&both_key].clone();
+        let both_branch = analysis.prunings[&both_branch_key].clone();
+        assert_eq!(analysis.live_sets(program.entry(), &[0, 1]), Ok(both));
+        let live = analysis.live_sets(branch, &[1, 0]).unwrap();
+        assert_eq!(live.atoms(), &[true; 4]);
+        assert_eq!(live.instructions(), &[true; 2]);
+        assert_eq!(analysis.prunings.len(), 6);
+        assert!(Rc::ptr_eq(&both_plan, &analysis.prunings[&both_key]));
+        assert!(Rc::ptr_eq(&both_branch, &analysis.prunings[&both_branch_key]));
+    }
+
+    #[test]
+    fn test_region_pruning_analysis_live_sets_scopes_cache_to_arena() {
+        // Both entries have the same RegionId and output mask, but only the second arena retains a print and its
+        // otherwise unused input. A cache shared by RegionId alone would return the first arena's smaller masks.
+        let pure = pruning_branch(false);
+        let effectful = pruning_branch(true);
+        assert_eq!(pure.entry(), effectful.entry());
+        let mut pure_analysis = RegionPruningAnalysis::new(&pure.regions);
+        let mut effectful_analysis = RegionPruningAnalysis::new(&effectful.regions);
+        let pure_live = pure_analysis.live_sets(pure.entry(), &[0]).unwrap();
+        assert_eq!(pure_live.atoms(), &[true, false, true, false]);
+        assert_eq!(pure_live.instructions(), &[true, false]);
+        let effectful_live = effectful_analysis.live_sets(effectful.entry(), &[0]).unwrap();
+        assert_eq!(effectful_live.atoms(), &[true, true, true, false, false]);
+        assert_eq!(effectful_live.instructions(), &[true, false, true]);
+        let key = (pure.entry(), vec![true, false]);
+        assert!(!Rc::ptr_eq(&pure_analysis.prunings[&key], &effectful_analysis.prunings[&key]));
+        assert_eq!(pure_analysis.live_sets(pure.entry(), &[0]), Ok(pure_live));
     }
 }
