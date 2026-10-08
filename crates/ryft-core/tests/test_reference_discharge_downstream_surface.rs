@@ -977,6 +977,15 @@ impl ReferenceTransform for RegisterTransform {
         Ok(input.clone())
     }
 
+    fn access_type(
+        &self,
+        input: &RegisterType,
+        _bindings: &[&RegisterIrType],
+        _mode: ReferenceAccessMode,
+    ) -> Result<RegisterType, TypeError> {
+        self.output_type(input)
+    }
+
     fn overlap(
         _type: &RegisterIrType,
         lhs: &[BoundReferenceTransform<Self>],
@@ -2089,6 +2098,15 @@ fn test_downstream_reference_access_analysis_does_not_require_batching() {
             Ok(input.clone())
         }
 
+        fn access_type(
+            &self,
+            input: &RegisterType,
+            bindings: &[&RegisterIrType],
+            mode: ReferenceAccessMode,
+        ) -> Result<RegisterType, TypeError> {
+            RegisterTransform::Bit.access_type(input, bindings, mode)
+        }
+
         fn overlap(
             _type: &RegisterIrType,
             lhs: &[BoundReferenceTransform<Self>],
@@ -2817,15 +2835,28 @@ mod custom_array_transforms {
     impl ReferenceTransform for CustomTransform {
         type Type = ArrayIrType;
         type Referent = ArrayType;
+
         fn binding_count(&self) -> usize {
             self.0.binding_count()
         }
+
         fn validate_bindings(&self, input: &ArrayType, bindings: &[&ArrayIrType]) -> Result<(), TypeError> {
             self.0.validate_bindings(input, bindings)
         }
+
         fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
             self.0.output_type(input)
         }
+
+        fn access_type(
+            &self,
+            input: &ArrayType,
+            bindings: &[&ArrayIrType],
+            mode: ReferenceAccessMode,
+        ) -> Result<ArrayType, TypeError> {
+            self.0.access_type(input, bindings, mode)
+        }
+
         fn overlap(
             _type: &ArrayIrType,
             lhs: &[BoundReferenceTransform<Self>],
@@ -2872,36 +2903,44 @@ mod custom_array_transforms {
             Self::Read(operation)
         }
     }
+
     impl From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>> for CustomOperation {
         fn from(operation: ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>) -> Self {
             Self::AddUpdate(operation)
         }
     }
+
     impl From<ReferenceNewOperation<ArrayType, ArrayIrType>> for CustomOperation {
         fn from(operation: ReferenceNewOperation<ArrayType, ArrayIrType>) -> Self {
             Self::Core(operation.into())
         }
     }
+
     impl From<ReferenceFreezeOperation<ArrayType, ArrayIrType>> for CustomOperation {
         fn from(operation: ReferenceFreezeOperation<ArrayType, ArrayIrType>) -> Self {
             Self::Core(operation.into())
         }
     }
+
     impl From<AddOperation<ArrayIrType>> for CustomOperation {
         fn from(operation: AddOperation<ArrayIrType>) -> Self {
             Self::Core(operation.into())
         }
     }
+
     impl OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for CustomOperation {
         type Operation = Self;
+
         fn provide(request: ZeroOperation<ArrayIrType>, inputs: &[&ArrayIrType]) -> Result<Self, ProgramError> {
             CoreOperation::provide(request, inputs).map(Self::Core)
         }
     }
+
     impl ResidualZeroProvider<ArrayIrType> for CustomOperation {}
 
     impl Operation for CustomOperation {
         type Type = ArrayIrType;
+
         fn name(&self) -> &'static str {
             match self {
                 Self::Core(operation) => operation.name(),
@@ -2909,6 +2948,7 @@ mod custom_array_transforms {
                 Self::AddUpdate(operation) => operation.name(),
             }
         }
+
         fn infer_output_types(
             &self,
             inputs: &[ArrayIrType],
@@ -2920,6 +2960,7 @@ mod custom_array_transforms {
                 Self::AddUpdate(operation) => operation.infer_output_types(inputs, regions),
             }
         }
+
         fn effects(&self) -> Cow<'_, Effects> {
             match self {
                 Self::Core(operation) => operation.effects(),
@@ -2927,6 +2968,7 @@ mod custom_array_transforms {
                 Self::AddUpdate(operation) => operation.effects(),
             }
         }
+
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
             match self {
                 Self::Core(operation) => operation.render(formatter, indentation),
@@ -2935,13 +2977,16 @@ mod custom_array_transforms {
             }
         }
     }
+
     impl Display for CustomOperation {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             self.render(formatter, 0)
         }
     }
+
     impl ReferenceAccessOperation for CustomOperation {
         type Transform = CustomTransform;
+
         fn base_input_count(&self) -> usize {
             match self {
                 Self::Core(operation) => operation.base_input_count(),
@@ -2949,6 +2994,7 @@ mod custom_array_transforms {
                 Self::AddUpdate(operation) => operation.base_input_count(),
             }
         }
+
         fn reference_access_descriptor(&self, input: usize) -> Option<ReferenceAccessDescriptor<'_, CustomTransform>> {
             match self {
                 Self::Read(operation) => operation.reference_access_descriptor(input),
@@ -2959,6 +3005,7 @@ mod custom_array_transforms {
                 _ => None,
             }
         }
+
         fn with_reference_access_transforms(
             &self,
             input: usize,
@@ -2976,14 +3023,17 @@ mod custom_array_transforms {
             }
         }
     }
+
     impl From<ArrayOperation<Array>> for CustomOperation {
         fn from(operation: ArrayOperation<Array>) -> Self {
             Self::Core(operation.into())
         }
     }
+
     impl OperationProjection<ArrayType> for CustomOperation {
         type Projected = ArrayOperation<Array>;
     }
+
     impl OperationPayloadProjection for CustomOperation {
         fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
             match self {
@@ -2997,6 +3047,7 @@ mod custom_array_transforms {
             CoreOperation::from_payload(payload).map(Self::Core)
         }
     }
+
     impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CustomOperation
     where
         CoreOperation: InterpretableOperation<C>,
@@ -3010,6 +3061,7 @@ mod custom_array_transforms {
             self.builtin().interpret(context, driver, inputs)
         }
     }
+
     impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for CustomOperation where
         C: Context<Operation = CustomOperation>
     {
@@ -3018,10 +3070,16 @@ mod custom_array_transforms {
     /// An explicit downstream policy, distinct from ArrayIrType's canonical policy.
     #[derive(Copy, Clone, Debug)]
     struct CustomPolicy;
+
     impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceDischargePolicy<C> for CustomPolicy {
         type Referent = ArrayType;
         type Transform = CustomTransform;
         type Alias = ArrayReferenceTransformPath<C::Value>;
+
+        fn storage_alias(_referent: &ArrayType) -> Self::Alias {
+            ArrayReferenceTransformPath::root()
+        }
+
         fn apply_transforms(
             context: &C,
             alias: &Self::Alias,
@@ -3035,12 +3093,11 @@ mod custom_array_transforms {
                 bindings,
             )
         }
-        fn storage_alias(_referent: &ArrayType) -> Self::Alias {
-            ArrayReferenceTransformPath::root()
-        }
+
         fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError> {
             ArrayReferenceDischarge::read(context, current, alias)
         }
+
         fn write(
             context: &C,
             current: &C::Value,
@@ -3050,6 +3107,7 @@ mod custom_array_transforms {
             ArrayReferenceDischarge::write(context, current, replacement, alias)
         }
     }
+
     impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceAccumulationPolicy<C> for CustomPolicy {
         fn accumulate(
             context: &C,
@@ -3060,6 +3118,7 @@ mod custom_array_transforms {
             ArrayReferenceDischarge::accumulate(context, current, update, alias)
         }
     }
+
     impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceDischargeableOperation<C, CustomPolicy>
         for CustomOperation
     {
@@ -3082,6 +3141,7 @@ mod custom_array_transforms {
             }
         }
     }
+
     impl<C: Context<Type = ArrayIrType, Operation = CustomOperation> + Zero<C::Value>> DifferentiableOperation<C>
         for CustomOperation
     {
@@ -3103,6 +3163,7 @@ mod custom_array_transforms {
             }
         }
     }
+
     impl TransposableOperation<ArrayValue, CustomOperation> for CustomOperation {
         fn transpose<D: TranspositionDriver<ArrayValue, CustomOperation>>(
             &self,
@@ -3125,6 +3186,7 @@ mod custom_array_transforms {
             }
         }
     }
+
     impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>, P: BatchingPolicy<C>> BatchableOperation<C, P>
         for CustomOperation
     {
@@ -3214,6 +3276,7 @@ mod custom_array_transforms {
         let discharged = program.into_flat_program().discharge_references_with_policy::<CustomPolicy>(0).unwrap();
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
     }
+
     #[test]
     fn test_downstream_array_view_batching() {
         use ryft_core::{

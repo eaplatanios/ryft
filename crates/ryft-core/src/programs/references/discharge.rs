@@ -4778,16 +4778,27 @@ mod tests {
         fn binding_count(&self) -> usize {
             0
         }
+
         fn validate_bindings(&self, input: &ListType, bindings: &[&ListIrType]) -> Result<(), TypeError> {
             check_count!("binding", bindings, 0, TypeError);
             self.output_type(input).map(|_| ())
         }
+
         fn output_type(&self, input: &ListType) -> Result<ListType, TypeError> {
             if self.offset.checked_add(self.length).is_none_or(|end| end > input.length) {
                 return Err(TypeError::invalid("list transform exceeds its input length"));
             }
             Ok(ListType { length: self.length })
         }
+        fn access_type(
+            &self,
+            input: &ListType,
+            _bindings: &[&ListIrType],
+            _mode: ReferenceAccessMode,
+        ) -> Result<ListType, TypeError> {
+            self.output_type(input)
+        }
+
         fn overlap(
             _type: &ListIrType,
             _lhs: &[BoundReferenceTransform<Self>],

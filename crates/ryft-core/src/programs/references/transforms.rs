@@ -65,18 +65,44 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     ///   - `bindings`: Types of this transform's dynamic inputs in the transform family's binding order.
     fn validate_bindings(&self, input: &Self::Referent, bindings: &[&Self::Type]) -> Result<(), TypeError>;
 
-    /// Returns the referent type after applying this transform to `input`. Rejects transforms that cannot apply to that
-    /// referent, including transforms through which an update could not be written back to `input`.
+    /// Returns the structural referent type after applying this transform to `input`, for view construction and
+    /// batching before an access mode and dynamic binding types are available. Validates the selection and write-back
+    /// constraints that can be determined from the transform and `input` alone. Metadata carried by dynamic bindings
+    /// is incorporated by [`access_type`](Self::access_type) when an actual access is typed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the transform cannot apply to `input` or fails its structural write-back constraints.
     fn output_type(&self, input: &Self::Referent) -> Result<Self::Referent, TypeError>;
 
-    /// Returns the referent type that a read-only access selects by applying this transform to `input`. Unlike
-    /// [`output_type`](Self::output_type), this function need not prove that an update through the transform could be
-    /// written back to `input`, because a read-only access never writes back. Families whose write-back validation
-    /// is expensive override this function to skip it. Note that, the default implementation delegates to
-    /// [`output_type`](Self::output_type).
-    fn read_type(&self, input: &Self::Referent) -> Result<Self::Referent, TypeError> {
-        self.output_type(input)
-    }
+    /// Returns the referent type that an access in `mode` selects by applying this transform to `input`
+    /// with dynamic inputs of types `bindings`. Callers must first validate those bindings against `input`
+    /// through [`validate_bindings`](Self::validate_bindings). Unlike structural derivation through
+    /// [`output_type`](Self::output_type), this function accounts for metadata carried by the bindings and the access
+    /// mode. A [`Read`](ReferenceAccessMode::Read) access need not validate write-back, while every other access mode
+    /// must validate that the selection can be written back to `input`.
+    ///
+    /// For example, an array index that varies over manual mesh axes selects a different element on each device, so
+    /// a read through it varies over those axes as well, while a mutation through it is rejected unless the referent
+    /// already varies over them, because the devices would otherwise update different elements of a referent that is
+    /// typed as identical across them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input`: Referent type before this transform is applied.
+    ///   - `bindings`: Types of this transform's dynamic inputs in the transform family's binding order.
+    ///   - `mode`: Access mode of the operation applying this transform.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the transform cannot apply to `input`, binding metadata is incompatible with the
+    /// referent, or a mutating access cannot be written back to `input`.
+    fn access_type(
+        &self,
+        input: &Self::Referent,
+        bindings: &[&Self::Type],
+        mode: ReferenceAccessMode,
+    ) -> Result<Self::Referent, TypeError>;
 
     /// Returns whether `lhs` and `rhs` address separate parts, exactly the same part, or potentially overlapping
     /// parts of the same reference allocation, without executing the program. Both paths must be relative to the
@@ -392,6 +418,12 @@ impl<T: 'static + Type, U: 'static + Type> ReferenceTransform for NoReferenceTra
         }
     }
 
+    fn access_type(&self, _input: &T, _bindings: &[&U], _mode: ReferenceAccessMode) -> Result<T, TypeError> {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+
     fn overlap(
         _type: &U,
         _lhs: &[BoundReferenceTransform<Self>],
@@ -418,9 +450,10 @@ pub enum NoReferenceTransformBinding {}
 /// Validates dynamic bindings and derives the referent of the view produced by an ordered path, applying its
 /// transforms in order. Every transform consumes its own consecutive group of [`ReferenceTransform::binding_count`]
 /// ordinary (non-reference) inputs, whose types are validated against the referent produced by the preceding transform
-/// before the transform computes the next one. A [`Read`](ReferenceAccessMode::Read) access derives each referent
-/// through [`ReferenceTransform::read_type`], and every other access mode also validates that updates can be written
-/// back through [`ReferenceTransform::output_type`].
+/// before the transform computes the next one through [`ReferenceTransform::access_type`].
+/// A [`Read`](ReferenceAccessMode::Read) access need not validate write-back, while every other access mode validates
+/// that updates can be written back through each transform. Type derivation also incorporates metadata carried by
+/// dynamic bindings, such as the manual variation of an array index.
 ///
 /// # Parameters
 ///
@@ -448,10 +481,7 @@ pub fn infer_reference_view_type<Transform: ReferenceTransform>(
 
         let (current, rest) = remaining.split_at(count);
         transform.validate_bindings(&output, current)?;
-        output = match mode {
-            ReferenceAccessMode::Read => transform.read_type(&output)?,
-            _ => transform.output_type(&output)?,
-        };
+        output = transform.access_type(&output, current, mode)?;
         remaining = rest;
     }
 
@@ -815,8 +845,16 @@ pub(crate) mod tests {
                 Err(TypeError::invalid("`read_only` transforms cannot be written back"))
             }
 
-            fn read_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
-                Ok(input.clone())
+            fn access_type(
+                &self,
+                input: &ArrayType,
+                _bindings: &[&ArrayIrType],
+                mode: ReferenceAccessMode,
+            ) -> Result<ArrayType, TypeError> {
+                match mode {
+                    ReferenceAccessMode::Read => Ok(input.clone()),
+                    _ => self.output_type(input),
+                }
             }
 
             fn overlap(

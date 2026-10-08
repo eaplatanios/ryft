@@ -1276,12 +1276,25 @@ impl LocalReferenceLifecycles {
         self.recomputable[index]
     }
 
-    /// Returns the positions, in the region's instruction list, of the instructions preceding position `index` that
-    /// allocate or mutate a selected root touched by the instruction at `index`: the state predecessors that a replay
-    /// must execute first so that the instruction observes its primal state.
+    /// Returns whether each instruction and all state predecessors needed to reproduce its observations are
+    /// recomputable. Every dependency precedes its consumer, so a forward pass evaluates each instruction once.
+    pub(crate) fn replayable_instructions(&self) -> Vec<bool> {
+        let mut replayable = Vec::with_capacity(self.recomputable.len());
+        for (index, recomputable) in self.recomputable.iter().enumerate() {
+            let eligible = *recomputable && self.state_predecessors(index).all(|predecessor| replayable[predecessor]);
+            replayable.push(eligible);
+        }
+        replayable
+    }
+
+    /// Returns the latest strictly earlier allocation or mutation for each selected root touched by instruction
+    /// `index`. Replaying the transitive closure reproduces every earlier mutation, while each direct dependency
+    /// list contains at most one instruction per root. Reads do not mutate the root and are never predecessors.
     pub(crate) fn state_predecessors(&self, index: usize) -> impl '_ + Iterator<Item = usize> {
-        self.roots[index].iter().flat_map(move |root| {
-            self.mutations[root].iter().copied().take_while(move |predecessor| *predecessor < index)
+        self.roots[index].iter().filter_map(move |root| {
+            let mutations = &self.mutations[root];
+            let earlier = mutations.partition_point(|predecessor| *predecessor < index);
+            earlier.checked_sub(1).map(|position| mutations[position])
         })
     }
 
@@ -5384,19 +5397,53 @@ mod tests {
             (0..region.instructions().len()).map(|index| lifecycles.is_recomputable(index)).collect::<Vec<_>>(),
             vec![true, false, true],
         );
+        assert_eq!(lifecycles.replayable_instructions(), vec![true, false, false]);
+    }
+
+    #[test]
+    fn test_local_reference_lifecycles_replayable_instructions_large_lifecycle() {
+        // Demand every intervening read to verify replay eligibility, sparse predecessor edges, and the complete
+        // transitive slice of a long lifecycle.
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let mut outputs = Vec::new();
+        for _ in 0..2000 {
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+                .unwrap();
+            outputs.push(
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0],
+            );
+        }
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(outputs, vec![Placeholder], vec![Placeholder; 2000])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let lifecycles = region.reference_analysis(0).unwrap().local_lifecycles(region, |_| true).unwrap();
+        assert_eq!(lifecycles.replayable_instructions(), vec![true; 4001]);
+        assert_eq!((0..4001).map(|index| lifecycles.state_predecessors(index).count()).sum::<usize>(), 4000);
+        let needed = lifecycles.slice(
+            region,
+            &region.region().instruction_by_output(),
+            region.output_ids().iter().copied(),
+            |_| false,
+        );
+        assert_eq!(needed, (0..4001).collect());
     }
 
     #[test]
     fn test_local_reference_lifecycles_state_predecessors() {
-        // Each access is preceded by the allocation and by the earlier mutations of its root, but not by reads.
+        // Each access directly depends on only the latest earlier mutation of its root, never a read or itself.
         let program = local_reference_lifecycles_fixture();
         let region = program.entry_region_ref();
         let analysis = region.reference_analysis(0).unwrap();
         let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
         assert_eq!(lifecycles.state_predecessors(0).collect::<Vec<_>>(), Vec::<usize>::new());
         assert_eq!(lifecycles.state_predecessors(1).collect::<Vec<_>>(), vec![0]);
-        assert_eq!(lifecycles.state_predecessors(3).collect::<Vec<_>>(), vec![0, 2]);
-        assert_eq!(lifecycles.state_predecessors(7).collect::<Vec<_>>(), vec![0, 2, 5]);
+        assert_eq!(lifecycles.state_predecessors(3).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(lifecycles.state_predecessors(7).collect::<Vec<_>>(), vec![5]);
         assert_eq!(lifecycles.state_predecessors(6).collect::<Vec<_>>(), Vec::<usize>::new());
     }
 

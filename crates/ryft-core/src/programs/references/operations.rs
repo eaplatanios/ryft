@@ -463,6 +463,15 @@ pub(crate) mod tests {
                 Ok(input.clone())
             }
 
+            fn access_type(
+                &self,
+                input: &ArrayType,
+                _bindings: &[&ArrayIrType],
+                _mode: ReferenceAccessMode,
+            ) -> Result<ArrayType, TypeError> {
+                self.output_type(input)
+            }
+
             fn overlap(
                 _type: &ArrayIrType,
                 _lhs: &[BoundReferenceTransform<Self>],
