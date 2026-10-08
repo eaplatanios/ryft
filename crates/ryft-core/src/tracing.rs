@@ -399,6 +399,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// type (such as a backend whose runtime [`Domain::Value`] differs from its staged [`Domain::Constant`]) observe
     /// that same context type. The trace must not register captures. Refer to the documentation of
     /// [`trace_with_named_axes`](Self::trace_with_named_axes) for the rationale and the rejection semantics.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -421,8 +422,59 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// occupies the referenced slot. Such traces are therefore rejected with [`ProgramError::DiscardedCaptures`].
     /// Traces that need to capture must construct their [`TracingContext`] directly and pair the traced program with
     /// the context's [`captures`](Self::captures) table (e.g., through a [`ClosedProgram`](crate::ClosedProgram)).
+    #[allow(clippy::type_complexity)]
+    #[inline]
     pub fn trace_with_named_axes<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        Self::trace_with_context_and_named_axes(|_, input| function(input), input_type, named_axes)
+    }
+
+    /// Creates a fresh [`TracingContext`] seeded with `named_axes` and traces `function` against `input_type`. Like
+    /// [`trace_with_named_axes`](Self::trace_with_named_axes), this returns the output types and finalized [`Program`],
+    /// but passes both the new context and the input [`Tracer`] structure to `function`. The context lets functions
+    /// with no input leaves create values through [`Context::lift`] or read named-axis indices through
+    /// [`AxisIndex`](crate::AxisIndex). It does not reuse an existing context or inherit its named axes.
+    ///
+    /// Output tracers must belong to the new context, and the callback must not retain that context or its tracers
+    /// after returning. Captures are rejected because the returned program has no accompanying capture table. Refer
+    /// to [`trace_with_named_axes`](Self::trace_with_named_axes) for the rationale and capture-owning alternatives.
+    ///
+    /// # Examples
+    ///
+    /// A function with no inputs can lift a constant through the explicitly supplied context:
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayOperation, Context, TracingContext};
+    /// let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+    ///     |context, ()| context.lift(Array::scalar(3f32).unwrap()),
+    ///     (),
+    ///     Vec::new(),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(program.interpret(()).unwrap(), Array::scalar(3f32).unwrap());
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Callback receiving the fresh tracing context and inputs with the structure of `input_type`.
+    ///   - `input_type`: Structured input types. Use `()` when the function has no inputs.
+    ///   - `named_axes`: Named-axis bindings available to the callback and operations it stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from the callback or program construction, [`ProgramError::MismatchedProgramBuilders`] for
+    /// foreign output tracers, [`ProgramError::EscapedProgramBuilder`] if the callback retains the tracing context
+    /// or a tracer, and [`ProgramError::DiscardedCaptures`] if the trace registers captures.
+    #[allow(clippy::type_complexity)]
+    pub fn trace_with_context_and_named_axes<
+        F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
@@ -452,16 +504,18 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         function: F,
         input_type: Input,
     ) -> Result<Output::To<V::Type>, ProgramError> {
-        Ok(Self::trace_with_named_axes_counting_captures(function, input_type, Vec::new())?.0)
+        Ok(Self::trace_with_named_axes_counting_captures(|_, input| function(input), input_type, Vec::new())?.0)
     }
 
     /// Traces like [`trace_with_named_axes`](Self::trace_with_named_axes) but additionally reports the number of
     /// captures the trace registered into its local (and discarded) capture table, leaving the decision of whether
     /// discarding them is acceptable to the caller. [`trace_with_named_axes`](Self::trace_with_named_axes) rejects
     /// such traces because it retains the program, while [`infer_output_type`](Self::infer_output_type) tolerates
-    /// them because it discards the program along with the captures.
+    /// them because it discards the program along with the captures. It passes the trace's context to `function`
+    /// together with its inputs, like [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes).
+    #[allow(clippy::type_complexity)]
     fn trace_with_named_axes_counting_captures<
-        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
         Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
@@ -481,7 +535,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
                 provenance: Rc::new(ProvenanceState::new()),
             };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
-            let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
+            let output = function(&context, input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
 
             // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
             // whichever atom shares its index in this builder, and so we check for this here.
@@ -1170,14 +1224,14 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-        DimensionVariable, Shape,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
-    use crate::axes::NamedAxes;
+    use crate::axes::{AxisError, NamedAxes};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike, OneOperation,
+        AddOperation, AxisIndex, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike, OneOperation,
         ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite, ZeroLike,
         ZeroOperation,
     };
@@ -1784,6 +1838,102 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes() {
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| context.lift(Array::scalar(3f32).unwrap()),
+            (),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::F32));
+        assert_eq!(program.interpret(()), Ok(Array::scalar(3f32).unwrap()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = const 3.0
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_axis_index() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 };
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| {
+                assert_eq!(context.named_axis("devices"), Some(axis.clone()));
+                assert!(matches!(
+                    context.axis_index("missing"),
+                    Err(ProgramError::Axis(AxisError::UnboundAxisName { name })) if name == "missing",
+                ));
+                context.axis_index("devices")
+            },
+            (),
+            vec![("devices".to_string(), axis.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayType::scalar(DataType::U64)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:u64[][sharding={mesh<['devices'=2:manual]>, [], varying_manual={'devices'}}] = \
+                        axis_index [axis_name=\"devices\", mesh=['devices'=2:manual]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_captures() {
+        let result =
+            TracingContext::<CaptureReference<ArrayType>, TestArrayOperation, Array>::trace_with_context_and_named_axes(
+                |context, ()| {
+                    let reference = context.capture(Array::scalar(3f32).unwrap())?;
+                    Ok(context.constant(reference))
+                },
+                (),
+                Vec::new(),
+            );
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_foreign_outputs() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |_, ()| context.lift(Array::scalar(3f32).unwrap()),
+            (),
+            Vec::new(),
+        );
+        assert!(matches!(result, Err(ProgramError::MismatchedProgramBuilders)));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_escaped_context() {
+        let mut escaped_context = None;
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| {
+                escaped_context = Some(context.clone());
+                context.lift(Array::scalar(3f32).unwrap())
+            },
+            (),
+            Vec::new(),
+        );
+        assert!(escaped_context.is_some());
+        assert!(matches!(result, Err(ProgramError::EscapedProgramBuilder)));
     }
 
     #[test]
