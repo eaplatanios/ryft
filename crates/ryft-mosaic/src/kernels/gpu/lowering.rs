@@ -1448,7 +1448,7 @@ mod tests {
         MaskedLoadOperation, ScratchOperation, WaitOperation, whole_array_parameter,
     };
     use ryft_core::{
-        AddOperation, ArrayIrType, Context as CoreContext, Dimension, NestedTracingContext, ReferenceRead,
+        AddOperation, ArrayIrType, Condition, Context as CoreContext, Dimension, NestedTracingContext, ReferenceRead,
         ReferenceWrite, WhileOperation,
     };
     use ryft_mlir::dialects::mosaic::gpu::mosaic_gpu_serde_version;
@@ -2006,8 +2006,7 @@ mod tests {
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let predicate = references[0].read()?;
             let value = references[1].read()?;
-            let result = ryft_core::condition(
-                &predicate,
+            let result = predicate.condition(
                 vec![value],
                 |inputs| {
                     inputs[0].context().bind(

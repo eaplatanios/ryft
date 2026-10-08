@@ -775,7 +775,7 @@ impl_differentiable_operation! {
                             // next to positive infinity, while the infinite inputs retain undefined derivatives.
                             let zero = maximum.zero_like()?;
                             let finite = maximum.sub(&maximum)?.equal(&zero)?;
-                            let maximum = C::Value::select(&finite, &maximum, &zero)?;
+                            let maximum = finite.select(&maximum, &zero)?;
                             let maximum = maximum.broadcast(input_type.clone(), output_axes.as_slice())?;
                             let exponentials = primal_input.sub(&maximum)?.exp()?;
                             let denominator = exponentials.reduce(operation.axes(), ReductionKind::Sum)?;

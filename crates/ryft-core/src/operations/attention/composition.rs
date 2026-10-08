@@ -304,11 +304,9 @@ where
     let score_type = <&ArrayType>::try_from(score_type.as_ref())?;
     let large_negative = if score_type.data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
     let masked = fill_like(&scores, large_negative)?;
-    Ok(<V as ValueProjection<ArrayType>>::from_projected(<ArrayProjection<V> as Select>::select(
-        &visible.unwrap(),
-        &scores_array,
-        &project_array::<V>(masked)?,
-    )?))
+    Ok(<V as ValueProjection<ArrayType>>::from_projected(
+        visible.unwrap().select(&scores_array, &project_array::<V>(masked)?)?,
+    ))
 }
 
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention compositions.
@@ -545,7 +543,7 @@ where
     let lengths = query_lengths.clone().dynamic_broadcast(array_dimensions(&value)?.as_slice(), &[0])?;
     let in_range = project_array::<V>(rows)?.compare(&project_array::<V>(lengths)?, ComparisonDirection::LessThan)?;
     let zero = fill_like(&value, 0.0)?;
-    <ArrayProjection<V> as Select>::select(&in_range, &project_array::<V>(value)?, &project_array::<V>(zero)?)
+    in_range.select(&project_array::<V>(value)?, &project_array::<V>(zero)?)
 }
 
 /// Evaluates the portable attention backward pass in the mixed array IR using the same first-class geometry and mask

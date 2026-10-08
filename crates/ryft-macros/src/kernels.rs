@@ -709,20 +709,24 @@ fn body(
                 quote! {
                     let __kernel_predicate = #predicate;
                     let __kernel_carried = __kernel_context.invoke_with_provenance_scope(#source_scope,
-                        || #core::condition(&__kernel_predicate,
-                        vec![#(#names.clone()),*],
-                        |__kernel_values| {
-                            let __kernel_context = __kernel_values[0].context().clone();
-                            #initialization
-                            #then_body
-                            Ok(vec![#(#names.clone()),*])
-                        },
-                        |__kernel_values| {
-                            let __kernel_context = __kernel_values[0].context().clone();
-                            #initialization
-                            #else_body
-                            Ok(vec![#(#names.clone()),*])
-                        }))?;
+                        || {
+                            use #core::Condition as _;
+                            __kernel_predicate.condition(
+                                vec![#(#names.clone()),*],
+                                |__kernel_values| {
+                                    let __kernel_context = __kernel_values[0].context().clone();
+                                    #initialization
+                                    #then_body
+                                    Ok(vec![#(#names.clone()),*])
+                                },
+                                |__kernel_values| {
+                                    let __kernel_context = __kernel_values[0].context().clone();
+                                    #initialization
+                                    #else_body
+                                    Ok(vec![#(#names.clone()),*])
+                                },
+                            )
+                        })?;
                     #restoration
                 }
             }

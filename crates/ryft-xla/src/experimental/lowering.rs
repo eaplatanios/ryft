@@ -161,6 +161,21 @@ pub enum LoweringError {
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
+    /// Error returned when [`to_mlir_module`] lowers a traced shard map whose global input or output type varies along
+    /// a mesh axis that is not one of its own manual axes. Only an enclosing manual region makes such an axis manual
+    /// (e.g., for a body traced with [`ryft_core::trace_shard_map_with_named_axes`]), and the standalone module that
+    /// [`to_mlir_module`] produces has none, so the shard map can only be lowered as part of the program that encloses
+    /// it.
+    #[error(
+        "{value_kind} type #{value_index} of a standalone `shard_map` varies along mesh axis `{axis_name}`, which is \
+         not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
+    )]
+    StandaloneShardMapVariesAlongEnclosingManualAxis {
+        value_kind: &'static str,
+        value_index: usize,
+        axis_name: String,
+    },
+
     /// Underlying program error returned while replaying a staged program through the generic
     /// [`Program::interpret_with`] domain, or raised directly by lowering for a program that it cannot lower (e.g., a
     /// [`ShardMapError`] for a nested manual computation that Shardy cannot represent, which
@@ -7785,14 +7800,35 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 /// [`ProgramError::Custom`] that [`ProgramError::downcast_custom`] recovers) a [`ShardMapError::AxisAlreadyManual`]
 /// when a nested shard map makes an axis manual that an enclosing manual computation already made manual, and a
 /// [`ShardMapError::SpecificationNamesEnclosingManualAxis`] when an input or output sharding of a nested shard map
-/// names such an axis. Other [`LoweringError`]s report failures to lower the traced body (e.g., for operations that
-/// the backend cannot lower or invalid tensor types).
+/// names such an axis. A traced shard map whose global input or output type varies along a mesh axis that is not one
+/// of its own manual axes (e.g., one traced with [`ryft_core::trace_shard_map_with_named_axes`] inside an enclosing
+/// manual region) is rejected with [`LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis`], because the
+/// standalone module has no enclosing manual region that makes such an axis manual. Other [`LoweringError`]s report
+/// failures to lower the traced body (e.g., for operations that the backend cannot lower or invalid tensor types).
 pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>, S: AsRef<str>>(
     traced_shard_map: &TracedShardMap<XlaDomain<'static>, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError> {
     let program = traced_shard_map.body();
     let shard_map = traced_shard_map.operation().shard_map();
+    // The boundary of a standalone module is global, so it cannot carry the variation of enclosing manual regions.
+    for (value_kind, types) in [
+        ("input", traced_shard_map.global_input_types().parameters().collect::<Vec<_>>()),
+        ("output", traced_shard_map.global_output_types().parameters().collect::<Vec<_>>()),
+    ] {
+        for (value_index, r#type) in types.into_iter().enumerate() {
+            let axis_name = r#type.sharding().and_then(|sharding| {
+                sharding.varying_manual_axes().iter().find(|axis| !shard_map.manual_axes().contains(*axis))
+            });
+            if let Some(axis_name) = axis_name {
+                return Err(LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis {
+                    value_kind,
+                    value_index,
+                    axis_name: axis_name.clone(),
+                });
+            }
+        }
+    }
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
     if contains_unresolved_references(program) {
@@ -14471,14 +14507,15 @@ pub(crate) mod tests {
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
         DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
-        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
-        ParallelRaggedAllToAll, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance,
+        LogicalMesh, MeshAxis, MeshAxisType, NamedAxis, OneLike, OneLikeOperation, OneOperation, OrOperation,
+        PadOperation, ParallelRaggedAllToAll, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance,
         ProvenanceScope, RaggedDot, RandomAlgorithm, Reduce, ReduceOperation, Reshape, ReshapeOperation,
         ReverseModeDifferentiate, RngBitGeneratorOperation, ScanOperation, ScatterDimensionNumbers, SelectOperation,
         Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
         TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, ValueProjection,
         WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, batch, i1, i2, i4,
-        shard_map_with_options, trace_shard_map, trace_shard_map_with_options, u1, u2, u4,
+        shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes, trace_shard_map_with_options, u1, u2,
+        u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -19686,6 +19723,42 @@ pub(crate) mod tests {
             to_mlir_module(&traced, "main"),
             Err(LoweringError::Tracing(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
         ));
+    }
+
+    #[test]
+    fn test_to_mlir_module_rejects_shard_maps_varying_along_enclosing_manual_axes() {
+        // A body traced for the named-axis scope of an enclosing manual region over `x` describes a computation nested
+        // in that region, so its global input varies along `x`. A standalone module has no manual region that makes
+        // `x` manual, so lowering the traced shard map on its own is rejected.
+        let mesh = test_logical_mesh_2x2();
+        let sharded = test_sharding(&mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_named_axes(
+            |y: XlaArrayTracer| y.clone() + y,
+            input_type,
+            mesh.clone(),
+            sharded.clone(),
+            sharded,
+            Vec::new(),
+            vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+        )
+        .unwrap();
+        let error = to_mlir_module(&traced, "main").unwrap_err();
+        assert_eq!(
+            error,
+            LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis {
+                value_kind: "input",
+                value_index: 0,
+                axis_name: "x".to_string(),
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "input type #0 of a standalone `shard_map` varies along mesh axis `x`, which is not one of its manual axes; \
+             lower it as part of the program whose manual region makes that axis manual",
+        );
     }
 
     #[test]

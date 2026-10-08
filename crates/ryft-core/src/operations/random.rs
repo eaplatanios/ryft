@@ -541,11 +541,11 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// The state must have the [`RandomAlgorithm::state_type`] of the requested algorithm, and the output element type must
 /// be `u8`, `u16`, `u32`, or `u64`. Narrower outputs keep the low bits of one 32-bit word per element. The output must
 /// be statically shaped (refer to [`DynamicRngBitGenerator`] for dynamic shape support), and neither the state nor the
-/// output may be sharded, since every shard would otherwise draw the same bits, or carry unreduced mesh axes.
-/// For XLA's `shard_map` operation, for example, you must derive per-shard states inside that operation instead.
-/// The bits then vary over the varying manual axes of their state in addition to those of `output_type`. Concrete
-/// [`Array`]s generate the bits immediately, bit-identical with XLA's
-/// [`rng_bit_generator`](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) expansion, while
+/// output may be sharded, since every shard would otherwise draw the same bits, or carry unreduced mesh axes. To draw
+/// distinct bits per shard, derive per-shard states inside the body of a
+/// [`ShardMapOperation`](crate::ShardMapOperation) instead. The bits then vary over the varying manual axes of their
+/// state in addition to those of `output_type`. Concrete [`Array`]s generate the bits immediately, bit-identical with
+/// XLA's [`rng_bit_generator`](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) expansion, while
 /// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers,
 /// and so their derivative is a structural zero.
 ///
@@ -1080,7 +1080,7 @@ impl<
                 // Extend the lower uniform tail with a second draw. Keeping the upper half unchanged prevents
                 // rounding to one, and ln_1p retains the small differences that ordinary `log(1 - x)` would lose.
                 let extended = uniform.add(&low.mul(&scale)?)?.add(&offset)?;
-                let uniform = Self::select(&uniform.greater_than_or_equal(&half)?, &uniform, &extended)?;
+                let uniform = uniform.greater_than_or_equal(&half)?.select(&uniform, &extended)?;
                 (state, uniform.neg()?.ln_1p()?.neg()?.log()?.neg()?)
             }
         };

@@ -1188,11 +1188,7 @@ mod tests {
             assert_eq!(
                 differentiate_at(Array::scalar(input).unwrap()).jvp(Array::scalar(1.0).unwrap(), |input| {
                     let condition = input.greater_than(&input.zero_like()?)?;
-                    Select::select(
-                        &condition,
-                        &(input.clone() + input.clone()),
-                        &(input.clone() + input.clone() + input),
-                    )
+                    condition.select(&(input.clone() + input.clone()), &(input.clone() + input.clone() + input))
                 }),
                 Ok((Array::scalar(primal).unwrap(), Array::scalar(tangent).unwrap())),
             );

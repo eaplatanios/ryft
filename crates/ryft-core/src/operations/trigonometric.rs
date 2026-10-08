@@ -352,9 +352,9 @@ impl_differentiable_operation! {
                 let zero = scale.zero_like()?;
                 let one = scale.one_like()?;
                 let finite = scale.sub(&scale)?.compare(&zero, ComparisonDirection::Equal)?;
-                let scale = C::Value::select(&finite, &scale, &one)?;
+                let scale = finite.select(&scale, &one)?;
                 let is_zero = scale.compare(&zero, ComparisonDirection::Equal)?;
-                let scale = C::Value::select(&is_zero, &one, &scale)?;
+                let scale = is_zero.select(&one, &scale)?;
                 let normalized_x = x_primal.div(&scale)?;
                 let normalized_y = y_primal.div(&scale)?;
                 let denominator = normalized_x.mul(&normalized_x)?.add(&normalized_y.mul(&normalized_y)?)?;

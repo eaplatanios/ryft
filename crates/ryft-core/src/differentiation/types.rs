@@ -517,7 +517,8 @@ where
                                     direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
                                 let zero = context.zero(&rectangular_type)?;
                                 let one = context.one(&rectangular_type)?;
-                                Ok(C::Value::select(&selected, &one, &zero)?
+                                Ok(selected
+                                    .select(&one, &zero)?
                                     .reshape_with_output_sharding(expected_type.shape().clone(), output_sharding)?)
                             } else {
                                 // Flattening is not a placement-preserving reshape for every explicit layout or
@@ -569,7 +570,7 @@ where
                                 let selected = direction_index.compare(&flat_coordinate, ComparisonDirection::Equal)?;
                                 let one = context.one(&expected_type)?;
                                 let zero = context.zero(&expected_type)?;
-                                Ok(C::Value::select(&selected, &one, &zero)?)
+                                Ok(selected.select(&one, &zero)?)
                             }
                         }
                     },

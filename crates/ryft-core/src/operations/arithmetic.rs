@@ -994,7 +994,7 @@ impl_differentiable_operation! {
                         let zero = denominator.zero_like()?;
                         let one = denominator.one_like()?;
                         let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
-                        let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
+                        let denominator = denominator_is_zero.select(&one, &denominator)?;
 
                         // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
                         // algebraically equivalent but can overflow even when the final directional derivative is
@@ -1013,7 +1013,7 @@ impl_differentiable_operation! {
                         let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = input.zero_like()?;
                         let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
-                        MaybeZero::Value(C::Value::select(&non_negative, &tangent, &tangent.neg()?)?)
+                        MaybeZero::Value(non_negative.select(&tangent, &tangent.neg()?)?)
                     }
                 }
             };
@@ -1248,7 +1248,7 @@ impl_differentiable_elementwise_operation! {
         };
         |(left, _), (right, right_tangent)| {
             let base_is_zero = left.compare(&left.zero_like()?, ComparisonDirection::Equal)?;
-            let safe_base = C::Value::select(&base_is_zero, &left.one_like()?, &left)?;
+            let safe_base = base_is_zero.select(&left.one_like()?, &left)?;
             left.pow(&right)?.mul(&safe_base.log()?)?.mul(&right_tangent)?
         };
     },

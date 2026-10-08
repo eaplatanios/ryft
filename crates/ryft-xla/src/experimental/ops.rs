@@ -1411,10 +1411,10 @@ where
 // `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. Tangents for
 // zero differential spaces are omitted from both compact boundaries, and the tangent sub-program is projected onto the
 // output tangents that depend on an active input tangent (refer to
-// [`Linearization::live_tangent_program`](ryft_core::Linearization::live_tangent_program)), since every other output
-// tangent is a structural zero (JAX's `which_nz_out`). When no output tangent is live and the projected tangent
-// sub-program has no observable effects, the rule binds only the source call and pairs every output with a structurally
-// zero tangent. Otherwise, it:
+// [`Program::output_dependence`](ryft_core::Program::output_dependence) and
+// [`Program::with_outputs`](ryft_core::Program::with_outputs)), since every other output tangent is a structural zero
+// (JAX's `which_nz_out`). When no output tangent is live and the projected tangent sub-program has no observable
+// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it:
 //
 //   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
 //      primal outputs followed by the residual values (program variables produced by the staged primal call).
@@ -1481,7 +1481,35 @@ where
         // is projected onto the live output tangents, and every other output is paired with a structurally zero
         // tangent. When no output tangent is live and the tangent callee has no observable effects, no tangent call is
         // bound, and the source callee is bound as the primal call, since nothing would consume its residuals.
-        let (tangent_program, output_activity) = linearization.live_tangent_program(&input_indices)?;
+        //
+        // The tangent program's leading inputs are compact active tangents, not the original primal input indices;
+        // trailing residual inputs are held independent during dependence analysis. Linearization has validated both
+        // boundaries, so subtracting the residual count cannot underflow.
+        let tangent_program = linearization.tangent();
+        let tangent_input_count = tangent_program.input_count() - linearization.residual_count();
+        let tangent_slots = linearization.primal().entry_region_ref().tangent_output_mask(&input_indices)?;
+        let mut dependence =
+            tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
+
+        // Map compact tangent output dependence back to the original callee's output order. Outputs without tangent
+        // slots consume no dependence entry; trailing primal residual outputs are outside this boundary entirely.
+        let output_activity = tangent_slots[..output_count]
+            .iter()
+            .map(|&slot| slot && dependence.next().unwrap())
+            .collect::<Vec<_>>();
+        let live_tangent_slots = (0..output_count)
+            .filter(|&index| tangent_slots[index])
+            .enumerate()
+            .filter_map(|(slot, index)| output_activity[index].then_some(slot))
+            .collect::<Vec<_>>();
+
+        // Output projection retains the complete tangent/residual input boundary and observable effects. Keep the
+        // shared callee handle when every slot is live, preserving the `Arc` identity used for callee interning.
+        let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
+            tangent_program.clone()
+        } else {
+            Arc::new(tangent_program.with_outputs(&live_tangent_slots)?)
+        };
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
             let callee = Arc::new(callee.to_program());
@@ -3058,6 +3086,52 @@ mod tests {
                     %6:f64[4] = zero [type=f64[4]]
                 in (%2, %3, %5, %6)"},
         );
+    }
+
+    #[test]
+    fn test_jit_call_jvp_preserves_live_outputs_around_inactive_tangent() {
+        // `f(x) = (sin(x), 0, x)` has an inactive middle tangent slot. Projecting that slot must leave both live
+        // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![sine, zero, input],
+                    vec![Placeholder],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(r#type.clone());
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.output_types(), vec![r#type; 6]);
+        let calls = jvp
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].outputs().len(), 2);
+        assert_eq!(jvp.output_ids()[3], calls[1].outputs()[0]);
+        assert_eq!(jvp.output_ids()[5], calls[1].outputs()[1]);
+        assert!(jvp.instructions().iter().any(|instruction| {
+            instruction.outputs().contains(&jvp.output_ids()[4]) && instruction.operation().is_zero(0)
+        }));
     }
 
     #[test]

@@ -13641,41 +13641,6 @@ mod tests {
             assert!(!names_opcode(opcode), "the optimized program contains a `{opcode}`");
         }
 
-        // TEMPORARY-ORACLE-BEGIN
-        {
-            let along_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-            let mut builder = XlaProgramBuilder::new();
-            let input = builder
-                .add_input(ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x.clone()).unwrap().into());
-            let resharded = builder
-                .add_instruction(
-                    XlaOperation::Array(ArrayOperation::Reshard(ryft_core::ReshardOperation::new(along_y))),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let output = builder
-                .add_instruction(
-                    XlaOperation::Array(ArrayOperation::Broadcast(ryft_core::BroadcastOperation::new(
-                        caller_type.clone(),
-                        vec![0],
-                    ))),
-                    Vec::new(),
-                    vec![resharded],
-                    None,
-                )
-                .unwrap()[0];
-            let old = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            let lowered = domain.lower_xla_program(&old, 0, &XlaOptions::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_xla_program(&lowered).unwrap();
-            let optimized = compiled.optimized_program().unwrap();
-            let names = |opcode: &str| optimized.bytes.windows(opcode.len()).any(|window| window == opcode.as_bytes());
-            eprintln!("ORACLE old collective-permute: {}", names("collective-permute"));
-        }
-        // TEMPORARY-ORACLE-END
         let cotangent_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(along_x).unwrap();
         let cotangent = XlaArray::from_host_buffer(
             &domain,

@@ -72,9 +72,9 @@ pub use constants::{
     Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, ConditionType, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
+    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
     ScanOperation, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType,
-    condition, transpose_primal_condition,
+    transpose_primal_condition,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_call::{
@@ -163,8 +163,11 @@ pub use rounding::{
     RoundOperation, RoundingOperations,
 };
 pub use sharding::{
-    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard,
-    ReshardOperation, ShardingOperations,
+    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
+    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
+    ShardMapContext, ShardMapError, ShardMapOperation, ShardMapTracer, ShardingOperations, TracedShardMap, shard_map,
+    shard_map_in_context, shard_map_with_options, trace_shard_map, trace_shard_map_with_named_axes,
+    trace_shard_map_with_options,
 };
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};

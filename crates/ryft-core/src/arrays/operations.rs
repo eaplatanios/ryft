@@ -191,7 +191,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Compare<Self, T>
     + Select<T>
     + ManipulationOperations<T>
-    + ShardingOperations
+    + ShardingOperations<Self, T>
     + StopGradient<T>
     + Tag<T>
     + RngBitGenerator<T>
@@ -223,7 +223,7 @@ impl<
         + Compare<V, T>
         + Select<T>
         + ManipulationOperations<T>
-        + ShardingOperations
+        + ShardingOperations<V, T>
         + StopGradient<T>
         + Tag<T>
         + RngBitGenerator<T>

@@ -731,7 +731,7 @@ mod tests {
         let condition = x.compare(&x.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
         let doubled = x.add(&x).unwrap();
         let tripled = doubled.add(&x).unwrap();
-        Select::select(&condition, &doubled, &tripled).unwrap()
+        condition.select(&doubled, &tripled).unwrap()
     }
 
     #[test]
@@ -916,7 +916,7 @@ mod tests {
         let jacobian = differentiate_at((scalar.clone(), vector.clone()))
             .jacobian_reverse(|(scalar, vector)| {
                 let condition = vector.compare(&vector.zero_like()?, ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &scalar, &vector)
+                condition.select(&scalar, &vector)
             })
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -932,7 +932,7 @@ mod tests {
         let jacobian = differentiate_at((scalar, vector))
             .jacobian_reverse(|(scalar, vector)| {
                 let condition = vector.compare(&vector.zero_like()?, ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &vector, &scalar)
+                condition.select(&vector, &scalar)
             })
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();

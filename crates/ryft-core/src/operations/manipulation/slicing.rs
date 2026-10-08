@@ -1757,7 +1757,7 @@ where
                                 .transfer_to_memory(starts_type.memory())?
                                 .broadcast(starts_type, &[])?;
                             let negative = starts.less_than(&starts.zero_like()?)?;
-                            C::Value::select(&negative, &starts.add(&extent)?, &starts)?
+                            negative.select(&starts.add(&extent)?, &starts)?
                         } else {
                             starts
                         };

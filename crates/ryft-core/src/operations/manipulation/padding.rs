@@ -573,7 +573,7 @@ where
             interior_padding.as_slice(),
         )?;
         let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
-        let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
+        let output = mask.select(&padded, &broadcasted_padding)?;
         Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(batch_axis))?.with_ragged_axes(ragged_axes)?].into())
     }
 }

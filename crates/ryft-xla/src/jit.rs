@@ -1855,17 +1855,17 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, ArgMax, Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
-        ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative, CustomCall,
-        CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
+        ComparisonDirection, ConstrainSharding, Context, ConvertElementType, Cos, CotangentDestinationKind, Cumulative,
+        CustomCall, CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
         DimensionBounds, DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers,
         DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
         LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
         Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension,
-        Sin, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value,
-        ValueProjection, WhileOperation, ZeroLike, constrain_sharding, differentiate_at, reshard,
+        ReferenceType, Reshape, Reshard, ScanOperation, Select, Shape, ShardMap, ShardMapOperation, Sharding,
+        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed,
+        Value, ValueProjection, WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -6443,9 +6443,9 @@ mod tests {
         assert_eq!(engine.cache_size(), 0);
     }
 
-    /// Verifies that `constrain_sharding` works inside a `compile`-compiled function over an auto mesh axis: the
-    /// propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the output array carries
-    /// the (input-derived) sharding on each device.
+    /// Verifies that [`ConstrainSharding::constrain_sharding`] works inside a `compile`-compiled function over an
+    /// auto mesh axis: the propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the
+    /// output array carries the (input-derived) sharding on each device.
     #[test]
     fn test_jit_constrain_sharding_constrains_output_sharding() {
         let plugin = load_cpu_plugin().unwrap();
@@ -6465,7 +6465,7 @@ mod tests {
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let constrained =
-                    constrain_sharding(x, target_sharding.clone()).expect("staged sharding constraint should succeed");
+                    x.constrain_sharding(&target_sharding).expect("staged sharding constraint should succeed");
                 constrained.sin().unwrap()
             },
             input_type.clone(),
@@ -6537,9 +6537,9 @@ mod tests {
         // the same MLIR program. After trace+compile, the executable runs all three in one PJRT dispatch.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let a = reshard(x, constraint_a.clone()).unwrap();
-                let b = reshard(a.sin().unwrap(), constraint_b.clone()).unwrap();
-                reshard(b.sin().unwrap(), constraint_c.clone()).unwrap()
+                let a = x.reshard(&constraint_a).unwrap();
+                let b = a.sin().unwrap().reshard(&constraint_b).unwrap();
+                b.sin().unwrap().reshard(&constraint_c).unwrap()
             },
             input_type.clone(),
             &engine,
@@ -7248,7 +7248,7 @@ mod tests {
                 let positions = context.iota(&positions_type, 0)?;
                 let visible = positions
                     .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
-                let masked = V::select(&visible, &scores, &context.fill(&scores_type, -1.0e30f32)?)?;
+                let masked = visible.select(&scores, &context.fill(&scores_type, -1.0e30f32)?)?;
                 let stabilized = masked
                     .sub(&masked.reduce(&[0], ReductionKind::Max).unwrap().broadcast(scores_type.clone(), &[])?)?;
                 let exponentials = stabilized.exp()?;

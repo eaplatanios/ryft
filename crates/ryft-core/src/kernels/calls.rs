@@ -28,9 +28,9 @@ use crate::operations::{
 };
 use crate::parameters::Placeholder;
 use crate::programs::{
-    Atom, FlatProgram, InputRegionProvenance, Operation, OperationFormatter, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Atom, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter, ProgramBuilder,
+    ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
+    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -56,6 +56,18 @@ pub enum KernelError {
     /// Reference access or lifetime validation rejected the body.
     #[error(transparent)]
     Validation(#[from] KernelValidationError),
+
+    /// The body applies an operation that kernels do not support anywhere in their attached-region closure. A
+    /// `shard_map` is the only such operation: a kernel body runs once per grid point of one device, so it cannot
+    /// contain a manual SPMD computation over a device mesh.
+    #[error("kernel body instruction {instruction} applies `{operation}`, which kernel bodies do not support")]
+    UnsupportedOperation {
+        /// Name of the unsupported operation.
+        operation: &'static str,
+
+        /// Instruction that applies the unsupported operation.
+        instruction: InstructionId,
+    },
 
     /// Grid ordering does not admit an access performed on a body parameter.
     #[error("kernel grid does not permit `{mode}` access on parameter {parameter}")]
@@ -489,7 +501,8 @@ impl KernelCallOperation {
 
     /// Validates the exact attached body and applies the same region access policy used by ordinary program analysis.
     /// Direct definitions and eager invocation must not bypass that policy merely because their outer call has not
-    /// been inserted into another program yet.
+    /// been inserted into another program yet. A `shard_map` anywhere in the body's attached-region closure is
+    /// rejected first, with [`KernelError::UnsupportedOperation`].
     pub(crate) fn validate_body<Extension>(
         &self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
@@ -497,6 +510,14 @@ impl KernelCallOperation {
     where
         Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
     {
+        // Every attached region of the body executes as part of the kernel, including the regions of instructions whose
+        // results are unused, so the whole closure is inspected.
+        if let Some((instruction, operation)) = region.instructions_in_closure().find_map(|(id, instruction)| {
+            matches!(instruction.operation(), KernelOperation::Portable(ArrayIrOperation::ShardMap(_)))
+                .then(|| (id, instruction.operation().name()))
+        }) {
+            return Err(KernelError::UnsupportedOperation { operation, instruction });
+        }
         self.infer_output_types(&self.input_types(), &[region.interface()])?;
         let references = validate_kernel_body(region, &self.boundary_contract())?;
         for (parameter, summary) in references.parameters().iter().enumerate() {
@@ -701,7 +722,8 @@ where
     Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
 {
     /// Validates the actual body and its call interface before retaining either. Reference constants, reference
-    /// outputs, undeclared accesses, and incompatible block types fail before a definition becomes observable.
+    /// outputs, undeclared accesses, incompatible block types, and `shard_map` instructions anywhere in the body's
+    /// attached-region closure fail before a definition becomes observable.
     pub fn new(
         operation: KernelCallOperation,
         body: FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
@@ -1219,6 +1241,10 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Rematerialize(_) => {}
+            // Kernel definitions reject `shard_map` instructions (refer to `KernelError::UnsupportedOperation`), so no
+            // definition reaches this arm. The `Debug` rendering above would nevertheless encode every boundary field
+            // of the payload (i.e., its mesh, shardings, active manual axes, global boundary types, and forwarding).
+            ArrayIrOperation::ShardMap(_) => {}
         }
         Ok(())
     }
@@ -1230,19 +1256,20 @@ mod tests {
 
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, DataType, DimensionError, DimensionType,
-        DimensionValue, Layout, Memory, Shape, TiledLayout,
+        DimensionValue, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, TiledLayout,
     };
     use crate::contexts::Context;
     use crate::kernels::authoring::whole_array_parameter;
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
-        CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
-        CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ZeroOperation,
+        ConditionOperation, CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation,
+        CustomRuleDefinition, CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ShardMap, ShardMapOperation,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, ProgramBuilder, ReferenceAccessDescriptor};
+    use crate::programs::{AtomId, EffectClasses, ProgramBuilder, ReferenceAccessDescriptor, RegionId};
 
     use super::*;
 
@@ -1931,6 +1958,122 @@ mod tests {
                 ..
             },))
         ));
+    }
+
+    /// A kernel body runs on one device, so a `shard_map` anywhere in the attached-region closure of its body is
+    /// rejected, whether its result is used, unused, or produced inside a nested region.
+    #[test]
+    fn test_kernel_definition_new_rejects_shard_maps() {
+        // Identity `shard_map` over a replicated scalar, whose body is attached as a kernel-family region.
+        fn identity_shard_map() -> (KernelOperation, FlatProgram<EagerContext<ArrayIrValue<Array>, KernelOperation>>) {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+            let scalar_type = ArrayType::scalar(DataType::I32);
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let body = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+            let shard_map = ShardMap::from_shardings(
+                mesh.clone(),
+                vec![Sharding::replicated(mesh.clone(), 0)],
+                vec![Sharding::replicated(mesh, 0)],
+                vec!["x".to_string()],
+            );
+            let operation = ShardMapOperation::from_boundary(shard_map, vec![scalar_type.clone()], vec![scalar_type]);
+            (KernelOperation::Portable(ArrayIrOperation::ShardMap(Box::new(operation))), body)
+        }
+
+        // Copy kernel `output = f(input)`, where `apply` stages `f` and returns the written value.
+        fn definition(
+            apply: impl FnOnce(&mut ProgramBuilder<ArrayIrValue<Array>, KernelOperation>, AtomId) -> AtomId,
+        ) -> (Result<KernelDefinition, KernelError>, RegionId) {
+            let operation = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![parameter(KernelParameterAccess::ReadOnly), parameter(KernelParameterAccess::WriteOnly)],
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(operation.parameters()[0].body_type());
+            let output = builder.add_input(operation.parameters()[1].body_type());
+            let value = builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![input], None).unwrap()[0];
+            let value = apply(&mut builder, value);
+            builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
+            let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
+            let entry = body.entry_region_ref().id();
+            (KernelDefinition::new(operation, body), entry)
+        }
+
+        // An array-only `shard_map` whose result the kernel writes.
+        let (result, entry) = definition(|builder, value| {
+            let (operation, body) = identity_shard_map();
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], vec![value], None).unwrap()[0]
+        });
+        let error = result.unwrap_err();
+        assert_eq!(
+            error,
+            KernelError::UnsupportedOperation { operation: "shard_map", instruction: InstructionId::new(entry, 1) },
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "kernel body instruction {} applies `shard_map`, which kernel bodies do not support",
+                InstructionId::new(entry, 1),
+            ),
+        );
+
+        // A `shard_map` whose result is unused is rejected too, because the kernel body still contains it.
+        let (result, entry) = definition(|builder, value| {
+            let (operation, body) = identity_shard_map();
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], vec![value], None).unwrap();
+            value
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            KernelError::UnsupportedOperation { operation: "shard_map", instruction: InstructionId::new(entry, 1) },
+        );
+
+        // A `shard_map` inside a nested region of the body is found through the attached-region closure, and the error
+        // names its instruction in that nested region.
+        let mut nested_region = None;
+        let (result, _) = definition(|builder, value| {
+            let branch = |nested: bool| {
+                let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+                let input = branch.add_input(ArrayType::scalar(DataType::I32).into());
+                let output = if nested {
+                    let (operation, body) = identity_shard_map();
+                    let body = branch.import_program(body);
+                    branch.add_instruction(operation, vec![body], vec![input], None).unwrap()[0]
+                } else {
+                    input
+                };
+                branch
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        vec![output],
+                        vec![Placeholder],
+                        vec![Placeholder],
+                    )
+                    .unwrap()
+            };
+            let true_branch = builder.import_program(branch(true));
+            nested_region = Some(true_branch);
+            let false_branch = builder.import_program(branch(false));
+            let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            builder
+                .add_instruction(
+                    ConditionOperation::<ArrayIrType>::new(),
+                    vec![true_branch, false_branch],
+                    vec![predicate, value],
+                    None,
+                )
+                .unwrap()[0]
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            KernelError::UnsupportedOperation {
+                operation: "shard_map",
+                instruction: InstructionId::new(nested_region.unwrap(), 0),
+            },
+        );
     }
 
     #[test]

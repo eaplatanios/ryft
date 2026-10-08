@@ -219,11 +219,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, Context, DataType, Device, DeviceMesh,
-        Differentiate, Dimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, Mul, NamedAxis, ParallelAllGather,
-        ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, ParallelVary, Placeholder, Print, Reduce,
-        ReductionKind, RegionRole, Reshape, Shape, ShardMap, ShardMapOperation, Sharding, ShardingDimension, Sin,
-        StagingContext, Typed, Value, batch, constrain_sharding, reshard, shard_map, shard_map_with_options,
+        Array, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType, Device,
+        DeviceMesh, Differentiate, Dimension, EffectClass, LogicalMesh, MeshAxis, MeshAxisType, Mul, NamedAxis,
+        ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll, ParallelVary, Placeholder, Print,
+        Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap, ShardMapContext, ShardMapOperation,
+        Sharding, ShardingDimension, Sin, StagingContext, Typed, Value, batch, shard_map, shard_map_in_context,
+        shard_map_with_options,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -376,7 +377,7 @@ mod tests {
             {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
-                    reshard(x.sin().unwrap(), sharding.clone()).expect("reshard should stage on traced XLA values")
+                    x.sin().unwrap().reshard(&sharding).expect("reshard should stage on traced XLA values")
                 }
             },
             global_input_type.clone(),
@@ -408,7 +409,7 @@ mod tests {
             {
                 let sharding = sharding.clone();
                 move |x: XlaArrayTracer| {
-                    reshard(x, sharding.clone())
+                    x.reshard(&sharding)
                         .expect("reshard should stage before reshape")
                         .reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(8), Dimension::Static(1)]))
                         .unwrap()
@@ -453,7 +454,7 @@ mod tests {
             {
                 let constraint = constraint.clone();
                 move |x: XlaArrayTracer| {
-                    constrain_sharding(x, constraint.clone()).expect("constraint should stage on traced XLA values")
+                    x.constrain_sharding(&constraint).expect("constraint should stage on traced XLA values")
                 }
             },
             global_input_type.clone(),
@@ -3004,6 +3005,155 @@ mod tests {
     }
 
     #[test]
+    fn test_spmd_batched_shard_map_matches_per_item_results_on_cpu() {
+        use ryft_core::{ArrayIrBatchingPolicy, BatchingContext, ParallelReduce, ShardMapTracer};
+
+        // Batching a `shard_map` over the manual axes `x` and `y` of four CPU devices, whose body sums its local shards
+        // along `x` only, over a leading axis of four items that the input places on `y` (the analogue of JAX's
+        // `spmd_axis_name`) makes `y` free in the batched `shard_map`: every device holds the two items of its
+        // coordinate along `y`, and the result for every item is what the unbatched `shard_map` yields for that item.
+        type BatchedShardMapTracer =
+            ShardMapTracer<BatchingContext<DomainTracingContext<XlaDomain<'static>>, ArrayIrBatchingPolicy>>;
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let caller_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let device_mesh = DeviceMesh::new(
+            caller_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let item_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let batched_sharding =
+            Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let item_sharding = item_sharding.clone();
+                move |x: XlaArrayTracer| {
+                    let output = batch(
+                        |item| {
+                            let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                            let output = shard_map(
+                                |local: BatchedShardMapTracer| local.parallel_reduce(ReductionKind::Sum, "x").unwrap(),
+                                item,
+                                mesh.clone(),
+                                item_sharding.clone(),
+                                item_sharding.clone(),
+                            )?;
+                            Ok(output.into_value())
+                        },
+                        x.into_value(),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::default(),
+                    )
+                    .unwrap();
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                }
+            },
+            static_sharded_array_type(DataType::F32, &[4, 8], batched_sharding.clone()),
+        )
+        .unwrap();
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<4x8xf32>) -> tensor<4x8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"y", ?}, {"x"}]>] out_shardings=[<@mesh, [{"y", ?}, {"x"}]>] manual_axes={"x"} (%arg1: tensor<4x4xf32>) {
+                      %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 2], [1, 3]]> : tensor<2x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %2 : tensor<f32>
+                      }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
+                      sdy.return %1 : tensor<4x4xf32>
+                    } : (tensor<4x8xf32>) -> tensor<4x8xf32>
+                    return %0 : tensor<4x8xf32>
+                  }
+                }
+            "#},
+        );
+
+        // Item `b` of the global `f32[4, 8]` input holds `8 · b + j` at column `j`, so the device at mesh coordinates
+        // `(x, y)` (device `2 · x + y`) holds columns `4 · x` to `4 · x + 3` of items `2 · y` and `2 · y + 1`.
+        let shard = |device: usize| {
+            let (x, y) = (device / 2, device % 2);
+            (2 * y..2 * y + 2)
+                .flat_map(|item| (0..4).map(move |column| (8 * item + 4 * x + column) as f32))
+                .collect::<Vec<_>>()
+        };
+        let buffers = devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard(device_index)).as_slice(),
+                        BufferType::F32,
+                        [2u64, 4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let input = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[4, 8], batched_sharding),
+            device_mesh,
+            buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: mlir_program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap()
+            .into_iter()
+            .map(|output| {
+                values_from_bytes::<f32>(output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap().as_slice())
+            })
+            .collect::<Vec<_>>();
+
+        // The unbatched `shard_map` for item `b` sums the two column blocks of that item along `x`, so its output holds
+        // `(8 · b + c) + (8 · b + 4 + c) = 16 · b + 2 · c + 4` at column `c` of every block. The device at mesh
+        // coordinates `(x, y)` holds the output columns `4 · x` to `4 · x + 3` of items `2 · y` and `2 · y + 1`.
+        for (device_index, device_outputs) in outputs.iter().enumerate() {
+            let y = device_index % 2;
+            let expected = (2 * y..2 * y + 2)
+                .flat_map(|item| (0..4).map(move |column| (16 * item + 2 * column + 4) as f32))
+                .collect::<Vec<_>>();
+            assert_eq!(device_outputs, &expected);
+        }
+    }
+
+    #[test]
     fn test_parallel_reduce_inside_condition_inside_shard_map_lowers_to_all_reduce() {
         use ryft_core::{ConditionOperation, ParallelReduceOperation, ReductionKind};
 
@@ -3316,6 +3466,109 @@ mod tests {
             let values: [u64; 1] = values_from_bytes::<u64>(output_bytes.as_slice()).try_into().unwrap();
             assert_eq!(values, [10 + device_index as u64]);
         }
+    }
+
+    #[test]
+    fn test_shard_map_in_context_without_inputs_executes_on_cpu() {
+        use ryft_core::AxisIndex;
+
+        // JAX's `test_axis_index`: a body without inputs reads the coordinate of each device along `x` through its
+        // context, and the output sharding tiles the coordinates along `x`, so the global output is `[0, 1, 2, 3]`. The
+        // `shard_map` lowers to an `sdy.manual_computation` without operands. The traced program takes an unused input
+        // only because its closure receives no context otherwise.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(
+            mesh.clone(),
+            client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharded = sharded.clone();
+                move |x: XlaArrayTracer| {
+                    shard_map_in_context(
+                        x.value().context(),
+                        |context: &ShardMapContext<DomainTracingContext<XlaDomain<'static>>>, ()| {
+                            context.axis_index("x").unwrap().reshape([1]).unwrap()
+                        },
+                        (),
+                        mesh,
+                        (),
+                        sharded,
+                        Vec::new(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::scalar(DataType::F32),
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings("main", Some(&[replicated.clone()]), Some(&[sharded]))
+            .unwrap();
+        assert_eq!(
+            program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={"x"}>}) -> (tensor<4xui64> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation() in_shardings=[] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} () {
+                      %1 = stablehlo.partition_id : tensor<ui32>
+                      %2 = stablehlo.convert %1 : (tensor<ui32>) -> tensor<ui64>
+                      %3 = stablehlo.reshape %2 : (tensor<ui64>) -> tensor<1xui64>
+                      sdy.return %3 : tensor<1xui64>
+                    } : () -> tensor<4xui64>
+                    return %0 : tensor<4xui64>
+                  }
+                }
+            "#},
+        );
+
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let input_buffers = client_devices
+            .iter()
+            .map(|device| client.buffer(&0f32.to_ne_bytes(), BufferType::F32, [], None, device.clone(), None).unwrap())
+            .collect();
+        let input = XlaArray::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[], replicated),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = XlaArray::into_execute_arguments(vec![input], &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Device `d` holds shard `d` of the output, which is its own coordinate along `x`.
+        let values = outputs
+            .into_iter()
+            .flat_map(|output| {
+                assert_eq!(output.outputs.len(), 1);
+                values_from_bytes::<u64>(&output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0, 1, 2, 3]);
     }
 
     #[test]

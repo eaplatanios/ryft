@@ -576,12 +576,12 @@ impl<C: Context<Type: Into<ArrayIrType>, Value: Assert>, P: AssertionBatchingPol
             // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
             // first failure. Successful and empty batches are handled by the independent Boolean reduction.
             let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
-            let candidates = Select::select(&condition, &sentinel, &coordinates)?;
+            let candidates = condition.select(&sentinel, &coordinates)?;
             let index = candidates.reduce(&[0], ReductionKind::Min)?;
             let condition = condition.reduce(&[0], ReductionKind::All)?;
 
             // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
-            let index = Select::select(&condition, &index.zero_like()?, &index)?;
+            let index = condition.select(&index.zero_like()?, &index)?;
             (condition, index)
         } else {
             // Only observations vary across items. A replicated false condition fails first at index zero,
@@ -876,7 +876,7 @@ impl<
         )?;
         check_count!("output", empty, 1, ProgramError);
         let empty = empty.remove(0).into_projected()?;
-        Select::select(&empty, &empty, &condition)
+        empty.select(&empty, &condition)
     }
 
     fn pad_empty_batch_observation(

@@ -230,7 +230,7 @@ impl WhilePredicate for XlaArray<'_> {
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
             self.broadcast(output_type, output_axes.as_slice())?
         };
-        Select::select(&condition, on_true, on_false)
+        condition.select(on_true, on_false)
     }
 }
 
@@ -1308,8 +1308,8 @@ mod tests {
         let condition = boolean_vector(&domain, &mesh, &condition_values);
         let reference_condition = Array::vector(condition_values.to_vec()).unwrap();
         assert_parity(
-            &Select::select(&condition, &left, &right).unwrap(),
-            &Select::select(&reference_condition, &reference_left, &reference_right).unwrap(),
+            &condition.select(&left, &right).unwrap(),
+            &reference_condition.select(&reference_left, &reference_right).unwrap(),
         );
 
         // Reductions agree, including the divide-by-count semantics of `Mean`.
@@ -3767,7 +3767,7 @@ mod tests {
         assert_eq!(less_than.data_type(), DataType::Boolean);
         assert_eq!(read_booleans(&less_than), vec![true, false, false, true]);
 
-        let selected = XlaArray::select(&less_than, &a, &b).unwrap();
+        let selected = less_than.select(&a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
     }
 
@@ -3824,22 +3824,16 @@ mod tests {
 
         // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Exercise both
         // branch positions so that recovering the sign cannot accidentally depend on the selected side.
-        let selected_signed = read_i32s(&XlaArray::select(&condition, &signed, &wide).unwrap());
+        let selected_signed = read_i32s(&condition.select(&signed, &wide).unwrap());
         assert_eq!(
             selected_signed,
-            Array::select(&reference_condition, &reference_signed, &reference_wide)
-                .unwrap()
-                .elements::<i32>()
-                .unwrap(),
+            reference_condition.select(&reference_signed, &reference_wide).unwrap().elements::<i32>().unwrap(),
         );
         assert_eq!(selected_signed, vec![-1, 3, 0, 5]);
-        let selected_wide = read_i32s(&XlaArray::select(&condition, &wide, &signed).unwrap());
+        let selected_wide = read_i32s(&condition.select(&wide, &signed).unwrap());
         assert_eq!(
             selected_wide,
-            Array::select(&reference_condition, &reference_wide, &reference_signed)
-                .unwrap()
-                .elements::<i32>()
-                .unwrap(),
+            reference_condition.select(&reference_wide, &reference_signed).unwrap().elements::<i32>().unwrap(),
         );
         assert_eq!(selected_wide, vec![2, -1, 4, 0]);
     }

@@ -899,6 +899,18 @@ where
         self.context.check_step(self.operation)?;
         self.region(index)?.interpret_in_context(self.context, inputs)
     }
+
+    fn bind<R: BindingRegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>>(
+        &self,
+        _context: &EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
+        operation: KernelOperation<Extension>,
+        regions: R,
+        inputs: &[ArrayIrValue<Array>],
+    ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+        // Operations that a rule binds on its own behalf are qualified exactly like the body's instructions, so they
+        // consume replay steps and undergo the same reference and NaN checks.
+        self.context.bind(operation, regions, inputs)
+    }
 }
 
 #[cfg(test)]

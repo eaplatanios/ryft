@@ -1017,14 +1017,13 @@ impl<
                         .map_err(|_| TypeError::invalid("indexed axis extent exceeds `i64::MAX`"))?;
                     let indices = if value.r#type().data_type() == DataType::U64 {
                         let maximum = self.constant(Array::scalar(i64::MAX as u64)?)?;
-                        V::select(&value.greater_than(&maximum)?, &maximum, value)?
-                            .convert_element_type(DataType::I64)?
+                        value.greater_than(&maximum)?.select(&maximum, value)?.convert_element_type(DataType::I64)?
                     } else {
                         value.convert_element_type(DataType::I64)?
                     };
                     let zero = self.constant(Array::scalar(0_i64)?)?;
                     let extent = self.constant(Array::scalar(extent)?)?;
-                    let indices = V::select(&indices.less_than(&zero)?, &indices.add(&extent)?, &indices)?;
+                    let indices = indices.less_than(&zero)?.select(&indices.add(&extent)?, &indices)?;
                     components.push((axis, indices, None));
                     collapsed.push(axis);
                     axis += 1;
@@ -1822,7 +1821,7 @@ impl<
                 let negative = indices.less_than(&zero)?;
                 let wrapped = indices.add(&extent)?;
 
-                Some((axis, V::from_projected(V::Projected::select(&negative, &wrapped, &indices)?)))
+                Some((axis, V::from_projected(negative.select(&wrapped, &indices)?)))
             }
         };
 

@@ -522,7 +522,7 @@ impl_differentiable_operation! {
                 }
                 let mask = mask.unwrap();
                 let dual_tangent = dual_tangent.align_tangent(&target, &primal)?;
-                let contribution = C::Value::select(&mask, &dual_tangent, &dual_tangent.zero_like()?)?;
+                let contribution = mask.select(&dual_tangent, &dual_tangent.zero_like()?)?;
                 tangent = Some(match tangent {
                     Some(tangent) => tangent.add(&contribution)?,
                     None => contribution,
@@ -655,7 +655,7 @@ fn balanced_extremum_weight<
     // Derive the half-weight from the candidate so runtime dimensions and placement stay in dataflow.
     let one = candidate.one_like()?;
     let half = one.div(&one.add(&one)?)?;
-    V::select(&wins, &one, &V::select(&ties, &half, &candidate.zero_like()?)?)
+    wins.select(&one, &ties.select(&half, &candidate.zero_like()?)?)
 }
 
 /// Returns the Boolean mask of `left` compared with `right` under `direction`, using the ordering of the extrema. Real
@@ -681,7 +681,7 @@ fn lexicographic_comparison<V: Value + ZeroLike + Real + Imaginary + And + Compa
     if direction == ComparisonDirection::Equal {
         return same_real.and(&imaginary);
     }
-    V::select(&same_real, &imaginary, &left_real.compare(&right_real, direction)?)
+    same_real.select(&imaginary, &left_real.compare(&right_real, direction)?)
 }
 
 #[cfg(test)]

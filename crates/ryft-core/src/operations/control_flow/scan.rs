@@ -2743,7 +2743,7 @@ fn forward_scan_carries<V: Value, O: Operation<Type = V::Type>, Carry: Clone>(
 ///
 /// The slice bounds and the squeezed shape are derived from the stacked value's own type, which must be fully static
 /// with a leading axis of extent greater than `iteration` (guaranteed for stacked scan values by construction).
-fn read_scan_iteration<V>(stack: &V, iteration: usize) -> Result<V, ProgramError>
+pub(crate) fn read_scan_iteration<V>(stack: &V, iteration: usize) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + Slice + Reshape,
 {
@@ -2776,7 +2776,7 @@ where
 
 /// Writes `value` as slice `iteration` of `accumulator` along its leading axis, prepending a unit axis to `value`
 /// first.
-fn write_scan_iteration<V>(accumulator: V, iteration: usize, value: V) -> Result<V, ProgramError>
+pub(crate) fn write_scan_iteration<V>(accumulator: V, iteration: usize, value: V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + UpdateSlice + Reshape,
 {

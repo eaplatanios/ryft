@@ -746,10 +746,10 @@ impl ScatterOperation {
             let input_ids = align_linearization_value(&scattered_ids, zero_ids.r#type().as_ref())?;
             let input_selected = input_ids.equal(&zero_ids)?;
             let update_selected = ids.equal(&gathered_ids)?;
-            let primal_input = V::select(&input_selected, input, &input.zero_like()?)?;
-            let primal_updates = V::select(&update_selected, updates, &updates.zero_like()?)?;
-            let tangent_input = V::select(&primal_to_tangent(input_selected)?, input_tangent, &zeros)?;
-            let tangent_updates = V::select(&primal_to_tangent(update_selected)?, updates_tangent, &update_zeros)?;
+            let primal_input = input_selected.select(input, &input.zero_like()?)?;
+            let primal_updates = update_selected.select(updates, &updates.zero_like()?)?;
+            let tangent_input = primal_to_tangent(input_selected)?.select(input_tangent, &zeros)?;
+            let tangent_updates = primal_to_tangent(update_selected)?.select(updates_tangent, &update_zeros)?;
 
             Ok((
                 primal_input.scatter(
@@ -834,7 +834,7 @@ impl ScatterOperation {
                 )?;
                 let untouched = touched.equal(&touched.zero_like()?)?;
                 let coefficient = align_linearization_value(&input, touched.r#type().as_ref())?;
-                let coefficient = V::select(&untouched, &touched.zero_like()?, &coefficient)?;
+                let coefficient = untouched.select(&touched.zero_like()?, &coefficient)?;
 
                 // Mask before multiplying as an untouched infinity must not be multiplied by a scattered zero.
                 // This mask depends only on the primal indices and crosses the boundary as a retained coefficient.
@@ -904,7 +904,7 @@ impl ScatterOperation {
             )?;
             let references = align_linearization_value(&references, input.r#type().as_ref())?;
             let untouched = references.equal(&references.zero_like()?)?;
-            let selected_input = V::select(&untouched, &selected_input.one_like()?, &selected_input)?;
+            let selected_input = untouched.select(&selected_input.one_like()?, &selected_input)?;
 
             // The dual gather keeps its default fill as NaN cannot match a floating-point update. Integer extremes
             // can match integer updates, but integer tangents are structural zeros. Moreover, the count and numerator
@@ -924,10 +924,10 @@ impl ScatterOperation {
             )?;
 
             // NaN extrema compare unequal to every source. No source receives a tangent at those locations.
-            let count = V::select(&count.equal(&count.zero_like()?)?, &count.one_like()?, &count)?;
-            let selected_input_tangent = V::select(&primal_to_tangent(selected_input)?, input_tangent, &zeros)?;
+            let count = count.equal(&count.zero_like()?)?.select(&count.one_like()?, &count)?;
+            let selected_input_tangent = primal_to_tangent(selected_input)?.select(input_tangent, &zeros)?;
             let selected_update_tangent =
-                V::select(&primal_to_tangent(selected_updates)?, updates_tangent, &update_zeros)?;
+                primal_to_tangent(selected_updates)?.select(updates_tangent, &update_zeros)?;
             let numerator = selected_input_tangent.scatter(
                 &primal_to_tangent(indices.clone())?,
                 &selected_update_tangent,

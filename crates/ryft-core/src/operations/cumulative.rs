@@ -2869,8 +2869,8 @@ mod tests {
             let (right_maximum, right_position, right_sum) = right;
             let greater = right_maximum.compare(left_maximum, ComparisonDirection::GreaterThan)?;
             Ok((
-                Array::select(&greater, right_maximum, left_maximum)?,
-                Array::select(&greater, right_position, left_position)?,
+                greater.select(right_maximum, left_maximum)?,
+                greater.select(right_position, left_position)?,
                 left_sum.add(right_sum)?,
             ))
         };

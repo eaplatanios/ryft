@@ -52,9 +52,9 @@ pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 ///     an equal-sized exact partition of the axis's participants and preserve the input's manual variation, because
 ///     distinct groups can produce distinct results. A `batch` level that binds their axis rejects them.
 ///   - **Mesh Reductions:** Are created by [`with_mesh`](Self::with_mesh) and reduce over a manual axis of that mesh
-///     inside a manual region (e.g., the body of a `shard_map` operation in the XLA backend). Their input must vary
-///     over the axis, and their output no longer does, because every device holds the full reduction. This is the Ryft
-///     analogue of JAX's `psum_invariant` primitive, and of `pmax` and `pmin` inside a `shard_map`. A cross-device
+///     inside a manual region (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)). Their input must
+///     vary over the axis, and their output no longer does, because every device holds the full reduction. This is the
+///     Ryft analogue of JAX's `psum_invariant` primitive, and of `pmax` and `pmin` inside a `shard_map`. A cross-device
 ///     reduction combines one value per device with a single associative operator, so mesh reductions support the sum,
 ///     product, extremum, and Boolean kinds directly, while [`ParallelReduce::parallel_reduce`] composes a mean and a
 ///     logarithmic sum of exponentials from them. A mesh reduction accumulates in the element data type of its input,
@@ -515,15 +515,15 @@ impl_differentiable_operation! {
 /// batch axis. A value that is the same for every batch item is counted once per item by a sum, so summing a constant
 /// `c` over an axis of size `n` yields `n · c`, exactly as JAX's
 /// [`jax.lax.psum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum.html) does. A name bound to a device mesh
-/// axis by a manual region (e.g., the body of a `shard_map` operation in the XLA backend) stays in the staged body
-/// program and lowers to a cross-device `all_reduce` over that mesh axis. For sums, means, maxima, and minima, this is
-/// the Ryft analogue of JAX's [`jax.lax.psum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum.html),
+/// axis by a manual region (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)) stays in the staged
+/// body program and lowers to a cross-device `all_reduce` over that mesh axis. For sums, means, maxima, and minima,
+/// this is the Ryft analogue of JAX's [`jax.lax.psum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum.html),
 /// [`jax.lax.pmean`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmean.html),
 /// [`jax.lax.pmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmax.html),
 /// and [`jax.lax.pmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pmin.html), respectively, while JAX has no
-/// counterpart for the other kinds. Refer to [`ReductionKind`] for the semantics and supported data types of each
-/// kind. Integer means truncate toward zero in the input's own type, whereas JAX's `pmean` promotes them to a
-/// floating-point type through its division, so a fractional mean requires converting the input first.
+/// counterpart for the other kinds. Refer to [`ReductionKind`] for the semantics and supported data types of each kind.
+/// Integer means truncate toward zero in the input's own type, whereas JAX's `pmean` promotes them to a floating-point
+/// type through its division, so a fractional mean requires converting the input first.
 ///
 /// Inside a manual region, every value is a per-device local shard and its type records over which manual axes the
 /// shards may differ. A value that varies over the axis holds a different shard on every device along it, and reducing
@@ -724,7 +724,7 @@ impl<
                 let maximum = magnitudes.parallel_reduce(ReductionKind::Max, axis_name)?;
                 let zero = maximum.zero_like()?;
                 let finite = maximum.sub(&maximum)?.equal(&zero)?;
-                let shift = Select::select(&finite, &maximum, &zero)?.stop_gradient()?;
+                let shift = finite.select(&maximum, &zero)?.stop_gradient()?;
                 let shift = if complex { shift.complex(&zero)? } else { shift };
                 let sum = input.sub(&shift)?.exp()?.parallel_reduce(ReductionKind::Sum, axis_name)?;
                 return sum.log()?.add(&shift);

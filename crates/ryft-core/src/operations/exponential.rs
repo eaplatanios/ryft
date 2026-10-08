@@ -353,7 +353,7 @@ impl_differentiable_operation! {
 
                 // A real value is its own component, so the zero it is compared against also replaces it.
                 let replacement = if target.is_complex() { value.zero_like()? } else { zero };
-                Ok(C::Value::select(&is_positive_infinity, &replacement, &value)?)
+                Ok(is_positive_infinity.select(&replacement, &value)?)
             };
 
             let output_exponent = replace_infinity(aligned_primal, real_output)?;

@@ -15,13 +15,13 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, Compare, ComparisonDirection,
+    BatchAxis, BatchingContext, BatchingTracer, CollectiveOptions, Compare, ComparisonDirection, Condition,
     ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds,
     DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers, DynamicSlice,
     DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather,
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter,
     Placeholder, ProgramBuilder, ProgramError, Reduce, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding,
-    ShardingDimension, Value, ValueProjection, ZeroLike, condition, shard_map,
+    ShardingDimension, Value, ValueProjection, ZeroLike, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -723,7 +723,7 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
 ///
 /// Each device of a four-device `x` mesh holds one element of `values = [1, -2, 3, -4]` and the replicated `weight
 /// = [2]`. Each device takes the `true` branch, `weight * values`, when its element is positive and the `false` branch,
-/// `values`, otherwise, and the result is summed over the mesh. [`ryft_core::condition`] varies the invariant weight
+/// `values`, otherwise, and the result is summed over the mesh. [`Condition::condition`] varies the invariant weight
 /// before the branches, so the gradient of the weight is summed across devices after the transposed condition rather
 /// than inside the branch that only some devices take. The value is `2 - 2 + 6 - 4 = 2`, the weight gradient is the sum
 /// of the positive elements, `4`, and the values gradient is `[2, 1, 2, 1]`.
@@ -749,17 +749,20 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
                                 let sum = values.reduce(&[0], ReductionKind::Sum).unwrap();
                                 let predicate =
                                     sum.compare(&sum.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
-                                let mut outputs = condition(
-                                    &predicate.into_value(),
-                                    vec![weight.into_value(), values.into_value()],
-                                    |inputs| {
-                                        let weight = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
-                                        let values = ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
-                                        Ok(vec![(weight * values).into_value()])
-                                    },
-                                    |inputs| Ok(vec![inputs[1].clone()]),
-                                )
-                                .unwrap();
+                                let mut outputs = predicate
+                                    .into_value()
+                                    .condition(
+                                        vec![weight.into_value(), values.into_value()],
+                                        |inputs| {
+                                            let weight =
+                                                ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
+                                            let values =
+                                                ValueProjection::<ArrayType>::into_projected(inputs[1].clone())?;
+                                            Ok(vec![(weight * values).into_value()])
+                                        },
+                                        |inputs| Ok(vec![inputs[1].clone()]),
+                                    )
+                                    .unwrap();
                                 ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
                                     .unwrap()
                                     .reduce(&[0], ReductionKind::Sum)

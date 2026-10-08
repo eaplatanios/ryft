@@ -2788,12 +2788,15 @@ fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
 
 /// A downstream operation family that keeps the existing array type universe while owning its transform metadata.
 mod custom_array_transforms {
+    use std::any::{Any, TypeId};
+
     use pretty_assertions::assert_eq;
 
     use super::*;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceDischarge, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayReferenceTransformPath, OperationProjection, ReferenceAccumulationPolicy,
+        ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ErasedOperation, OperationPayloadProjection,
+        OperationProjection, ReferenceAccumulationPolicy,
     };
 
     type ArrayValue = ArrayIrValue<Array>;
@@ -2980,6 +2983,19 @@ mod custom_array_transforms {
     }
     impl OperationProjection<ArrayType> for CustomOperation {
         type Projected = ArrayOperation<Array>;
+    }
+    impl OperationPayloadProjection for CustomOperation {
+        fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
+            match self {
+                Self::Core(operation) => operation.project_payload(payload),
+                Self::Read(operation) => (operation.type_id() == payload).then_some(operation as &dyn Any),
+                Self::AddUpdate(operation) => (operation.type_id() == payload).then_some(operation as &dyn Any),
+            }
+        }
+
+        fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+            CoreOperation::from_payload(payload).map(Self::Core)
+        }
     }
     impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CustomOperation
     where

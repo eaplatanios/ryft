@@ -1436,7 +1436,7 @@ impl_differentiable_operation! {
                                 let received =
                                     received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
                                 let zero = context.zero(&output_type)?;
-                                MaybeZero::Value(Tracer::select(&received, &zero, cotangent)?)
+                                MaybeZero::Value(received.select(&zero, cotangent)?)
                             };
                             accumulators[0].accumulate(context, operand_cotangent)?;
                             accumulators[1].accumulate(context, output_cotangent)
@@ -2783,7 +2783,8 @@ mod tests {
     #[test]
     fn test_parallel_ragged_all_to_all_batching() {
         // A matching named `batch` level is the participant axis of the eager reference implementation, which executes
-        // the complete exchange between its batch items.
+        // the complete exchange between its batch items. These inputs are the example in the documentation of
+        // `jax.lax.ragged_all_to_all`, and the expected output is the one documented there.
         let operand = vec![1i32, 2, 2, 3, 4, 0];
         let output_seed = vec![0i32; 8];
         let output: Array = batch(
@@ -2811,6 +2812,7 @@ mod tests {
             1,
             &[(0, 0, 0, 0, 1), (0, 1, 1, 0, 2), (1, 0, 0, 1, 1), (1, 1, 1, 2, 1)],
         );
+        assert_eq!(expected, vec![1, 3, 0, 0, 2, 2, 4, 0]);
         assert_eq!(output, Array::matrix(2, 4, expected).unwrap());
 
         // Reversed noncontiguous groups, two slices per peer, and width-two rows exercise every routing index and

@@ -259,16 +259,16 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 }
 
 /// Represents the ability to declare that a value varies across a manual mesh axis. Inside a manual region (e.g., the
-/// body of a `shard_map` operation in the XLA backend), every value is a per-device local shard, and its type records
-/// over which manual axes the shards may differ. A value that came from a replicated input, or from a constant, is
-/// _invariant_ meaning that every device holds the same shard. A value that came from a tiled input is _varying_
+/// body of a [`ShardMapOperation`](crate::ShardMapOperation)), every value is a per-device local shard, and its type
+/// records over which manual axes the shards may differ. A value that came from a replicated input, or from a constant,
+/// is _invariant_ meaning that every device holds the same shard. A value that came from a tiled input is _varying_
 /// meaning that each device holds its own piece. Combining the two in one operation is only sound when the invariant
 /// value is first weakened to a varying one, which is what [`parallel_vary`](Self::parallel_vary) does. It stages a
 /// [`ParallelVaryOperation`], which changes no bytes on any device and only records the weaker fact, so it lowers to
 /// nothing. Placement, local shape, and reduction state are left as they are; only the variation changes. It is the
 /// analogue of `jax.lax.pcast(x, axis_name, to='varying')` in JAX, which appears in jaxprs as the `pvary` primitive.
-/// Refer to the [JAX `shard_map` guide](https://docs.jax.dev/en/latest/201/shard-map.html) for more information on how
-/// JAX handles varying manual axes, which serves as the basis for how Ryft handles them.
+/// Refer to JAX's [`shard_map` guide](https://docs.jax.dev/en/latest/201/shard-map.html) for more information on
+/// how JAX handles varying manual axes, which serves as the basis for how Ryft handles them.
 ///
 /// The reason this transition is an explicit operation rather than a silent widening of the type is differentiation.
 /// Treating one shared value as `n` per-device copies is the linear map `x ↦ (x, …, x)`, whose adjoint sums the `n`
@@ -465,9 +465,9 @@ impl<
 }
 
 /// Represents the ability to make the manual variation of an operation's inputs agree before binding it. Inside a
-/// manual region (e.g., the body of a `shard_map` operation in the XLA backend), an ordinary operation with several
-/// inputs computes a function of them on every device independently, so its inputs must vary over the same manual
-/// mesh axes, and its output varies over exactly those axes. This is the standard variation rule that
+/// manual region (e.g., the body of a [`ShardMapOperation`](crate::ShardMapOperation)), an ordinary operation with
+/// several inputs computes a function of them on every device independently, so its inputs must vary over the same
+/// manual mesh axes, and its output varies over exactly those axes. This is the standard variation rule that
 /// [`ArrayType::check_matching_manual_variation`] enforces in type inference. A capability for such an operation calls
 /// [`align_manual_variation`](Self::align_manual_variation) on its inputs before binding, which weakens every input to
 /// the union of the manual axes that any input varies over by staging a [`ParallelVaryOperation`] on each axis that it
