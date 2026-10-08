@@ -3,14 +3,16 @@ use std::cell::Cell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::partial::partitions::PartitionedProgram;
-use crate::programs::{AtomId, Program, Typed, Value};
+use crate::programs::{AtomId, Typed, Value};
 
 #[cfg(doc)]
 use crate::partial::contexts::PartialEvaluationContext;
 
 #[cfg(doc)]
 use crate::partial::evaluations::PartialEvaluation;
+
+#[cfg(doc)]
+use crate::partial::partitions::PartitionedProgram;
 
 #[cfg(doc)]
 use crate::programs::{Program, Type};
@@ -269,9 +271,9 @@ impl<V> PartialEvaluationOutput<V> {
 }
 
 /// Source of a residual program input of a [`PartitionedProgram`] obtained via [`PartitionedProgram::residual_inputs`].
-/// [`Program::partition`] produces only [`UnknownInput`](Self::UnknownInput) and [`Edge`](Self::Edge) sources, with
-/// edges numbered in residual input order. [`PartitionedProgram::forward_residuals`] additionally produces
-/// [`KnownInput`](Self::KnownInput) and [`KnownOutput`](Self::KnownOutput) sources for residual inputs that
+/// [`Program::partition`] produces only [`UnknownInput`](Self::UnknownInput) and [`ResidualEdge`](Self::ResidualEdge)
+/// sources, with edges numbered in residual input order. [`PartitionedProgram::forward_residuals`] additionally
+/// produces [`KnownInput`](Self::KnownInput) and [`KnownOutput`](Self::KnownOutput) sources for residual inputs that
 /// would otherwise repeat a value that the caller of the partition already has.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResidualInputSource {
@@ -290,7 +292,7 @@ pub enum ResidualInputSource {
     KnownOutput(usize),
 
     /// Residual edge `index` (i.e., known program output `index` after the fully known outputs).
-    Edge(usize),
+    ResidualEdge(usize),
 }
 
 #[cfg(test)]

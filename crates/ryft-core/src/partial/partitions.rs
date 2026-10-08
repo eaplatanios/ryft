@@ -10,7 +10,9 @@ use crate::parameters::Placeholder;
 use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
 use crate::partial::operations::PartiallyEvaluatableOperation;
 use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
-use crate::partial::values::{PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue};
+use crate::partial::values::{
+    PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, ResidualInputSource,
+};
 use crate::programs::{
     EffectClass, EffectsSummary, InstructionId, Operation, OperationFormatter, OperationPayloadProjection, Program,
     ProgramError, ProgramRenderingMode, ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, Value, ValueId,
@@ -135,11 +137,14 @@ impl EffectsSummary {
 /// [`Program`]s so that region transform caches can store and reassemble the complete partition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionMetadata {
+    /// Refer to the documentation of [`PartitionedProgram::original_input_count`] for more information.
+    original_input_count: usize,
+
     /// Refer to the documentation of [`PartitionedProgram::known_input_indices`] for more information.
     known_input_indices: Vec<usize>,
 
     /// Refer to the documentation of [`PartitionedProgram::residual_inputs`] for more information.
-    residual_inputs: Vec<PartialEvaluationInput<usize>>,
+    residual_inputs: Vec<ResidualInputSource>,
 
     /// Refer to the documentation of [`PartitionedProgram::outputs`] for more information.
     outputs: Vec<PartialEvaluationOutput<usize>>,
@@ -154,10 +159,11 @@ pub struct PartitionMetadata {
 }
 
 impl PartitionMetadata {
-    /// Returns this [`PartitionMetadata`] with its residual inputs replaced by `residual_inputs`, keeping its known
-    /// inputs, outputs, and effect-ordering constraints. [`PartitionedProgram::with_residual_policy`] uses this after
-    /// it rewrites which residual edges the residual program consumes.
-    pub(super) fn with_residual_inputs(mut self, residual_inputs: Vec<PartialEvaluationInput<usize>>) -> Self {
+    /// Returns this [`PartitionMetadata`] with its residual inputs replaced by `residual_inputs`,
+    /// keeping its original input count, known inputs, outputs, and effect-ordering constraints.
+    /// [`PartitionedProgram::with_residual_policy`] uses this after it rewrites which residual
+    /// edges the residual program consumes.
+    pub(super) fn with_residual_inputs(mut self, residual_inputs: Vec<ResidualInputSource>) -> Self {
         self.residual_inputs = residual_inputs;
         self
     }
@@ -179,6 +185,8 @@ impl PartitionMetadata {
 ///   known_program --> residual_edges["Residual Edge Values"]
 ///   unknown_inputs["Original Unknown Inputs"] --> residual_program["Residual Program"]
 ///   residual_edges --> residual_program
+///   known_inputs -. "forwarded" .-> residual_program
+///   known_outputs -. "forwarded" .-> residual_program
 ///   residual_program --> residual_outputs["Residual Original Outputs"]
 ///   known_outputs --> descriptors["Output Descriptors"]
 ///   residual_outputs --> descriptors
@@ -186,9 +194,11 @@ impl PartitionMetadata {
 /// ```
 ///
 /// The known program receives only the original inputs selected by [`known_input_indices`](Self::known_input_indices).
-/// Its outputs place fully known original outputs before residual edge values. The residual program consumes the
-/// original unknown inputs together with those edges, while [`outputs`](Self::outputs) records which side supplies
-/// each original output.
+/// Its outputs place fully known original outputs before residual edge values. Each residual program input names its
+/// [`ResidualInputSource`] in [`residual_inputs`](Self::residual_inputs): an original unknown input or a residual edge
+/// and, after [`forward_residuals`](Self::forward_residuals), possibly also an original known input or a fully known
+/// output that the residual program reads directly (the dotted arrows above). [`outputs`](Self::outputs) records which
+/// side supplies each original output.
 ///
 /// # Rendering
 ///
@@ -199,7 +209,7 @@ impl PartitionMetadata {
 /// ```text
 /// partition [
 ///     known_inputs=[0],
-///     residual_inputs=[Unknown(1), Known(0)],
+///     residual_inputs=[UnknownInput(1), ResidualEdge(0)],
 ///     outputs=[Known(0), Unknown(0)],
 /// ]
 /// known={
@@ -219,7 +229,8 @@ impl PartitionMetadata {
 /// Here, `residual_inputs` lists the original input `1` followed by the edge `0` (i.e., known output `%3`), and
 /// `outputs` takes the first original output from the known program and the second one from the residual program.
 /// The wiring renders on one line when it is short enough. The effect-ordering constraints are not rendered, because
-/// reference analysis derives them from the two programs.
+/// reference analysis derives them from the two programs, and neither is the
+/// [`original_input_count`](Self::original_input_count).
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
@@ -233,14 +244,34 @@ pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
-    /// Reassembles an internally constructed [`PartitionedProgram`] whose programs and boundary wiring were validated
-    /// together. The caller preserves the known-output prefix and residual feeder ordering documented on
-    /// [`PartitionedProgram`].
-    pub(crate) fn from_parts(
+    /// Assembles a [`PartitionedProgram`] from its two programs and their boundary wiring, which is the inverse of
+    /// [`into_parts`](Self::into_parts) apart from the [`original_input_count`](Self::original_input_count) that
+    /// [`into_parts`](Self::into_parts) omits. The caller is responsible for the consistency of the programs and their
+    /// wiring, following the layout documented on [`PartitionedProgram`]. This function does not validate them, but
+    /// the consumers that bind or interpret the partition (e.g., [`interpret_in_context`](Self::interpret_in_context)
+    /// and [`PartialEvaluationContext::inline_partitioned_program`]) report inconsistent wiring before running any
+    /// known work. Effect-ordering constraints are derived conservatively: each program with ordered effects must keep
+    /// them ordered relative to every ordered effect of the other program.
+    ///
+    /// # Parameters
+    ///
+    ///   - `known_program`: Known-side [`Program`], whose inputs are the original inputs listed in
+    ///     `known_input_indices` and whose outputs are the fully known original outputs followed by the residual edges.
+    ///   - `residual_program`: Residual-side [`Program`], whose inputs are described by `residual_inputs` and whose
+    ///     outputs are the original outputs that `outputs` assigns to the residual side.
+    ///   - `original_input_count`: Number of inputs of the original (i.e., pre-partitioning) boundary, which callers
+    ///     must supply in full and which the input indices in `known_input_indices` and `residual_inputs` address.
+    ///   - `known_input_indices`: Index of the original input feeding each input of `known_program`, in order.
+    ///   - `residual_inputs`: [`ResidualInputSource`] feeding each input of `residual_program`, in order.
+    ///   - `outputs`: Source of each original output, in original output order, where
+    ///     [`Known`](PartialEvaluationOutput::Known) indexes the fully known outputs of `known_program` and
+    ///     [`Unknown`](PartialEvaluationOutput::Unknown) indexes the outputs of `residual_program`.
+    pub fn from_parts(
         known_program: Program<V, O, Vec<V>, Vec<V>>,
         residual_program: Program<V, O, Vec<V>, Vec<V>>,
+        original_input_count: usize,
         known_input_indices: Vec<usize>,
-        residual_inputs: Vec<PartialEvaluationInput<usize>>,
+        residual_inputs: Vec<ResidualInputSource>,
         outputs: Vec<PartialEvaluationOutput<usize>>,
     ) -> Self {
         let effect_ordering = [&known_program, &residual_program].map(|program| {
@@ -249,7 +280,13 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         Self {
             known_program,
             residual_program,
-            metadata: PartitionMetadata { known_input_indices, residual_inputs, outputs, effect_ordering },
+            metadata: PartitionMetadata {
+                original_input_count,
+                known_input_indices,
+                residual_inputs,
+                outputs,
+                effect_ordering,
+            },
         }
     }
 
@@ -283,6 +320,16 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         &self.residual_program
     }
 
+    /// Returns the number of inputs of the original (i.e., pre-partitioning) boundary, which callers must supply in
+    /// full when invoking this [`PartitionedProgram`]. The [`known_input_indices`](Self::known_input_indices) and the
+    /// input sources among the [`residual_inputs`](Self::residual_inputs) address this boundary, but they need not
+    /// mention every position. For example, [`forward_residuals`](Self::forward_residuals) stops passing a known input
+    /// to the known program when only the residual program reads it, or when no program reads it at all.
+    #[inline]
+    pub fn original_input_count(&self) -> usize {
+        self.metadata.original_input_count
+    }
+
     /// Returns the indices of the original program inputs feeding the known-side [`Program`]
     /// (i.e., [`known_program`](Self::known_program)), in order.
     #[inline]
@@ -290,14 +337,16 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         &self.metadata.known_input_indices
     }
 
-    /// Returns the source feeding each residual [`Program`] (i.e., [`residual_program`](Self::residual_program))
-    /// input, in residual program input order. This is the callee's [`PartialEvaluation::inputs`] with each feeder
-    /// _value_ erased to a position/index: [`Unknown`](PartialEvaluationInput::Unknown) entries keep their original
-    /// boundary input index, and each [`Known`](PartialEvaluationInput::Known) feeder is erased to its residual edge
-    /// ordinal which is also, offset by the fully known output count, the position of the edge among the known-side
-    /// operation's outputs.
+    /// Returns the [`ResidualInputSource`] feeding each residual [`Program`] (i.e.,
+    /// [`residual_program`](Self::residual_program)) input, in residual program input order. This is the callee's
+    /// [`PartialEvaluation::inputs`] with each feeder _value_ erased to a position/index: an unknown feeder becomes an
+    /// [`UnknownInput`](ResidualInputSource::UnknownInput) naming its original boundary input, and each known feeder
+    /// becomes a [`ResidualEdge`](ResidualInputSource::ResidualEdge) naming its residual edge ordinal which is also,
+    /// offset by the fully known output count, the position of the edge among the known-side operation's outputs.
+    /// [`forward_residuals`](Self::forward_residuals) can replace edges with
+    /// [`KnownInput`](ResidualInputSource::KnownInput) and [`KnownOutput`](ResidualInputSource::KnownOutput) sources.
     #[inline]
-    pub fn residual_inputs(&self) -> &[PartialEvaluationInput<usize>] {
+    pub fn residual_inputs(&self) -> &[ResidualInputSource] {
         &self.metadata.residual_inputs
     }
 
@@ -311,17 +360,18 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         &self.metadata.outputs
     }
 
-    /// Returns the residual input positions that receive known reference values from the known program, in residual
-    /// input order. Unknown reference inputs, known non-reference inputs, and inline constants are excluded. These
-    /// positions describe boundary wiring, not whether the two programs access overlapping reference allocations.
+    /// Returns the residual input positions that receive known reference values, whether through residual edges of
+    /// the known program or forwarded from original known inputs or fully known outputs, in residual input order.
+    /// Unknown reference inputs, known non-reference inputs, and inline constants are excluded. These positions
+    /// describe boundary wiring, not whether the two programs access overlapping reference allocations.
     #[inline]
     pub fn known_reference_inputs(&self) -> impl '_ + Iterator<Item = usize> {
-        self.metadata
-            .residual_inputs
-            .iter()
-            .zip(self.residual_program.inputs())
-            .enumerate()
-            .filter_map(|(index, (input, atom))| (input.is_known() && atom.r#type().is_reference()).then_some(index))
+        self.metadata.residual_inputs.iter().zip(self.residual_program.inputs()).enumerate().filter_map(
+            |(index, (source, atom))| {
+                (!matches!(source, ResidualInputSource::UnknownInput(_)) && atom.r#type().is_reference())
+                    .then_some(index)
+            },
+        )
     }
 
     /// Returns whether effects in the known program must stay ordered relative to effects in the residual program.
@@ -331,18 +381,127 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// For example, splitting a loop into one loop that runs all known work followed by another that runs all residual
     /// work changes the order of work across iterations. If the known work reads a reference that the residual work
     /// writes, the split could make the next iteration's read run before the preceding iteration's write. This
-    /// function returns `true` for that conflict, allowing the caller to keep the original loop intact.
+    /// function returns `true` for that conflict, allowing the caller to keep the original loop intact. Split rules of
+    /// custom region-carrying operations that run the two halves of a partition as separate invocations (e.g., a custom
+    /// loop operation, like the split rule of `scan`) must perform the same check before splitting.
+    ///
+    /// The precision of the result depends on how the partition was constructed:
+    ///
+    ///   - [`Program::partition`], [`Program::partition_with_residual_policy`], and [`from_parts`](Self::from_parts)
+    ///     record global ordering for every ordered effect, so the result is `true` whenever both programs have
+    ///     ordered effects.
+    ///   - The partitions that drivers return for repeated residual invocations (i.e.,
+    ///     [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program) and
+    ///     [`DifferentiationDriver::partition_jvp_program`](crate::DifferentiationDriver::partition_jvp_program)) can
+    ///     record ordering per reference allocation, established by reference analysis, so the result can be `false`
+    ///     when the two programs only access independent allocations.
+    ///   - When [`forward_residuals`](Self::forward_residuals) rebuilds the known program, the ordering of the known
+    ///     program is reset to global ordering, so the result can only become more conservative.
     ///
     /// A `false` result means only that the recorded effect constraints do not prevent such a split. The caller must
     /// still check value dependencies, loop-carried values, shapes, and how intermediate values are stored. The query
     /// does not inspect runtime reference identities; it relies on the assumptions used to construct the partition.
-    pub(crate) fn has_effect_ordering_conflicts(&self) -> bool {
+    #[inline]
+    pub fn has_effect_ordering_conflicts(&self) -> bool {
         self.metadata.effect_ordering[0].conflicts(&self.metadata.effect_ordering[1])
+    }
+
+    /// Returns whether any [`residual_inputs`](Self::residual_inputs) entry is a
+    /// [`KnownInput`](ResidualInputSource::KnownInput) or a [`KnownOutput`](ResidualInputSource::KnownOutput) source
+    /// (i.e., whether [`forward_residuals`](Self::forward_residuals) forwarded any residual edge). Consumers whose
+    /// algorithms require every known feeder to be a residual edge (e.g., residual placement and the split rules of
+    /// `condition` and `scan`) use this to reject forwarded wiring with their own diagnostics.
+    #[inline]
+    pub fn has_forwarded_residual_inputs(&self) -> bool {
+        self.metadata
+            .residual_inputs
+            .iter()
+            .any(|source| matches!(source, ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_)))
+    }
+
+    /// Validates that the boundary wiring of this [`PartitionedProgram`] addresses its two programs and its original
+    /// boundary consistently: the known input indices match the known program inputs, each residual program input has
+    /// exactly one source, input sources address the [`original_input_count`](Self::original_input_count) inputs of
+    /// the original boundary, [`KnownOutput`](ResidualInputSource::KnownOutput) sources and known output descriptors
+    /// address the fully known outputs of the known program, [`ResidualEdge`](ResidualInputSource::ResidualEdge)
+    /// sources address its residual edges, and unknown output descriptors address the residual program outputs. Types
+    /// are not checked, because binding or interpreting either program validates them. Consumers that bind or execute
+    /// the known program call this first, so that malformed wiring is reported before any known work runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] describing the first inconsistency that it finds.
+    pub(crate) fn validate_wiring(&self) -> Result<(), ProgramError> {
+        let original_input_count = self.metadata.original_input_count;
+        let known_input_count = self.known_program.input_ids().len();
+        if self.metadata.known_input_indices.len() != known_input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition lists {} known input indices but its known program has {} inputs",
+                self.metadata.known_input_indices.len(),
+                known_input_count,
+            )));
+        }
+
+        if let Some(index) = self.metadata.known_input_indices.iter().find(|&&index| index >= original_input_count) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition known input index {index} is out of bounds for {original_input_count} original inputs",
+            )));
+        }
+
+        let residual_input_count = self.residual_program.input_ids().len();
+        if self.metadata.residual_inputs.len() != residual_input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition lists {} residual input sources but its residual program has {} inputs",
+                self.metadata.residual_inputs.len(),
+                residual_input_count,
+            )));
+        }
+
+        let known_output_count = self.metadata.outputs.iter().filter(|output| output.is_known()).count();
+        let edge_count = self.known_program.output_ids().len().checked_sub(known_output_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "partition declares {} known outputs but its known program has {} outputs",
+                known_output_count,
+                self.known_program.output_ids().len(),
+            ))
+        })?;
+
+        for (position, source) in self.metadata.residual_inputs.iter().enumerate() {
+            let (index, count) = match *source {
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    (index, original_input_count)
+                }
+                ResidualInputSource::KnownOutput(index) => (index, known_output_count),
+                ResidualInputSource::ResidualEdge(index) => (index, edge_count),
+            };
+            if index >= count {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "partition residual input {position} names `{source:?}` outside of its index space of size {count}",
+                )));
+            }
+        }
+
+        let residual_output_count = self.residual_program.output_ids().len();
+        for (position, output) in self.metadata.outputs.iter().enumerate() {
+            let (index, count) = match *output {
+                PartialEvaluationOutput::Known(index) => (index, known_output_count),
+                PartialEvaluationOutput::Unknown(index) => (index, residual_output_count),
+            };
+            if index >= count {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "partition output {position} names `{output:?}` outside of its index space of size {count}",
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Consumes this [`PartitionedProgram`] and returns its [`known_program`](Self::known_program),
     /// [`residual_program`](Self::residual_program), [`known_input_indices`](Self::known_input_indices),
-    /// [`residual_inputs`](Self::residual_inputs), and [`outputs`](Self::outputs), in that order.
+    /// [`residual_inputs`](Self::residual_inputs), and [`outputs`](Self::outputs), in that order. The result omits the
+    /// [`original_input_count`](Self::original_input_count) and the effect-ordering constraints, so it describes how
+    /// to invoke the two programs but cannot be reassembled into an equivalent [`PartitionedProgram`].
     #[allow(clippy::type_complexity)]
     #[inline]
     pub fn into_parts(
@@ -351,7 +510,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         Program<V, O, Vec<V>, Vec<V>>,
         Program<V, O, Vec<V>, Vec<V>>,
         Vec<usize>,
-        Vec<PartialEvaluationInput<usize>>,
+        Vec<ResidualInputSource>,
         Vec<PartialEvaluationOutput<usize>>,
     ) {
         (
@@ -369,6 +528,145 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         self,
     ) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, PartitionMetadata) {
         (self.known_program, self.residual_program, self.metadata)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Consumes this [`PartitionedProgram`] and returns an equivalent partition in which the residual program reads
+    /// the values that its residual edges merely repeat directly from where the caller of the partition already has
+    /// them: the original known inputs and the fully known outputs. The residual program itself is unchanged; only its
+    /// [`residual_inputs`](Self::residual_inputs) and the known program change.
+    ///
+    /// # Notation
+    ///
+    /// Write the known program as `K` and the residual program as `R`. In the outputs of `K`, `‖` separates the fully
+    /// known original outputs `y` from the residual edges `e`, and `p ← s` states that input `p` of `R` reads its value
+    /// from the [`ResidualInputSource`] `s`:
+    ///
+    /// ```text
+    ///     K(k₀, …, kₘ)  = (y₀, …, yₙ ‖ e₀, …, eₗ)
+    ///     R(r₀, …, rₜ),   rⱼ ← UnknownInput(i) | KnownInput(i) | KnownOutput(i) | ResidualEdge(i)
+    /// ```
+    ///
+    /// Here, `UnknownInput(i)` and `KnownInput(i)` name original input `i`, `KnownOutput(i)` names `yᵢ`, and
+    /// `ResidualEdge(i)` names `eᵢ` (i.e., output `n + 1 + i` of `K`). [`Program::partition`] produces only
+    /// `UnknownInput` and `ResidualEdge` sources, with one edge per known value that `R` reads.
+    ///
+    /// # Forwarding
+    ///
+    /// Each `ResidualEdge` source is classified by the atom that `K` returns for it:
+    ///
+    ///   - an edge that returns an input of `K` becomes a [`KnownInput`](ResidualInputSource::KnownInput) naming the
+    ///     corresponding original input (the analogue of the input forwarding of JAX's
+    ///     `trace_to_subjaxpr_nounits_fwd2`),
+    ///   - an edge that returns the same atom as a fully known output becomes a
+    ///     [`KnownOutput`](ResidualInputSource::KnownOutput) naming the first such output (the analogue of its output
+    ///     forwarding), and
+    ///   - every other edge stays a [`ResidualEdge`](ResidualInputSource::ResidualEdge), renumbered in order of first
+    ///     use, with edges that return the same atom sharing one edge.
+    ///
+    /// An edge that is both an input and a fully known output of `K` is fed by the input, which does not depend on `K`
+    /// at all. `K` then keeps every fully known output slot (including repeated ones), stops returning the edges that
+    /// are no longer read, and stops receiving the inputs that it no longer uses. Its
+    /// [`known_input_indices`](Self::known_input_indices) can therefore shrink, while
+    /// [`original_input_count`](Self::original_input_count) is unchanged, so that callers still supply the complete
+    /// original boundary. Existing `UnknownInput`, `KnownInput`, and `KnownOutput` sources are kept unchanged, which
+    /// makes forwarding idempotent.
+    ///
+    /// # Example
+    ///
+    /// Partitioning `f(a, b, c, x) = (a + a, (a + a) · x, b · x, -c · x)` with `x` unknown produces one fully known
+    /// output, `a + a`, and three residual edges. The first edge repeats that output, the second repeats the known
+    /// input `b`, and only the third, `-c`, is computed for the residual program alone:
+    ///
+    /// ```text
+    ///     R(x, p, q, r) = (p · x, q · x, r · x)
+    ///
+    ///     before:  K(a, b, c) = (a + a ‖ a + a, b, -c)
+    ///              x ← UnknownInput(3)   p ← ResidualEdge(0)   q ← ResidualEdge(1)   r ← ResidualEdge(2)
+    ///
+    ///     after:   K(a, c)    = (a + a ‖ -c)
+    ///              x ← UnknownInput(3)   p ← KnownOutput(0)   q ← KnownInput(1)   r ← ResidualEdge(0)
+    /// ```
+    ///
+    /// After forwarding, `K` returns `a + a` once and no longer receives `b`, whose value the caller passes to `R`
+    /// directly. When no edge is forwarded or deduplicated, the partition is returned unchanged. Otherwise, the
+    /// effect-ordering constraints of the rebuilt `K` are conservatively reset to global ordering of its ordered
+    /// effects, because rebuilding renumbers the instructions that identify its reference allocations. The constraints
+    /// of `R` stay valid, because `R` is unchanged.
+    ///
+    /// # Usage
+    ///
+    /// Forwarding is a separate step, rather than part of [`Program::partition`], because an edge and the value it
+    /// repeats are interchangeable only at the boundary of a single invocation. Residual placement (refer to
+    /// [`with_residual_policy`](Self::with_residual_policy)), precision rounding, and the split rules of `condition`
+    /// and `scan` rely on the edges forming a contiguous suffix of the outputs of `K`, and they reject forwarded
+    /// partitions. In a `scan` body, for example, an edge that repeats a body input carries the value of one
+    /// iteration rather than the input of the enclosing `scan`. Boundary operations whose two halves become separate
+    /// operations (e.g., through [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls
+    /// forward residuals after placing and rounding them, so that their known half does not return the same value
+    /// twice and does not route its own inputs back out.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the known program cannot be restricted to the remaining outputs.
+    pub fn forward_residuals(self) -> Result<Self, ProgramError>
+    where
+        O: Clone,
+    {
+        let Self { known_program, residual_program, metadata } = self;
+        let known_output_count = metadata.outputs.iter().filter(|output| output.is_known()).count();
+        let known_input_ids = known_program.input_ids();
+        let known_output_ids = known_program.output_ids();
+        // Atom IDs index the known arena, so one source table handles forwarding and edge deduplication without
+        // repeatedly scanning the boundary. Original inputs take precedence, then the first fully known output.
+        let mut sources = vec![None; known_program.atoms().len()];
+        for (&atom, &index) in known_input_ids.iter().zip(&metadata.known_input_indices) {
+            sources[atom.index()] = Some(ResidualInputSource::KnownInput(index));
+        }
+        for (index, atom) in known_output_ids[..known_output_count].iter().enumerate() {
+            sources[atom.index()].get_or_insert(ResidualInputSource::KnownOutput(index));
+        }
+        let mut kept_output_ids = known_output_ids[..known_output_count].to_vec();
+        let residual_inputs = metadata
+            .residual_inputs
+            .iter()
+            .map(|&source| match source {
+                ResidualInputSource::ResidualEdge(edge) => {
+                    let atom = known_output_ids[known_output_count + edge];
+                    *sources[atom.index()].get_or_insert_with(|| {
+                        let edge = kept_output_ids.len() - known_output_count;
+                        kept_output_ids.push(atom);
+                        ResidualInputSource::ResidualEdge(edge)
+                    })
+                }
+                source => source,
+            })
+            .collect::<Vec<_>>();
+        if kept_output_ids == known_output_ids {
+            return Ok(Self {
+                known_program,
+                residual_program,
+                metadata: metadata.with_residual_inputs(residual_inputs),
+            });
+        }
+        let (known_program, live_input_positions) = known_program.filtered(known_input_ids, &kept_output_ids, &[])?;
+        let known_input_indices =
+            live_input_positions.into_iter().map(|position| metadata.known_input_indices[position]).collect();
+        // Without resolved reference roots, the ordering derivation falls back to global ordering for ordered effects.
+        // The residual program is unchanged, so its constraints remain valid.
+        let [_, residual_effect_ordering] = metadata.effect_ordering;
+        let effect_ordering = [known_program.effects().effect_ordering(std::iter::empty()), residual_effect_ordering];
+        Ok(Self {
+            known_program,
+            residual_program,
+            metadata: PartitionMetadata {
+                original_input_count: metadata.original_input_count,
+                known_input_indices,
+                residual_inputs,
+                outputs: metadata.outputs,
+                effect_ordering,
+            },
+        })
     }
 }
 
@@ -525,13 +823,13 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             let residual_inputs = evaluation
                 .inputs
                 .iter()
-                .scan(0, |known_count, input| {
+                .scan(0, |edge_count, input| {
                     Some(match input {
-                        PartialEvaluationInput::Unknown(index) => PartialEvaluationInput::Unknown(*index),
+                        PartialEvaluationInput::Unknown(index) => ResidualInputSource::UnknownInput(*index),
                         PartialEvaluationInput::Known(_) => {
-                            let index = *known_count;
-                            *known_count += 1;
-                            PartialEvaluationInput::Known(index)
+                            let edge = *edge_count;
+                            *edge_count += 1;
+                            ResidualInputSource::ResidualEdge(edge)
                         }
                     })
                 })
@@ -567,6 +865,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             let mut partition = PartitionedProgram::from_parts(
                 known_program,
                 evaluation.program,
+                input_known.len(),
                 known_input_indices,
                 residual_inputs,
                 outputs,
@@ -596,7 +895,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                         ReferenceRoot::RegionInput { region, input_index } if region == analysis.region() => {
                             if index == 0 {
                                 Some(PartitionReferenceRoot::Input(partition.metadata.known_input_indices[input_index]))
-                            } else if let PartialEvaluationInput::Unknown(original) =
+                            } else if let ResidualInputSource::UnknownInput(original) =
                                 partition.metadata.residual_inputs[input_index]
                             {
                                 Some(PartitionReferenceRoot::Input(original))
@@ -770,14 +1069,14 @@ mod tests {
     use crate::operations::{
         AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, MulOperation, NegOperation,
         PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation, ScanOperation, SinOperation,
+        ReferenceWriteOperation, ScanOperation, SinOperation, SubOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::residuals::{
         NoStorage, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualRejection,
     };
     use crate::partial::tests::{TestCapture, TestOperation, TestValue, reference_ordering_program};
-    use crate::partial::values::{PartialEvaluationInput, PartialEvaluationOutput};
+    use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::{
         EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, ProgramBuilder, ProgramError,
         ReferenceType,
@@ -870,6 +1169,42 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_program_original_input_count() {
+        // `f(a, x, b, u) = (-a * x, b * x)` partitioned with `x` unknown: forwarding feeds `b` to the residual program
+        // directly and the known program uses neither `b` nor `u`, yet the original boundary still has four inputs.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let b = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let negated_product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, x], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![b, x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated_product, product], vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+        let partition = program.partition(&[true, false, true, true]).unwrap();
+        assert_eq!(partition.original_input_count(), 4);
+        assert_eq!(partition.known_input_indices(), &[0, 2, 3]);
+        let forwarded = partition.forward_residuals().unwrap();
+        assert_eq!(forwarded.original_input_count(), 4);
+        assert_eq!(forwarded.known_input_indices(), &[0]);
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[
+                ResidualInputSource::UnknownInput(1),
+                ResidualInputSource::ResidualEdge(0),
+                ResidualInputSource::KnownInput(2)
+            ],
+        );
+
+        // Cache reassembly preserves the original input count.
+        let (known, residual, metadata) = forwarded.into_programs_and_metadata();
+        assert_eq!(PartitionedProgram::from_programs_and_metadata(known, residual, metadata).original_input_count(), 4);
+    }
+
+    #[test]
     fn test_partitioned_program_known_reference_inputs() {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
@@ -883,8 +1218,15 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
             .unwrap();
 
-        // The unknown value occupies residual input 0 and the known reference enters at residual input 1.
+        // The unknown value occupies residual input 0 and the known reference enters at residual input 1, either
+        // through a residual edge or, once forwarded, directly as the original known input.
         assert_eq!(program.partition(&[false, true]).unwrap().known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        let forwarded = program.partition(&[false, true]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(0), ResidualInputSource::KnownInput(1)],
+        );
+        assert_eq!(forwarded.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
         assert_eq!(
             program.partition(&[false, false]).unwrap().known_reference_inputs().collect::<Vec<_>>(),
             Vec::<usize>::new(),
@@ -963,13 +1305,484 @@ mod tests {
         let repeated = PartitionedProgram::from_programs_and_metadata(known, residual, metadata);
         assert!(!repeated.has_effect_ordering_conflicts());
         assert_eq!(repeated.known_input_indices(), &[0]);
-        assert_eq!(repeated.residual_inputs(), &[PartialEvaluationInput::Unknown(1)]);
+        assert_eq!(repeated.residual_inputs(), &[ResidualInputSource::UnknownInput(1)]);
         assert_eq!(repeated.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
 
         // Reconstructing through the unqualified boundary constructor carries no repeated-invocation evidence.
         let (known, residual, input_indices, residual_inputs, outputs) = repeated.into_parts();
-        let reconstructed = PartitionedProgram::from_parts(known, residual, input_indices, residual_inputs, outputs);
+        let reconstructed = PartitionedProgram::from_parts(known, residual, 2, input_indices, residual_inputs, outputs);
         assert!(reconstructed.has_effect_ordering_conflicts());
+    }
+
+    #[test]
+    fn test_partitioned_program_has_forwarded_residual_inputs() {
+        // `f(a, x) = (-a, -a * x, a * x)` partitioned with `x` unknown has residual edges that repeat a known output
+        // and a known input until they are forwarded.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let negated_product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, x], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![negated, negated_product, product],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        assert!(!partition.has_forwarded_residual_inputs());
+        let forwarded = partition.forward_residuals().unwrap();
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[
+                ResidualInputSource::UnknownInput(1),
+                ResidualInputSource::KnownOutput(0),
+                ResidualInputSource::KnownInput(0),
+            ],
+        );
+        assert!(forwarded.has_forwarded_residual_inputs());
+        assert!(
+            !program
+                .partition(&[false, false])
+                .unwrap()
+                .forward_residuals()
+                .unwrap()
+                .has_forwarded_residual_inputs()
+        );
+    }
+
+    #[test]
+    fn test_partitioned_program_validate_wiring() {
+        // The known program returns `-a` as a fully known output followed by `-a` as a residual edge, and the residual
+        // program computes `x - e` from the unknown input `x` and the edge `e`.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let known = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated, negated], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let edge = builder.add_input(ArrayType::scalar(DataType::F64));
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, edge], None).unwrap()[0];
+        let residual = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let validate = |known_input_indices: Vec<usize>,
+                        residual_inputs: Vec<ResidualInputSource>,
+                        outputs: Vec<PartialEvaluationOutput<usize>>| {
+            PartitionedProgram::from_parts(
+                known.clone(),
+                residual.clone(),
+                2,
+                known_input_indices,
+                residual_inputs,
+                outputs,
+            )
+            .validate_wiring()
+        };
+        let error = |message: &str| Err(ProgramError::MalformedProgram(message.to_string()));
+        let outputs = || vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)];
+        let sources = |source| vec![ResidualInputSource::UnknownInput(1), source];
+
+        assert_eq!(validate(vec![0], sources(ResidualInputSource::ResidualEdge(0)), outputs()), Ok(()));
+        assert_eq!(validate(vec![0], sources(ResidualInputSource::KnownOutput(0)), outputs()), Ok(()));
+        assert_eq!(validate(vec![0], sources(ResidualInputSource::KnownInput(0)), outputs()), Ok(()));
+        assert_eq!(
+            validate(vec![0, 1], sources(ResidualInputSource::ResidualEdge(0)), outputs()),
+            error("partition lists 2 known input indices but its known program has 1 inputs"),
+        );
+        assert_eq!(
+            validate(vec![2], sources(ResidualInputSource::ResidualEdge(0)), outputs()),
+            error("partition known input index 2 is out of bounds for 2 original inputs"),
+        );
+        assert_eq!(
+            validate(vec![0], vec![ResidualInputSource::UnknownInput(1)], outputs()),
+            error("partition lists 1 residual input sources but its residual program has 2 inputs"),
+        );
+        assert_eq!(
+            validate(
+                vec![0],
+                sources(ResidualInputSource::ResidualEdge(0)),
+                vec![
+                    PartialEvaluationOutput::Known(0),
+                    PartialEvaluationOutput::Known(1),
+                    PartialEvaluationOutput::Known(2),
+                ],
+            ),
+            error("partition declares 3 known outputs but its known program has 2 outputs"),
+        );
+        assert_eq!(
+            validate(vec![0], sources(ResidualInputSource::UnknownInput(2)), outputs()),
+            error("partition residual input 1 names `UnknownInput(2)` outside of its index space of size 2"),
+        );
+        assert_eq!(
+            validate(vec![0], sources(ResidualInputSource::KnownOutput(1)), outputs()),
+            error("partition residual input 1 names `KnownOutput(1)` outside of its index space of size 1"),
+        );
+        assert_eq!(
+            validate(vec![0], sources(ResidualInputSource::ResidualEdge(1)), outputs()),
+            error("partition residual input 1 names `ResidualEdge(1)` outside of its index space of size 1"),
+        );
+        assert_eq!(
+            validate(
+                vec![0],
+                sources(ResidualInputSource::ResidualEdge(0)),
+                vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(1)],
+            ),
+            error("partition output 1 names `Unknown(1)` outside of its index space of size 1"),
+        );
+    }
+
+    #[test]
+    fn test_partitioned_program_forward_residuals() {
+        // `f(a, b, c, x) = (a + a, (a + a) * x, b * x, -c * x)` partitioned with `x` unknown: the residual edges are
+        // the known output `a + a`, the known input `b`, and `-c`. Forwarding feeds the first two from that output and
+        // that input, so the known program returns each value once and no longer receives `b`.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let b = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let doubled_product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![doubled, x], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![b, x], None).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![c], None).unwrap()[0];
+        let negated_product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![doubled, doubled_product, product, negated_product],
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let partition = program.partition(&[true, true, true, false]).unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1, 2],
+                    residual_inputs=[UnknownInput(3), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
+                    outputs=[Known(0), Unknown(0), Unknown(1), Unknown(2)],
+                ]
+                known={
+                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                    let %3:f64[] = add %0 %0
+                        %4:f64[] = neg %2
+                    in (%3, %3, %1, %4)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
+                        %5:f64[] = mul %2 %0
+                        %6:f64[] = mul %3 %0
+                    in (%4, %5, %6)
+                }"},
+        );
+
+        // The residual program is unchanged; only its sources and the known program change.
+        assert_eq!(
+            partition.forward_residuals().unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 2],
+                    residual_inputs=[UnknownInput(3), KnownOutput(0), KnownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0), Unknown(1), Unknown(2)],
+                ]
+                known={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = add %0 %0
+                        %3:f64[] = neg %1
+                    in (%2, %3)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
+                        %5:f64[] = mul %2 %0
+                        %6:f64[] = mul %3 %0
+                    in (%4, %5, %6)
+                }"},
+        );
+
+        // Edges that carry the same known program atom share one edge.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let known_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated, negated], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sum, x], None).unwrap()[0];
+        let residual_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let partition = PartitionedProgram::from_parts(
+            known_program,
+            residual_program,
+            2,
+            vec![0],
+            vec![
+                ResidualInputSource::UnknownInput(1),
+                ResidualInputSource::ResidualEdge(0),
+                ResidualInputSource::ResidualEdge(1),
+            ],
+            vec![PartialEvaluationOutput::Unknown(0)],
+        );
+        let forwarded = partition.forward_residuals().unwrap();
+        assert_eq!(forwarded.known_input_indices(), &[0]);
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[
+                ResidualInputSource::UnknownInput(1),
+                ResidualInputSource::ResidualEdge(0),
+                ResidualInputSource::ResidualEdge(0),
+            ],
+        );
+        assert_eq!(
+            forwarded.known_program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partitioned_program_forward_residuals_preserves_repeated_known_outputs() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let known = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![input, negated, negated, input, negated],
+                vec![Placeholder],
+                vec![Placeholder; 5],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let residual = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = PartitionedProgram::from_parts(
+            known,
+            residual,
+            1,
+            vec![0],
+            vec![ResidualInputSource::ResidualEdge(0), ResidualInputSource::ResidualEdge(1)],
+            vec![
+                PartialEvaluationOutput::Known(0),
+                PartialEvaluationOutput::Known(1),
+                PartialEvaluationOutput::Known(2),
+                PartialEvaluationOutput::Unknown(0),
+            ],
+        );
+        let forwarded = partition.forward_residuals().unwrap();
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[ResidualInputSource::KnownInput(0), ResidualInputSource::KnownOutput(1)]
+        );
+        assert_eq!(
+            forwarded.known_program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%0, %1, %1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            forwarded.residual_program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partitioned_program_forward_residuals_large_boundary() {
+        let count = 4096;
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let known = builder.add_input(ArrayType::scalar(DataType::F64));
+        let unknown = builder.add_input(ArrayType::scalar(DataType::F64));
+        let mut value = known;
+        let mut outputs = Vec::new();
+        for _ in 0..count {
+            value = builder.add_instruction(NegOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
+            outputs
+                .push(builder.add_instruction(MulOperation::new(), Vec::new(), vec![value, unknown], None).unwrap()[0]);
+        }
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; count])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        let known_rendering = partition.known_program().to_string();
+        let residual_rendering = partition.residual_program().to_string();
+        let known = partition.known_program().clone();
+        let input_indices = partition.known_input_indices().to_vec();
+        let forwarded = partition.forward_residuals().unwrap();
+        assert_eq!(forwarded.known_program().to_string(), known_rendering);
+        assert_eq!(forwarded.residual_program().to_string(), residual_rendering);
+        assert_eq!(
+            forwarded.residual_inputs(),
+            std::iter::once(ResidualInputSource::UnknownInput(1))
+                .chain((0..count).map(ResidualInputSource::ResidualEdge))
+                .collect::<Vec<_>>(),
+        );
+
+        // Repeated feeders share edges in first-use order, even when that order reverses the known outputs.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let unknown = builder.add_input(ArrayType::scalar(DataType::F64));
+        let mut sources = vec![ResidualInputSource::UnknownInput(1)];
+        let mut outputs = Vec::new();
+        for edge in (0..count).rev() {
+            let left = builder.add_input(ArrayType::scalar(DataType::F64));
+            let right = builder.add_input(ArrayType::scalar(DataType::F64));
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+            outputs
+                .push(builder.add_instruction(MulOperation::new(), Vec::new(), vec![sum, unknown], None).unwrap()[0]);
+            sources.extend([ResidualInputSource::ResidualEdge(edge); 2]);
+        }
+        let residual = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2 * count + 1], vec![Placeholder; count])
+            .unwrap();
+        let residual_rendering = residual.to_string();
+        let expected_outputs = known.output_ids().iter().rev().copied().collect::<Vec<_>>();
+        let expected_known = known.filtered(known.input_ids(), &expected_outputs, &[]).unwrap().0.to_string();
+        let forwarded = PartitionedProgram::from_parts(
+            known,
+            residual,
+            2,
+            input_indices,
+            sources,
+            (0..count).map(PartialEvaluationOutput::Unknown).collect(),
+        )
+        .forward_residuals()
+        .unwrap();
+        assert_eq!(forwarded.known_program().to_string(), expected_known);
+        assert_eq!(forwarded.residual_program().to_string(), residual_rendering);
+        assert_eq!(
+            forwarded.residual_inputs(),
+            std::iter::once(ResidualInputSource::UnknownInput(1))
+                .chain((0..count).flat_map(|edge| [ResidualInputSource::ResidualEdge(edge); 2]))
+                .collect::<Vec<_>>(),
+        );
+        let values = forwarded.known_program().interpret(vec![Array::scalar(2f64).unwrap()]).unwrap();
+        let inputs = std::iter::once(Array::scalar(3f64).unwrap())
+            .chain(values.iter().flat_map(|value| [value.clone(), value.clone()]))
+            .collect::<Vec<_>>();
+        let expected = (0..count)
+            .map(|index| Array::scalar(if index % 2 == 0 { 12f64 } else { -12f64 }).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(forwarded.residual_program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_partitioned_program_forward_residuals_is_idempotent() {
+        // `f(a, b, x) = (a + a, (a + a) * x, b * x)` partitioned with `x` unknown forwards a known output and a known
+        // input that the known program then stops receiving. Forwarding again keeps both sources and both programs.
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let b = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let doubled_product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![doubled, x], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![b, x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![doubled, doubled_product, product],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let forwarded = program.partition(&[true, true, false]).unwrap().forward_residuals().unwrap();
+        let rendering = indoc! {"
+            partition [
+                known_inputs=[0],
+                residual_inputs=[UnknownInput(2), KnownOutput(0), KnownInput(1)],
+                outputs=[Known(0), Unknown(0), Unknown(1)],
+            ]
+            known={
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0
+                in (%1)
+            }
+            residual={
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = mul %1 %0
+                    %4:f64[] = mul %2 %0
+                in (%3, %4)
+            }"};
+        assert_eq!(forwarded.to_string(), rendering);
+        let forwarded_twice = forwarded.forward_residuals().unwrap();
+        assert_eq!(forwarded_twice.to_string(), rendering);
+        assert_eq!(forwarded_twice.original_input_count(), 3);
+    }
+
+    #[test]
+    fn test_partitioned_program_forward_residuals_effect_ordering() {
+        // Forwarding that leaves the known program unchanged preserves the evidence that the two programs access
+        // independent references.
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let known = builder.add_input(reference_type.clone());
+        let unknown = builder.add_input(reference_type.clone());
+        let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let unknown =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![known, unknown], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (repeated, _) = program
+            .entry_region_ref()
+            .partition_with_configuration(&[true, false], true, true, Some(&[0]), None)
+            .unwrap();
+        assert!(!repeated.forward_residuals().unwrap().has_effect_ordering_conflicts());
+
+        // Rebuilding the known program renumbers the instructions that identify its reference allocations, so its
+        // constraints conservatively become global. Here, forwarding the scale `s` removes it from the known outputs.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let known = builder.add_input(reference_type.clone());
+        let unknown = builder.add_input(reference_type);
+        let scale = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let unknown =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
+        let product = builder
+            .add_instruction(ArrayOperation::<Array>::from(MulOperation::new()), Vec::new(), vec![unknown, scale], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![known, product], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let (repeated, _) = program
+            .entry_region_ref()
+            .partition_with_configuration(&[true, false, true], true, true, Some(&[0]), None)
+            .unwrap();
+        assert!(!repeated.has_effect_ordering_conflicts());
+        let forwarded = repeated.forward_residuals().unwrap();
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::KnownInput(2)],
+        );
+        assert_eq!(forwarded.known_input_indices(), &[0]);
+        assert!(forwarded.has_effect_ordering_conflicts());
     }
 
     #[test]
@@ -999,7 +1812,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -1084,11 +1897,12 @@ mod tests {
             .residual_inputs()
             .iter()
             .map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => {
+                ResidualInputSource::UnknownInput(index) => {
                     assert_eq!(*index, 1);
                     TestValue::Reference(source.clone())
                 }
-                PartialEvaluationInput::Known(index) => known[*index].clone(),
+                ResidualInputSource::ResidualEdge(index) => known[*index].clone(),
+                source => panic!("ordinary partitions have no `{source:?}` sources"),
             })
             .collect();
         let error = partition.residual_program().interpret(residual_inputs).unwrap_err();
@@ -1115,11 +1929,12 @@ mod tests {
             .residual_inputs()
             .iter()
             .map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => {
+                ResidualInputSource::UnknownInput(index) => {
                     assert_eq!(*index, 1);
                     TestValue::Reference(source.clone())
                 }
-                PartialEvaluationInput::Known(index) => known[*index].clone(),
+                ResidualInputSource::ResidualEdge(index) => known[*index].clone(),
+                source => panic!("ordinary partitions have no `{source:?}` sources"),
             })
             .collect();
         let error = partition.residual_program().interpret(residual_inputs).unwrap_err();
@@ -1401,7 +2216,7 @@ mod tests {
         assert_eq!(known[0], TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         assert_eq!(
             partition.residual_inputs(),
-            &[PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(0)],
+            &[ResidualInputSource::UnknownInput(0), ResidualInputSource::ResidualEdge(0)]
         );
         assert_eq!(
             partition
@@ -1436,7 +2251,7 @@ mod tests {
         assert_eq!(partition.known_input_indices(), &[0]);
         assert_eq!(
             partition.residual_inputs(),
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(0),],
+            vec![ResidualInputSource::UnknownInput(1), ResidualInputSource::ResidualEdge(0),],
         );
         assert_eq!(partition.outputs(), vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
@@ -1476,7 +2291,7 @@ mod tests {
         assert!(partition.known_program.output_ids().is_empty());
         assert_eq!(
             partition.residual_inputs(),
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1),],
+            vec![ResidualInputSource::UnknownInput(0), ResidualInputSource::UnknownInput(1),],
         );
         assert_eq!(partition.outputs(), vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
 
@@ -1524,7 +2339,11 @@ mod tests {
         assert_eq!(
             partition.to_string(),
             indoc! {"
-                partition [known_inputs=[1], residual_inputs=[Unknown(0), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[1],
+                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[2, 3] .
                     let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
@@ -1556,7 +2375,11 @@ mod tests {
         assert_eq!(
             planned.to_string(),
             indoc! {"
-                partition [known_inputs=[1], residual_inputs=[Unknown(0), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[1],
+                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[2, 3] .
                     let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
@@ -1632,7 +2455,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0)],
                 ]
                 known={
@@ -1677,7 +2500,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
                     outputs=[Unknown(0)],
                 ]
                 known={
