@@ -95,7 +95,7 @@ use crate::programs::atoms::AtomId;
 use crate::programs::effects::{EffectClass, ReferenceAccessMode};
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
-use crate::programs::programs::Program;
+use crate::programs::programs::{Program, compact_regions};
 use crate::programs::references::discharge::ReferenceSource;
 use crate::programs::references::operations::{ReferenceAccessOperation, reference_access_layout};
 use crate::programs::references::transforms::{
@@ -1595,6 +1595,9 @@ impl<
             instructions,
         );
 
+        // Removing a region-carrying instruction can orphan its descendants. Compact the surviving closure before
+        // constructing the program, whose validation requires every region to be reachable from its entry.
+        let (regions, entry) = compact_regions(regions, entry);
         Program::new(self.input_structure().clone(), self.output_structure().clone(), regions, entry)?.into_simplified()
     }
 }
@@ -5598,5 +5601,104 @@ mod tests {
         // Without candidates, the program is returned unchanged.
         let unchanged = program.clone().without_unobserved_local_references(&HashSet::new()).unwrap();
         assert_eq!(unchanged.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_program_without_unobserved_local_references_compacts_nested_regions() {
+        // The removed lifecycle's condition has a nested condition with a private leaf and a shared leaf. A retained
+        // condition also uses the shared leaf, so cleanup must remove only the private closure and renumber the shared
+        // leaf from ^1 to ^0 in both retained attachments.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let predicate_type: ArrayIrType = ArrayType::scalar(DataType::Boolean).into();
+        let mut private = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let input = private.add_input(scalar_type.clone().into());
+        let doubled = private
+            .add_instruction(
+                TestArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                vec![input, input],
+                None,
+            )
+            .unwrap()[0];
+        let private = private
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut shared = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let input = shared.add_input(scalar_type.clone().into());
+        let squared = shared
+            .add_instruction(
+                TestArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![input, input],
+                None,
+            )
+            .unwrap()[0];
+        let shared = shared
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![squared], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut branch = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let predicate = branch.add_input(predicate_type.clone());
+        let reference = branch.add_input(ReferenceType::new(scalar_type.clone()).into());
+        let input = branch.add_input(scalar_type.clone().into());
+        let private = branch.import_program(private);
+        let shared = branch.import_program(shared);
+        let value = branch
+            .add_instruction(ConditionOperation::new(), vec![private, shared], vec![predicate, input], None)
+            .unwrap()[0];
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let branch = branch
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let predicate = builder.add_input(predicate_type);
+        let input = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let branch = builder.import_program(branch);
+        let shared = builder.region_ref(branch).unwrap().instructions()[0].regions()[1];
+        assert_eq!(shared, RegionId::new(1));
+        builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![branch, branch],
+                vec![predicate, predicate, reference, input],
+                None,
+            )
+            .unwrap();
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![shared, shared], vec![predicate, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let simplified = program.clone().without_unobserved_local_references(&HashSet::from([reference])).unwrap();
+        assert_eq!(simplified.regions().len(), 2);
+        assert_eq!(simplified.entry(), RegionId::new(1));
+        assert_eq!(
+            simplified.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[] = condition %0 %1 [
+                    true=^0={
+                        lambda %0:f32[] .
+                        let %1:f32[] = mul %0 %0
+                        in (%1)
+                    },
+                    false=^0,
+                ]
+                in (%2)"},
+        );
+        let input = TestArrayValue::Array(Array::scalar(3f32).unwrap());
+        let expected = vec![TestArrayValue::Array(Array::scalar(9f32).unwrap())];
+        let true_inputs = vec![TestArrayValue::Array(Array::scalar(true).unwrap()), input.clone()];
+        let false_inputs = vec![TestArrayValue::Array(Array::scalar(false).unwrap()), input];
+        assert_eq!(program.interpret(true_inputs.clone()), Ok(expected.clone()));
+        assert_eq!(program.interpret(false_inputs.clone()), Ok(expected.clone()));
+        assert_eq!(simplified.interpret(true_inputs), Ok(expected.clone()));
+        assert_eq!(simplified.interpret(false_inputs), Ok(expected));
     }
 }

@@ -14,6 +14,7 @@ use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilderId;
+use crate::programs::effects::ReferenceAccessMode;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::references::ReferenceError;
 use crate::programs::references::transforms::{ReferenceTransform, ReferenceTransformPath};
@@ -1806,11 +1807,19 @@ impl<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = T
     /// immediately. Construction performs no reference access. The view is consumed so that the transform is appended
     /// to its existing path without copying it, making a view with `k` transforms cost `O(k)` to construct; clone the
     /// view first to derive several views from a common prefix.
+    ///
+    /// The referent of the extended view is the type that a [`Read`](ReferenceAccessMode::Read) through it returns
+    /// (refer to [`ReferenceTransform::access_type`]), so it also carries metadata of the bindings (e.g., an array
+    /// view through an index that varies over a manual mesh axis varies over that axis even when the viewed referent
+    /// does not). Construction still validates that the selected value can be written back through the transform,
+    /// while mutations through the view validate their bindings against the referent of its root, which rejects,
+    /// for example, a write through such an index into an invariant root.
     pub fn with_bound_transform(mut self, transform: Transform, bindings: Vec<Binding>) -> Result<Self, ProgramError> {
         let binding_types = bindings.iter().map(Typed::r#type).collect::<Vec<_>>();
         let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         transform.validate_bindings(self.r#type.referent(), &binding_types)?;
-        let referent = transform.output_type(self.r#type.referent())?;
+        transform.output_type(self.r#type.referent())?;
+        let referent = transform.access_type(self.r#type.referent(), &binding_types, ReferenceAccessMode::Read)?;
         self.path.push_bound_transform(transform, bindings);
         self.r#type = ReferenceType::new(referent);
         Ok(self)
@@ -1980,6 +1989,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Add;
+    use crate::operations::references::tests::{manual_array_type, manual_reference_type, manual_type};
     use crate::programs::values::ValueDirectDispatch;
     use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -3332,5 +3342,24 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error, TypeError::invalid("reference index axis 0 is out of bounds for rank 0").into());
+    }
+
+    #[test]
+    fn test_reference_view_with_bound_transform_manual_variation() {
+        // A view is typed like a read through it, so a view of an invariant referent through an index that varies over
+        // a manual axis varies over that axis as well, while a view through an invariant index stays invariant.
+        let detached = |r#type: ArrayIrType| DetachedValue { r#type, identity: None };
+        let view = ReferenceView::<_, ArrayReferenceTransform, DetachedValue>::new(detached(manual_reference_type(
+            DataType::F32,
+            &[2],
+            false,
+        )))
+        .unwrap();
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        for varying in [false, true] {
+            let index = detached(manual_array_type(DataType::I32, &[], varying));
+            let selected = view.clone().with_bound_transform(transform.clone(), vec![index]).unwrap();
+            assert_eq!(selected.r#type().referent(), &manual_type(DataType::F32, &[], varying));
+        }
     }
 }

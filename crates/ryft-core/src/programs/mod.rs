@@ -164,6 +164,8 @@ pub use values::{
     ValueDomainDispatch, ValueId, ValueProjection,
 };
 
+pub(crate) use programs::RegionPruningAnalysis;
+
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum ProgramError {

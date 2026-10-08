@@ -4790,6 +4790,7 @@ mod tests {
             }
             Ok(ListType { length: self.length })
         }
+
         fn access_type(
             &self,
             input: &ListType,

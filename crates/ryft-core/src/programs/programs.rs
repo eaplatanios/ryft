@@ -1761,6 +1761,218 @@ impl ProgramLiveSets {
     }
 }
 
+/// Demand-specific boundary-pruning analysis of one borrowed [`RegionArena`]. Queries account for nested boundary
+/// pruning and instructions retained for their effects or deferred work, and keep the original region, atom, and
+/// instruction identifiers. Each region's pruning plan is memoized by its demanded-output mask, so one instance can
+/// serve a complete traversal, including repeated queries and loop-feedback iterations. The arena is immutable for
+/// the lifetime of the analysis and its cache is local to this instance and cannot mix results from different arenas.
+///
+/// [`Program::into_pruned`] uses the private pruning plans to rebuild regions, while transforms that only inspect
+/// demand use [`Self::live_sets`]. This analysis neither emits regions nor changes their boundaries.
+pub(crate) struct RegionPruningAnalysis<'o, V: Value, O: Operation<Type = V::Type>> {
+    /// Immutable source arena whose original identifiers index every query and result.
+    arena: &'o RegionArena<V, O>,
+
+    /// Pruning of each region under each demanded-output mask queried so far.
+    prunings: HashMap<(RegionId, Vec<bool>), Rc<RegionPruning<O>>>,
+}
+
+impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O> {
+    /// Creates an analysis with an empty query cache for the borrowed `arena`.
+    #[inline]
+    pub(crate) fn new(arena: &'o RegionArena<V, O>) -> Self {
+        Self { arena, prunings: HashMap::new() }
+    }
+
+    /// Returns liveness of `region` for the output positions in `outputs`, accounting for nested boundary pruning
+    /// and instructions retained for their effects or deferred work. Atom and instruction positions refer to the
+    /// original region, so callers can inspect shared descendants without rebuilding or renumbering their arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] for an out-of-range output position, and errors from region lookup
+    /// or boundary-pruning analysis.
+    pub(crate) fn live_sets(&mut self, region: RegionId, outputs: &[usize]) -> Result<ProgramLiveSets, ProgramError> {
+        let source = RegionRef::new(self.arena, region)?;
+        let output_count = source.output_ids().len();
+        let mut used_outputs = vec![false; output_count];
+        for &output in outputs {
+            let Some(used) = used_outputs.get_mut(output) else {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("output index {output} is out of range for a program with {output_count} outputs"),
+                });
+            };
+            *used = true;
+        }
+        let pruning = self.region_pruning(region, &used_outputs)?;
+        let instructions = pruning
+            .instructions
+            .iter()
+            .map(|instruction| !matches!(instruction, InstructionPruning::Removed))
+            .collect();
+        Ok(ProgramLiveSets::new(pruning.live_atoms.clone(), instructions))
+    }
+
+    /// Returns the pruning of `region` when only the outputs of it that `used_outputs` marks are used.
+    fn region_pruning(
+        &mut self,
+        region: RegionId,
+        used_outputs: &[bool],
+    ) -> Result<Rc<RegionPruning<O>>, ProgramError> {
+        let key = (region, used_outputs.to_vec());
+        if let Some(region_pruning) = self.prunings.get(&key) {
+            return Ok(region_pruning.clone());
+        }
+        let arena = self.arena;
+        let source = RegionRef::new(arena, region)?;
+        check_count!("output", used_outputs, source.output_ids().len(), ProgramError);
+
+        // Liveness flows backwards from the used outputs, so instructions are visited in reverse program order, and the
+        // inputs of an instruction become live once the instruction is known to be kept.
+        let mut live = vec![false; source.atoms().len()];
+        for (output, used) in source.output_ids().iter().zip(used_outputs) {
+            live[output.index()] |= *used;
+        }
+        let mut instructions = Vec::with_capacity(source.instructions().len());
+        for (index, instruction) in source.instructions().iter().enumerate().rev() {
+            // Instructions with effects that remain observable when unused, or that carry deferred work, are kept even
+            // when no used value depends on them, exactly as in simplification.
+            let used_outputs = instruction.outputs().iter().map(|output| live[output.index()]).collect::<Vec<_>>();
+            if !used_outputs.contains(&true) && !source.instruction_effects(index)?.is_retained_when_unused() {
+                instructions.push(InstructionPruning::Removed);
+                continue;
+            }
+
+            // Region-carrying instructions may prune their boundaries. A pruning that keeps everything is treated like
+            // no pruning, so that the instruction and its regions are not needlessly rebuilt.
+            let pruning = if instruction.regions().is_empty() {
+                None
+            } else {
+                let mut liveness = AttachedRegionLiveness { analysis: self, regions: instruction.regions() };
+                instruction.operation().prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
+            };
+
+            let instruction_pruning = match pruning {
+                None => InstructionPruning::Kept,
+                Some(pruning) => {
+                    pruning.validate(instruction, &used_outputs)?;
+                    let (kept_region_inputs, kept_region_outputs) =
+                        pruning.kept_region_boundaries(instruction, arena)?;
+                    let prunes = pruning.kept_inputs.contains(&false)
+                        || pruning.kept_outputs.contains(&false)
+                        || kept_region_inputs.iter().chain(&kept_region_outputs).any(|kept| kept.contains(&false));
+
+                    // An operation may infer more refined output types from inputs that its regions never read (e.g.,
+                    // a `condition` input whose static extent fixes a dynamic dimension of every branch input that
+                    // shares it), so a pruning that drops such an input would change the types of the kept outputs.
+                    // Such a pruning is rejected as a whole and the instruction keeps its boundary, because only the
+                    // operation could propose a narrower one. The comparison is exact, like the output type validation
+                    // of the pruned program in `Program::into_pruned`, so an instruction whose recorded output types
+                    // differ from the inferred ones (e.g., one added with `ProgramBuilder::add_instruction_unchecked`)
+                    // conservatively keeps its boundary too.
+                    let preserves_output_types = prunes && {
+                        let keep = |types: &[V::Type], kept: &[bool]| {
+                            types
+                                .iter()
+                                .zip(kept)
+                                .filter(|(_, kept)| **kept)
+                                .map(|(r#type, _)| r#type.clone())
+                                .collect::<Vec<_>>()
+                        };
+
+                        let atom_types = |atoms: &[AtomId]| {
+                            atoms
+                                .iter()
+                                .map(|atom| source.atoms()[atom.index()].r#type().into_owned())
+                                .collect::<Vec<_>>()
+                        };
+
+                        // The pruned region interfaces keep the effects and deferred work of the original regions,
+                        // which is a conservative superset of what their pruned copies retain.
+                        let region_interfaces = instruction
+                            .regions()
+                            .iter()
+                            .zip(kept_region_inputs.iter().zip(&kept_region_outputs))
+                            .map(|(region, (kept_inputs, kept_outputs))| {
+                                let interface = RegionRef::new(arena, *region)?.interface();
+                                Ok(RegionInterface::new(
+                                    keep(interface.input_types(), kept_inputs),
+                                    keep(interface.output_types(), kept_outputs),
+                                    interface.effects(),
+                                )
+                                .with_deferred_work(interface.has_deferred_work()))
+                            })
+                            .collect::<Result<Vec<_>, ProgramError>>()?;
+
+                        // Re-infer the kept outputs from the pruned operation over the kept instruction inputs. An
+                        // inference error means that the pruned boundary is not well-typed, which also rejects it.
+                        let input_types = keep(&atom_types(instruction.inputs()), &pruning.kept_inputs);
+                        let output_types = keep(&atom_types(instruction.outputs()), &pruning.kept_outputs);
+                        pruning
+                            .operation
+                            .infer_output_types(&input_types, &region_interfaces)
+                            .is_ok_and(|inferred_output_types| inferred_output_types == output_types)
+                    };
+
+                    if preserves_output_types {
+                        InstructionPruning::Pruned { pruning, kept_region_inputs, kept_region_outputs }
+                    } else {
+                        InstructionPruning::Kept
+                    }
+                }
+            };
+            for (position, input) in instruction.inputs().iter().enumerate() {
+                if !matches!(
+                    &instruction_pruning,
+                    InstructionPruning::Pruned { pruning, .. } if !pruning.kept_inputs[position]
+                ) {
+                    live[input.index()] = true;
+                }
+            }
+
+            instructions.push(instruction_pruning);
+        }
+        instructions.reverse();
+
+        let region_pruning = Rc::new(RegionPruning { live_atoms: live, instructions });
+        self.prunings.insert(key, region_pruning.clone());
+        Ok(region_pruning)
+    }
+}
+
+/// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following [`Instruction`] attached-region
+/// references), compacts the surviving regions' identifiers while preserving their relative order, and rewrites every
+/// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
+/// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
+/// remains valid for ascending-order recursive metadata derivation by [`RegionArena`].
+pub(super) fn compact_regions<V: Typed + Parameter, O>(
+    regions: Vec<Region<V, O>>,
+    entry: RegionId,
+) -> (Vec<Region<V, O>>, RegionId) {
+    let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
+    let mut remapping = vec![None; regions.len()];
+    let mut kept = 0usize;
+    for (index, is_reachable) in reachable.iter().copied().enumerate() {
+        if is_reachable {
+            remapping[index] = Some(RegionId::new(kept));
+            kept += 1;
+        }
+    }
+    let mut compacted = Vec::with_capacity(kept);
+    for (index, mut region) in regions.into_iter().enumerate() {
+        if !reachable[index] {
+            continue;
+        }
+        for instruction in &mut region.instructions {
+            for attached in &mut instruction.regions {
+                *attached = remapping[attached.index()].unwrap();
+            }
+        }
+        compacted.push(region);
+    }
+    (compacted, remapping[entry.index()].unwrap())
+}
+
 /// Entry-[`Region`] liveness analysis result shared by the borrowing and consuming [`Program`] filter implementations.
 struct ProgramLivenessAnalysis {
     /// Source [`Instruction`] index producing each entry-[`Region`] [`Atom`], or [`None`] for atoms without a producer.
@@ -2139,221 +2351,6 @@ fn adopt_transform_caches_for_identity_rebuilds<V: Typed + Parameter, O>(
     }
 }
 
-// TODO(eaplatanios): Move this to right after `impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O>`.
-/// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following [`Instruction`] attached-region
-/// references), compacts the surviving regions' identifiers while preserving their relative order, and rewrites every
-/// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
-/// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
-/// remains valid for ascending-order recursive metadata derivation by [`RegionArena`].
-pub(super) fn compact_regions<V: Typed + Parameter, O>(
-    regions: Vec<Region<V, O>>,
-    entry: RegionId,
-) -> (Vec<Region<V, O>>, RegionId) {
-    let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
-    let mut remapping = vec![None; regions.len()];
-    let mut kept = 0usize;
-    for (index, is_reachable) in reachable.iter().copied().enumerate() {
-        if is_reachable {
-            remapping[index] = Some(RegionId::new(kept));
-            kept += 1;
-        }
-    }
-    let mut compacted = Vec::with_capacity(kept);
-    for (index, mut region) in regions.into_iter().enumerate() {
-        if !reachable[index] {
-            continue;
-        }
-        for instruction in &mut region.instructions {
-            for attached in &mut instruction.regions {
-                *attached = remapping[attached.index()].unwrap();
-            }
-        }
-        compacted.push(region);
-    }
-    (compacted, remapping[entry.index()].unwrap())
-}
-
-// TODO(eaplatanios): Move this and its impl block to right after `impl ProgramLiveSets`.
-/// Demand-specific boundary-pruning analysis of one borrowed [`RegionArena`]. Queries account for nested boundary
-/// pruning and instructions retained for their effects or deferred work, and keep the original region, atom, and
-/// instruction identifiers. Each region's pruning plan is memoized by its demanded-output mask, so one instance can
-/// serve a complete traversal, including repeated queries and loop-feedback iterations. The arena is immutable for
-/// the lifetime of the analysis and its cache is local to this instance and cannot mix results from different arenas.
-///
-/// [`Program::into_pruned`] uses the private pruning plans to rebuild regions, while transforms that only inspect
-/// demand use [`Self::live_sets`]. This analysis neither emits regions nor changes their boundaries.
-pub(crate) struct RegionPruningAnalysis<'o, V: Value, O: Operation<Type = V::Type>> {
-    /// Immutable source arena whose original identifiers index every query and result.
-    arena: &'o RegionArena<V, O>,
-
-    /// Pruning of each region under each demanded-output mask queried so far.
-    prunings: HashMap<(RegionId, Vec<bool>), Rc<RegionPruning<O>>>,
-}
-
-impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O> {
-    /// Creates an analysis with an empty query cache for the borrowed `arena`.
-    #[inline]
-    pub(crate) fn new(arena: &'o RegionArena<V, O>) -> Self {
-        Self { arena, prunings: HashMap::new() }
-    }
-
-    /// Returns liveness of `region` for the output positions in `outputs`, accounting for nested boundary pruning
-    /// and instructions retained for their effects or deferred work. Atom and instruction positions refer to the
-    /// original region, so callers can inspect shared descendants without rebuilding or renumbering their arena.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::InvalidArgument`] for an out-of-range output position, and errors from region lookup
-    /// or boundary-pruning analysis.
-    pub(crate) fn live_sets(&mut self, region: RegionId, outputs: &[usize]) -> Result<ProgramLiveSets, ProgramError> {
-        let source = RegionRef::new(self.arena, region)?;
-        let output_count = source.output_ids().len();
-        let mut used_outputs = vec![false; output_count];
-        for &output in outputs {
-            let Some(used) = used_outputs.get_mut(output) else {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!("output index {output} is out of range for a program with {output_count} outputs"),
-                });
-            };
-            *used = true;
-        }
-        let pruning = self.region_pruning(region, &used_outputs)?;
-        let instructions = pruning
-            .instructions
-            .iter()
-            .map(|instruction| !matches!(instruction, InstructionPruning::Removed))
-            .collect();
-        Ok(ProgramLiveSets::new(pruning.live_atoms.clone(), instructions))
-    }
-
-    /// Returns the pruning of `region` when only the outputs of it that `used_outputs` marks are used.
-    fn region_pruning(
-        &mut self,
-        region: RegionId,
-        used_outputs: &[bool],
-    ) -> Result<Rc<RegionPruning<O>>, ProgramError> {
-        let key = (region, used_outputs.to_vec());
-        if let Some(region_pruning) = self.prunings.get(&key) {
-            return Ok(region_pruning.clone());
-        }
-        let arena = self.arena;
-        let source = RegionRef::new(arena, region)?;
-        check_count!("output", used_outputs, source.output_ids().len(), ProgramError);
-
-        // Liveness flows backwards from the used outputs, so instructions are visited in reverse program order, and the
-        // inputs of an instruction become live once the instruction is known to be kept.
-        let mut live = vec![false; source.atoms().len()];
-        for (output, used) in source.output_ids().iter().zip(used_outputs) {
-            live[output.index()] |= *used;
-        }
-        let mut instructions = Vec::with_capacity(source.instructions().len());
-        for (index, instruction) in source.instructions().iter().enumerate().rev() {
-            // Instructions with effects that remain observable when unused, or that carry deferred work, are kept even
-            // when no used value depends on them, exactly as in simplification.
-            let used_outputs = instruction.outputs().iter().map(|output| live[output.index()]).collect::<Vec<_>>();
-            if !used_outputs.contains(&true) && !source.instruction_effects(index)?.is_retained_when_unused() {
-                instructions.push(InstructionPruning::Removed);
-                continue;
-            }
-
-            // Region-carrying instructions may prune their boundaries. A pruning that keeps everything is treated like
-            // no pruning, so that the instruction and its regions are not needlessly rebuilt.
-            let pruning = if instruction.regions().is_empty() {
-                None
-            } else {
-                let mut liveness = AttachedRegionLiveness { analysis: self, regions: instruction.regions() };
-                instruction.operation().prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
-            };
-
-            let instruction_pruning = match pruning {
-                None => InstructionPruning::Kept,
-                Some(pruning) => {
-                    pruning.validate(instruction, &used_outputs)?;
-                    let (kept_region_inputs, kept_region_outputs) =
-                        pruning.kept_region_boundaries(instruction, arena)?;
-                    let prunes = pruning.kept_inputs.contains(&false)
-                        || pruning.kept_outputs.contains(&false)
-                        || kept_region_inputs.iter().chain(&kept_region_outputs).any(|kept| kept.contains(&false));
-
-                    // An operation may infer more refined output types from inputs that its regions never read (e.g.,
-                    // a `condition` input whose static extent fixes a dynamic dimension of every branch input that
-                    // shares it), so a pruning that drops such an input would change the types of the kept outputs.
-                    // Such a pruning is rejected as a whole and the instruction keeps its boundary, because only the
-                    // operation could propose a narrower one. The comparison is exact, like the output type validation
-                    // of the pruned program in `Program::into_pruned`, so an instruction whose recorded output types
-                    // differ from the inferred ones (e.g., one added with `ProgramBuilder::add_instruction_unchecked`)
-                    // conservatively keeps its boundary too.
-                    let preserves_output_types = prunes && {
-                        let keep = |types: &[V::Type], kept: &[bool]| {
-                            types
-                                .iter()
-                                .zip(kept)
-                                .filter(|(_, kept)| **kept)
-                                .map(|(r#type, _)| r#type.clone())
-                                .collect::<Vec<_>>()
-                        };
-
-                        let atom_types = |atoms: &[AtomId]| {
-                            atoms
-                                .iter()
-                                .map(|atom| source.atoms()[atom.index()].r#type().into_owned())
-                                .collect::<Vec<_>>()
-                        };
-
-                        // The pruned region interfaces keep the effects and deferred work of the original regions,
-                        // which is a conservative superset of what their pruned copies retain.
-                        let region_interfaces = instruction
-                            .regions()
-                            .iter()
-                            .zip(kept_region_inputs.iter().zip(&kept_region_outputs))
-                            .map(|(region, (kept_inputs, kept_outputs))| {
-                                let interface = RegionRef::new(arena, *region)?.interface();
-                                Ok(RegionInterface::new(
-                                    keep(interface.input_types(), kept_inputs),
-                                    keep(interface.output_types(), kept_outputs),
-                                    interface.effects(),
-                                )
-                                .with_deferred_work(interface.has_deferred_work()))
-                            })
-                            .collect::<Result<Vec<_>, ProgramError>>()?;
-
-                        // Re-infer the kept outputs from the pruned operation over the kept instruction inputs. An
-                        // inference error means that the pruned boundary is not well-typed, which also rejects it.
-                        let input_types = keep(&atom_types(instruction.inputs()), &pruning.kept_inputs);
-                        let output_types = keep(&atom_types(instruction.outputs()), &pruning.kept_outputs);
-                        pruning
-                            .operation
-                            .infer_output_types(&input_types, &region_interfaces)
-                            .is_ok_and(|inferred_output_types| inferred_output_types == output_types)
-                    };
-
-                    if preserves_output_types {
-                        InstructionPruning::Pruned { pruning, kept_region_inputs, kept_region_outputs }
-                    } else {
-                        InstructionPruning::Kept
-                    }
-                }
-            };
-            for (position, input) in instruction.inputs().iter().enumerate() {
-                if !matches!(
-                    &instruction_pruning,
-                    InstructionPruning::Pruned { pruning, .. } if !pruning.kept_inputs[position]
-                ) {
-                    live[input.index()] = true;
-                }
-            }
-
-            instructions.push(instruction_pruning);
-        }
-        instructions.reverse();
-
-        let used_inputs = source.input_ids().iter().map(|input| live[input.index()]).collect();
-        let region_pruning = Rc::new(RegionPruning { used_inputs, live_atoms: live, instructions });
-        self.prunings.insert(key, region_pruning.clone());
-        Ok(region_pruning)
-    }
-}
-
 /// State of [`Program::into_pruned`], which determines the pruning of regions under sets of used outputs and emits
 /// pruned copies of regions for kept boundaries.
 struct BoundaryPruner<'o, V: Value, O: Operation<Type = V::Type>> {
@@ -2403,7 +2400,12 @@ impl<'o, V: Value, O: Clone + Operation<Type = V::Type>> BoundaryPruner<'o, V, O
         // The instructions of the copy are those that the kept outputs use, and a pruned boundary may keep region
         // inputs that are not live but must keep every live one.
         let region_pruning = self.analysis.region_pruning(region, kept_outputs)?;
-        if region_pruning.used_inputs.iter().zip(kept_inputs).any(|(used, kept)| *used && !*kept) {
+        if source
+            .input_ids()
+            .iter()
+            .zip(kept_inputs)
+            .any(|(input, kept)| region_pruning.live_atoms[input.index()] && !*kept)
+        {
             return Err(ProgramError::MalformedProgram(format!(
                 "boundary pruning drops a live input of region {region}",
             )));
@@ -2507,10 +2509,8 @@ impl<'o, V: Value, O: Clone + Operation<Type = V::Type>> BoundaryPruner<'o, V, O
 /// Pruning of one [`Region`] under one set of used outputs, as determined by [`RegionPruningAnalysis`],
 /// which specifies which of its inputs are live and what happens to each of its instructions.
 struct RegionPruning<O> {
-    /// Whether each input of the region is live.
-    used_inputs: Vec<bool>, // TODO(eaplatanios): Now that we have `live_atoms` do we also need this or is it derivable?
-
-    /// Whether each original atom is live, including inputs needed by retained effects or deferred work.
+    /// Whether each original atom is live, including inputs needed by retained effects or deferred work. Region input
+    /// liveness is derived by indexing this mask with [`Region::input_ids`] in boundary order.
     live_atoms: Vec<bool>,
 
     /// Pruning of each instruction of the region, in instruction order.
@@ -2538,11 +2538,10 @@ enum InstructionPruning<O> {
     },
 }
 
-// TODO(eaplatanios): Rename `'s` to `'a`.
 /// [`RegionLiveness`] of the regions attached to one [`Instruction`] during [`RegionPruningAnalysis`].
-struct AttachedRegionLiveness<'s, 'o, V: Value, O: Operation<Type = V::Type>> {
+struct AttachedRegionLiveness<'a, 'o, V: Value, O: Operation<Type = V::Type>> {
     /// Analysis that determines the liveness of the attached regions.
-    analysis: &'s mut RegionPruningAnalysis<'o, V, O>,
+    analysis: &'a mut RegionPruningAnalysis<'o, V, O>,
 
     /// Regions attached to the instruction, in [`Instruction::regions`] order.
     regions: &'o [RegionId],
@@ -2554,7 +2553,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
         let region = *self.regions.get(region_index).ok_or_else(|| {
             ProgramError::MalformedProgram(format!("the instruction has no attached region {region_index}"))
         })?;
-        Ok(self.analysis.region_pruning(region, used_outputs)?.used_inputs.clone())
+        let source = RegionRef::new(self.analysis.arena, region)?;
+        let pruning = self.analysis.region_pruning(region, used_outputs)?;
+        Ok(source.input_ids().iter().map(|input| pruning.live_atoms[input.index()]).collect())
     }
 }
 
@@ -4089,29 +4090,6 @@ mod tests {
     }
 
     #[test]
-    fn test_region_simplification_shape_refuses_output_free_instructions() {
-        // An instruction with no outputs produces no atom, so the source-to-rebuilt atom mapping cannot attest to its
-        // survival or its position. Even the strongest possible evidence (i.e., the region rebuilt as itself under an
-        // identity mapping) must therefore be refused.
-        let scalar = ArrayType::scalar(DataType::F64);
-        let region: Region<Array, ArrayOperation<Array>> = Region::new(
-            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
-            vec![AtomId::new(0)],
-            vec![AtomId::new(1)],
-            vec![
-                Instruction::new(NegOperation::new().into(), vec![AtomId::new(0)], vec![AtomId::new(1)], Vec::new()),
-                Instruction::new(PrintOperation::new("effect").into(), vec![AtomId::new(0)], Vec::new(), Vec::new()),
-            ],
-        );
-        let identity_mapping = (0..region.atoms().len())
-            .map(|index| (AtomId::new(index), AtomId::new(index)))
-            .collect::<HashMap<_, _>>();
-        let shape = RegionSimplificationShape::of(&region);
-        assert!(!shape.atoms_pin_every_instruction);
-        assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
-    }
-
-    #[test]
     fn test_program_into_pruned() {
         // `f(p, x, y)` returns only the first output of a condition over `pruning_branch`, so the condition drops its
         // second output together with the input `y`, which only that output uses.
@@ -4223,6 +4201,84 @@ mod tests {
                         false=^1,
                     ]
                 in (%3, %4, %5, %6)"},
+        );
+    }
+
+    #[test]
+    fn test_program_into_pruned_preserves_region_input_order() {
+        // Input boundary positions need not match atom positions: this branch receives atoms 2 and 0, in that
+        // order. Only its first output is demanded, so the region liveness query and emitter must keep atom 2.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let branch: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> = Program::new(
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+            vec![Region::new(
+                vec![Atom::Variable(scalar.clone()); 4],
+                vec![AtomId::new(2), AtomId::new(0)],
+                vec![AtomId::new(1), AtomId::new(3)],
+                vec![
+                    Instruction::new(
+                        NegOperation::new().into(),
+                        vec![AtomId::new(2)],
+                        vec![AtomId::new(1)],
+                        Vec::new(),
+                    ),
+                    Instruction::new(
+                        NegOperation::new().into(),
+                        vec![AtomId::new(0)],
+                        vec![AtomId::new(3)],
+                        Vec::new(),
+                    ),
+                ],
+            )],
+            RegionId::new(0),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let first = builder.add_input(scalar.clone());
+        let second = builder.add_input(scalar);
+        let branch = builder.import_program(branch);
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![branch, branch],
+                vec![predicate, first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[] = condition %0 %1 %2 [
+                    true=^0={
+                        lambda %2:f64[], %0:f64[] .
+                        let %1:f64[] = neg %2
+                            %3:f64[] = neg %0
+                        in (%1, %3)
+                    },
+                    false=^0,
+                ]
+                in (%3)"},
+        );
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[] = condition %0 %1 [
+                    true=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = neg %0
+                        in (%1)
+                    },
+                    false=^0,
+                ]
+                in (%3)"},
         );
     }
 
@@ -5285,5 +5341,28 @@ mod tests {
         let key = (pure.entry(), vec![true, false]);
         assert!(!Rc::ptr_eq(&pure_analysis.prunings[&key], &effectful_analysis.prunings[&key]));
         assert_eq!(pure_analysis.live_sets(pure.entry(), &[0]), Ok(pure_live));
+    }
+
+    #[test]
+    fn test_region_simplification_shape_refuses_output_free_instructions() {
+        // An instruction with no outputs produces no atom, so the source-to-rebuilt atom mapping cannot attest to its
+        // survival or its position. Even the strongest possible evidence (i.e., the region rebuilt as itself under an
+        // identity mapping) must therefore be refused.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region: Region<Array, ArrayOperation<Array>> = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1)],
+            vec![
+                Instruction::new(NegOperation::new().into(), vec![AtomId::new(0)], vec![AtomId::new(1)], Vec::new()),
+                Instruction::new(PrintOperation::new("effect").into(), vec![AtomId::new(0)], Vec::new(), Vec::new()),
+            ],
+        );
+        let identity_mapping = (0..region.atoms().len())
+            .map(|index| (AtomId::new(index), AtomId::new(index)))
+            .collect::<HashMap<_, _>>();
+        let shape = RegionSimplificationShape::of(&region);
+        assert!(!shape.atoms_pin_every_instruction);
+        assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
     }
 }
