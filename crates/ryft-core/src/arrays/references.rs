@@ -10,6 +10,7 @@ use ryft_macros::Parameter;
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::{ArrayIrContext, ArrayIrValue};
 use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::arrays::types::ir::ArrayIrType;
@@ -17,16 +18,17 @@ use crate::batching::{BatchAxis, BatchingError};
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::{
-    Add, AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Reshape, ReshapeOperation, Slice,
-    SliceOperation, UpdateSlice, UpdateSliceOperation,
+    Add, AddOperation, BroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ParallelVaryOperation,
+    Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Parameter;
 use crate::programs::{
     BatchableReferenceTransform, BoundReferenceTransform, Concretizable, NoReferenceTransformBinding, Operation,
     OperationProjection, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType,
-    ReferenceError, ReferenceId, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
-    ReferenceViewAnalysis, ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargePolicy,
+    ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceTransform, ReferenceTransformPath, ReferenceType,
+    ReferenceView, ReferenceViewAnalysis, ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueId,
 };
 
 /// Error produced by an invalid eager array-reference view operation.
@@ -222,7 +224,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
                 (ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic }, [index]) => {
                     // Binding validation has checked the scalar integer index; the transform's own validation checks
                     // the shape and axis.
-                    transform.read_type(&referent)?;
+                    transform.selected_type(&referent)?;
                     let extent = referent.static_shape().unwrap()[*axis] as i128;
                     if extent == 0 {
                         return Err(TypeError::invalid("cannot dynamically index an empty reference axis").into());
@@ -714,9 +716,16 @@ pub enum ArrayReferenceTransform {
 }
 
 impl ArrayReferenceTransform {
-    /// Returns the exact canonical [`ArrayType`] produced from `input`. A dynamic index removes its axis exactly like
-    /// a static one, without the static bounds check and write-back check, because the index it selects is only
-    /// known to the access that applies the transform.
+    /// Returns the canonical [`ArrayType`] selected from `input`, for structural view derivation. A dynamic index
+    /// removes its axis exactly like a static one, without the static bounds check and write-back check, because the
+    /// index it selects is only known to the access that applies the transform. This function does not incorporate
+    /// metadata from a dynamic index's type; actual accesses derive their types through
+    /// [`access_type`](ReferenceTransform::access_type).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] for an invalid selection or when a static selection cannot be written back while
+    /// preserving the input type.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         let (output, selection) = self.selected_type(input)?;
         let Some(selection) = selection else {
@@ -728,7 +737,7 @@ impl ArrayReferenceTransform {
         // owned by the type system, so an update-slice may reject a selection whose metadata does not fit back into
         // its parent. An accepted update-slice always produces `input` itself, so only its acceptance needs checking.
         // The check runs when a view is constructed and when an access that writes back derives its path type.
-        // Read-only accesses derive their path types through `ReferenceTransform::read_type`, which skips it.
+        // Read-only accesses derive their path types through `ReferenceTransform::access_type`, which skips it.
         let update = if selection.removed_axis.is_some() {
             output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
         } else {
@@ -952,10 +961,64 @@ impl ReferenceTransform for ArrayReferenceTransform {
         self.output_type(input)
     }
 
-    #[inline]
-    fn read_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
-        // Reads never write back through the view, so they skip the write-back check of `output_type`.
-        Ok(self.selected_type(input)?.0)
+    fn access_type(
+        &self,
+        input: &ArrayType,
+        bindings: &[&ArrayIrType],
+        mode: ReferenceAccessMode,
+    ) -> Result<ArrayType, TypeError> {
+        // Inside a manual region, a dynamic index that varies over a manual mesh axis selects a different element on
+        // every device along it, exactly like the start indices of `dynamic_slice`, whose output varies over the union
+        // of the axes that its input and indices vary over. A read through such an index therefore gains the axes that
+        // the index varies over and the referent does not. A mutation through it would update a different element on
+        // every device, which is only well-typed when the referent already varies over those axes: an invariant
+        // referent would diverge across devices while its type claims that it is identical across them.
+        let output = match mode {
+            ReferenceAccessMode::Read => self.selected_type(input)?.0,
+            _ => self.output_type(input)?,
+        };
+
+        let Some(index) = bindings.first() else {
+            return Ok(output);
+        };
+
+        let index = <&ArrayType>::try_from(*index)?;
+        let Some(index_sharding) = index.sharding() else {
+            return Ok(output);
+        };
+
+        let missing_axes = index_sharding
+            .varying_manual_axes()
+            .iter()
+            .filter(|axis| !input.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(axis) = missing_axes.first() else {
+            return Ok(output);
+        };
+
+        if mode != ReferenceAccessMode::Read {
+            return Err(TypeError::invalid(format!(
+                "reference transform index `{index}` varies over manual axis `{axis}` but the referent `{input}` does \
+                 not, so a mutation through it would update a different element on every device of a referent that \
+                 is identical across them; vary the referent over that axis or use an invariant index",
+            )));
+        }
+
+        let mut sharding = match output.sharding() {
+            Some(sharding) if sharding.mesh() != index_sharding.mesh() => {
+                return Err(TypeError::invalid(format!(
+                    "reference transform index `{index}` and referent `{input}` must use the same mesh",
+                )));
+            }
+            Some(sharding) => sharding.clone(),
+            None => Sharding::replicated(index_sharding.mesh().clone(), output.rank()),
+        };
+
+        sharding
+            .extend_varying_manual_axes(missing_axes)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        output.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
     }
 
     fn overlap(
@@ -1115,10 +1178,12 @@ where
     C::Operation: OperationProjection<
             ArrayType,
             Projected: From<ReshapeOperation>
+                           + From<BroadcastOperation>
                            + From<SliceOperation>
                            + From<UpdateSliceOperation>
                            + From<DynamicSliceOperation>
-                           + From<DynamicUpdateSliceOperation>,
+                           + From<DynamicUpdateSliceOperation>
+                           + From<ParallelVaryOperation>,
         >,
 {
     type Referent = ArrayType;
@@ -1181,10 +1246,12 @@ where
         + OperationProjection<
             ArrayType,
             Projected: From<ReshapeOperation>
+                           + From<BroadcastOperation>
                            + From<SliceOperation>
                            + From<UpdateSliceOperation>
                            + From<DynamicSliceOperation>
-                           + From<DynamicUpdateSliceOperation>,
+                           + From<DynamicUpdateSliceOperation>
+                           + From<ParallelVaryOperation>,
         >,
 {
     fn accumulate(
@@ -1637,11 +1704,74 @@ struct ContextTransformCarrier<'c, C> {
     context: &'c C,
 }
 
+impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C>
+where
+    C::Operation: OperationProjection<
+            ArrayType,
+            Projected: From<ReshapeOperation>
+                           + From<BroadcastOperation>
+                           + From<SliceOperation>
+                           + From<DynamicSliceOperation>
+                           + From<ParallelVaryOperation>,
+        >,
+{
+    /// Returns `values` with their manual variation aligned, in the same order: every value is varied over each
+    /// manual mesh axis that some value varies over and it does not, through one staged `parallel_vary` per missing
+    /// axis, after placing a value without a sharding on the mesh of the first value that varies over that axis
+    /// with a placement-only `broadcast`. This is the alignment that the value-level capability of a dynamic
+    /// slicing operation performs before binding it (refer to
+    /// [`ManualVariationAlignment::align_manual_variation`](crate::ManualVariationAlignment::align_manual_variation)),
+    /// so that an access through an index that varies over axes that the selected value does not vary over binds a
+    /// well-typed dynamic slice or update whose result varies over the union of those axes. Without manual variation,
+    /// the values are returned unchanged.
+    fn align_manual_variation(&self, values: Vec<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
+        let types = values
+            .iter()
+            .map(|value| self.array_type(value).map(Cow::into_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut axes = Vec::<(String, Sharding)>::new();
+        for sharding in types.iter().filter_map(ArrayType::sharding) {
+            for axis in sharding.varying_manual_axes() {
+                if !axes.iter().any(|(candidate, _)| candidate == axis) {
+                    axes.push((axis.clone(), sharding.clone()));
+                }
+            }
+        }
+        values
+            .into_iter()
+            .zip(types)
+            .map(|(mut value, mut r#type)| {
+                for (axis, sharding) in &axes {
+                    if r#type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis)) {
+                        continue;
+                    }
+                    if r#type.sharding().is_none() {
+                        let rank = r#type.rank();
+                        let placed = r#type
+                            .clone()
+                            .with_sharding(Sharding::replicated(sharding.mesh().clone(), rank))
+                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                        let operation = BroadcastOperation::new(placed, (0..rank).collect());
+                        value = self.context.bind_array(operation, &[value])?;
+                    }
+                    value = self.context.bind_array(ParallelVaryOperation::new(axis.clone()), &[value])?;
+                    r#type = self.array_type(&value)?.into_owned();
+                }
+                Ok(value)
+            })
+            .collect()
+    }
+}
+
 impl<C: Context<Type = ArrayIrType>> TransformReadCarrier for ContextTransformCarrier<'_, C>
 where
     C::Operation: OperationProjection<
             ArrayType,
-            Projected: From<ReshapeOperation> + From<SliceOperation> + From<DynamicSliceOperation>,
+            Projected: From<ReshapeOperation>
+                           + From<BroadcastOperation>
+                           + From<SliceOperation>
+                           + From<DynamicSliceOperation>
+                           + From<ParallelVaryOperation>,
         >,
 {
     type Value = C::Value;
@@ -1670,8 +1800,13 @@ where
         let mut sizes = ArrayReferenceTransform::indexed_shape(axis, &input_type)?.dimensions().to_vec();
         sizes[axis] = 1;
 
-        // Unselected axes span their complete extent, so dynamic slicing clamps their start to zero. Reusing
-        // the scalar index there avoids constructing redundant zero values in the context's value family.
+        // Unselected axes span their complete extent, so dynamic slicing clamps their start to zero. Reusing the scalar
+        // index there avoids constructing redundant zero values in the context's value family. An index that varies
+        // over manual axes that the input does not vary over selects a different element on every device, so the input
+        // is aligned with it first, and the selected value varies over those axes as well (refer to
+        // `ArrayReferenceTransform::access_type`).
+        let aligned = self.align_manual_variation(vec![input.clone(), binding.clone()])?;
+        let (input, binding) = (&aligned[0], &aligned[1]);
         let mut inputs = vec![input.clone()];
         inputs.extend(std::iter::repeat_n(binding.clone(), sizes.len()));
         let selected = self.context.bind_array(DynamicSliceOperation::new(sizes), &inputs)?;
@@ -1684,10 +1819,12 @@ where
     C::Operation: OperationProjection<
             ArrayType,
             Projected: From<ReshapeOperation>
+                           + From<BroadcastOperation>
                            + From<SliceOperation>
                            + From<UpdateSliceOperation>
                            + From<DynamicSliceOperation>
-                           + From<DynamicUpdateSliceOperation>,
+                           + From<DynamicUpdateSliceOperation>
+                           + From<ParallelVaryOperation>,
         >,
 {
     #[inline]
@@ -1708,10 +1845,14 @@ where
         let rank = dimensions.len();
         let update = self.reshape(update, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))?;
 
-        // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path,
-        // while the selected axis uses the same runtime index and clamping extent as the original index transform.
-        let mut inputs = vec![target.clone(), update];
-        inputs.extend(std::iter::repeat_n(binding.clone(), rank));
+        // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path, while
+        // the selected axis uses the same runtime index and clamping extent as the original index transform. A mutation
+        // through an index requires the target to vary over every manual axis that the index varies over (refer to
+        // `ArrayReferenceTransform::access_type`), so the alignment only varies the index (and the update) over the
+        // axes that the target varies over.
+        let mut inputs = self.align_manual_variation(vec![target.clone(), update, binding.clone()])?;
+        let binding = inputs.pop().unwrap();
+        inputs.extend(std::iter::repeat_n(binding, rank));
         self.context.bind_array(DynamicUpdateSliceOperation::new(), &inputs)
     }
 }
@@ -1725,6 +1866,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::arrays::types::memories::Memory;
@@ -1763,6 +1905,14 @@ mod tests {
 
     /// Array IR read operation over array reference transforms.
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
+
+    /// Returns `r#type` placed replicated on a two-device manual mesh over `x`, varying along `x` when `varying` is
+    /// set, as the values of a manual region over that mesh are typed.
+    fn manual_type(r#type: ArrayType, varying: bool) -> ArrayType {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, r#type.rank()).with_varying_manual_axes(varying.then_some("x"));
+        r#type.with_sharding(sharding.unwrap()).unwrap()
+    }
 
     /// Returns the rendering of the program that `access` stages through [`ArrayReferenceDischarge`] over the
     /// composed view `root[1:3, 0:2][1]` of an `f32[3, 3]` allocation, given that allocation and an `f32[2]` value.
@@ -2659,27 +2809,120 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_transform_read_type() {
+    fn test_array_reference_transform_access_type() {
         // Read-only accesses derive the same types as `output_type`; they only skip its write-back check.
         let input = ArrayType::new_static(DataType::F32, [3, 4]);
+        let binding = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        let read = ReferenceAccessMode::Read;
         assert_eq!(
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }
-                .read_type(&input),
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }.access_type(
+                &input,
+                &[],
+                read,
+            ),
             Ok(ArrayType::new_static(DataType::F32, [4])),
         );
         assert_eq!(
-            ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic }.read_type(&input),
+            ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic }.access_type(
+                &input,
+                &[&binding],
+                read,
+            ),
             Ok(ArrayType::new_static(DataType::F32, [3])),
         );
         assert_eq!(
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] }
-                .read_type(&input),
+                .access_type(&input, &[], read),
             Ok(ArrayType::new_static(DataType::F32, [2, 3])),
         );
         assert_eq!(
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) }
-                .read_type(&input),
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) }.access_type(
+                &input,
+                &[],
+                read,
+            ),
             Err(TypeError::invalid("reference index 3 on axis 0 is out of bounds for size 3")),
+        );
+
+        // Mutation accesses retain the same selected type when the selection can be written back.
+        assert_eq!(
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }.access_type(
+                &input,
+                &[],
+                ReferenceAccessMode::Write,
+            ),
+            Ok(ArrayType::new_static(DataType::F32, [4])),
+        );
+        assert_eq!(
+            ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic }.access_type(
+                &input,
+                &[&binding],
+                ReferenceAccessMode::Write,
+            ),
+            Ok(ArrayType::new_static(DataType::F32, [3])),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_transform_access_type_manual_variation() {
+        // A read through an index that varies along a manual axis varies along that axis as well, joining the
+        // variation of the referent, and an index without such variation leaves the read type unchanged.
+        let index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let referent = manual_type(ArrayType::new_static(DataType::F32, [3, 4]), false);
+        let varying_referent = manual_type(ArrayType::new_static(DataType::F32, [3, 4]), true);
+        let row = manual_type(ArrayType::new_static(DataType::F32, [4]), false);
+        let varying_row = manual_type(ArrayType::new_static(DataType::F32, [4]), true);
+        let invariant_binding = ArrayIrType::Array(manual_type(ArrayType::scalar(DataType::I32), false));
+        let varying_binding = ArrayIrType::Array(manual_type(ArrayType::scalar(DataType::I32), true));
+        let read = ReferenceAccessMode::Read;
+        assert_eq!(index.access_type(&referent, &[&invariant_binding], read), Ok(row.clone()));
+        assert_eq!(index.access_type(&referent, &[&varying_binding], read), Ok(varying_row.clone()));
+        assert_eq!(index.access_type(&varying_referent, &[&invariant_binding], read), Ok(varying_row.clone()));
+        assert_eq!(index.access_type(&varying_referent, &[&varying_binding], read), Ok(varying_row.clone()));
+
+        // A referent without a sharding is placed replicated on the mesh of the index, and a referent on another mesh
+        // is rejected.
+        let unsharded = ArrayType::new_static(DataType::F32, [3, 4]);
+        assert_eq!(index.access_type(&unsharded, &[&varying_binding], read), Ok(varying_row.clone()));
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let other_referent = unsharded.clone().with_sharding(Sharding::replicated(other_mesh, 2)).unwrap();
+        assert_eq!(
+            index.access_type(&other_referent, &[&varying_binding], read),
+            Err(TypeError::invalid(
+                "reference transform index `i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` and \
+                 referent `f32[3, 4][sharding={mesh<['y'=2:manual]>, [{}, {}]}]` must use the same mesh",
+            )),
+        );
+
+        // Every mutation through such an index is rejected unless the referent already varies along its axes, and the
+        // mutated view keeps the referent's variation.
+        for mode in [
+            ReferenceAccessMode::Write,
+            ReferenceAccessMode::ReadWrite,
+            ReferenceAccessMode::Accumulate,
+            ReferenceAccessMode::AtomicAccumulate,
+        ] {
+            assert_eq!(index.access_type(&referent, &[&invariant_binding], mode), Ok(row.clone()));
+            assert_eq!(index.access_type(&varying_referent, &[&varying_binding], mode), Ok(varying_row.clone()));
+            assert_eq!(index.access_type(&varying_referent, &[&invariant_binding], mode), Ok(varying_row.clone()));
+            assert_eq!(
+                index.access_type(&referent, &[&varying_binding], mode),
+                Err(TypeError::invalid(
+                    "reference transform index `i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` \
+                     varies over manual axis `x` but the referent \
+                     `f32[3, 4][sharding={mesh<['x'=2:manual]>, [{}, {}]}]` does not, so a mutation through it would \
+                     update a different element on every device of a referent that is identical across them; vary \
+                     the referent over that axis or use an invariant index",
+                )),
+            );
+        }
+
+        // Static transforms have no bindings, so they preserve the referent's manual variation.
+        let axes = vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)];
+        let slice = ArrayReferenceTransform::Slice { axes };
+        assert_eq!(
+            slice.access_type(&referent, &[], read),
+            Ok(manual_type(ArrayType::new_static(DataType::F32, [2, 4]), false)),
         );
     }
 
@@ -3505,6 +3748,70 @@ mod tests {
             Ok(vec![last_row.clone()]),
         );
         assert_eq!(staged.interpret(vec![matrix, TestValue::Array(Array::scalar(80i32).unwrap())]), Ok(vec![last_row]));
+    }
+
+    #[test]
+    fn test_array_reference_discharge_aligns_the_manual_variation_of_dynamic_indices() {
+        // An index that varies along a manual axis that the allocation does not vary along selects a different row
+        // on every device, so a read through it varies the allocation along that axis before slicing it, like the
+        // value-level `dynamic_slice`. An index that is invariant along an axis that the allocation varies along
+        // is varied along it before slicing or updating, so that every dynamic slicing operation is well-typed.
+        let invariant = manual_type(ArrayType::new_static(DataType::F32, [2, 3]), false);
+        let varying = manual_type(ArrayType::new_static(DataType::F32, [2, 3]), true);
+        let invariant_index = manual_type(ArrayType::scalar(DataType::I32), false);
+        let varying_index = manual_type(ArrayType::scalar(DataType::I32), true);
+        let row = manual_type(ArrayType::new_static(DataType::F32, [3]), true);
+        let (_, staged): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
+            TestEagerContext::trace(
+                |inputs: Vec<TestTracer>| {
+                    let context = inputs[0].context().clone();
+                    let path = |index: &TestTracer| {
+                        ArrayReferenceTransformPath::root().with_bound_transform(
+                            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+                            vec![index.clone()],
+                        )
+                    };
+                    let selected = ArrayReferenceDischarge::read(&context, &inputs[0], &path(&inputs[2]))?;
+                    let varying_selected = ArrayReferenceDischarge::read(&context, &inputs[1], &path(&inputs[3]))?;
+                    let written =
+                        ArrayReferenceDischarge::write(&context, &inputs[1], inputs[4].clone(), &path(&inputs[3]))?;
+                    Ok(vec![selected, varying_selected, written])
+                },
+                vec![
+                    ArrayIrType::Array(invariant),
+                    ArrayIrType::Array(varying),
+                    ArrayIrType::Array(varying_index),
+                    ArrayIrType::Array(invariant_index),
+                    ArrayIrType::Array(row),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+            lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
+               %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
+               %2:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
+               %3:i32[][sharding={mesh<['x'=2:manual]>, []}], \
+                   %4:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %5:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %0
+                    %6:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        dynamic_slice [sizes=[1, 3]] %5 %2 %2
+                    %7:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[3]] %6
+                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %3
+                    %9:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        dynamic_slice [sizes=[1, 3]] %1 %8 %8
+                    %10:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[3]] %9
+                    %11:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        reshape [shape=[1, 3]] %4
+                    %12:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        parallel_vary [axis_name=\"x\"] %3
+                    %13:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
+                        dynamic_update_slice %1 %11 %12 %12
+                in (%7, %10, %13)"},
+        );
     }
 
     #[test]
