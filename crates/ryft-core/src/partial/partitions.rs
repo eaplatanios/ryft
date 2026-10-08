@@ -491,8 +491,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// After forwarding, `K` returns `a + a` once and no longer receives `b`, whose value the caller passes to `R`
     /// directly. When no edge is forwarded or deduplicated, the partition is returned unchanged. Otherwise, the
     /// effect-ordering constraints of the rebuilt `K` are conservatively reset to global ordering of its ordered
-    /// effects, because rebuilding renumbers the instructions that identify its reference allocations. The constraints
-    /// of `R` stay valid, because `R` is unchanged.
+    /// effects, because rebuilding renumbers the instructions that identify its reference allocations. The
+    /// constraints of `R` stay valid, because `R` is unchanged.
     ///
     /// # Usage
     ///
