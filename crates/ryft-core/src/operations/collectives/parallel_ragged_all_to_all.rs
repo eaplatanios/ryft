@@ -4,15 +4,15 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, Dimension, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, Shape, Sharding,
-    ShardingDimension,
+    ArrayOperation, ArrayType, DataType, Dimension, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh,
+    Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation, batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, ValueResolution};
+use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
@@ -49,9 +49,10 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError,
-    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch,
-    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
+    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueDomainDispatch, ValueProjection, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -216,10 +217,12 @@ impl ParallelRaggedAllToAllOperation {
     /// participants in one host-side evaluation without an enclosing binder. The clone keeps the axis name, groups,
     /// and update semantics of this operation, and it renders with `representation=Physical`.
     ///
-    /// This function is private because only the batching rule of a level that binds [`axis_name`](Self::axis_name)
-    /// can establish that the leading axis enumerates the participants of that axis. That level consumes the axis, so
-    /// every other level treats the physical operation as unrelated to its own axis. A physical operation has no
-    /// backend lowering (refer to the documentation of [`is_physical`](Self::is_physical)).
+    /// This function is private because the physical representation is only meaningful where the leading axis is
+    /// known to enumerate the participants of [`axis_name`](Self::axis_name). The batching rule of a level that binds
+    /// that axis establishes it and consumes the axis, so every other level treats the physical operation as unrelated
+    /// to its own axis. [`interpret_participants`](Self::interpret_participants) establishes it by stacking the inputs
+    /// of every participant along the leading axis itself. A physical operation has no backend lowering (refer to the
+    /// documentation of [`is_physical`](Self::is_physical)).
     #[inline]
     fn with_physical_representation(&self) -> Self {
         Self { representation: ParallelRaggedAllToAllRepresentation::Physical, ..self.clone() }
@@ -307,6 +310,93 @@ impl ParallelRaggedAllToAllOperation {
     #[inline]
     pub fn accumulates_updates(&self) -> bool {
         self.update_kind == ParallelRaggedAllToAllUpdateKind::Add
+    }
+
+    /// Exchanges segments between all [`axis_size`](Self::axis_size) participants of the named axis on the host and
+    /// returns the result of every participant. Reference execution of manual regions (i.e., the `shard_map` emulation
+    /// of the reference backend), which holds the values of every device explicitly, uses this function to execute an
+    /// exchange over a manual mesh axis. The participant groups of this operation select the exchange partners exactly
+    /// as they do on devices, and the metadata are validated like those of the batching-internal physical
+    /// representation, through which the exchange runs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Six inputs of every participant, in the canonical input order, ordered by axis index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] unless there are [`axis_size`](Self::axis_size) participants, when an input has
+    /// a dynamic shape, or when the corresponding inputs of the participants have different shapes or data types,
+    /// [`ProgramError::InvalidInputCount`] unless every participant has six inputs, the type inference errors of
+    /// the logical exchange of each participant, and the metadata validation errors of the exchange.
+    pub(crate) fn interpret_participants(&self, inputs: &[Vec<Array>]) -> Result<Vec<Array>, ProgramError> {
+        if inputs.len() != self.axis_size {
+            return Err(TypeError::invalid(format!(
+                "`{}` over axis `{}` of size {} cannot exchange segments between {} participants",
+                PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME,
+                self.axis_name,
+                self.axis_size,
+                inputs.len(),
+            ))
+            .into());
+        }
+        let mut output_types = Vec::with_capacity(inputs.len());
+        for participant_inputs in inputs {
+            check_count!("input", participant_inputs, 6, ProgramError);
+            let input_types = participant_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            output_types.push(self.infer_output_types(&input_types, &[])?.remove(0));
+        }
+
+        // Stack the inputs of all participants along a leading participant axis at unplaced types, whose physical
+        // exchange carries no mesh, because the manual variation of every participant was validated above.
+        let stacked_inputs = (0..6)
+            .map(|index| {
+                let input_type = inputs[0][index].r#type();
+                let Some(shape) = input_type.static_shape() else {
+                    return Err(TypeError::invalid(format!(
+                        "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` participant input {index} must have a static \
+                         shape but got `{input_type}`",
+                    ))
+                    .into());
+                };
+                let mut stacked_shape = vec![inputs.len()];
+                stacked_shape.extend(shape.dimensions());
+                let mut bytes = Vec::new();
+                for participant_inputs in inputs {
+                    let participant_type = participant_inputs[index].r#type();
+                    if participant_type.data_type() != input_type.data_type()
+                        || participant_type.shape() != input_type.shape()
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME}` participant inputs {index} must share one \
+                             static shape and data type but got `{input_type}` and `{participant_type}`",
+                        ))
+                        .into());
+                    }
+                    bytes.extend(participant_inputs[index].logical_bytes());
+                }
+                Array::from_logical_bytes(ArrayType::new_static(input_type.data_type(), stacked_shape), &bytes)
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let physical = Self { mesh: None, ..self.with_physical_representation() };
+        let mut stacked_outputs = physical.interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &EmptyRegionDriver,
+            &stacked_inputs,
+        )?;
+        check_count!("output", stacked_outputs, 1, ProgramError);
+
+        // Row `p` of the physical result is the result of the participant with axis index `p`.
+        let stacked_bytes = stacked_outputs.remove(0).logical_bytes();
+        let row_byte_count = stacked_bytes.len() / inputs.len();
+        output_types
+            .into_iter()
+            .enumerate()
+            .map(|(participant, output_type)| {
+                let row = participant * row_byte_count..(participant + 1) * row_byte_count;
+                Array::from_logical_bytes(output_type, &stacked_bytes[row])
+            })
+            .collect()
     }
 
     /// Returns the participant groups that exchange segments (i.e., the ordered participant groups of a grouped
@@ -1753,6 +1843,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -2012,6 +2104,97 @@ mod tests {
         assert_eq!(
             internal.to_string(),
             "parallel_ragged_all_to_all [axis_name=\"x\", axis_size=4, representation=Physical, update_kind=Add]",
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_interpret_participants() {
+        // Participant `p` holds the rows `[10·p + 1, 10·p + 2]` and sends row `i` to the member at position `i` of its
+        // group, which places it at the row given by the sender's own position. With groups `[[0, 2], [3, 1]]`, the
+        // members exchange only within their group, and the last row of every output seed passes through unchanged.
+        let operation = ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]]);
+        let operation = operation.unwrap();
+        let participant_inputs = |participant: usize, position: i64| {
+            vec![
+                Array::vector(vec![(10 * participant + 1) as f32, (10 * participant + 2) as f32]).unwrap(),
+                Array::vector(vec![-1.0f32; 3]).unwrap(),
+                Array::vector(vec![0i64, 1]).unwrap(),
+                Array::vector(vec![1i64, 1]).unwrap(),
+                Array::vector(vec![position, position]).unwrap(),
+                Array::vector(vec![1i64, 1]).unwrap(),
+            ]
+        };
+        let inputs = vec![
+            participant_inputs(0, 0),
+            participant_inputs(1, 1),
+            participant_inputs(2, 1),
+            participant_inputs(3, 0),
+        ];
+        assert_eq!(
+            operation.interpret_participants(&inputs),
+            Ok(vec![
+                Array::vector(vec![1.0f32, 21.0, -1.0]).unwrap(),
+                Array::vector(vec![32.0f32, 12.0, -1.0]).unwrap(),
+                Array::vector(vec![2.0f32, 22.0, -1.0]).unwrap(),
+                Array::vector(vec![31.0f32, 11.0, -1.0]).unwrap(),
+            ]),
+        );
+
+        // Every participant of the axis must take part in the exchange.
+        assert_eq!(
+            operation.interpret_participants(&inputs[..2]),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` over axis `x` of size 4 cannot exchange segments between 2 participants",
+            )
+            .into()),
+        );
+
+        // Every participant must supply the six inputs of the exchange.
+        let mut short_inputs = inputs.clone();
+        short_inputs[1].pop();
+        assert_eq!(
+            operation.interpret_participants(&short_inputs),
+            Err(ProgramError::InvalidInputCount { expected: 6, actual: 5 }),
+        );
+
+        // The corresponding inputs of the participants must share one static shape and data type, even when each
+        // participant's own inputs describe a valid exchange.
+        let mut longer_inputs = inputs.clone();
+        longer_inputs[1][0] = Array::vector(vec![11.0f32, 12.0, 13.0]).unwrap();
+        assert_eq!(
+            operation.interpret_participants(&longer_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f32[3]`",
+            )
+            .into()),
+        );
+        let mut wider_inputs = inputs.clone();
+        wider_inputs[1][0] = Array::vector(vec![11.0f64, 12.0]).unwrap();
+        wider_inputs[1][1] = Array::vector(vec![-1.0f64; 3]).unwrap();
+        assert_eq!(
+            operation.interpret_participants(&wider_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f64[2]`",
+            )
+            .into()),
+        );
+
+        // The physical exchange stacks the participants' inputs, which requires static shapes.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut dynamic_inputs = inputs;
+        for participant_inputs in &mut dynamic_inputs {
+            let bytes = participant_inputs[0].logical_bytes();
+            participant_inputs[0] = Array::new_unchecked(dynamic_type.clone(), Arc::new(bytes));
+        }
+        assert_eq!(
+            operation.interpret_participants(&dynamic_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant input 0 must have a static shape but got `f32[extent]`",
+            )
+            .into()),
         );
     }
 
