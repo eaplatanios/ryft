@@ -9,8 +9,8 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::programs::{Program, ProgramRenderingMode};
 use crate::programs::regions::{
-    InputRegionProvenance, OutputRegionProvenance, RegionArena, RegionInterface, RegionLiveness, RegionRef, RegionRole,
-    RegionSlot,
+    InputRegionProvenance, OutputRegionProvenance, RegionArena, RegionDataFlow, RegionInterface, RegionLiveness,
+    RegionRef, RegionRole, RegionSlot,
 };
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
@@ -690,6 +690,11 @@ pub trait Operation: Clone {
     /// roots across boundaries without guessing from equal types or matching positions. Unlike diagnostic
     /// [`Provenance`](crate::Provenance), these declarations carry semantics used by analyses and transforms.
     ///
+    /// Provenance declares boundary correspondence only. It does not state which values produce a region input or how
+    /// often a region executes, which [`Self::region_data_flow`] declares on top of it. For example, each body input of
+    /// a `while` loop corresponds to an instruction input, even though the body also receives the outputs of its
+    /// previous iteration.
+    ///
     /// The default declares no provenance. Executed reference region inputs require an explicit instruction input or
     /// local origin; local references remain borrowed, cannot escape or be consumed, and gain no initialization or
     /// access permission from this declaration. Region access policies still apply and executed region effects still
@@ -709,11 +714,28 @@ pub trait Operation: Clone {
     /// This is the output side counterpart of [`Self::input_region_provenance`]. Analyses can recursively follow the
     /// returned region outputs to their producers; a path may end at a region input or constant and therefore have no
     /// producing instruction. The empty default is correct when instruction outputs do not directly forward outputs
-    /// from attached regions.
+    /// from attached regions. Like [`Self::input_region_provenance`], this declares correspondence only, and
+    /// [`Self::region_data_flow`] declares whether these region outputs are the complete producers of the output.
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
         Vec::new()
+    }
+
+    /// Declares context-independent producer and execution semantics of the attached computation regions, layered
+    /// on top of the boundary correspondence that [`input_region_provenance`](Self::input_region_provenance) and
+    /// [`output_region_provenance`](Self::output_region_provenance) declare. Operations whose regions execute once
+    /// per application, and whose provenance is therefore exactly their data flow, opt in with
+    /// [`RegionDataFlow::Provenance`]. Operations with recurrences (e.g., loops) or bypasses borrow their own
+    /// [`RegionDataFlowRule`](crate::programs::RegionDataFlowRule) through [`RegionDataFlow::Custom`].
+    /// Wrapper operations forward the declaration of the operation they wrap unchanged. The default is
+    /// [`RegionDataFlow::Opaque`]: analyses must not infer single-invocation semantics, the absence of producers, or
+    /// permission to replay the operation. Opaque operations (e.g., kernel calls, whose bodies execute once per grid
+    /// point) may still declare provenance for reference analyses. This contract carries no residual policy, storage,
+    /// reference identity, or execution-context decisions.
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Opaque
     }
 
     /// Prunes the boundary of an [`Instruction`] that applies this operation, given which of its outputs are used,
@@ -1007,6 +1029,11 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.as_ref().output_region_provenance(output_index)
+    }
+
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        self.as_ref().region_data_flow()
     }
 
     #[inline]
@@ -1570,8 +1597,8 @@ mod tests {
         DimensionValue,
     };
     use crate::operations::{
-        ConditionOperation, DimensionAddOperation, DimensionPowOperation, ReferenceNewOperation, SinOperation,
-        StopGradientOperation, TagOperation, ZeroOperation,
+        ConditionOperation, DimensionAddOperation, DimensionPowOperation, ReferenceNewOperation, ScanOperation,
+        SinOperation, StopGradientOperation, TagOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -1626,6 +1653,10 @@ mod tests {
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
             vec![OutputRegionProvenance { region_index: 0, output_index }]
+        }
+
+        fn region_data_flow(&self) -> RegionDataFlow<'_> {
+            RegionDataFlow::Provenance
         }
 
         fn prune_boundary(
@@ -1825,6 +1856,7 @@ mod tests {
         );
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
         assert_eq!(operation.output_region_provenance(0), Vec::new());
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Opaque));
         assert!(matches!(operation.prune_boundary(1, &[false], &mut FirstInputLiveness), Ok(None)));
         assert_eq!(operation.region_capture_input_count(0), None);
         assert_eq!(operation.reference_output_identity_input(0), None);
@@ -1866,6 +1898,15 @@ mod tests {
             operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
         );
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        let boxed_scan = Box::new(ScanOperation::<ArrayType>::new(2, 3usize));
+        let RegionDataFlow::Custom(expected) = boxed_scan.as_ref().region_data_flow() else {
+            panic!("a scan must declare its custom region data flow");
+        };
+        let RegionDataFlow::Custom(forwarded) = boxed_scan.region_data_flow() else {
+            panic!("boxed operation dispatch must retain its payload's custom region data flow");
+        };
+        assert!(std::ptr::eq(forwarded, expected));
         assert_eq!(
             operation.prune_boundary(3, &[true, false], &mut FirstInputLiveness),
             Ok(Some(OperationBoundaryPruning {

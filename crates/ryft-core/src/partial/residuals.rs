@@ -51,9 +51,9 @@ use crate::parameters::Placeholder;
 use crate::partial::partitions::PartitionedProgram;
 use crate::partial::values::ResidualInputSource;
 use crate::programs::{
-    Atom, AtomId, ErasedOperation, Instruction, Operation, OperationPayloadProjection, Program, ProgramBuilder,
-    ProgramError, RegionDataFlowBoundary, RegionDataFlowSource, RegionDataFlowSources, RegionId, RegionPruningAnalysis,
-    RegionRole, Type, Typed, Value, ValueId,
+    Atom, AtomId, AttachedRegionLiveness, ErasedOperation, Instruction, Operation, OperationPayloadProjection, Program,
+    ProgramBuilder, ProgramError, RegionDataFlowBoundary, RegionDataFlowSource, RegionDataFlowSources, RegionId,
+    RegionPruningAnalysis, Type, Typed, Value, ValueId,
 };
 
 /// Error returned when classifying residuals with a [`ResidualPolicy`], staging their [`ResidualStorage`],
@@ -1736,10 +1736,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
         let program = self.program;
         let policy = self.policy;
         let instruction = &program.instructions()[instruction_index];
-        let Some(data_flow) = instruction.operation().region_data_flow() else {
-            return Ok(false);
-        };
-
+        let data_flow = instruction.operation().region_data_flow();
         let regions = program.region_data_flow_boundaries(instruction)?;
         let boundary = RegionDataFlowBoundary {
             input_count: instruction.inputs().len(),
@@ -1871,20 +1868,9 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
         boundary: RegionDataFlowBoundary<'_>,
     ) -> Result<Vec<(RegionId, Vec<bool>)>, ProgramError> {
         let operation = instruction.operation();
-        let demands = if let Some(data_flow) = operation.region_data_flow() {
-            let mut regions = self.analysis.attached_region_liveness(instruction.regions());
-            data_flow.execution_demands(operation, used_outputs, boundary, &mut regions)?
-        } else {
-            boundary
-                .regions
-                .iter()
-                .enumerate()
-                .map(|(region_index, region)| {
-                    (operation.region_role(region_index) == Some(RegionRole::Computation))
-                        .then(|| vec![true; region.output_count])
-                })
-                .collect()
-        };
+        let mut regions = AttachedRegionLiveness::new(&mut self.analysis, instruction.regions());
+        let demands =
+            operation.region_data_flow().execution_demands(operation, used_outputs, boundary, &mut regions)?;
         Ok(instruction
             .regions()
             .iter()
@@ -2050,10 +2036,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
         // Region-local summaries stay symbolic. Initial bindings and recurrent edges belong to the attachment,
         // so a shared body can be used by ordinary and recurrent carriers without contaminating its cached summary.
         let operation = instruction.operation();
-        let Some(data_flow) = operation.region_data_flow() else {
-            return Ok(vec![ResidualProvenanceLeaf::Producer(value)]);
-        };
-
+        let data_flow = operation.region_data_flow();
         let regions = program.region_data_flow_boundaries(instruction)?;
         let boundary = RegionDataFlowBoundary {
             input_count: instruction.inputs().len(),
@@ -4642,8 +4625,8 @@ mod tests {
                 }
             }
 
-            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
-                self.provenance.then_some(RegionDataFlow::Ordinary)
+            fn region_data_flow(&self) -> RegionDataFlow<'_> {
+                if self.provenance { RegionDataFlow::Provenance } else { RegionDataFlow::Opaque }
             }
         }
 
@@ -5280,11 +5263,11 @@ mod tests {
                     .collect()
             }
 
-            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
+            fn region_data_flow(&self) -> RegionDataFlow<'_> {
                 let queries = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
                 // Bound work deterministically: a cache regression must fail before unfolding the diamond's paths.
                 assert!(queries <= 82, "shared provenance must not repeat operation queries");
-                (!self.region_slots().is_empty()).then_some(RegionDataFlow::Ordinary)
+                if self.region_slots().is_empty() { RegionDataFlow::Opaque } else { RegionDataFlow::Provenance }
             }
         }
 
@@ -5531,8 +5514,8 @@ mod tests {
                 self.input
             }
 
-            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
-                Some(RegionDataFlow::Ordinary)
+            fn region_data_flow(&self) -> RegionDataFlow<'_> {
+                RegionDataFlow::Provenance
             }
 
             fn output_region_provenance(&self, _output_index: usize) -> Vec<OutputRegionProvenance> {

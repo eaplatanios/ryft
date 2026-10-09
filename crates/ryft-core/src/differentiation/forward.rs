@@ -20,7 +20,8 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::partial::residuals::ResidualPlacement;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
-    PartialValue, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram, ResidualPolicyReference,
+    PartialValue, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram, ResidualInputSource,
+    ResidualPolicyReference,
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
@@ -203,7 +204,7 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 ///   primal --> residuals["Evaluate Once and Save Residual Values"]
 ///   tangent --> pushforward["Reusable &lt;code&gt;Pushforward&lt;/code&gt;"]
 ///   residuals --> pushforward
-///   tangent --> transpose["Transpose in Reverse Dataflow Order"]
+///   tangent --> transpose["Transpose in Reverse Data Flow Order"]
 ///   transpose --> pullback["Reusable &lt;code&gt;Pullback&lt;/code&gt;"]
 ///   residuals --> pullback
 ///   pullback --> reverse_jacobian["Reverse Jacobian via Batched Output Cotangents"]
@@ -2812,10 +2813,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::InvalidInputCount`] when the input count differs from the original boundary recorded
-    /// by the partition. Returns [`ProgramError::InvalidArgument`] when the primal-output prefix is out-of-bounds or
-    /// contains a residual output. These checks run before either program executes. Interpretation and value transfer
-    /// errors are propagated when replaying the validated partition.
+    /// Returns [`ProgramError::InvalidInputCount`] when the input count differs from the
+    /// [`original_input_count`](Self::original_input_count) and [`ProgramError::InvalidArgument`] when the
+    /// primal-output prefix is out-of-bounds or contains a residual output. These checks run before either program
+    /// executes. Interpretation and value transfer errors are propagated when replaying the validated partition.
     pub fn interpret_in_context<
         C: Context<Type = V::Type, Constant = V, Operation = O>,
         P: DifferentiationPolicy<C>,
@@ -2845,19 +2846,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         primal_output_count: usize,
         interpret_residual_program: InterpretFn,
     ) -> Result<Vec<C::Value>, DifferentiationError> {
-        // Known inputs and unknown residual inputs together retain the original fused input boundary. Saved
-        // residual values are not original inputs. Check this boundary before known work can execute effects.
-        let input_count = self
-            .known_input_indices()
-            .iter()
-            .copied()
-            .chain(self.residual_inputs().iter().filter_map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => Some(*index),
-                PartialEvaluationInput::Known(_) => None,
-            }))
-            .max()
-            .map_or(0, |index| index + 1);
-        check_count!("input", inputs, input_count, ProgramError);
+        // Check the original fused input boundary, including inputs that neither program uses, before known work
+        // can execute effects. The wiring itself was validated when the partition was constructed.
+        check_count!("input", inputs, self.original_input_count(), ProgramError);
 
         let primal_outputs =
             self.outputs().get(..primal_output_count).ok_or_else(|| ProgramError::InvalidArgument {
@@ -2878,15 +2869,18 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         let known_inputs = self.known_input_indices().iter().map(|&index| inputs[index].clone()).collect();
         let known_outputs = self.known_program().interpret_in_context(context.primal(), known_inputs)?;
 
-        // The known program returns known original outputs first, followed by saved values for residual inputs.
-        // Feeder indices address only the latter group, so they need the known-output prefix offset.
+        // Unknown inputs already belong to the tangent context. Every other source is a primal value (i.e., a forwarded
+        // known input, a fully known output, or a residual edge, which trails the fully known outputs among the known
+        // program outputs).
         let known_count = self.outputs().iter().filter(|output| output.is_known()).count();
         let residual_inputs = self
             .residual_inputs()
             .iter()
-            .map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => Ok(inputs[*index].clone()),
-                PartialEvaluationInput::Known(index) => {
+            .map(|source| match *source {
+                ResidualInputSource::UnknownInput(index) => Ok(inputs[index].clone()),
+                ResidualInputSource::KnownInput(index) => context.primal_to_tangent(inputs[index].clone()),
+                ResidualInputSource::KnownOutput(index) => context.primal_to_tangent(known_outputs[index].clone()),
+                ResidualInputSource::ResidualEdge(index) => {
                     context.primal_to_tangent(known_outputs[known_count + index].clone())
                 }
             })
@@ -7183,6 +7177,86 @@ pub(crate) mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "cannot import an unknown value from another partial-evaluation context",
         ));
+    }
+
+    #[test]
+    fn test_partitioned_program_interpret_in_context_forwarded_sources() {
+        // `f(a, b, ẋ, u) = (a + 1, (a + 1) * ẋ, b * ẋ, (a + a) * ẋ)` with `ẋ` unknown and `u` unused. Forwarding feeds
+        // the residual program from the unknown input `ẋ`, the known output `a + 1`, the known input `b`, and the
+        // edge `a + a`, and the known program stops receiving `b` and `u`.
+        let scalar: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let a = builder.add_input(scalar.clone());
+        let b = builder.add_input(scalar.clone());
+        let tangent = builder.add_input(scalar.clone());
+        builder.add_input(scalar);
+        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0f32).unwrap()));
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, one], None).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let outputs = [shifted, b, doubled]
+            .into_iter()
+            .map(|value| {
+                builder
+                    .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![value, tangent], None)
+                    .unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let partition = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                [vec![shifted], outputs].concat(),
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap()
+            .partition(&[true, true, false, true])
+            .unwrap()
+            .forward_residuals()
+            .unwrap();
+        assert_eq!(partition.original_input_count(), 4);
+        assert_eq!(partition.known_input_indices(), &[0]);
+        assert_eq!(
+            partition.residual_inputs(),
+            &[
+                ResidualInputSource::UnknownInput(2),
+                ResidualInputSource::KnownOutput(0),
+                ResidualInputSource::KnownInput(1),
+                ResidualInputSource::ResidualEdge(0),
+            ],
+        );
+
+        // Separate primal and tangent contexts expose any source that is not transferred to the tangent context,
+        // because residual interpretation in the tangent context cannot accept a value of the primal context.
+        let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
+            TestValue,
+            TestOperation,
+        >::new()));
+        let array = |value: f32| TestValue::Array(Array::scalar(value).unwrap());
+        let tangent = PartialTracer::new(
+            context.tangent().clone(),
+            context.tangent().unknown_input(ArrayType::scalar(DataType::F32).into(), 0),
+        );
+        let inputs = [
+            context.primal().lift(array(3.0)).unwrap(),
+            context.primal().lift(array(2.0)).unwrap(),
+            tangent,
+            context.primal().lift(array(7.0)).unwrap(),
+        ];
+        let outputs = partition.interpret_in_context(&context, &inputs, 1).unwrap();
+        assert_eq!(outputs[0].value().unwrap().as_known(), Some(&array(4.0)));
+        assert!(outputs[1..].iter().all(|output| output.value().unwrap().is_unknown()));
+
+        // The values match the original program, and the pruned trailing known input still belongs to the original
+        // boundary.
+        let context = DifferentiationContext::fused(EagerContext::<TestValue, TestOperation>::new());
+        let inputs = [array(3.0), array(2.0), array(5.0), array(7.0)];
+        assert!(matches!(
+            partition.interpret_in_context(&context, &inputs[..3], 1),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 4, actual: 3 })),
+        ));
+        assert_eq!(
+            partition.interpret_in_context(&context, &inputs, 1),
+            Ok(vec![array(4.0), array(20.0), array(10.0), array(30.0)]),
+        );
     }
 
     #[test]

@@ -92,7 +92,7 @@
 //! Reverse mode differentiation reuses the forward partitioning machinery while selecting
 //! [`DifferentiableOperation::jvp_for_transpose`]. Its default delegates to the standard JVP rule while an override
 //! can choose different primal computations and saved residuals without changing public forward linearization. The
-//! resulting derivative carrier is transposed by applying [`TransposableOperation`] rules in reverse dataflow order,
+//! resulting derivative carrier is transposed by applying [`TransposableOperation`] rules in reverse data flow order,
 //! and the result is a [`Pullback`] that accepts output cotangents, consumes saved residuals, and accumulates input
 //! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
 //! concerns. Nested region requests preserve rule selection, and the two derivative rules use distinct cache keys.
@@ -994,8 +994,8 @@ impl<Input, ContextState>
     /// Reverse mode uses the partitioning machinery of [`linearize`](Self::linearize), selecting
     /// [`DifferentiableOperation::jvp_for_transpose`] before primal work executes. Its default delegates to
     /// the standard JVP rule while overrides can select independent residuals and backward implementations.
-    /// [`TransposableOperation`] rules transpose the resulting derivative program in reverse dataflow order. The
-    /// returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
+    /// [`TransposableOperation`] rules transpose the resulting derivative program in reverse data flow order.
+    /// The returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
     /// arguments and reconstructs the structured input cotangents. Callers only provide output cotangents.
     ///
     /// # Parameters
