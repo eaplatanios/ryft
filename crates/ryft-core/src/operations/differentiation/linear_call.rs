@@ -17,8 +17,8 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
-    TypeError, TypeRefinements, Typed, Value,
+    InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError,
+    RegionDataFlow, RegionInterface, RegionSlot, TypeError, TypeRefinements, Typed, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -48,6 +48,11 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 /// result must describe the same cotangent space as its corresponding linear input. Besides identical types, this
 /// admits representations that refine one another under [`TypeRefinements`], such as a static extent of 2 and a
 /// retained dimension constrained to exactly 2. A merely compatible or less precise shape is not sufficient.
+///
+/// Instruction inputs carry ordinary values. Reference allocations may be created and consumed locally
+/// within either attached region, but caller references cannot enter through the instruction inputs. The local
+/// [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) rule rebuilds such allocations
+/// in each region independently without threading external state through the call boundary.
 ///
 /// Every residual is an ordinary typed Single Static Assignment (SSA) edge rather than differentiation-only payload
 /// metadata. Partial evaluation can lift those values into the enclosing [`Linearization`](crate::Linearization)
@@ -105,6 +110,14 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 LINEAR_CALL_OPERATION_NAME,
                 self.residual_count,
                 input_types.len(),
+            )));
+        }
+        // The local-reference discharge rule rebuilds allocations inside each region but does not thread caller
+        // references through either boundary. Positional input provenance must not implicitly widen that contract.
+        if let Some(position) = input_types.iter().position(|r#type| r#type.is_reference()) {
+            return Err(TypeError::invalid(format!(
+                "`{LINEAR_CALL_OPERATION_NAME}` input {position} is a reference; only references local to its attached \
+                 regions are supported",
             )));
         }
         Ok(input_types.split_at(self.residual_count))
@@ -409,9 +422,25 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
     }
 
     #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        // The forward computation receives instruction inputs positionally while the transpose is a dormant rule with
+        // a distinct cotangent boundary. This correspondence does not grant reference access or output identity.
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
+    }
+
+    #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         // The call's outputs are exactly its forward region's outputs.
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
     }
 
     #[inline]
@@ -719,7 +748,8 @@ pub(crate) mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot, ValueProjection,
+        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver, RegionRef,
+        RegionSlot, ValueProjection,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
@@ -815,6 +845,46 @@ pub(crate) mod tests {
         let residual = ProjectedProgramValue::Third(ProjectedMemberValue(7));
         assert_eq!(program.interpret(vec![residual, linear.clone()]), Ok(vec![linear]));
         assert_eq!(program.instructions()[0].regions().len(), 2);
+    }
+
+    #[test]
+    fn test_linear_call_operation_type_inference_rejects_reference_inputs() {
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let inputs = vec![reference, scalar.clone()];
+        let regions = vec![
+            RegionInterface::new(inputs.clone(), vec![scalar.clone()], EffectClasses::NONE),
+            RegionInterface::new(inputs.clone(), vec![scalar], EffectClasses::NONE),
+        ];
+        let operation = LinearCallOperation::<ArrayIrType>::new(1);
+        // A reference residual previously failed reference-region validation. Declaring positional producer sources
+        // keeps that boundary unsupported and now rejects it explicitly before specialization or ordinary inference.
+        assert_eq!(
+            operation.infer_region_input_types(&inputs, &regions),
+            Err(TypeError::invalid(
+                "`linear_call` input 0 is a reference; only references local to its attached regions are supported",
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(&inputs, &regions),
+            Err(TypeError::invalid(
+                "`linear_call` input 0 is a reference; only references local to its attached regions are supported",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_region_data_flow() {
+        let operation = LinearCallOperation::<ArrayType>::new(1);
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        // Only the forward region executes; its residual and linear inputs retain their declared positions.
+        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::None);
+        assert_eq!(
+            operation.output_region_provenance(1),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
+        );
     }
 
     #[test]
