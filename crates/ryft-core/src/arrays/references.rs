@@ -17,6 +17,7 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::batching::{BatchAxis, BatchingError};
 use crate::contexts::Context;
 use crate::macros::check_count;
+use crate::operations::collectives::parallel_vary::{manual_variation_axes, vary_over_missing_manual_axes};
 use crate::operations::{
     Add, AddOperation, BroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ParallelVaryOperation,
     Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
@@ -1724,42 +1725,28 @@ where
     /// so that an access through an index that varies over axes that the selected value does not vary over binds a
     /// well-typed dynamic slice or update whose result varies over the union of those axes. Without manual variation,
     /// the values are returned unchanged.
+    ///
+    /// Like other rules that replay staged programs, this alignment binds the transitions directly into the discharge
+    /// context instead of resolving axis names against it as the value-level alignment does, because the variation in
+    /// the types of a staged program always names manual mesh axes.
     fn align_manual_variation(&self, values: Vec<C::Value>) -> Result<Vec<C::Value>, ProgramError> {
         let types = values
             .iter()
             .map(|value| self.array_type(value).map(Cow::into_owned))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut axes = Vec::<(String, Sharding)>::new();
-        for sharding in types.iter().filter_map(ArrayType::sharding) {
-            for axis in sharding.varying_manual_axes() {
-                if !axes.iter().any(|(candidate, _)| candidate == axis) {
-                    axes.push((axis.clone(), sharding.clone()));
-                }
+        let axes = manual_variation_axes(&types);
+        vary_over_missing_manual_axes(values, &types, &axes, |mut value, axis, mesh| {
+            let r#type = self.array_type(&value)?.into_owned();
+            if r#type.sharding().is_none() {
+                let rank = r#type.rank();
+                let placed = r#type
+                    .with_sharding(Sharding::replicated(mesh.clone(), rank))
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                let operation = BroadcastOperation::new(placed, (0..rank).collect());
+                value = self.context.bind_array(operation, &[value])?;
             }
-        }
-        values
-            .into_iter()
-            .zip(types)
-            .map(|(mut value, mut r#type)| {
-                for (axis, sharding) in &axes {
-                    if r#type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(axis)) {
-                        continue;
-                    }
-                    if r#type.sharding().is_none() {
-                        let rank = r#type.rank();
-                        let placed = r#type
-                            .clone()
-                            .with_sharding(Sharding::replicated(sharding.mesh().clone(), rank))
-                            .map_err(|error| TypeError::invalid(error.to_string()))?;
-                        let operation = BroadcastOperation::new(placed, (0..rank).collect());
-                        value = self.context.bind_array(operation, &[value])?;
-                    }
-                    value = self.context.bind_array(ParallelVaryOperation::new(axis.clone()), &[value])?;
-                    r#type = self.array_type(&value)?.into_owned();
-                }
-                Ok(value)
-            })
-            .collect()
+            self.context.bind_array(ParallelVaryOperation::new(axis.to_string()), &[value])
+        })
     }
 }
 
@@ -1862,7 +1849,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
@@ -1873,6 +1860,7 @@ mod tests {
     use crate::axes::{Axis, AxisError};
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
+    use crate::operations::references::tests::manual_type;
     use crate::operations::{
         ReferenceAddUpdate, ReferenceFreezeOperation, ReferenceNew, ReferenceRead, ReferenceReadOperation,
         ReferenceSwap, ReferenceWrite,
@@ -1905,14 +1893,6 @@ mod tests {
 
     /// Array IR read operation over array reference transforms.
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
-
-    /// Returns `r#type` placed replicated on a two-device manual mesh over `x`, varying along `x` when `varying` is
-    /// set, as the values of a manual region over that mesh are typed.
-    fn manual_type(r#type: ArrayType, varying: bool) -> ArrayType {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh, r#type.rank()).with_varying_manual_axes(varying.then_some("x"));
-        r#type.with_sharding(sharding.unwrap()).unwrap()
-    }
 
     /// Returns the rendering of the program that `access` stages through [`ArrayReferenceDischarge`] over the
     /// composed view `root[1:3, 0:2][1]` of an `f32[3, 3]` allocation, given that allocation and an `f32[2]` value.
@@ -2868,12 +2848,12 @@ mod tests {
         // A read through an index that varies along a manual axis varies along that axis as well, joining the
         // variation of the referent, and an index without such variation leaves the read type unchanged.
         let index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let referent = manual_type(ArrayType::new_static(DataType::F32, [3, 4]), false);
-        let varying_referent = manual_type(ArrayType::new_static(DataType::F32, [3, 4]), true);
-        let row = manual_type(ArrayType::new_static(DataType::F32, [4]), false);
-        let varying_row = manual_type(ArrayType::new_static(DataType::F32, [4]), true);
-        let invariant_binding = ArrayIrType::Array(manual_type(ArrayType::scalar(DataType::I32), false));
-        let varying_binding = ArrayIrType::Array(manual_type(ArrayType::scalar(DataType::I32), true));
+        let referent = manual_type(DataType::F32, &[3, 4], false);
+        let varying_referent = manual_type(DataType::F32, &[3, 4], true);
+        let row = manual_type(DataType::F32, &[4], false);
+        let varying_row = manual_type(DataType::F32, &[4], true);
+        let invariant_binding = ArrayIrType::Array(manual_type(DataType::I32, &[], false));
+        let varying_binding = ArrayIrType::Array(manual_type(DataType::I32, &[], true));
         let read = ReferenceAccessMode::Read;
         assert_eq!(index.access_type(&referent, &[&invariant_binding], read), Ok(row.clone()));
         assert_eq!(index.access_type(&referent, &[&varying_binding], read), Ok(varying_row.clone()));
@@ -2920,10 +2900,7 @@ mod tests {
         // Static transforms have no bindings, so they preserve the referent's manual variation.
         let axes = vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)];
         let slice = ArrayReferenceTransform::Slice { axes };
-        assert_eq!(
-            slice.access_type(&referent, &[], read),
-            Ok(manual_type(ArrayType::new_static(DataType::F32, [2, 4]), false)),
-        );
+        assert_eq!(slice.access_type(&referent, &[], read), Ok(manual_type(DataType::F32, &[2, 4], false)),);
     }
 
     #[test]
@@ -3756,11 +3733,11 @@ mod tests {
         // on every device, so a read through it varies the allocation along that axis before slicing it, like the
         // value-level `dynamic_slice`. An index that is invariant along an axis that the allocation varies along
         // is varied along it before slicing or updating, so that every dynamic slicing operation is well-typed.
-        let invariant = manual_type(ArrayType::new_static(DataType::F32, [2, 3]), false);
-        let varying = manual_type(ArrayType::new_static(DataType::F32, [2, 3]), true);
-        let invariant_index = manual_type(ArrayType::scalar(DataType::I32), false);
-        let varying_index = manual_type(ArrayType::scalar(DataType::I32), true);
-        let row = manual_type(ArrayType::new_static(DataType::F32, [3]), true);
+        let invariant = manual_type(DataType::F32, &[2, 3], false);
+        let varying = manual_type(DataType::F32, &[2, 3], true);
+        let invariant_index = manual_type(DataType::I32, &[], false);
+        let varying_index = manual_type(DataType::I32, &[], true);
+        let row = manual_type(DataType::F32, &[3], true);
         let (_, staged): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
             TestEagerContext::trace(
                 |inputs: Vec<TestTracer>| {
@@ -3786,30 +3763,29 @@ mod tests {
                 ],
             )
             .unwrap();
+        let mesh = "mesh<['x'=2:manual]>";
+        let invariant_matrix = format!("f32[2, 3][sharding={{{mesh}, [{{}}, {{}}]}}]");
+        let varying_matrix = format!("f32[2, 3][sharding={{{mesh}, [{{}}, {{}}], varying_manual={{'x'}}}}]");
+        let varying_row = format!("f32[1, 3][sharding={{{mesh}, [{{}}, {{}}], varying_manual={{'x'}}}}]");
+        let varying_vector = format!("f32[3][sharding={{{mesh}, [{{}}], varying_manual={{'x'}}}}]");
+        let invariant_index = format!("i32[][sharding={{{mesh}, []}}]");
+        let varying_index = format!("i32[][sharding={{{mesh}, [], varying_manual={{'x'}}}}]");
+        let inputs = format!(
+            "%0:{invariant_matrix}, %1:{varying_matrix}, %2:{varying_index}, %3:{invariant_index}, %4:{varying_vector}",
+        );
         assert_eq!(
             staged.to_string(),
-            indoc! {"
-            lambda %0:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}]}], \
-               %1:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}], \
-               %2:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}], \
-               %3:i32[][sharding={mesh<['x'=2:manual]>, []}], \
-                   %4:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
-                let %5:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name=\"x\"] %0
-                    %6:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        dynamic_slice [sizes=[1, 3]] %5 %2 %2
-                    %7:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[3]] %6
-                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name=\"x\"] %3
-                    %9:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        dynamic_slice [sizes=[1, 3]] %1 %8 %8
-                    %10:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[3]] %9
-                    %11:f32[1, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        reshape [shape=[1, 3]] %4
-                    %12:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
-                        parallel_vary [axis_name=\"x\"] %3
-                    %13:f32[2, 3][sharding={mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}] = \
-                        dynamic_update_slice %1 %11 %12 %12
+            formatdoc! {"
+                lambda {inputs} .
+                let %5:{varying_matrix} = parallel_vary [axis_name=\"x\"] %0
+                    %6:{varying_row} = dynamic_slice [sizes=[1, 3]] %5 %2 %2
+                    %7:{varying_vector} = reshape [shape=[3]] %6
+                    %8:{varying_index} = parallel_vary [axis_name=\"x\"] %3
+                    %9:{varying_row} = dynamic_slice [sizes=[1, 3]] %1 %8 %8
+                    %10:{varying_vector} = reshape [shape=[3]] %9
+                    %11:{varying_row} = reshape [shape=[1, 3]] %4
+                    %12:{varying_index} = parallel_vary [axis_name=\"x\"] %3
+                    %13:{varying_matrix} = dynamic_update_slice %1 %11 %12 %12
                 in (%7, %10, %13)"},
         );
     }

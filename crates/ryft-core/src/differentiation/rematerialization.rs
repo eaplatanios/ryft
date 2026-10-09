@@ -23,10 +23,11 @@
 //! members. A residual that several producers may produce (e.g., the corresponding outputs of the two branches of a
 //! `condition` operation) matches a policy when any of its producers does.
 //!
-//! The built-in policies are generic over the type universe and declare their instantiations for the array universes
-//! [`ArrayType`] and [`ArrayIrType`] (refer to [`ResidualPolicy::native_instantiations`]), so that promoting a staged
-//! rematerialization from one of these universes to the other re-instantiates its policy rather than projecting the
-//! types of its candidates.
+//! The concrete built-in policies are generic over the type universe and declare their instantiations for the array
+//! universes [`ArrayType`] and [`ArrayIrType`] (refer to [`ResidualPolicy::native_instantiations`]), so that promoting
+//! a staged rematerialization from one of these universes to the other re-instantiates its policy rather than
+//! projecting the types of its candidates. [`SaveFromBothPolicies`] retains the native universes that both of
+//! its policies support.
 //!
 //! # Examples
 //!
@@ -123,6 +124,11 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! An already registered policy can be installed with [`RematerializedFunction::with_policy_reference`],
+//! preserving its identity and any [native instantiations](ResidualPolicyReference::with_native_instantiation) or
+//! [projection fallbacks](ResidualPolicyReference::with_projection_fallback). Calls use the reference's type universe;
+//! promoting a staged call into another universe lifts the reference together with its configuration.
 //!
 //! ## Offloading
 //!
@@ -252,6 +258,30 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         }
     }
 
+    /// Returns this function with the already registered `policy`, preserving its definition identity and its native
+    /// instantiations and projection fallbacks. Repeated calls and clones reuse this exact reference rather than
+    /// registering a new definition.
+    ///
+    /// Calls must use a context whose type universe is `T`, including calls without inputs. A staged call can still
+    /// be promoted into another universe, which [lifts](ResidualPolicyReference::lift) its policy and preserves its
+    /// configuration. [`with_policy`](Self::with_policy) replaces this configuration with an ordinary typed policy.
+    pub fn with_policy_reference<T: 'static + Type>(
+        self,
+        policy: ResidualPolicyReference<T>,
+    ) -> RematerializedFunction<Input, Output, Body> {
+        let name = Some(policy.name().to_owned());
+        RematerializedFunction {
+            body: self.body,
+            policy: Arc::new(PolicyReferences {
+                policy: NothingSavable,
+                name,
+                references: Mutex::new(vec![(TypeId::of::<T>(), Box::new(policy))]),
+            }),
+            optimization_barrier: self.optimization_barrier,
+            marker: PhantomData,
+        }
+    }
+
     /// Sets the inputs on which backends place an optimization barrier when the staged calls of this
     /// [`RematerializedFunction`] are differentiated, which are [all](RematerializationOptimizationBarrier::All)
     /// by default. A [`RematerializationOptimizationBarrier::Inputs`] selection has one entry per leaf of the input
@@ -274,8 +304,9 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `input` has no leaves (in which case [`call_in_context`](Self::call_in_context)
-    /// must be used instead), when tracing the body fails, or when the staged [`RematerializeOperation`] rejects the
-    /// call.
+    /// must be used instead), when the context's type universe differs from that of a
+    /// [configured reference](Self::with_policy_reference), when tracing the body fails,
+    /// or when the staged [`RematerializeOperation`] rejects the call.
     pub fn call<
         V: Value<Type = C::Type, Domain = C>,
         C: Context<Type: 'static, Value = V, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes,
@@ -318,8 +349,9 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when tracing the body fails or when the staged [`RematerializeOperation`] rejects
-    /// the call.
+    /// Returns a [`ProgramError`] when the context's type universe differs from that of a
+    /// [configured reference](Self::with_policy_reference), when tracing the body fails,
+    /// or when the staged [`RematerializeOperation`] rejects the call.
     pub fn call_in_context<
         C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes,
         InputValues: Parameterized<C::Value, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
@@ -366,11 +398,12 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<C::Value>,
         Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
     {
+        let policy = self.policy.reference::<C::Type>()?;
         let (output_types, body) =
             DomainTracingContext::<C>::trace_with_named_axes(&self.body, input_types, context.named_axes())?;
         let output_structure = output_types.parameter_structure();
-        let operation = RematerializeOperation::new(self.policy.reference::<C::Type>())
-            .with_optimization_barrier(self.optimization_barrier.clone());
+        let operation =
+            RematerializeOperation::new(policy).with_optimization_barrier(self.optimization_barrier.clone());
         let outputs = context.bind(operation, vec![body.into_flat_program()], input_values)?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -392,7 +425,13 @@ impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input,
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RematerializedFunction")
-            .field("policy", &self.policy.policy)
+            .field(
+                "policy",
+                match &self.policy.name {
+                    Some(name) => name,
+                    None => &self.policy.policy,
+                },
+            )
             .field("optimization_barrier", &self.optimization_barrier)
             .finish_non_exhaustive()
     }
@@ -591,13 +630,17 @@ pub fn saved_residuals<
 /// that its calls have used so far. [`ResidualPolicyReference`]s compare by the identity of the policy definition that
 /// [`ResidualPolicyReference::new`] registers, so creating one per call would make calls of the same function stage
 /// unequal operations. Clones of a [`RematerializedFunction`] share one [`PolicyReferences`], and therefore stage equal
-/// operations too.
+/// operations too. An explicitly configured reference fixes the cache to its own universe; a miss must fail instead
+/// of registering the placeholder policy in another universe and silently changing the selected behavior.
 struct PolicyReferences<Policy> {
-    /// Residual policy.
+    /// Policy registered on first use when no configured reference is installed.
     policy: Policy,
 
-    /// [`ResidualPolicyReference`] to `policy` in each type universe that was used so far, keyed by the [`TypeId`]
-    /// of the universe.
+    /// Name of the configured reference, if this cache is fixed to one pre-registered universe.
+    name: Option<String>,
+
+    /// Cached [`ResidualPolicyReference`]s, keyed by the [`TypeId`] of their universe. A configured cache contains
+    /// only the installed reference; an ordinary cache registers its policy in each universe on first use.
     references: Mutex<Vec<(TypeId, Box<dyn Any + Send + Sync>)>>,
 }
 
@@ -605,12 +648,12 @@ impl<Policy> PolicyReferences<Policy> {
     /// Creates new [`PolicyReferences`] for `policy` that hold no references yet.
     #[inline]
     fn new(policy: Policy) -> Self {
-        Self { policy, references: Mutex::new(Vec::new()) }
+        Self { policy, name: None, references: Mutex::new(Vec::new()) }
     }
 
     /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered
-    /// on first use.
-    fn reference<T: 'static + Type>(&self) -> ResidualPolicyReference<T>
+    /// on first use for an ordinary policy. Configured references reject calls in a different universe.
+    fn reference<T: 'static + Type>(&self) -> Result<ResidualPolicyReference<T>, ProgramError>
     where
         Policy: Clone + ResidualPolicy<T>,
     {
@@ -620,11 +663,17 @@ impl<Policy> PolicyReferences<Policy> {
             .find(|(universe, _)| *universe == TypeId::of::<T>())
             .and_then(|(_, reference)| reference.downcast_ref::<ResidualPolicyReference<T>>());
         if let Some(reference) = reference {
-            return reference.clone();
+            return Ok(reference.clone());
+        }
+        if let Some(name) = &self.name {
+            return Err(TypeError::invalid(format!(
+                "configured rematerialization policy `{name}` cannot be called in a different type universe",
+            ))
+            .into());
         }
         let reference = ResidualPolicyReference::new(self.policy.clone());
         references.push((TypeId::of::<T>(), Box::new(reference.clone())));
-        reference
+        Ok(reference)
     }
 }
 
@@ -1083,10 +1132,10 @@ pub const SAVE_FROM_BOTH_POLICIES_POLICY_NAME: &str = "save_from_both_policies";
 /// Rejections of either policy are returned as they are. This is the Ryft analogue of JAX's
 /// [`save_from_both_policies`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_from_both_policies.html).
 ///
-/// Unlike the other built-in policies, this policy declares no instantiations in other type universes, because its two
-/// policies may be defined for one universe only (e.g., [`RematerializationPolicyFn`]s). Promoting a staged
-/// rematerialization that uses it to another universe therefore projects the types of its candidates (refer to
-/// [`ResidualPolicyReference::lift`]).
+/// Native instantiations are retained in every universe supported by both policies, with the same decision
+/// order and storage precedence. If either policy has no native instantiation in the destination universe (e.g., a
+/// [`RematerializationPolicyFn`] defined for one universe only), promoting the staged rematerialization projects its
+/// candidate types instead (refer to [`ResidualPolicyReference::lift`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveFromBothPolicies<P1, P2> {
     /// Policy that classifies each residual first.
@@ -1126,6 +1175,7 @@ impl<T: 'static + Type, P1: ResidualPolicy<T>, P2: ResidualPolicy<T>> ResidualPo
         SAVE_FROM_BOTH_POLICIES_POLICY_NAME
     }
 
+    #[inline]
     fn classify(
         &self,
         candidate: &ResidualCandidate<'_, T>,
@@ -1134,6 +1184,13 @@ impl<T: 'static + Type, P1: ResidualPolicy<T>, P2: ResidualPolicy<T>> ResidualPo
             ResidualDecision::Recompute => Ok(self.second.classify(candidate)?.into_erased()),
             decision => Ok(decision),
         }
+    }
+
+    #[inline]
+    fn native_instantiations(&self) -> NativeResidualPolicies {
+        self.first
+            .native_instantiations()
+            .save_from_both(self.second.native_instantiations(), SAVE_FROM_BOTH_POLICIES_POLICY_NAME)
     }
 }
 
@@ -1380,15 +1437,20 @@ mod tests {
     fn classify_lifted_dimension<P: ResidualPolicy<ArrayType>>(
         policy: P,
     ) -> Result<ResidualDecision<ErasedResidualStorage<ArrayIrType>>, ResidualPolicyError> {
+        classify_lifted_dimension_reference(&ResidualPolicyReference::new(policy))
+    }
+
+    /// Classifies a non-projectable dimension after lifting an existing, possibly configured policy reference.
+    fn classify_lifted_dimension_reference(
+        policy: &ResidualPolicyReference<ArrayType>,
+    ) -> Result<ResidualDecision<ErasedResidualStorage<ArrayIrType>>, ResidualPolicyError> {
         let dimension_type =
             ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()));
         let dimension_size = TestIrOperation::DimensionSize(
             DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
         );
         let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type.clone()]);
-        ResidualPolicyReference::<ArrayType>::new(policy)
-            .lift::<ArrayIrType>()
-            .classify(&ResidualCandidate::new(vec![producer], dimension_type))
+        policy.lift::<ArrayIrType>().classify(&ResidualCandidate::new(vec![producer], dimension_type))
     }
 
     #[test]
@@ -1409,6 +1471,101 @@ mod tests {
                 ]
                 in (%1)"},
         );
+    }
+
+    #[test]
+    fn test_rematerialized_function_with_policy_reference() {
+        let policy = RematerializationPolicyFn::new::<ArrayType>(|_| {
+            Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Recompute)
+        })
+        .with_name("configured");
+        let policy = ResidualPolicyReference::new(policy)
+            .with_projection_fallback::<ArrayIrType, _>(|_| Ok(ResidualDecision::Save));
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy_reference(policy.clone());
+        let clone = function.clone();
+        let program = trace(|x| clone.call(function.call(x)?));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize [policy=\"configured\"] %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ]
+                    %2:f64[] = rematerialize [policy=\"configured\"] %1 [
+                        body={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                    ]
+                in (%2)"},
+        );
+        assert_eq!(operation(&program, 0).policy(), &policy);
+        assert_eq!(operation(&program, 1).policy(), &policy);
+        assert!(matches!(
+            classify_lifted_dimension_reference(operation(&program, 0).policy()),
+            Ok(ResidualDecision::Save)
+        ));
+
+        // Installing another reference preserves its native instantiation, which takes precedence over the fallback.
+        let native = policy.clone().with_native_instantiation::<ArrayIrType, _>(NothingSavable);
+        let function = function.clone().with_policy_reference(native.clone());
+        let program = trace(|x| function.call(x));
+        let rendering = indoc! {"
+            lambda %0:f64[] .
+            let %1:f64[] = rematerialize [policy=\"configured\"] %0 [
+                body={
+                    lambda %0:f64[] .
+                    let %1:f64[] = sin %0
+                    in (%1)
+                },
+            ]
+            in (%1)"};
+        assert_eq!(program.to_string(), rendering);
+        assert_eq!(operation(&program, 0).policy(), &native);
+        assert!(matches!(
+            classify_lifted_dimension_reference(operation(&program, 0).policy()),
+            Ok(ResidualDecision::Recompute)
+        ));
+
+        // Rich errors from a configured fallback keep both their policy name and original rejection.
+        let rejected =
+            policy.with_projection_fallback::<ArrayIrType, _>(|_| Err(ResidualRejection::new("dimension forbidden")));
+        let function = function.with_policy_reference(rejected);
+        let program = trace(|x| function.call(x));
+        assert_eq!(program.to_string(), rendering);
+        assert_eq!(
+            classify_lifted_dimension_reference(operation(&program, 0).policy()).map(|_| ()),
+            Err(ResidualPolicyError::Rejected {
+                policy: "configured".to_owned(),
+                rejection: ResidualRejection::new("dimension forbidden"),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_rematerialized_function_with_policy_reference_type_universe() {
+        let policy = ResidualPolicyReference::<ArrayType>::new(DotsSavable);
+        let function = rematerialize(|(): ()| Ok(())).with_policy_reference(policy);
+        let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let ir_context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        assert_eq!(function.call_in_context(&array_context, ()), Ok(()));
+        assert_eq!(
+            function.call_in_context(&ir_context, ()),
+            Err(TypeError::invalid(
+                "configured rematerialization policy `dots_savable` cannot be called in a different type universe",
+            )
+            .into()),
+        );
+
+        // Selecting an ordinary policy removes the fixed-universe configuration.
+        let function = function.with_policy(EverythingSavable);
+        assert_eq!(function.call_in_context(&array_context, ()), Ok(()));
+        assert_eq!(function.call_in_context(&ir_context, ()), Ok(()));
     }
 
     #[test]
@@ -1460,6 +1617,7 @@ mod tests {
         );
         assert_eq!(operation(&program, 0), operation(&program, 1));
         assert_eq!(program.interpret(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin().sin()).unwrap()));
+        assert_eq!(function.call(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin()).unwrap()));
     }
 
     #[test]
@@ -1650,8 +1808,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call_in_context() {
-        // Eager arrays dispatch to a context whose operation family cannot represent `rematerialize`, so eager calls
-        // name a context that can.
+        // An explicit context stages the same call as the domain recovered by `call`.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let function = rematerialize(|inputs: Vec<TestTracer>| -> Result<Vec<TestTracer>, ProgramError> {
             inputs.into_iter().map(|x| Ok(x.sin()?)).collect()
@@ -1725,6 +1882,11 @@ mod tests {
         assert_eq!(
             format!("{function:?}"),
             "RematerializedFunction { policy: NothingSavable, optimization_barrier: None, .. }",
+        );
+        let function = function.with_policy_reference(ResidualPolicyReference::<ArrayType>::new(DotsSavable));
+        assert_eq!(
+            format!("{function:?}"),
+            "RematerializedFunction { policy: \"dots_savable\", optimization_barrier: None, .. }",
         );
     }
 
@@ -2114,6 +2276,17 @@ mod tests {
         assert!(matches!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save)));
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute)));
 
+        // Lifting retains the same first-policy storage and the second-policy name selection.
+        let lifted = ResidualPolicyReference::<ArrayType>::new(policy).lift::<ArrayIrType>();
+        let Ok(ResidualDecision::SaveWith(storage)) = lifted.classify(&candidate(&[dot()])) else {
+            panic!("expected an offloaded residual");
+        };
+        let mut store = storage.store_payloads(&ArrayIrType::from(ArrayType::scalar(DataType::F64))).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.remove(0).downcast::<TransferToMemoryOperation>().unwrap().destination(), host);
+        assert!(matches!(lifted.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save)));
+        assert!(matches!(lifted.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute)));
+
         // Rejections of either policy are returned as they are. A rejection of the first policy is returned without
         // consulting the second one, and a residual that the first policy saves never reaches a rejecting second one.
         let rejecting = RematerializationPolicyFn::new::<ArrayIrType>(|_| {
@@ -2126,10 +2299,16 @@ mod tests {
         let policy = SaveFromBothPolicies::new(EverythingSavable, rejecting);
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save)));
 
-        // The policy declares no native instantiations, so lifting a reference to it projects the types of each
-        // candidate and cannot classify the ones that do not project.
+        // Shared native universes can classify dimensions; a universe missing from either child still projects.
+        assert!(matches!(
+            classify_lifted_dimension(SaveFromBothPolicies::new(DotsSavable, NothingSavable)),
+            Ok(ResidualDecision::Recompute),
+        ));
+        let array_policy = RematerializationPolicyFn::new::<ArrayType>(|_| {
+            Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Recompute)
+        });
         assert_eq!(
-            classify_lifted_dimension(SaveFromBothPolicies::new(DotsSavable, NothingSavable)).map(|_| ()),
+            classify_lifted_dimension(SaveFromBothPolicies::new(DotsSavable, array_policy)).map(|_| ()),
             Err(ResidualPolicyError::UnsupportedProjection {
                 policy: SAVE_FROM_BOTH_POLICIES_POLICY_NAME.to_owned(),
                 position: "the output 0 of producer `dimension_size`".to_owned(),

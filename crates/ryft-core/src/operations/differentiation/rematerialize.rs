@@ -1561,6 +1561,142 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_partial_evaluation_forwarded_known_outputs() {
+        // The known sin(a) is both an output and the coefficient of the unknown x. Its residual input must use the
+        // known output, and its barrier must be selected even though neither original input was selected.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let angle = body.add_input(scalar_type.clone());
+        let multiplier = body.add_input(scalar_type.clone());
+        let sine = body.add_instruction(SinOperation::new(), Vec::new(), vec![angle], None).unwrap()[0];
+        let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![sine, multiplier], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![sine, product], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let angle = builder.add_input(scalar_type.clone());
+        let multiplier = builder.add_input(scalar_type.clone());
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSavable))
+            .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, false]));
+        let outputs = builder.add_instruction(operation, vec![body], vec![angle, multiplier], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    let %1:f64[] = sin %0
+                    in (%1, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = rematerialize [
+                        policy=\"everything_savable\",
+                        optimization_barrier=[false, true],
+                        differentiated=true,
+                    ] %0 %1 [
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+
+        // Forwarding at the enclosing boundary removes the duplicate known output without changing the residual
+        // call's input order or barrier selection.
+        assert_eq!(
+            partition.forward_residuals().unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), KnownOutput(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    let %1:f64[] = sin %0
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = rematerialize [
+                        policy=\"everything_savable\",
+                        optimization_barrier=[false, true],
+                        differentiated=true,
+                    ] %0 %1 [
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+
+        let angle = Array::scalar(0.5f64).unwrap();
+        let multiplier = Array::scalar(2f64).unwrap();
+        let expected = vec![Array::scalar(0.5f64.sin()).unwrap(), Array::scalar(2.0 * 0.5f64.sin()).unwrap()];
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(angle.clone()), PartialValue::Unknown(scalar_type)])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [
+                    policy=\"everything_savable\",
+                    optimization_barrier=[false, true],
+                    differentiated=true,
+                ] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[multiplier.clone()]), Ok(expected.clone()));
+
+        // Unequal tangent and cotangent seeds pin both output positions independently. For f(a, x) = (sin(a),
+        // x sin(a)), Jf(3, 5) = (3 cos(a), 6 cos(a) + 5 sin(a)) and Jfᵀ(7, 11) = (29 cos(a), 11 sin(a)).
+        let inputs = vec![angle, multiplier];
+        let tangents = vec![Array::scalar(3f64).unwrap(), Array::scalar(5f64).unwrap()];
+        let (value, tangent) = differentiate_at(inputs.clone())
+            .jvp(tangents, |inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(
+            tangent,
+            vec![
+                Array::scalar(3.0 * 0.5f64.cos()).unwrap(),
+                Array::scalar(6.0 * 0.5f64.cos() + 5.0 * 0.5f64.sin()).unwrap(),
+            ],
+        );
+        let (value, pullback) = differentiate_at(inputs)
+            .vjp(|inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(
+            pullback.apply(vec![Array::scalar(7f64).unwrap(), Array::scalar(11f64).unwrap()]),
+            Ok(vec![Array::scalar(29.0 * 0.5f64.cos()).unwrap(), Array::scalar(11.0 * 0.5f64.sin()).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_rematerialize_partial_evaluation_pending_error() {
         // A partial evaluation that already retained a binding error reports that error before it hoists the known side
         // of a call into the known-side context, which would otherwise stage the dot product into the enclosing trace.
@@ -2286,11 +2422,43 @@ mod tests {
 
     #[test]
     fn test_rematerialize_differentiation_nested_policies() {
-        // The inner checkpoint saves everything while either outer policy recomputes its nonlinear body.
-        let inner = rematerialize(|x: TestTracer| Ok(x.clone() * x)).with_policy(EverythingSavable);
+        // The inner checkpoint saves cos(x²), a computed residual that saving nothing would recompute from x.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let inner =
+            rematerialize(|input: TestTracer| Ok((input.clone() * input).sin()?)).with_policy(EverythingSavable);
+        let (_, inner_program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input: TestTracer| inner.call(input),
+            scalar_type.clone(),
+        )
+        .unwrap();
+        let inner_linearization = inner_program.into_flat_program().linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", inner_linearization.primal(), inner_linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %1
+                    %3:f64[] = cos %1
+                in (%2, %0, %3)
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = rematerialize [policy=\"everything_savable\", differentiated=true] %0 %1 %2 [
+                    body={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %1 %0
+                            %4:f64[] = mul %1 %0
+                            %5:f64[] = add %3 %4
+                            %6:f64[] = mul %2 %5
+                        in (%6)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        // The outer body is sin(sin(x²)). Neither outer policy saves its nonlinear intermediates, so its derivative
+        // recomputes the inner coefficient and passes it to the inner differentiated checkpoint.
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<TestTracer>| Ok(vec![inner.call(inputs[0].clone())?.sin()?]),
-            vec![ArrayType::scalar(DataType::F64)],
+            vec![scalar_type],
         )
         .unwrap();
         assert_eq!(
@@ -2301,10 +2469,79 @@ mod tests {
                     body={
                         lambda %0:f64[] .
                         let %1:f64[] = mul %0 %0
-                        in (%1)
+                            %2:f64[] = sin %1
+                        in (%2)
                     },
                 ]
                     %2:f64[] = sin %1
+                in (%2)"},
+        );
+        let linearization =
+            rematerialized_program(&body, ResidualPolicyReference::new(NothingSavable)).linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %1
+                    %3:f64[] = sin %2
+                in (%3, %0)
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %1
+                            %3:f64[] = sin %2
+                            %4:f64[] = cos %3
+                            %5:f64[] = cos %2
+                            %6:f64[] = rematerialize [policy=\"everything_savable\", differentiated=true] %0 %1 %5 [
+                                body={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    let %3:f64[] = mul %1 %0
+                                        %4:f64[] = mul %1 %0
+                                        %5:f64[] = add %3 %4
+                                        %6:f64[] = mul %2 %5
+                                    in (%6)
+                                },
+                            ]
+                            %7:f64[] = mul %4 %6
+                        in (%7)
+                    },
+                ]
+                in (%2)"},
+        );
+        let linearization =
+            rematerialized_program(&body, ResidualPolicyReference::new(DotsSavable)).linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %1
+                    %3:f64[] = sin %2
+                in (%3, %0)
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %1
+                            %3:f64[] = sin %2
+                            %4:f64[] = cos %3
+                            %5:f64[] = cos %2
+                            %6:f64[] = rematerialize [policy=\"everything_savable\", differentiated=true] %0 %1 %5 [
+                                body={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    let %3:f64[] = mul %1 %0
+                                        %4:f64[] = mul %1 %0
+                                        %5:f64[] = add %3 %4
+                                        %6:f64[] = mul %2 %5
+                                    in (%6)
+                                },
+                            ]
+                            %7:f64[] = mul %4 %6
+                        in (%7)
+                    },
+                ]
                 in (%2)"},
         );
         let inputs = [Array::scalar(0.5f64).unwrap()];
