@@ -5,6 +5,7 @@ use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, ValueResolution};
+use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
@@ -12,6 +13,7 @@ use crate::partial::partitions::{EffectOrdering, PartitionedProgram};
 use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
 use crate::partial::values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
+    ResidualInputSource,
 };
 use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
@@ -253,12 +255,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// [`PartitionedProgram::with_residual_policy`]) and carries `policy` into the partitions nested within it. This
     /// has implications for various region-carrying operation types. For example, it means that decisions apply per
     /// iteration of a `scan` operation and per branch of a `condition` operation. When the residuals of an enclosing
-    /// partition are placed, a region-carrying operation in its known program is replayed as a whole only if the policy
-    /// would recompute every value that its regions compute, so that the decisions of a split rule that already placed
-    /// the residuals of its body are never undone, while an operation whose inputs are all known (and which was
-    /// therefore not split) is recomputed whenever the policy recomputes everything that it computes. A `while` loop
-    /// is an exception that saves nothing, because its residual loop re-runs every iteration, and so its split rule
-    /// partitions its regions without the policy.
+    /// partition are placed, the policy first classifies each demanded output. Replaying a region-carrying operation
+    /// also requires recomputation of every live value needed for that output, so that decisions of a split rule that
+    /// already placed the body's residuals are never undone. Unused sibling outputs and dormant derivative regions
+    /// do not contribute residual demand. An all-known operation whose selected region work is entirely recomputed
+    /// can therefore be replayed even when unrelated primal outputs would be saved or rejected. A `while` loop
+    /// is an exception that saves nothing, because its residual loop re-runs every iteration, and so its split
+    /// rule partitions its regions without the policy.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program
     /// or changing previously emitted work. Existing clones retain their own residual policy.
@@ -338,6 +341,17 @@ impl<C: Context> PartialEvaluationContext<C> {
     #[inline]
     pub fn allow_effect_folding(&self) -> bool {
         self.allow_effect_folding
+    }
+
+    /// Returns the [`ResidualPolicyReference`] configured by [`with_residual_policy`](Self::with_residual_policy),
+    /// or `None` when no policy is configured. The reference borrows the installed policy without cloning it.
+    /// Higher-order rules, including backend call rules, inspect this configuration to expose pure known computations
+    /// to the enclosing residual planner when keeping their boundary opaque would prevent the policy from selecting
+    /// interior values. Reading this configuration does not classify a value or establish that an operation can be
+    /// safely inlined. Rules must still preserve effects, references, captures, and type identities.
+    #[inline]
+    pub fn residual_policy(&self) -> Option<&ResidualPolicyReference<C::Type>> {
+        self.residual_placement.as_ref().map(|placement| placement.policy())
     }
 
     /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
@@ -878,15 +892,21 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// protocol of online boundary partial-evaluation rules (i.e., the boundary-wise counterpart of the
     /// instruction-wise [`inline_program`](Self::inline_program)). The partitioned program's known [`Program`] is
     /// wrapped through `build_known_operation` and [folded-or-residualized](Self::fold_or_residualize) over the
-    /// original known boundary inputs. The residual program is wrapped through `build_residual_operation` and
-    /// [residualized](Self::residualize) over the surviving unknown boundary inputs plus the known-side operation's
-    /// residual outputs. Each original output is picked from the known-side or residual-side operation's outputs per
-    /// the partitioned program's [`outputs`](PartitionedProgram::outputs). Consuming the partitioned program in a
-    /// single step keeps it whole until it is gone, so no partially moved partition state can ever be observed.
+    /// original known boundary inputs that it uses. The residual program is wrapped through `build_residual_operation`
+    /// and [residualized](Self::residualize) over the values that its
+    /// [`residual_inputs`](PartitionedProgram::residual_inputs) name: original boundary inputs (unknown ones and,
+    /// once [forwarded](PartitionedProgram::forward_residuals), known ones), fully known outputs of the known-side
+    /// operation, and its residual edge outputs. Each original output is picked from the known-side or residual-side
+    /// operation's outputs per the partitioned program's [`outputs`](PartitionedProgram::outputs). The number of inputs
+    /// is validated before the known-side operation is bound, so that a missing input never leaves known work behind
+    /// ([`PartitionedProgram::from_parts`] already validates the wiring itself). Consuming the partitioned program
+    /// in a single step keeps it whole until it is gone, so no partially moved partition state can ever be observed.
     ///
     /// # Parameters
     ///
-    ///   - `partition`: [`PartitionedProgram`] to inline, produced by [`Program::partition`].
+    ///   - `program`: [`PartitionedProgram`] to inline, produced by [`Program::partition`] and typically forwarded
+    ///     through [`PartitionedProgram::forward_residuals`], so that the known-side operation does not return the
+    ///     same value twice or route its own inputs back out.
     ///   - `inputs`: Input [`PartialEvaluationValue`]s in the order of the original program's input, pre-partitioning.
     ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary [`Operation`]
     ///     together with the owned [`Region`](crate::Region) programs (in region order) that the emitted instruction
@@ -906,41 +926,34 @@ impl<C: Context> PartialEvaluationContext<C> {
         build_known_operation: BuildKnownProgramOperation,
         build_residual_operation: BuildResidualProgramOperation,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // Bind the known-side operation into the known-side context over the original known inputs.
+        check_count!("input", inputs, program.original_input_count(), ProgramError);
+
+        // Bind the known-side operation into the known-side context over the original known inputs that it uses.
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = program.into_parts();
-        let known_inputs = known_input_indices
-            .iter()
-            .map(|&index| {
-                inputs
-                    .get(index)
-                    .cloned()
-                    .ok_or(ProgramError::InvalidInputCount { expected: index + 1, actual: inputs.len() })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let known_inputs = known_input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
         let (known_program_operation, known_regions) = build_known_operation(known_program);
         let known_outputs =
             self.fold_or_residualize(known_program_operation, known_regions, known_inputs.as_slice())?;
 
-        // Emit the residual operation over the surviving unknown boundary inputs plus the residual edges, which trail
-        // the fully known outputs among the known-side operation's outputs. The emission is unconditional: a residual
-        // program without outputs can still carry effectful residual instructions whose effects must be preserved, and
-        // an entirely empty residual program only yields a dead pure operation that the walk's final simplification
-        // removes.
+        // Emit the residual operation over its sources (i.e., original boundary inputs, fully known outputs, and the
+        // residual edges, which trail the fully known outputs among the known-side operation's outputs). The emission
+        // is unconditional meaning that a residual program without outputs can still carry effectful residual
+        // instructions whose effects must be preserved, and an entirely empty residual program only yields a
+        // dead pure operation that the walk's final simplification removes.
         let known_output_count = outputs.iter().filter(|output| output.is_known()).count();
+        let known_output = |index: usize| {
+            known_outputs.get(index).cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("known program partition produced no output {index}"))
+            })
+        };
         let residual_inputs = residual_inputs
             .iter()
-            .map(|source| match source {
-                PartialEvaluationInput::Unknown(index) => inputs
-                    .get(*index)
-                    .cloned()
-                    .ok_or(ProgramError::InvalidInputCount { expected: *index + 1, actual: inputs.len() }),
-                PartialEvaluationInput::Known(index) => {
-                    known_outputs.get(known_output_count + index).cloned().ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "known program partition produced no output for residual known input index {index}",
-                        ))
-                    })
+            .map(|source| match *source {
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    Ok(inputs[index].clone())
                 }
+                ResidualInputSource::KnownOutput(index) => known_output(index),
+                ResidualInputSource::ResidualEdge(index) => known_output(known_output_count + index),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (residual_program_operation, residual_regions) = build_residual_operation(residual_program);
@@ -999,19 +1012,6 @@ impl<C: Context> PartialEvaluationContext<C> {
         }) && evaluation.outputs.iter().all(|output| match output {
             PartialEvaluationOutput::Known(value) => self.parent.resolve(value).is_constant(),
             PartialEvaluationOutput::Unknown(_) => true,
-        })
-    }
-
-    /// Returns `true` when any of the provided `inputs` is known but does not [`resolve`](Context::resolve)
-    /// to a [`Constant`](ValueResolution::Constant) in the known-side [`Context`] of this
-    /// [`PartialEvaluationContext`] (i.e., it is a genuine [`Tracer`](crate::Tracer) into a live outer trace). This
-    /// is the signal online boundary rules split on: all-constant knowledge keeps the default fold-or-residualize
-    /// behavior.
-    #[inline]
-    pub fn any_known_is_symbolic(&self, inputs: &[PartialEvaluationValue<C::Value>]) -> bool {
-        inputs.iter().any(|input| match input.value() {
-            PartialValue::Known(value) => !self.parent.resolve(value).is_constant(),
-            PartialValue::Unknown(_) => false,
         })
     }
 
@@ -1695,6 +1695,23 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_residual_policy() {
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        assert_eq!(context.residual_policy(), None);
+        let policy = save_nothing();
+        let configured = context.clone().with_residual_policy(&policy);
+        let cloned = configured.clone();
+        let sibling = configured.deferred_sibling();
+        assert_eq!(configured.residual_policy(), Some(&policy));
+        assert_eq!(cloned.residual_policy(), Some(&policy));
+        assert_eq!(sibling.residual_policy(), Some(&policy));
+        assert_eq!(configured.without_residual_policy().residual_policy(), None);
+        assert_eq!(cloned.residual_policy(), Some(&policy));
+        assert_eq!(sibling.residual_policy(), Some(&policy));
+        assert_eq!(context.residual_policy(), None);
+    }
+
+    #[test]
     fn test_partial_evaluation_context_error() {
         // The first binding failure is retained, and clones share it.
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
@@ -2341,7 +2358,7 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let partition = program.partition(&[true, false]).unwrap();
+        let partition = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
         let outputs = context
             .inline_partitioned_program(
                 partition,
@@ -2371,6 +2388,50 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program_forwards_known_outputs() {
+        // Partition `(-a, x - -a)` with `a` known. The residual input that `-a` feeds is the known output itself,
+        // so the known-side operation returns `-a` once and the residual operation consumes that output.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, negated], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated, difference], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            partition.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::KnownOutput(0)]
+        );
+        let outputs = context
+            .inline_partitioned_program(
+                partition,
+                &[
+                    PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
+                    context.unknown_input(ArrayType::scalar(DataType::F64), 0),
+                ],
+                |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
+                |_| (ArrayOperation::Sub(SubOperation::new()), Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f64).unwrap()));
+        assert!(outputs[1].is_unknown());
+
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.inputs,
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(-2.0f64).unwrap())],
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0).unwrap()]),
+            Ok(vec![Array::scalar(-2.0f64).unwrap(), Array::scalar(5.0 - (-2.0f64)).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_inline_partitioned_program_all_known() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2379,7 +2440,7 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![negated], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let partition = program.partition(&[true]).unwrap();
+        let partition = program.partition(&[true]).unwrap().forward_residuals().unwrap();
 
         // Preserve the empty residual program's boundary with a region wrapper. It emits no outputs and is removed
         // by finalization because it has no observable effects.
@@ -2403,9 +2464,99 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program_without_forwarding() {
+        // Partition `(-a, x - -a, -a * x)` with `a` known. The ordinary partition returns `-a` as a known output and
+        // again as a residual edge, while the forwarded one feeds the residual program from the known output. Both
+        // wirings must reassemble the same outputs.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, negated], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![negated, difference, product],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let ordinary = program.partition(&[true, false]).unwrap();
+        let forwarded = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            ordinary.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::ResidualEdge(0)]
+        );
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::KnownOutput(0)],
+        );
+        assert_eq!(ordinary.known_program().output_ids().len(), 2);
+        assert_eq!(forwarded.known_program().output_ids().len(), 1);
+        let inline = |partition| {
+            let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+            let inputs = [
+                PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
+                context.unknown_input(ArrayType::scalar(DataType::F64), 0),
+            ];
+            let outputs = context
+                .inline_partitioned_program(
+                    partition,
+                    &inputs,
+                    |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
+                    |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
+                )
+                .unwrap();
+            assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f64).unwrap()));
+            context
+                .into_evaluation(outputs)
+                .unwrap()
+                .interpret(&EagerContext::new(), &[Array::scalar(5.0).unwrap()])
+        };
+        let expected = vec![
+            Array::scalar(-2.0f64).unwrap(),
+            Array::scalar(5.0 - (-2.0f64)).unwrap(),
+            Array::scalar(-2.0f64 * 5.0).unwrap(),
+        ];
+        assert_eq!(inline(ordinary), Ok(expected.clone()));
+        assert_eq!(inline(forwarded), Ok(expected));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program_rejects_missing_inputs() {
+        // Partition `x - -a` with `a` known. A call that omits the unknown input `x` is rejected before the known-side
+        // operation is even built, so no known work is left behind.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, negated], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let built = Cell::new(false);
+        assert_eq!(
+            context
+                .inline_partitioned_program(
+                    program.partition(&[true, false]).unwrap(),
+                    &[PartialEvaluationValue::known(Array::scalar(2.0).unwrap())],
+                    |_| {
+                        built.set(true);
+                        (ArrayOperation::Neg(NegOperation::new()), Vec::new())
+                    },
+                    |_| (ArrayOperation::Sub(SubOperation::new()), Vec::new()),
+                )
+                .map(|outputs| outputs.len()),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+        );
+        assert!(!built.get());
+    }
+
+    #[test]
     fn test_partial_evaluation_context_known_constant() {
-        // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
-        // constant, while under a staging known-side context only literal-backed tracers do.
+        // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves
+        // to a constant, while under a staging known-side context only literal-backed tracers do.
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(context.known_constant(&Array::scalar(5.0).unwrap()), Ok(Array::scalar(5.0).unwrap()));
         let staging = TestArrayTracingContext::new();
@@ -2462,25 +2613,6 @@ mod tests {
             inputs: vec![PartialEvaluationInput::Unknown(0)],
             outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(symbolic)],
         }),);
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_any_known_is_symbolic() {
-        let context = PartialEvaluationContext::new(TestArrayContext::new());
-        let staging = TestArrayTracingContext::new();
-        let staging_context = PartialEvaluationContext::new(staging.clone());
-        let symbolic = staging.input(ArrayType::scalar(DataType::F64));
-        let literal = staging.constant(Array::scalar(4.0).unwrap());
-
-        // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
-        // resolve to a program constant counts, and so eager knowns and unknowns never do.
-        assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Array::scalar(1.0).unwrap())]));
-        assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
-        assert!(staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
-        assert!(
-            !staging_context
-                .any_known_is_symbolic(&[staging_context.unknown_input(ArrayType::scalar(DataType::F64), 0)]),
-        );
     }
 
     #[test]

@@ -60,7 +60,11 @@
 //!
 //! [`PartitionedProgram`] expresses the same split without retaining parent-context values. It replaces feeder and
 //! output values with positions, yielding a known program whose trailing outputs are residual edges and a residual
-//! program that consumes those edges together with the original unknown inputs.
+//! program that consumes those edges together with the original unknown inputs, each named by a
+//! [`ResidualInputSource`]. Boundary operations whose two halves become separate operations, and rematerialized calls,
+//! [forward](PartitionedProgram::forward_residuals) the edges that merely repeat original known inputs or fully known
+//! outputs, so that the residual program consumes those values directly. The result is still a
+//! [`PartitionedProgram`], whose residual inputs then also name those known inputs and outputs.
 //!
 //! # Identity, Concretization, and Failure Propagation
 //!
@@ -121,6 +125,7 @@ pub use residuals::{
 };
 pub use values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
+    ResidualInputSource,
 };
 
 #[cfg(test)]
