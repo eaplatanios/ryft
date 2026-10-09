@@ -50,7 +50,7 @@ use crate::arrays::{
     ShardingDimension,
 };
 use crate::contexts::{Domain, EagerContext};
-use crate::interpretation::InterpretationDriver;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::collectives::CollectiveMode;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
@@ -72,8 +72,8 @@ use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
 use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_NAME;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::programs::{
-    Concretizable, Instruction, Operation, OperationPayloadProjection, ProgramError, RegionRef, RegionReplayMappings,
-    ReplayRegionDriver, Type, Typed,
+    Concretizable, EmptyRegionDriver, Instruction, Operation, OperationPayloadProjection, ProgramError, RegionRef,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, Typed,
 };
 
 use super::{SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapError, ShardMapOperation, boundary_array_type};
@@ -519,8 +519,59 @@ where
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let participant_outputs = payload.interpret_participants(&participant_inputs)?;
-                for (participant, output) in participants.iter().zip(participant_outputs) {
+                // Validate each participant at its logical type before packing unplaced physical arrays. The
+                // inferred output types retain its mesh and manual variation for restoration after the exchange.
+                let output_types = participant_inputs
+                    .iter()
+                    .map(|inputs| {
+                        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                        Ok(payload.infer_output_types(&input_types, &[])?.remove(0))
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+
+                // Each of the six physical inputs has one leading row per participant, in axis-index order.
+                // Corresponding inputs must have one static shape and data type to share that representation.
+                let stacked_inputs = (0..6)
+                    .map(|index| {
+                        let input_type = participant_inputs[0][index].r#type();
+                        let Some(shape) = input_type.static_shape() else {
+                            return Err(TypeError::invalid(format!(
+                                "`{name}` participant input {index} must have a static shape but got `{input_type}`",
+                            ))
+                            .into());
+                        };
+                        let mut stacked_shape = vec![participants.len()];
+                        stacked_shape.extend(shape.dimensions());
+                        let mut bytes = Vec::new();
+                        for inputs in &participant_inputs {
+                            let participant_type = inputs[index].r#type();
+                            if participant_type.data_type() != input_type.data_type()
+                                || participant_type.shape() != input_type.shape()
+                            {
+                                return Err(TypeError::invalid(format!(
+                                    "`{name}` participant inputs {index} must share one static shape and data type but \
+                                     got `{input_type}` and `{participant_type}`",
+                                ))
+                                .into());
+                            }
+                            bytes.extend(inputs[index].logical_bytes());
+                        }
+                        Array::from_logical_bytes(ArrayType::new_static(input_type.data_type(), stacked_shape), &bytes)
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                let mut stacked_outputs = payload.with_physical_representation(None).interpret(
+                    &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                    &EmptyRegionDriver,
+                    &stacked_inputs,
+                )?;
+                check_count!("output", stacked_outputs, 1, ProgramError);
+
+                // Split the physical result in the same participant order and restore each logical output type.
+                let stacked_bytes = stacked_outputs.remove(0).logical_bytes();
+                let row_byte_count = stacked_bytes.len() / participants.len();
+                for (position, (participant, output_type)) in participants.iter().zip(output_types).enumerate() {
+                    let row = position * row_byte_count..(position + 1) * row_byte_count;
+                    let output = Array::from_logical_bytes(output_type, &stacked_bytes[row])?;
                     outputs[*participant] = Some(ArrayIrValue::Array(output));
                 }
             }
@@ -1152,6 +1203,7 @@ fn for_each_index<F: FnMut(&[usize])>(shape: &[usize], mut function: F) {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
@@ -1161,7 +1213,6 @@ mod tests {
     };
     use crate::contexts::Context;
     use crate::differentiation::NothingSavable;
-    use crate::interpretation::InterpretableOperation;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::collectives::CollectiveOptions;
     use crate::operations::collectives::axis_index::AxisIndex;
@@ -1190,8 +1241,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicyReference;
     use crate::programs::{
-        AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Program, ProgramBuilder, ProjectedValue,
-        ReferenceType, RegionDriver, ValueProjection,
+        AtomId, BindingRegionDriver, EffectClass, Program, ProgramBuilder, ProjectedValue, ReferenceType, RegionDriver,
+        ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -2127,6 +2178,112 @@ mod tests {
                 metadata(&[1, 2, 2, 1]),
             ]),
             Ok(vec![f32_value(f32_type(&[8], Some(sharded)), &[1.0, 4.0, 5.0, -1.0, 2.0, 3.0, 6.0, -1.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_emulator_run_collective_parallel_ragged_all_to_all() {
+        // Participant `p` holds the rows `[10·p + 1, 10·p + 2]` and sends row `i` to the member at position `i` of its
+        // group, which places it at the row given by the sender's own position. With groups `[[0, 2], [3, 1]]`, the
+        // members exchange only within their group, and the last row of every output seed passes through unchanged.
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let driver = EmptyRegionDriver;
+        let emulator = ShardMapEmulator {
+            context: &context,
+            driver: &driver,
+            grid: ManualDeviceGrid { axes: vec![("x".to_string(), 4)] },
+        };
+        let operation = TestOperation::ParallelRaggedAllToAll(
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]]).unwrap(),
+        );
+        let inputs = vec![
+            vec![
+                f32_value(f32_type(&[2], None), &[1.0, 2.0]),
+                f32_value(f32_type(&[2], None), &[11.0, 12.0]),
+                f32_value(f32_type(&[2], None), &[21.0, 22.0]),
+                f32_value(f32_type(&[2], None), &[31.0, 32.0]),
+            ],
+            vec![f32_value(f32_type(&[3], None), &[-1.0; 3]); 4],
+            vec![ArrayIrValue::Array(Array::vector(vec![0i64, 1]).unwrap()); 4],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
+            ],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
+        ];
+        assert_eq!(
+            emulator.run_collective(&operation, &inputs),
+            Ok(Some(vec![vec![
+                f32_value(f32_type(&[3], None), &[1.0, 21.0, -1.0]),
+                f32_value(f32_type(&[3], None), &[32.0, 12.0, -1.0]),
+                f32_value(f32_type(&[3], None), &[2.0, 22.0, -1.0]),
+                f32_value(f32_type(&[3], None), &[31.0, 11.0, -1.0]),
+            ]])),
+        );
+
+        // The staged participant count must agree with the emulated axis, whose inputs cover every device.
+        let smaller_emulator = ShardMapEmulator {
+            context: &context,
+            driver: &driver,
+            grid: ManualDeviceGrid { axes: vec![("x".to_string(), 2)] },
+        };
+        let fewer_inputs = inputs.iter().map(|values| values[..2].to_vec()).collect::<Vec<_>>();
+        assert_eq!(
+            smaller_emulator.run_collective(&operation, &fewer_inputs),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_ragged_all_to_all` was staged for 4 participants, but manual axis `x` has 2 devices"
+                    .to_string(),
+            )),
+        );
+
+        // The emulator requires all six exchange inputs, each containing one value per device.
+        assert_eq!(
+            emulator.run_collective(&operation, &inputs[..5]),
+            Err(ProgramError::InvalidInputCount { expected: 6, actual: 5 }),
+        );
+
+        // Corresponding participant inputs must share one static shape and data type, even when each participant's
+        // own inputs describe a valid exchange.
+        let mut longer_inputs = inputs.clone();
+        longer_inputs[0][1] = f32_value(f32_type(&[3], None), &[11.0, 12.0, 13.0]);
+        assert_eq!(
+            emulator.run_collective(&operation, &longer_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f32[3]`",
+            )
+            .into()),
+        );
+        let mut wider_inputs = inputs.clone();
+        wider_inputs[0][1] = ArrayIrValue::Array(Array::vector(vec![11.0f64, 12.0]).unwrap());
+        wider_inputs[1][1] = ArrayIrValue::Array(Array::vector(vec![-1.0f64; 3]).unwrap());
+        assert_eq!(
+            emulator.run_collective(&operation, &wider_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f64[2]`",
+            )
+            .into()),
+        );
+
+        // Packing the physical exchange requires static shapes even when the logical exchange types are valid.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut dynamic_inputs = inputs;
+        for input in &mut dynamic_inputs[0] {
+            let ArrayIrValue::Array(array) = input else { unreachable!() };
+            let bytes = array.logical_bytes();
+            *input = ArrayIrValue::Array(Array::new_unchecked(dynamic_type.clone(), Arc::new(bytes)));
+        }
+        assert_eq!(
+            emulator.run_collective(&operation, &dynamic_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant input 0 must have a static shape but got `f32[extent]`",
+            )
+            .into()),
         );
     }
 
