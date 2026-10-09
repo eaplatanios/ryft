@@ -38,6 +38,7 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -48,10 +49,11 @@ use thiserror::Error;
 
 use crate::parameters::Placeholder;
 use crate::partial::partitions::PartitionedProgram;
-use crate::partial::values::PartialEvaluationInput;
+use crate::partial::values::ResidualInputSource;
 use crate::programs::{
-    Atom, AtomId, ErasedOperation, InputRegionProvenance, Operation, OperationPayloadProjection, Program,
-    ProgramBuilder, ProgramError, RegionId, Type, Typed, Value, ValueId,
+    Atom, AtomId, ErasedOperation, Instruction, Operation, OperationPayloadProjection, Program, ProgramBuilder,
+    ProgramError, RegionDataflowBoundary, RegionDataflowSource, RegionDataflowSources, RegionId, RegionPruningAnalysis,
+    RegionRole, Type, Typed, Value, ValueId,
 };
 
 /// Error returned when classifying residuals with a [`ResidualPolicy`], staging their [`ResidualStorage`],
@@ -207,7 +209,10 @@ impl<'o, T: Type> ResidualProducer<'o, T> {
 
 /// Description of one residual that a [`ResidualPolicy`] classifies. It contains every operation output that may have
 /// produced the residual, in a stable order (most residuals have one producer, while the output of a condition, for
-/// example, has one producer per branch). Policies return one decision for the complete candidate.
+/// example, has one producer per branch). Built-in loops conservatively include the initial carry and every producer
+/// reachable through the body carry dependencies, including producers that a particular finite trip count may not
+/// reach. A statically empty scan contributes only its initial carries; stacked empty outputs have no producers.
+/// Policies return one decision for the complete candidate.
 pub struct ResidualCandidate<'o, T: Type> {
     /// Operation outputs that may have produced the residual, in semantic order.
     producers: Vec<ResidualProducer<'o, T>>,
@@ -465,8 +470,8 @@ pub trait ResidualPolicy<T: 'static + Type>: 'static + Send + Sync {
 /// a policy into another type universe (i.e., [`LiftedResidualPolicy`]) fail with
 /// [`ResidualPolicyError::UnsupportedProjection`] and return [`LiftedResidualStorage`]. That adapter is not a policy
 /// that users should implement, which is why this trait is private while [`ResidualPolicy`] stays small, typed, and
-/// public. Its implementations are [`NativeResidualPolicy`], which wraps any [`ResidualPolicy`], and
-/// [`LiftedResidualPolicy`].
+/// public. [`NativeResidualPolicy`] wraps a typed policy, [`LiftedResidualPolicy`] projects into another universe,
+/// and [`CombinedNativeResidualPolicy`] combines two native instantiations.
 trait ErasedResidualPolicy<T: Type>: Send + Sync {
     /// Returns the name of the policy.
     fn name(&self) -> &str;
@@ -615,9 +620,53 @@ where
     }
 }
 
+/// Executable native policy for one type universe supported by both child policies, instantiated from a deferred
+/// [`NativeResidualPolicyComposition`]. The first saving decision takes precedence, and the second policy is consulted
+/// only when the first requests recomputation.
+struct CombinedNativeResidualPolicy<T: Type> {
+    /// Name of the composed policy, matching its non-erased definition.
+    name: &'static str,
+
+    /// Policy that classifies a candidate first.
+    first: Arc<dyn ErasedResidualPolicy<T>>,
+
+    /// Policy that classifies candidates that the first policy recomputes.
+    second: Arc<dyn ErasedResidualPolicy<T>>,
+}
+
+impl<T: Type> ErasedResidualPolicy<T> for CombinedNativeResidualPolicy<T> {
+    #[inline]
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn classify(
+        &self,
+        candidate: &ResidualCandidate<'_, T>,
+    ) -> Result<ResidualDecision<ErasedResidualStorage<T>>, ResidualPolicyError> {
+        let result = match self.first.classify(candidate) {
+            Ok(ResidualDecision::Recompute) => self.second.classify(candidate),
+            result => result,
+        };
+
+        // The typed composition returns its child's rejection as a rejection of the composed policy.
+        // Keep the same diagnostic after erasure, preserving other error variants and all rejection details.
+        result.map_err(|error| match error {
+            ResidualPolicyError::Rejected { rejection, .. } => {
+                ResidualPolicyError::Rejected { policy: self.name.to_owned(), rejection }
+            }
+            error => error,
+        })
+    }
+}
+
+// TODO(eaplatanios): Is the way this is structured and its `composition` correct and reasonable? I wonder if
+//  it's not really very compositional and hardcodes a very specific relationship. Also, why do we need this
+//  and `NativeResidualPolicyComposition`separate from the machinery we have for combining policies like
+//  `CombinedNativeResidualPolicy`?
 /// Instantiations of one [`ResidualPolicy`] in other type universes, which [`ResidualPolicy::native_instantiations`]
-/// returns and [`ResidualPolicyReference::lift`] prefers over projecting candidate types. For example, a policy that is
-/// generic over its type universe returns `NativeResidualPolicies::default().with::<ArrayType, _>(
+/// returns and [`ResidualPolicyReference::lift`] prefers over projecting candidate types. For example, a policy that
+/// is generic over its type universe returns `NativeResidualPolicies::default().with::<ArrayType, _>(
 /// self.clone()).with::<ArrayIrType, _>(self.clone())`.
 ///
 /// An instantiation is _native_ to its universe because it is implemented for that universe and so classifies its
@@ -632,6 +681,9 @@ pub struct NativeResidualPolicies {
     /// Instantiations keyed by the [`TypeId`] of their universe `U`, each holding an
     /// `Arc<dyn ErasedResidualPolicy<U>>`.
     entries: Vec<(TypeId, Arc<dyn Any + Send + Sync>)>,
+
+    /// Deferred composition of child registries in their common type universes.
+    composition: Option<Arc<NativeResidualPolicyComposition>>,
 }
 
 impl NativeResidualPolicies {
@@ -644,13 +696,47 @@ impl NativeResidualPolicies {
         self
     }
 
-    /// Returns the instantiation that is registered for type universe `U`, if any.
+    /// Combines the native policies available in both registries, with the first policy's saves taking precedence.
+    /// Availability is intersected lazily because the erased entries cannot be instantiated in an unknown universe.
+    /// Explicit registrations added with [`with`](Self::with) override the derived policy for their universe.
+    pub(crate) fn intersection(self, other: Self, name: &'static str) -> Self {
+        Self {
+            entries: Vec::new(),
+            composition: Some(Arc::new(NativeResidualPolicyComposition { name, first: self, second: other })),
+        }
+    }
+
+    /// Returns the explicitly registered or composed native instantiation for type universe `U`, if any.
     fn get<U: 'static + Type>(&self) -> Option<Arc<dyn ErasedResidualPolicy<U>>> {
         self.entries
             .iter()
             .find(|(universe, _)| *universe == TypeId::of::<U>())
             .and_then(|(_, policy)| policy.downcast_ref::<Arc<dyn ErasedResidualPolicy<U>>>().cloned())
+            .or_else(|| {
+                let composition = self.composition.as_ref()?;
+                Some(Arc::new(CombinedNativeResidualPolicy {
+                    name: composition.name,
+                    first: composition.first.get::<U>()?,
+                    second: composition.second.get::<U>()?,
+                }))
+            })
     }
+}
+
+/// Deferred recipe for composing native policies in the type universes supported by both child registries. The
+/// registries erase their type universes, so composition is deferred until a lookup supplies the destination universe.
+/// The lookup then instantiates a [`CombinedNativeResidualPolicy`] from both children's native policies. Only universe
+/// availability is intersected; classification preserves the first saving decision and consults the second policy only
+/// when the first requests recomputation.
+struct NativeResidualPolicyComposition {
+    /// Name of the composed policy, used in rejection diagnostics.
+    name: &'static str,
+
+    /// Registry of the first policy, whose saves take precedence.
+    first: NativeResidualPolicies,
+
+    /// Registry of the policy consulted when the first policy recomputes.
+    second: NativeResidualPolicies,
 }
 
 /// Candidate of type universe `T` that does not fully project into the universe of a lifted policy, as passed to the
@@ -916,16 +1002,12 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     ///   - Known inputs are forwarded as edges and constants are re-created in the residual program, without consulting
     ///     the policy. Known inputs are therefore the only inputs that are ever saved, and only when residual work
     ///     needs them.
-    ///   - Outputs of region-carrying operations that forward the value of one of their inputs (i.e., every region
-    ///     that may produce the output returns one of its own inputs, and the operation supplies all of those region
-    ///     inputs from that input, with the same type) are replaced by that input, which is classified in turn, so that
-    ///     a value is never saved once more as an output that merely forwards it (e.g., the input of a call that its
-    ///     linearized callee also returns as a residual).
     ///   - Values whose producers cannot be replayed safely are saved regardless of the policy. This covers producers
     ///     that access references shared with the caller of the known program (e.g., reference inputs, or local
     ///     references that escape through an output), producers with other observable effects, and deferred work.
-    ///     Other outputs of operations that forward region inputs are saved too, because replaying them would
-    ///     re-execute the complete operation for a value that it merely forwards.
+    ///   - Values whose provenance contains only region inputs or constants are saved without consulting the policy,
+    ///     because they have no operation producer to classify. Region-input correspondence does not establish value
+    ///     identity: a loop carry, for example, can change on each iteration.
     ///   - Every other value is classified by `policy`. Saved values become edges, possibly through the storage that
     ///     the policy returns, whose store operations apply to the value in the known program and whose restore
     ///     operations reproduce it in the residual program before its first use. Recomputed values mark their
@@ -947,15 +1029,21 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// gains only complete local reference lifecycles that nothing outside it can observe. Both programs are finally
     /// pruned with [`Program::into_pruned`], so that their region-carrying instructions (e.g., a known `scan` whose
     /// stacked residuals are now recomputed) stop producing values that nothing uses. A policy that saves every value
-    /// therefore reproduces this partition, apart from dropping edges that the residual program does not read, reading
-    /// the inputs of region-carrying instructions instead of the outputs that forward them, and the unused boundaries
-    /// of those instructions.
+    /// therefore reproduces this partition, apart from dropping edges that the residual program does not read and
+    /// the unused boundaries of region-carrying instructions. Region-input provenance records correspondence rather
+    /// than value identity, so it never substitutes an instruction input for one of those instructions' outputs.
+    ///
+    /// Placement requires a partition whose residual edges have not been
+    /// [forwarded](PartitionedProgram::forward_residuals) yet, because it can introduce new edges that repeat known
+    /// inputs (e.g., the known input of a recomputed producer), which forwarding then feeds to the residual program
+    /// directly. Residuals are therefore placed first and forwarded afterwards.
     ///
     /// # Errors
     ///
     /// Returns the errors of classifying candidates with `policy` (refer to [`ResidualPolicyReference::classify`]),
     /// [`ResidualPolicyError::UnsupportedStorage`] or [`ResidualPolicyError::InvalidStorage`] when a storage cannot be
-    /// staged, and [`ResidualPolicyError::Program`] when rebuilding the programs fails (e.g., when residual work would
+    /// staged, and [`ResidualPolicyError::Program`] when this partition has forwarded residual inputs (wrapping a
+    /// [`ProgramError::InvalidArgument`]) or when rebuilding the programs fails (e.g., when residual work would
     /// require a local reference handle as a new edge).
     #[inline]
     pub fn with_residual_policy(self, policy: &ResidualPolicyReference<V::Type>) -> Result<Self, ResidualPolicyError> {
@@ -963,14 +1051,23 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     }
 
     /// Places the residuals of this partition like [`with_residual_policy`](Self::with_residual_policy). When
-    /// `replay_region_operations` is `false`, outputs of region-carrying operations are saved rather than replayed
-    /// unless the policy would recompute every value that their regions compute, because the split rules of those
-    /// operations may already have placed the residuals of their bodies with the same policy.
+    /// `replay_region_operations` is `false`, a requested recomputation of a region-carrying output preserves the
+    /// existing nested cuts unless the policy recomputes every live producer needed for that output. Unused sibling
+    /// outputs and dormant derivative regions do not contribute demand. Requested saves, storage, and errors are
+    /// handled directly before checking whether replay would discard a nested cut.
     fn with_residual_policy_and_region_replay(
         self,
         policy: &ResidualPolicyReference<V::Type>,
         replay_region_operations: bool,
     ) -> Result<Self, ResidualPolicyError> {
+        if self.has_forwarded_residual_inputs() {
+            return Err(ProgramError::InvalidArgument {
+                message: "cannot place the residuals of a partition whose residual inputs are already forwarded"
+                    .to_string(),
+            }
+            .into());
+        }
+
         let known_output_count = self.outputs().iter().filter(|output| output.is_known()).count();
         let residual_inputs = self.residual_inputs().to_vec();
         let (known_program, residual_program, metadata) = self.into_programs_and_metadata();
@@ -988,7 +1085,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             .iter()
             .zip(residual_program.input_ids())
             .filter_map(|(input, atom)| match input {
-                PartialEvaluationInput::Known(edge) if read[atom.index()] => Some(edges[*edge]),
+                ResidualInputSource::ResidualEdge(edge) if read[atom.index()] => Some(edges[*edge]),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1004,103 +1101,20 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         let mut is_input = vec![false; atom_count];
         known_program.input_ids().iter().for_each(|input| is_input[input.index()] = true);
 
-        // An instruction of the known program can be replayed in the residual program only if it and its transitive
-        // state predecessors (i.e., the earlier accesses to the local reference state that it observes) are all
-        // recomputable. The answer is memoized per instruction, because many demanded atoms share predecessors.
-        let mut replayable = vec![None; known_program.instructions().len()];
-        let mut is_replayable = |index: usize| {
-            if let Some(replayable) = replayable[index] {
-                return replayable;
-            }
-            let mut pending = vec![index];
-            let mut visited = HashSet::new();
-            let mut is_replayable = true;
-            while let Some(index) = pending.pop() {
-                if !visited.insert(index) {
-                    continue;
-                }
-                if !lifecycles.is_recomputable(index) {
-                    is_replayable = false;
-                    break;
-                }
-                pending.extend(lifecycles.state_predecessors(index));
-            }
-            replayable[index] = Some(is_replayable);
-            is_replayable
-        };
+        // State predecessors always precede their consumer, so one forward pass determines replayability of every
+        // lifecycle prefix. Demanded outputs can then share the result without repeatedly walking those prefixes.
+        let replayable = lifecycles.replayable_instructions();
 
-        // A region-carrying producer can only be replayed as a whole, which recomputes every value that its regions
-        // compute. That agrees with the policy only when the policy recomputes each of those values (e.g., under a
-        // policy that saves nothing), which is decided per instruction from the producers alone, and memoized because
-        // many demanded atoms can share a producer.
-        let mut recomputes_regions = vec![None; known_program.instructions().len()];
-        let mut recomputes_regions = |index: usize| {
-            if let Some(recomputes) = recomputes_regions[index] {
-                return recomputes;
-            }
-            let recomputes = known_program.instructions()[index].regions().iter().all(|region| {
-                let Ok(region) = known_program.region_ref(*region) else { return false };
-                region.instructions_in_closure().all(|(id, instruction)| {
-                    // The values of nested region-carrying operations are computed by the instructions of their own
-                    // regions, which the closure contains.
-                    if !instruction.regions().is_empty() {
-                        return true;
-                    }
-                    let Ok(region) = known_program.region_ref(id.region()) else { return false };
-                    let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
-                    let input_types = instruction.inputs().iter().map(atom_type).collect::<Vec<_>>();
-                    let output_types = instruction.outputs().iter().map(atom_type).collect::<Vec<_>>();
-                    output_types.iter().enumerate().all(|(output_index, output_type)| {
-                        let producer = ResidualProducer::new(
-                            instruction.operation(),
-                            output_index,
-                            input_types.clone(),
-                            output_types.clone(),
-                        );
-                        let candidate = ResidualCandidate::new(vec![producer], output_type.clone());
-                        matches!(policy.classify(&candidate), Ok(ResidualDecision::Recompute))
-                    })
-                })
-            });
-            recomputes_regions[index] = Some(recomputes);
-            recomputes
-        };
-
-        // Returns the input of the instruction at `index` whose value its output `atom` forwards, if any. That is the
-        // case when every region that may produce the output returns one of its own inputs as it, and the operation
-        // supplies all of those region inputs from one of its inputs of the same type (e.g., a call whose callee
-        // returns its input, or a condition whose branches all return the same input). This is a statement about
-        // values, so it does not look through operations inside the regions, unlike the provenance of the policy
-        // candidates.
-        let forwarded_input = |index: usize, atom: AtomId| -> Option<AtomId> {
-            let instruction = &known_program.instructions()[index];
-            let operation = instruction.operation();
-            let output_index = instruction.outputs().iter().position(|output| *output == atom)?;
-            let mut input_index = None;
-            for provenance in operation.output_region_provenance(output_index) {
-                let region = known_program.region_ref(*instruction.regions().get(provenance.region_index)?).ok()?;
-                let region_output = *region.output_ids().get(provenance.output_index)?;
-                let region_input = region.input_ids().iter().position(|input| *input == region_output)?;
-                let InputRegionProvenance::Input { index } =
-                    operation.input_region_provenance(provenance.region_index, region_input)
-                else {
-                    return None;
-                };
-                if input_index.replace(index).is_some_and(|previous| previous != index) {
-                    return None;
-                }
-            }
-            let input = *instruction.inputs().get(input_index?)?;
-            (known_program.atoms()[input.index()].r#type() == known_program.atoms()[atom.index()].r#type())
-                .then_some(input)
-        };
+        // Replaying the known half of a nested split must preserve its interior policy decisions. Operations determine
+        // the demanded outputs of the regions that they execute, which the analysis uses to cache work per region.
+        let mut replay_analysis = ResidualReplayAnalysis::new(&known_program, policy);
 
         // Plans one demanded known atom, applying the rules listed in the documentation of `with_residual_policy` in
         // order: constants and known inputs never consult the policy, reference handles are either original edges or
         // replayed, values whose producers cannot be replayed are saved, and the policy classifies everything else.
         // The provenance of the known program provides the candidates that the policy classifies, and memoizes the
-        // provenance of region outputs across calls.
-        let mut provenance = ResidualProvenance { program: &known_program, summaries: HashMap::new() };
+        // provenance of every visited value across calls.
+        let mut provenance = ResidualProvenanceAnalysis::new(&known_program);
         let mut plan = |atom: AtomId| -> Result<ResidualPlan<V::Type>, ResidualPolicyError> {
             let atom_type = match &known_program.atoms()[atom.index()] {
                 Atom::Constant(_) => return Ok(ResidualPlan::Constant),
@@ -1118,7 +1132,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 // handle edges. The handle edges of the original partition stay edges.
                 return if edges.contains(&atom) {
                     Ok(ResidualPlan::Edge(None))
-                } else if is_replayable(index) {
+                } else if replayable[index] {
                     Ok(ResidualPlan::Recompute)
                 } else {
                     Err(ProgramError::MalformedProgram(format!(
@@ -1129,27 +1143,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 };
             }
 
-            // A value that its producer forwards from one of its inputs is that input, which residual work reads
-            // instead, so that the value is not saved once more as the output that forwards it.
-            if let Some(input) = forwarded_input(index, atom) {
-                return Ok(ResidualPlan::Forward(input));
-            }
-
-            if !is_replayable(index) {
-                return Ok(ResidualPlan::Edge(None));
-            }
-
-            // Replaying a region-carrying producer re-executes it as a whole. Unless region operations are replayed
-            // unconditionally, its outputs are saved when the policy would save any value that its regions compute,
-            // so that a known operation that the split rule of a region-carrying operation constructed after placing
-            // the residuals of its body with the same policy (e.g., a known scan that stacks per-iteration dot
-            // products) keeps the per-iteration and per-branch decisions of that rule. Operations whose regions the
-            // policy would recompute entirely (e.g., an operation whose inputs are all known, and which was therefore
-            // not split) are replayed instead, consistently with the policy.
-            if !replay_region_operations
-                && !known_program.instructions()[index].regions().is_empty()
-                && !recomputes_regions(index)
-            {
+            if !replayable[index] {
                 return Ok(ResidualPlan::Edge(None));
             }
 
@@ -1162,7 +1156,21 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             Ok(match policy.classify(&candidate)? {
                 ResidualDecision::Save => ResidualPlan::Edge(None),
                 ResidualDecision::SaveWith(storage) => ResidualPlan::Edge(Some(storage)),
-                ResidualDecision::Recompute => ResidualPlan::Recompute,
+                ResidualDecision::Recompute => {
+                    // Classify the demanded output before consulting the nested replay guard, so a sibling's save
+                    // cannot hide its rejection or its requested storage. Only recomputation can overwrite the
+                    // existing interior cuts of a nested split and therefore needs this extra validation.
+                    let instruction = &known_program.instructions()[index];
+                    let output_index = instruction.outputs().iter().position(|output| *output == atom).unwrap();
+                    if !replay_region_operations
+                        && !instruction.regions().is_empty()
+                        && !replay_analysis.allows_replay(index, output_index)?
+                    {
+                        ResidualPlan::Edge(None)
+                    } else {
+                        ResidualPlan::Recompute
+                    }
+                }
             })
         };
 
@@ -1186,7 +1194,6 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                     // The `unwrap` is safe because only atoms produced by instructions are ever recomputed.
                     ResidualPlan::Recompute => pending_instructions.push(instruction_by_output[atom.index()].unwrap()),
                     ResidualPlan::Edge(_) | ResidualPlan::Constant => {}
-                    ResidualPlan::Forward(input) => pending_atoms.push(input),
                 }
                 plans[atom.index()] = Some(atom_plan);
             }
@@ -1207,8 +1214,8 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         let is_edge = |atom: &AtomId| matches!(plans[atom.index()], Some(ResidualPlan::Edge(_)));
         let mut new_edges = Vec::new();
         let original_edges = residual_inputs.iter().filter_map(|input| match input {
-            PartialEvaluationInput::Known(edge) => Some(edges[*edge]),
-            PartialEvaluationInput::Unknown(_) => None,
+            ResidualInputSource::ResidualEdge(edge) => Some(edges[*edge]),
+            _ => None,
         });
         for atom in original_edges.chain((0..atom_count).map(AtomId::new)) {
             if is_edge(&atom) && !new_edges.contains(&atom) {
@@ -1314,19 +1321,22 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 && !edge_inputs.contains_key(&edge)
             {
                 edge_inputs.insert(edge, builder.add_input(edge_types[position].clone()));
-                inputs.push(PartialEvaluationInput::Known(position));
+                inputs.push(ResidualInputSource::ResidualEdge(position));
             }
         };
 
         for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
             match input {
-                PartialEvaluationInput::Unknown(index) => {
+                ResidualInputSource::UnknownInput(index) => {
                     let r#type = residual_program.atoms()[atom.index()].r#type().into_owned();
                     residual_atoms[atom.index()] = Some(builder.add_input(r#type));
-                    new_residual_inputs.push(PartialEvaluationInput::Unknown(*index));
+                    new_residual_inputs.push(ResidualInputSource::UnknownInput(*index));
                 }
-                PartialEvaluationInput::Known(edge) => {
+                ResidualInputSource::ResidualEdge(edge) => {
                     add_edge_input(edges[*edge], &mut builder, &mut new_residual_inputs)
+                }
+                ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                    unreachable!("forwarded residual inputs are rejected before placement")
                 }
             }
         }
@@ -1336,22 +1346,13 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         }
 
         // Resolves the atom of the residual program that provides the demanded known atom `atom`, memoized in
-        // `known_atoms`: its edge input (through the restore operations of its storage, which are staged on
-        // first use and must reproduce the residual type), its replayed value, or a re-created constant.
+        // `known_atoms`: its edge input (through the restore operations of its storage, which are staged on first use
+        // and must reproduce the residual type), its replayed value, or a re-created constant.
         let resolve_known_atom = |atom: AtomId,
                                   known_atoms: &mut [Option<AtomId>],
                                   builder: &mut ProgramBuilder<V, O>|
          -> Result<AtomId, ResidualPolicyError> {
             if let Some(resolved) = known_atoms[atom.index()] {
-                return Ok(resolved);
-            }
-            let demanded = atom;
-            let mut atom = atom;
-            while let Some(ResidualPlan::Forward(input)) = &plans[atom.index()] {
-                atom = *input;
-            }
-            if let Some(resolved) = known_atoms[atom.index()] {
-                known_atoms[demanded.index()] = Some(resolved);
                 return Ok(resolved);
             }
             let resolved = match &plans[atom.index()] {
@@ -1402,13 +1403,8 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                     ))
                     .into());
                 }
-                Some(ResidualPlan::Forward(_)) => {
-                    // Forwarding chains end at an atom with another plan.
-                    unreachable!()
-                }
             };
             known_atoms[atom.index()] = Some(resolved);
-            known_atoms[demanded.index()] = Some(resolved);
             Ok(resolved)
         };
 
@@ -1449,7 +1445,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         // Edge inputs of the original residual program resolve to the known atoms that they received. Edges that the
         // original residual program does not read were never demanded, so they have no plan and are dropped.
         for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
-            if let PartialEvaluationInput::Known(edge) = input
+            if let ResidualInputSource::ResidualEdge(edge) = input
                 && plans[edges[*edge].index()].is_some()
             {
                 residual_atoms[atom.index()] = Some(resolve_known_atom(edges[*edge], &mut known_atoms, &mut builder)?);
@@ -1512,7 +1508,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// before it is stored, if the known program also consumes that value elsewhere. Edges that only the residual
     /// program consumes, constant edges, and edges whose types `rounding` returns no operation for are left unchanged.
     /// Each rounding operation is constructed in the operation family of this partition through
-    /// [`OperationPayloadProjection::from_payload`].
+    /// [`OperationPayloadProjection::from_payload`]. Rounding requires a partition whose residual edges have not been
+    /// [forwarded](Self::forward_residuals) yet, because a forwarded known input or output would reach the residual
+    /// program without passing through the edge that this function rounds.
     ///
     /// # Parameters
     ///
@@ -1524,13 +1522,21 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when the operation family cannot hold a rounding operation
-    /// or when rebuilding the known program fails.
+    /// Returns a [`ProgramError::InvalidArgument`] when this partition has forwarded residual inputs and another
+    /// [`ProgramError`] when the operation family cannot hold a rounding operation or when rebuilding the known
+    /// program fails.
     pub(crate) fn with_rounded_residuals<R: Fn(&V::Type) -> Option<ErasedOperation>, S: Fn(&O) -> bool>(
         self,
         rounding: R,
         is_storage: S,
     ) -> Result<Self, ProgramError> {
+        if self.has_forwarded_residual_inputs() {
+            return Err(ProgramError::InvalidArgument {
+                message: "cannot round the residuals of a partition whose residual inputs are already forwarded"
+                    .to_string(),
+            });
+        }
+
         let known_output_count = self.outputs().iter().filter(|output| output.is_known()).count();
         let (known_program, residual_program, metadata) = self.into_programs_and_metadata();
         let mut use_counts = vec![0usize; known_program.atoms().len()];
@@ -1647,11 +1653,14 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
 /// split rules of region-carrying operations construct, without requiring every operation family to support residual
 /// placement. [`ResidualPolicyReference`]s implement it for every family that does.
 pub(crate) trait ResidualPlacement<V: Value, O: Operation<Type = V::Type>> {
+    /// Returns the policy that places this adapter's residuals, preserving its definition identity.
+    fn policy(&self) -> &ResidualPolicyReference<V::Type>;
+
     /// Returns `partition` with its residuals placed according to the policy (refer to the documentation of
-    /// [`PartitionedProgram::with_residual_policy`] for more information on that). Outputs of region-carrying
-    /// operations in the known program are saved rather than replayed unless the policy would recompute every value
-    /// that their regions compute, because the split rules of those operations may already have placed the residuals
-    /// of their bodies with the same policy when the partition was constructed.
+    /// [`PartitionedProgram::with_residual_policy`] for more information on that). Replaying a demanded output of a
+    /// region-carrying operation preserves the saved values that its split rule already placed inside its body. Only
+    /// producers needed for that output participate. Unused sibling outputs and dormant derivative regions do not
+    /// contribute residual demand.
     fn place_residuals(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError>;
 }
 
@@ -1659,9 +1668,470 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     for ResidualPolicyReference<V::Type>
 {
     #[inline]
+    fn policy(&self) -> &ResidualPolicyReference<V::Type> {
+        self
+    }
+
+    #[inline]
     fn place_residuals(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError> {
         Ok(partition.with_residual_policy_and_region_replay(self, false)?)
     }
+}
+
+/// Analysis that decides, for one residual policy, whether replaying an output of a region-carrying instruction of the
+/// known program of a nested split preserves the residual decisions that the split already made inside the regions of
+/// that instruction. Replay recomputes all the work that the regions execute for that output, so it agrees with the
+/// policy only when the policy recomputes every value that this work produces, which
+/// [`allows_replay`](Self::allows_replay) checks by classifying each of those values.
+///
+/// The executed work comes from the [`RegionDataflow`](crate::RegionDataflow) of each region-carrying operation. For
+/// each region that an instruction executes, it determines the _demanded outputs_ of that region: the outputs that the
+/// instruction needs from the region, together with every output that the operation's own semantics need for them
+/// (e.g., the carries that later iterations of a loop read). The answer for a region therefore depends only on the
+/// region, its demanded outputs, and the policy. The policy is fixed for the lifetime of the analysis, so answers are
+/// cached by region and demanded outputs, and a region that several instructions share is classified once for each
+/// distinct set of demanded outputs.
+struct ResidualReplayAnalysis<'o, V: Value, O: Operation<Type = V::Type>> {
+    /// [`Program`] containing all source instructions and regions.
+    program: &'o Program<V, O, Vec<V>, Vec<V>>,
+
+    /// [`ResidualPolicyReference`] whose decisions replay must agree with.
+    policy: &'o ResidualPolicyReference<V::Type>,
+
+    /// [`RegionPruningAnalysis`] that caches the region-local liveness of each set of demanded outputs.
+    analysis: RegionPruningAnalysis<'o, V, O>,
+
+    /// Whether replay agrees with the policy for each region and its demanded outputs, accounting for the regions that
+    /// the region executes in turn.
+    resolved: HashMap<(RegionId, Vec<bool>), bool>,
+}
+
+impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection>
+    ResidualReplayAnalysis<'o, V, O>
+{
+    /// Creates a replay analysis of `program` under `policy`, with empty caches.
+    #[inline]
+    fn new(program: &'o Program<V, O, Vec<V>, Vec<V>>, policy: &'o ResidualPolicyReference<V::Type>) -> Self {
+        Self { program, policy, analysis: RegionPruningAnalysis::new(program.regions()), resolved: HashMap::new() }
+    }
+
+    /// Returns whether replaying output `output_index` of the instruction at position `instruction_index` in the
+    /// entry region of the program recomputes only values that the policy also recomputes. Returns `false` without
+    /// classifying any value when the operation of the instruction does not declare which of its regions produce
+    /// that output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of classifying values with the policy and of the region dataflow and liveness queries.
+    fn allows_replay(&mut self, instruction_index: usize, output_index: usize) -> Result<bool, ResidualPolicyError> {
+        let program = self.program;
+        let policy = self.policy;
+        let instruction = &program.instructions()[instruction_index];
+        let Some(dataflow) = instruction.operation().region_dataflow() else {
+            return Ok(false);
+        };
+
+        let regions = program.region_dataflow_boundaries(instruction)?;
+        let boundary = RegionDataflowBoundary {
+            input_count: instruction.inputs().len(),
+            output_count: instruction.outputs().len(),
+            regions: &regions,
+        };
+
+        if matches!(
+            dataflow.output_sources(instruction.operation(), output_index, boundary)?,
+            RegionDataflowSources::Unknown
+        ) {
+            // Whole-operation public replay is handled by the caller. A nested split cannot infer precise replay
+            // permission for a root whose producing computations have not been declared.
+            return Ok(false);
+        }
+
+        let mut outputs = vec![false; instruction.outputs().len()];
+        outputs[output_index] = true;
+        let roots = self.demands(instruction, &outputs, boundary)?;
+        let mut pending = roots
+            .iter()
+            .rev()
+            .cloned()
+            .map(|(region, outputs)| ResidualReplayFrame::Visit { region, outputs })
+            .collect::<Vec<_>>();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                ResidualReplayFrame::Finish { region, outputs, mut recomputes, dependencies } => {
+                    // Each dependency was pushed after this frame and therefore resolved before it was popped. Regions
+                    // never contain themselves, so no dependency can still be waiting for its own `Finish` frame.
+                    for dependency in dependencies {
+                        recomputes &= self.resolved[&dependency];
+                    }
+                    self.resolved.insert((region, outputs), recomputes);
+                }
+                ResidualReplayFrame::Visit { region, outputs } => {
+                    if self.resolved.contains_key(&(region, outputs.clone())) {
+                        continue;
+                    }
+
+                    let source = program.region_ref(region)?;
+                    let selected = outputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, used)| used.then_some(index))
+                        .collect::<Vec<_>>();
+                    let live = self.analysis.live_sets(region, &selected)?;
+                    let mut recomputes = true;
+                    let mut dependencies = Vec::new();
+                    for (index, instruction) in source.instructions().iter().enumerate() {
+                        if !live.instructions()[index] {
+                            continue;
+                        }
+
+                        let used_outputs =
+                            instruction.outputs().iter().map(|output| live.atoms()[output.index()]).collect::<Vec<_>>();
+                        if instruction.regions().is_empty() {
+                            let atom_type = |atom: &AtomId| source.atoms()[atom.index()].r#type().into_owned();
+                            let input_types = instruction.inputs().iter().map(atom_type).collect::<Vec<_>>();
+                            let output_types = instruction.outputs().iter().map(atom_type).collect::<Vec<_>>();
+                            for (output_index, used) in used_outputs.iter().enumerate() {
+                                if !used {
+                                    continue;
+                                }
+
+                                let producer = ResidualProducer::new(
+                                    instruction.operation(),
+                                    output_index,
+                                    input_types.clone(),
+                                    output_types.clone(),
+                                );
+
+                                let candidate =
+                                    ResidualCandidate::new(vec![producer], output_types[output_index].clone());
+
+                                // Saved siblings must not hide another demanded output's rejection.
+                                recomputes &= matches!(policy.classify(&candidate)?, ResidualDecision::Recompute);
+                            }
+                        } else {
+                            let regions = program.region_dataflow_boundaries(instruction)?;
+                            let boundary = RegionDataflowBoundary {
+                                input_count: instruction.inputs().len(),
+                                output_count: instruction.outputs().len(),
+                                regions: &regions,
+                            };
+                            dependencies.extend(self.demands(instruction, &used_outputs, boundary)?);
+                        }
+                    }
+
+                    pending.push(ResidualReplayFrame::Finish {
+                        region,
+                        outputs,
+                        recomputes,
+                        dependencies: dependencies.clone(),
+                    });
+
+                    pending.extend(
+                        dependencies
+                            .into_iter()
+                            .rev()
+                            .map(|(region, outputs)| ResidualReplayFrame::Visit { region, outputs }),
+                    );
+                }
+            }
+        }
+
+        Ok(roots.iter().all(|root| self.resolved[root]))
+    }
+
+    /// Returns the demanded outputs of each region that `instruction` executes when only the outputs that
+    /// `used_outputs` marks are used, according to the [`RegionDataflow`](crate::RegionDataflow) of its operation,
+    /// marked in the order of the outputs of each region. An operation that declares no region dataflow conservatively
+    /// demands every output of each of its computation regions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `instruction`: Region-carrying instruction of the program.
+    ///   - `used_outputs`: Outputs of `instruction` that are used, marked in the order of its outputs.
+    ///   - `boundary`: Boundary of `instruction` and its attached regions, as constructed from
+    ///     [`Program::region_dataflow_boundaries`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of the region dataflow and region liveness queries.
+    fn demands(
+        &mut self,
+        instruction: &Instruction<O>,
+        used_outputs: &[bool],
+        boundary: RegionDataflowBoundary<'_>,
+    ) -> Result<Vec<(RegionId, Vec<bool>)>, ProgramError> {
+        let operation = instruction.operation();
+        let demands = if let Some(dataflow) = operation.region_dataflow() {
+            let mut regions = self.analysis.attached_region_liveness(instruction.regions());
+            dataflow.execution_demands(operation, used_outputs, boundary, &mut regions)?
+        } else {
+            boundary
+                .regions
+                .iter()
+                .enumerate()
+                .map(|(region_index, region)| {
+                    (operation.region_role(region_index) == Some(RegionRole::Computation))
+                        .then(|| vec![true; region.output_count])
+                })
+                .collect()
+        };
+        Ok(instruction
+            .regions()
+            .iter()
+            .zip(demands)
+            .filter_map(|(&region, outputs)| outputs.map(|outputs| (region, outputs)))
+            .collect())
+    }
+}
+
+/// Work item of the iterative traversal in [`ResidualReplayAnalysis::allows_replay`]. Visiting a region classifies its
+/// own demanded values and schedules the regions that its instructions execute, and finishing it, after those regions
+/// have been resolved, combines their answers into its own. This postorder traversal avoids recursion and resolves a
+/// region that several instructions share only once for each distinct set of demanded outputs.
+enum ResidualReplayFrame {
+    /// Visits a region with its demanded outputs.
+    Visit {
+        /// Region to visit.
+        region: RegionId,
+
+        /// Demanded outputs of the region, marked in the order of its outputs.
+        outputs: Vec<bool>,
+    },
+
+    /// Publishes the answer for a region once the answers of all the regions that it executes are available.
+    Finish {
+        /// Region whose answer is published.
+        region: RegionId,
+
+        /// Demanded outputs of the region, marked in the order of its outputs.
+        outputs: Vec<bool>,
+
+        /// Whether the policy recomputes every demanded value that the region's own instructions produce.
+        recomputes: bool,
+
+        /// Regions, with their demanded outputs, whose answers contribute to the answer for this region.
+        dependencies: Vec<(RegionId, Vec<bool>)>,
+    },
+}
+
+/// Analysis that resolves the operation outputs that may have produced the values of a [`Program`].
+/// It follows the [`RegionDataflowSource`]s that region-carrying operations declare through their
+/// [`RegionDataflow`](crate::RegionDataflow), across attached regions, initial bindings, and recurrent feedback
+/// (e.g., loop carries). A region-carrying operation that declares no dataflow, or whose declared sources are unknown,
+/// is itself kept as a possible producer.
+///
+/// Every visited value is summarized symbolically, in terms of its containing region's inputs, and each summary is
+/// computed once. Region summaries are instantiated separately at every call site. A region that several operations
+/// invoke (e.g., with differently tagged inputs) therefore resolves to each call site's own input producers.
+struct ResidualProvenanceAnalysis<'o, V: Value, O: Operation<Type = V::Type>> {
+    /// Program whose values are resolved.
+    program: &'o Program<V, O, Vec<V>, Vec<V>>,
+
+    /// Producer and input positions, indexed once for each region that resolution visits.
+    positions: HashMap<RegionId, ResidualAtomPositions>,
+
+    /// Symbolic provenance of each resolved value, independent of the callers of its containing region.
+    resolved: HashMap<ValueId, Vec<ResidualProvenanceLeaf>>,
+}
+
+impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection>
+    ResidualProvenanceAnalysis<'o, V, O>
+{
+    /// Creates a new [`ResidualProvenanceAnalysis`] of `program`, with empty caches.
+    #[inline]
+    fn new(program: &'o Program<V, O, Vec<V>, Vec<V>>) -> Self {
+        Self { program, positions: HashMap::new(), resolved: HashMap::new() }
+    }
+
+    /// Returns the [`ResidualCandidate`] that describes `value` to a [`ResidualPolicy`], which classifies it to decide
+    /// whether residual work receives `value` as a saved residual or recomputes it. The candidate lists every operation
+    /// output that may have produced `value`, in the order of its [`resolve`](Self::resolve)d provenance. Operation
+    /// outputs that only forward an output of an attached region are looked through, so that the candidate lists the
+    /// operations inside those regions that may actually produce the value (e.g., one producer for each branch of a
+    /// `condition`).
+    ///
+    /// Returns [`None`] when no operation output may have produced `value` (i.e., when every path of its provenance
+    /// ends at an input or a constant of the program, such as a `condition` output that both branches forward from
+    /// the same input). Such a value has no producer that a policy could classify, so
+    /// [`PartitionedProgram::with_residual_policy`] saves it without consulting the policy.
+    ///
+    /// # Parameters
+    ///
+    ///   - `value`: Value of the program whose producers are resolved.
+    ///   - `residual_type`: Type of `value`, which the candidate reports as the type of the residual.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] for malformed region dataflow declarations, and
+    /// [`ProgramError::UnboundAtomId`] when `value` or one of its sources does not exist in the program.
+    fn candidate(
+        &mut self,
+        value: ValueId,
+        residual_type: V::Type,
+    ) -> Result<Option<ResidualCandidate<'o, V::Type>>, ProgramError> {
+        let program = self.program;
+        let mut producers = Vec::new();
+        for leaf in self.resolve(value)? {
+            if let ResidualProvenanceLeaf::Producer(value) = leaf {
+                // Producer leaves are instruction outputs, so their indexed producer always exists.
+                let (instruction_index, output_index) =
+                    self.positions(value.region())?.producers[value.atom().index()].unwrap();
+                let region = program.region(value.region())?;
+                let instruction = &region.instructions()[instruction_index];
+                let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
+                producers.push(ResidualProducer::new(
+                    instruction.operation(),
+                    output_index,
+                    instruction.inputs().iter().map(atom_type).collect(),
+                    instruction.outputs().iter().map(atom_type).collect(),
+                ));
+            }
+        }
+        Ok((!producers.is_empty()).then(|| ResidualCandidate::new(producers, residual_type)))
+    }
+
+    /// Returns the positions of the producers and inputs of `region`, indexing its atoms on the first visit.
+    fn positions(&mut self, region: RegionId) -> Result<&ResidualAtomPositions, ProgramError> {
+        if let Entry::Vacant(entry) = self.positions.entry(region) {
+            let region = self.program.region(region)?;
+            let mut producers = vec![None; region.atoms().len()];
+            let mut inputs = vec![None; region.atoms().len()];
+            for (instruction_index, instruction) in region.instructions().iter().enumerate() {
+                for (output_index, output) in instruction.outputs().iter().enumerate() {
+                    producers[output.index()] = Some((instruction_index, output_index));
+                }
+            }
+            for (input_index, input) in region.input_ids().iter().enumerate() {
+                inputs[input.index()] = Some(input_index);
+            }
+            entry.insert(ResidualAtomPositions { producers, inputs });
+        }
+        Ok(&self.positions[&region])
+    }
+
+    /// Returns the symbolic provenance of `value`, in semantic order and without duplicates. Every value is resolved
+    /// once, including caller values that several branches share. Region inputs remain symbolic until their caller
+    /// instantiates them, so caching never confuses callers with differently tagged inputs.
+    fn resolve(&mut self, value: ValueId) -> Result<Vec<ResidualProvenanceLeaf>, ProgramError> {
+        if let Some(leaves) = self.resolved.get(&value) {
+            return Ok(leaves.clone());
+        }
+        let leaves = self.resolve_uncached(value)?;
+        self.resolved.insert(value, leaves.clone());
+        Ok(leaves)
+    }
+
+    /// Computes the symbolic provenance of `value` for [`resolve`](Self::resolve), which caches it.
+    fn resolve_uncached(&mut self, value: ValueId) -> Result<Vec<ResidualProvenanceLeaf>, ProgramError> {
+        let program = self.program;
+        let positions = self.positions(value.region())?;
+        let producer = positions
+            .producers
+            .get(value.atom().index())
+            .ok_or(ProgramError::UnboundAtomId { id: value.atom() })?;
+
+        // Inputs stay symbolic and constants have no provenance. The caller of this region substitutes each input
+        // through its own input bindings, without changing the cached region-local summary.
+        let Some((instruction_index, output_index)) = *producer else {
+            return Ok(positions.inputs[value.atom().index()].map(ResidualProvenanceLeaf::Input).into_iter().collect());
+        };
+        let instruction = &program.region(value.region())?.instructions()[instruction_index];
+
+        // Region-local summaries stay symbolic. Initial bindings and recurrent edges belong to the attachment,
+        // so a shared body can be used by ordinary and recurrent carriers without contaminating its cached summary.
+        let operation = instruction.operation();
+        let Some(dataflow) = operation.region_dataflow() else {
+            return Ok(vec![ResidualProvenanceLeaf::Producer(value)]);
+        };
+
+        let regions = program.region_dataflow_boundaries(instruction)?;
+        let boundary = RegionDataflowBoundary {
+            input_count: instruction.inputs().len(),
+            output_count: instruction.outputs().len(),
+            regions: &regions,
+        };
+
+        let RegionDataflowSources::Known(sources) = dataflow.output_sources(operation, output_index, boundary)? else {
+            return Ok(vec![ResidualProvenanceLeaf::Producer(value)]);
+        };
+
+        let mut pending = sources.into_iter().rev().map(ResidualProvenanceSource::Boundary).collect::<Vec<_>>();
+        let mut expanded_inputs = HashSet::new();
+        let mut expanded_outputs = HashSet::new();
+        let mut leaves = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            let replacements = match source {
+                ResidualProvenanceSource::Producer(producer) => vec![ResidualProvenanceLeaf::Producer(producer)],
+                ResidualProvenanceSource::Boundary(RegionDataflowSource::InstructionInput(index)) => {
+                    self.resolve(ValueId::new(value.region(), instruction.inputs()[index]))?
+                }
+                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionInput { region_index, input_index }) => {
+                    if !expanded_inputs.insert((region_index, input_index)) {
+                        continue;
+                    }
+                    match dataflow.input_sources(operation, region_index, input_index, boundary)? {
+                        RegionDataflowSources::Unknown => vec![ResidualProvenanceLeaf::Producer(value)],
+                        RegionDataflowSources::Known(sources) => {
+                            // Complete each declared alternative before the next. Region input/output positions
+                            // terminate cycles without changing the region-local symbolic summaries.
+                            pending.extend(sources.into_iter().rev().map(ResidualProvenanceSource::Boundary));
+                            Vec::new()
+                        }
+                    }
+                }
+                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionOutput(origin)) => {
+                    if !expanded_outputs.insert((origin.region_index, origin.output_index)) {
+                        continue;
+                    }
+                    let region = instruction.regions()[origin.region_index];
+                    let output = program.region(region)?.output_ids()[origin.output_index];
+                    for leaf in self.resolve(ValueId::new(region, output))?.into_iter().rev() {
+                        pending.push(match leaf {
+                            ResidualProvenanceLeaf::Producer(producer) => ResidualProvenanceSource::Producer(producer),
+                            ResidualProvenanceLeaf::Input(input_index) => {
+                                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionInput {
+                                    region_index: origin.region_index,
+                                    input_index,
+                                })
+                            }
+                        });
+                    }
+                    Vec::new()
+                }
+            };
+
+            for leaf in replacements {
+                if seen.insert(leaf) {
+                    leaves.push(leaf);
+                }
+            }
+        }
+
+        Ok(leaves)
+    }
+}
+
+/// Work item of the expansion of the sources of one instruction output in
+/// [`ResidualProvenanceAnalysis::resolve_uncached`].
+enum ResidualProvenanceSource {
+    /// Source that the [`RegionDataflow`](crate::RegionDataflow) of the instruction declares, relative to the
+    /// instruction and its attached regions.
+    Boundary(RegionDataflowSource),
+
+    /// Instruction output that is itself a producer of the resolved value.
+    Producer(ValueId),
+}
+
+/// Positions at which the atoms of one region are produced or enter the region, indexed by atom.
+struct ResidualAtomPositions {
+    /// Position of the producing instruction in the region and of the atom among the outputs of that instruction, for
+    /// each atom that an instruction produces.
+    producers: Vec<Option<(usize, usize)>>,
+
+    /// Position of the atom among the inputs of the region, for each atom that is a region input.
+    inputs: Vec<Option<usize>>,
 }
 
 /// Plan of [`PartitionedProgram::with_residual_policy`] for one known atom that residual work demands.
@@ -1674,158 +2144,11 @@ enum ResidualPlan<T: Type> {
 
     /// The atom is a constant, which the residual program re-creates.
     Constant,
-
-    /// The atom has the value of the provided known atom, which its producer forwards from one of its inputs,
-    /// and residual work reads that atom instead.
-    Forward(AtomId),
 }
 
-/// Resolution of the operation outputs that may have produced the values of a [`Program`], which looks through the
-/// outputs of operations that forward the outputs of their attached regions (for more information on this, refer to
-/// [`Operation::output_region_provenance`]) and through the inputs of those regions back to the instruction inputs
-/// that supply them (for more information on this refer to [`Operation::input_region_provenance`]).
-///
-/// Region outputs are summarized symbolically, in terms of the inputs of their regions, and each summary is computed
-/// once and instantiated at every call site. A region that several operations invoke (e.g., with differently tagged
-/// inputs) therefore resolves to the producers of each call site's own inputs.
-struct ResidualProvenance<'p, V: Value, O: Operation<Type = V::Type>> {
-    /// Program whose values are resolved.
-    program: &'p Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Symbolic provenance of each region output that was summarized so far, keyed by region and output index.
-    summaries: HashMap<(RegionId, usize), Vec<ProvenanceLeaf>>,
-}
-
-impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> ResidualProvenance<'p, V, O> {
-    /// Returns the candidate for `value` with residual type `residual_type`, or [`None`] when every provenance path
-    /// of `value` ends at an input or constant of the program.
-    fn candidate(
-        &mut self,
-        value: ValueId,
-        residual_type: V::Type,
-    ) -> Result<Option<ResidualCandidate<'p, V::Type>>, ProgramError> {
-        let program = self.program;
-        let producers = self
-            .resolve(value)?
-            .into_iter()
-            .filter_map(|leaf| match leaf {
-                ProvenanceLeaf::Producer(value) => Some(value),
-                ProvenanceLeaf::Input(_) => None,
-            })
-            .map(|value| {
-                // The `unwrap`s are safe because producer leaves are always outputs of instructions.
-                let instruction = program.instruction(program.producer(value)?.unwrap())?;
-                let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
-                let region = program.region(value.region())?;
-                let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
-                Ok(ResidualProducer::new(
-                    instruction.operation(),
-                    output_index,
-                    instruction.inputs().iter().map(atom_type).collect(),
-                    instruction.outputs().iter().map(atom_type).collect(),
-                ))
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        Ok((!producers.is_empty()).then(|| ResidualCandidate::new(producers, residual_type)))
-    }
-
-    /// Returns the symbolic provenance of `value`, in semantic order and without duplicates. The provenance of each
-    /// region output that it looks through is summarized once, in terms of the inputs of that region, and reused at
-    /// every call site of the region.
-    fn resolve(&mut self, value: ValueId) -> Result<Vec<ProvenanceLeaf>, ProgramError> {
-        let program = self.program;
-
-        // A value without a producer is an input or a constant of its region. An input stays symbolic as an input
-        // leaf, which the call site of the region instantiates through its own inputs, and a constant has no
-        // provenance at all.
-        let Some(instruction_id) = program.producer(value)? else {
-            let region = program.region(value.region())?;
-            let input = region.input_ids().iter().position(|input| *input == value.atom());
-            return Ok(input.map(ProvenanceLeaf::Input).into_iter().collect());
-        };
-        let instruction = program.instruction(instruction_id)?;
-
-        // The `unwrap` is safe because `value` is an output of the instruction that produces it.
-        let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
-
-        // An operation that produces the output itself is its producer. Otherwise, the output forwards outputs of the
-        // attached regions (e.g., the corresponding outputs of both branches of a `condition`), whose provenance is
-        // resolved through those regions.
-        let origins = instruction.operation().output_region_provenance(output_index);
-        if origins.is_empty() {
-            return Ok(vec![ProvenanceLeaf::Producer(value)]);
-        }
-
-        let mut leaves = Vec::new();
-        for origin in origins {
-            let region = *instruction.regions().get(origin.region_index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares provenance from its region {} but its instruction has {} regions",
-                    instruction.operation().name(),
-                    origin.region_index,
-                    instruction.regions().len(),
-                ))
-            })?;
-
-            // Summarize the provenance of the forwarded region output in terms of the inputs of its region. The
-            // summary does not depend on this call site, so it is computed once per region output and reused by
-            // every instruction that attaches the region.
-            let summary = match self.summaries.get(&(region, origin.output_index)) {
-                Some(summary) => summary.clone(),
-                None => {
-                    let output = *program.region(region)?.output_ids().get(origin.output_index).ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!("region {region} has no output {}", origin.output_index))
-                    })?;
-                    let summary = self.resolve(ValueId::new(region, output))?;
-                    self.summaries.insert((region, origin.output_index), summary.clone());
-                    summary
-                }
-            };
-
-            // Instantiate the summary at this call site. Producer leaves carry over unchanged, while each input leaf is
-            // replaced by the provenance of the input that this instruction supplies to that region input, resolved
-            // in the region that contains the instruction. Region inputs that the operation creates itself, or whose
-            // provenance it does not declare, have no producer that a policy could classify and contribute nothing.
-            for leaf in summary {
-                let leaves_of_leaf = match leaf {
-                    ProvenanceLeaf::Producer(_) => vec![leaf],
-                    ProvenanceLeaf::Input(input_index) => {
-                        match instruction.operation().input_region_provenance(origin.region_index, input_index) {
-                            InputRegionProvenance::Input { index } => {
-                                let input = *instruction.inputs().get(index).ok_or_else(|| {
-                                    ProgramError::MalformedProgram(format!(
-                                        "operation `{}` declares its input {} as the source of an input of its \
-                                         region {} but its instruction has {} inputs",
-                                        instruction.operation().name(),
-                                        index,
-                                        origin.region_index,
-                                        instruction.inputs().len(),
-                                    ))
-                                })?;
-                                self.resolve(ValueId::new(value.region(), input))?
-                            }
-                            InputRegionProvenance::None | InputRegionProvenance::Local => Vec::new(),
-                        }
-                    }
-                };
-
-                // Alternative origins may share leaves (e.g., two branches that forward the same input),
-                // so each leaf is kept once, at its first position in semantic order.
-                for leaf in leaves_of_leaf {
-                    if !leaves.contains(&leaf) {
-                        leaves.push(leaf);
-                    }
-                }
-            }
-        }
-
-        Ok(leaves)
-    }
-}
-
-/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenance`].
+/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenanceAnalysis`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum ProvenanceLeaf {
+enum ResidualProvenanceLeaf {
     /// Output of an instruction that produces it itself, rather than forwarding an output of an attached region.
     Producer(ValueId),
 
@@ -1890,6 +2213,7 @@ fn stage_storage<V: Value<Type: 'static>, O: Operation<Type = V::Type> + Operati
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1898,15 +2222,20 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
         DimensionType, Memory,
     };
-    use crate::differentiation::MemoryTransferStorage;
+    use crate::differentiation::{MemoryTransferStorage, NothingSavable};
     use crate::operations::{
-        AddOperation, ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation,
-        ExpOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, SinOperation, TagOperation,
-        TransferToMemoryOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, CosOperation, CustomFunctionJvpRule,
+        CustomFunctionOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
+        LinearCallOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation, ScanOperation,
+        SinOperation, TagOperation, TransferToMemoryOperation, WhileOperation,
     };
     use crate::partial::values::PartialEvaluationOutput;
-    use crate::programs::ReferenceType;
+    use crate::programs::{
+        InputRegionProvenance, OutputRegionProvenance, ReferenceType, RegionDataflow, RegionInterface, RegionSlot,
+        TypeError,
+    };
+    use crate::tests::TestRegionOperation;
 
     use super::*;
 
@@ -2091,9 +2420,12 @@ mod tests {
         let residual_inputs = partition
             .residual_inputs()
             .iter()
-            .map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => inputs[*index].clone(),
-                PartialEvaluationInput::Known(edge) => known_outputs[known_output_count + edge].clone(),
+            .map(|source| match source {
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    inputs[*index].clone()
+                }
+                ResidualInputSource::KnownOutput(index) => known_outputs[*index].clone(),
+                ResidualInputSource::ResidualEdge(edge) => known_outputs[known_output_count + edge].clone(),
             })
             .collect();
         let residual_outputs = partition.residual_program().interpret(residual_inputs).unwrap();
@@ -2166,6 +2498,245 @@ mod tests {
         let first = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[0], t]);
         let second = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[1], t]);
         build(builder, vec![first, second])
+    }
+
+    /// Builds a partition whose known program attaches one shared body to a condition and a scan. The ordinary call
+    /// forwards an input; the scan feeds it through two carries and a sine of a dot. An unused stacked result is
+    /// tagged separately. Residual outputs multiply the selected ordinary result, carry history, or final first
+    /// carry by an unknown scalar. Building both halves explicitly preserves the shared region identity under test.
+    fn feedback_partition(length: usize, outputs: &[usize]) -> TestPartition {
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = body.add_input(scalar_type());
+        let second = body.add_input(scalar_type());
+        let dot = add(
+            &mut body,
+            DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![])).into(),
+            vec![first, first],
+        );
+        let next = add(&mut body, SinOperation::<ArrayType>::new().into(), vec![dot]);
+        let unused = add(&mut body, TagOperation::<ArrayType>::new("unused").into(), vec![first]);
+        let body = build(body, vec![second, next, first, unused]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let initial = add(&mut builder, TagOperation::<ArrayType>::new("initial").into(), vec![input]);
+        let index = builder.add_constant(ArrayIrValue::Array(Array::scalar(0i64).unwrap()));
+        let body = builder.import_program(body);
+        let ordinary = builder
+            .add_instruction(ConditionOperation::new(), vec![body, body], vec![predicate, index, initial, input], None)
+            .unwrap()[2];
+        let scan = builder
+            .add_instruction(ScanOperation::<ArrayIrType>::new(2, length), vec![body], vec![initial, input], None)
+            .unwrap()
+            .to_vec();
+        let known = build(builder, vec![ordinary, scan[2], scan[0]]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let unknown = builder.add_input(scalar_type());
+        let edges = [
+            builder.add_input(scalar_type()),
+            builder.add_input(ArrayType::new_static(DataType::F64, [length]).into()),
+            builder.add_input(scalar_type()),
+        ];
+        let values = outputs
+            .iter()
+            .map(|&output| add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![edges[output], unknown]))
+            .collect();
+        PartitionedProgram::from_parts(
+            known,
+            build(builder, values),
+            3,
+            vec![0, 1],
+            vec![
+                ResidualInputSource::UnknownInput(2),
+                ResidualInputSource::ResidualEdge(0),
+                ResidualInputSource::ResidualEdge(1),
+                ResidualInputSource::ResidualEdge(2),
+            ],
+            (0..outputs.len()).map(PartialEvaluationOutput::Unknown).collect(),
+        )
+        .unwrap()
+    }
+
+    /// Builds a known condition whose branches use a scan carry, optionally invoking the same scan body separately.
+    /// A zero-trip scan cannot demand the body's dot, while an ordinary invocation of the shared body still can.
+    fn nested_scan_program(length: usize, invoke_shared_body: bool) -> TestProgram {
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let input = body.add_input(scalar_type());
+        let output = add(
+            &mut body,
+            DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![])).into(),
+            vec![input, input],
+        );
+        let body = build(body, vec![output]);
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = branch.add_input(scalar_type());
+        let body = branch.import_program(body);
+        let mut output = branch
+            .add_instruction(ScanOperation::<ArrayIrType>::new(1, length), vec![body], vec![input], None)
+            .unwrap()[0];
+        if invoke_shared_body {
+            let predicate = branch.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            let index = branch.add_constant(ArrayIrValue::Array(Array::scalar(0i64).unwrap()));
+            let called = branch
+                .add_instruction(ConditionOperation::new(), vec![body, body], vec![predicate, index, input], None)
+                .unwrap()[0];
+            output = add(&mut branch, AddOperation::<ArrayType>::new().into(), vec![output, called]);
+        }
+        let output = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![output]);
+        let branch = build(branch, vec![output]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+        build(builder, vec![output])
+    }
+
+    /// Builds a known condition whose branches apply the residual-parameterized linear map
+    /// `(r, u) ↦ (sin(r) · u, tag(cos(r) · u, "unused"))` with `r = u` and return its first output. A `linear_call`
+    /// cannot prune its boundary, so its forward region keeps the unused second output. Its transpose maps the two
+    /// output cotangents to `tag(sin(r) · first + cos(r) · second, "rule")`; that region remains dormant during forward
+    /// execution. The condition's result is multiplied by an unknown scalar.
+    fn linear_call_condition_program() -> TestProgram {
+        let mut forward = ProgramBuilder::<TestValue, TestOperation>::new();
+        let residual = forward.add_input(scalar_type());
+        let linear = forward.add_input(scalar_type());
+        let sine = add(&mut forward, SinOperation::<ArrayType>::new().into(), vec![residual]);
+        let cosine = add(&mut forward, CosOperation::<ArrayType>::new().into(), vec![residual]);
+        let first = add(&mut forward, MulOperation::<ArrayType>::new().into(), vec![sine, linear]);
+        let second = add(&mut forward, MulOperation::<ArrayType>::new().into(), vec![cosine, linear]);
+        let unused = add(&mut forward, TagOperation::<ArrayType>::new("unused").into(), vec![second]);
+        let forward = build(forward, vec![first, unused]);
+        let mut transpose = ProgramBuilder::<TestValue, TestOperation>::new();
+        let residual = transpose.add_input(scalar_type());
+        let first = transpose.add_input(scalar_type());
+        let second = transpose.add_input(scalar_type());
+        let sine = add(&mut transpose, SinOperation::<ArrayType>::new().into(), vec![residual]);
+        let cosine = add(&mut transpose, CosOperation::<ArrayType>::new().into(), vec![residual]);
+        let first = add(&mut transpose, MulOperation::<ArrayType>::new().into(), vec![sine, first]);
+        let second = add(&mut transpose, MulOperation::<ArrayType>::new().into(), vec![cosine, second]);
+        let cotangent = add(&mut transpose, AddOperation::<ArrayType>::new().into(), vec![first, second]);
+        let rule = add(&mut transpose, TagOperation::<ArrayType>::new("rule").into(), vec![cotangent]);
+        let transpose = build(transpose, vec![rule]);
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = branch.add_input(scalar_type());
+        let forward = branch.import_program(forward);
+        let transpose = branch.import_program(transpose);
+        let output = branch
+            .add_instruction(
+                ArrayOperation::<Array>::LinearCall(LinearCallOperation::new(1)),
+                vec![forward, transpose],
+                vec![input, input],
+                None,
+            )
+            .unwrap()[0];
+        let branch = build(branch, vec![output]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+        build(builder, vec![output])
+    }
+
+    /// Checks that replay of [`linear_call_condition_program`] preserves both outputs and the transpose rule of each
+    /// linear call while saving only the condition's predicate and input.
+    fn check_linear_call_condition_partition(partition: &TestPartition) {
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[], %2:f64[] = linear_call [residual_count=1] %0 %0 [
+                                forward={
+                                    lambda %0:f64[], %1:f64[] .
+                                    let %2:f64[] = sin %0
+                                        %3:f64[] = mul %2 %1
+                                        %4:f64[] = cos %0
+                                        %5:f64[] = mul %4 %1
+                                        %6:f64[] = tag [key=unused] %5
+                                    in (%3, %6)
+                                },
+                                transpose={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    let %3:f64[] = sin %0
+                                        %4:f64[] = mul %3 %1
+                                        %5:f64[] = cos %0
+                                        %6:f64[] = mul %5 %2
+                                        %7:f64[] = add %4 %6
+                                        %8:f64[] = tag [key=rule] %7
+                                    in (%8)
+                                },
+                            ]
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[], %2:f64[] = linear_call [residual_count=1] %0 %0 [
+                                forward={
+                                    lambda %0:f64[], %1:f64[] .
+                                    let %2:f64[] = sin %0
+                                        %3:f64[] = mul %2 %1
+                                        %4:f64[] = cos %0
+                                        %5:f64[] = mul %4 %1
+                                        %6:f64[] = tag [key=unused] %5
+                                    in (%3, %6)
+                                },
+                                transpose={
+                                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                                    let %3:f64[] = sin %0
+                                        %4:f64[] = mul %3 %1
+                                        %5:f64[] = cos %0
+                                        %6:f64[] = mul %5 %2
+                                        %7:f64[] = add %4 %6
+                                        %8:f64[] = tag [key=rule] %7
+                                    in (%8)
+                                },
+                            ]
+                            in (%1)
+                        },
+                    ]
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+    }
+
+    /// Returns a policy named `name` that rejects the residuals tagged with `key` and recomputes every other residual.
+    fn reject_name(name: &'static str, key: &'static str) -> ResidualPolicyReference<ArrayIrType> {
+        policy(name, move |candidate| {
+            if candidate
+                .producers()
+                .iter()
+                .any(|producer| producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == key))
+            {
+                Err(ResidualRejection::new(format!("the `{key}` result cannot cross this boundary")))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        })
     }
 
     #[test]
@@ -2310,6 +2881,94 @@ mod tests {
             lifted.classify(&candidate(&dimension_size, vec![vector_type()], dimension_type())),
             Ok(ResidualDecision::Save),
         ));
+    }
+
+    #[test]
+    fn test_native_residual_policies_intersection() {
+        /// Returns one native policy over the composite test universe with a fixed decision.
+        fn native(decision: ResidualDecision<NoStorage>) -> NativeResidualPolicies {
+            NativeResidualPolicies::default().with(TestPolicy {
+                name: "native",
+                classify: move |_: &ResidualCandidate<'_, ArrayIrType>| Ok(decision.clone()),
+            })
+        }
+        let recompute = || native(ResidualDecision::Recompute);
+        let save = || native(ResidualDecision::Save);
+        let operation = dimension_size();
+        let candidate = candidate(&operation, vec![vector_type()], dimension_type());
+        let combined = recompute().intersection(save(), "combined");
+        assert!(combined.get::<ArrayType>().is_none());
+        assert!(matches!(combined.get::<ArrayIrType>().unwrap().classify(&candidate), Ok(ResidualDecision::Save)));
+        assert!(
+            recompute()
+                .intersection(NativeResidualPolicies::default(), "missing_second")
+                .get::<ArrayIrType>()
+                .is_none()
+        );
+        assert!(
+            NativeResidualPolicies::default()
+                .intersection(save(), "missing_first")
+                .get::<ArrayIrType>()
+                .is_none()
+        );
+
+        // Derived registries can compose again, and a subsequent explicit native entry overrides the derived one.
+        let nested = recompute().intersection(combined, "nested");
+        assert_eq!(nested.get::<ArrayIrType>().unwrap().name(), "nested");
+        assert!(matches!(nested.get::<ArrayIrType>().unwrap().classify(&candidate), Ok(ResidualDecision::Save)));
+        let overridden = nested.with(TestPolicy {
+            name: "override",
+            classify: |_: &ResidualCandidate<'_, ArrayIrType>| Ok(ResidualDecision::<NoStorage>::Recompute),
+        });
+        assert_eq!(overridden.get::<ArrayIrType>().unwrap().name(), "override");
+        assert!(matches!(
+            overridden.get::<ArrayIrType>().unwrap().classify(&candidate),
+            Ok(ResidualDecision::Recompute)
+        ));
+    }
+
+    #[test]
+    fn test_native_residual_policies_intersection_preserves_storage_and_rejections() {
+        let operation = dimension_size();
+        let candidate = candidate(&operation, vec![vector_type()], dimension_type());
+        let store = || {
+            NativeResidualPolicies::default().with(TestPolicy {
+                name: "store",
+                classify: |_: &ResidualCandidate<'_, ArrayIrType>| Ok(ResidualDecision::SaveWith(NegationStorage)),
+            })
+        };
+        let reject = || {
+            NativeResidualPolicies::default().with(TestPolicy {
+                name: "child_rejection",
+                classify: |_: &ResidualCandidate<'_, ArrayIrType>| -> Result<ResidualDecision<NoStorage>, _> {
+                    Err(ResidualRejection::new("the candidate is forbidden"))
+                },
+            })
+        };
+        let recompute = || {
+            NativeResidualPolicies::default().with(TestPolicy {
+                name: "recompute",
+                classify: |_: &ResidualCandidate<'_, ArrayIrType>| Ok(ResidualDecision::<NoStorage>::Recompute),
+            })
+        };
+        // The second policy is not called when the first saves, and second-policy storage survives when it is used.
+        for combined in [store().intersection(reject(), "combined"), recompute().intersection(store(), "combined")] {
+            let ResidualDecision::SaveWith(storage) =
+                combined.get::<ArrayIrType>().unwrap().classify(&candidate).unwrap()
+            else {
+                panic!("expected the selected storage");
+            };
+            assert_eq!(storage.name(), "negation");
+        }
+        for combined in [reject().intersection(store(), "combined"), recompute().intersection(reject(), "combined")] {
+            assert_eq!(
+                combined.get::<ArrayIrType>().unwrap().classify(&candidate).map(|_| ()),
+                Err(ResidualPolicyError::Rejected {
+                    policy: "combined".to_owned(),
+                    rejection: ResidualRejection::new("the candidate is forbidden"),
+                }),
+            );
+        }
     }
 
     #[test]
@@ -2510,7 +3169,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -2536,7 +3195,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -2563,7 +3222,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -2612,7 +3271,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -2652,7 +3311,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2708,7 +3367,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2763,7 +3422,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2820,7 +3479,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2863,7 +3522,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2922,7 +3581,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -2968,7 +3627,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1), Unknown(2)],
                 ]
                 known={
@@ -2995,7 +3654,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Unknown(0), Unknown(1), Unknown(2)],
                 ]
                 known={
@@ -3024,6 +3683,128 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_program_with_residual_policy_replays_nested_reference_lifecycles() {
+        // Each branch writes a different value to state allocated by the enclosing program and reads it back. Saving
+        // nothing moves the complete lifecycle to residual execution, leaving neither its condition nor orphaned
+        // branch regions in the known program.
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F64)).into();
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = branch.add_input(reference_type.clone());
+        let input = branch.add_input(scalar_type());
+        let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![input]);
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, sine], None)
+            .unwrap();
+        let read = branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let true_branch = build(branch, vec![read]);
+
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = branch.add_input(reference_type);
+        let input = branch.add_input(scalar_type());
+        let cosine = add(&mut branch, CosOperation::<ArrayType>::new().into(), vec![input]);
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, cosine], None)
+            .unwrap();
+        let read = branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let false_branch = build(branch, vec![read]);
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let true_branch = builder.import_program(true_branch);
+        let false_branch = builder.import_program(false_branch);
+        let selected = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, input],
+                None,
+            )
+            .unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![selected, unknown]);
+        let program = build(builder, vec![output]);
+        let placed = program.partition(&[true, true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:ref<f64[]> = reference_new %2
+                        %4:f64[] = condition %1 %3 %2 [
+                            true={
+                                lambda %0:ref<f64[]>, %1:f64[] .
+                                let %2:f64[] = sin %1
+                                    () = reference_write %0 %2
+                                    %3:f64[] = reference_read %0
+                                in (%3)
+                            },
+                            false={
+                                lambda %0:ref<f64[]>, %1:f64[] .
+                                let %2:f64[] = cos %1
+                                    () = reference_write %0 %2
+                                    %3:f64[] = reference_read %0
+                                in (%3)
+                            },
+                        ]
+                        %5:f64[] = mul %4 %0
+                    in (%5)
+                }"},
+        );
+        for (predicate, expected) in [(true, 2.0 * 0.5f64.sin()), (false, 2.0 * 0.5f64.cos())] {
+            let inputs = vec![
+                ArrayIrValue::Array(Array::scalar(predicate).unwrap()),
+                ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+            ];
+            let expected = vec![ArrayIrValue::Array(Array::scalar(expected).unwrap())];
+            assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+            assert_eq!(run(&placed, &inputs), expected);
+        }
+    }
+
+    #[test]
+    fn test_partitioned_program_with_residual_policy_replays_many_reference_observations() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let mut outputs = Vec::new();
+        for index in 0..2000 {
+            let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(index as f64).unwrap()));
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+                .unwrap();
+            let read =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            outputs.push(add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![read, unknown]));
+        }
+        let program = build(builder, outputs);
+        let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
+        assert!(placed.known_program().instructions().is_empty());
+        assert_eq!(placed.known_program().output_ids().len(), 1);
+        let inputs =
+            vec![ArrayIrValue::Array(Array::scalar(0f64).unwrap()), ArrayIrValue::Array(Array::scalar(2f64).unwrap())];
+        let expected = (0..2000)
+            .map(|index| ArrayIrValue::Array(Array::scalar(2f64 * index as f64).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(run(&placed, &inputs), expected);
+        assert_eq!(program.interpret(inputs).unwrap(), expected);
+    }
+
+    #[test]
     fn test_partitioned_program_with_residual_policy_stages_storage() {
         // The known program stores the dot product and the residual program restores it before the cosine uses it.
         let program = sin_dot_program();
@@ -3037,7 +3818,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -3194,7 +3975,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -3315,10 +4096,10 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_with_residual_policy_saves_forwarded_inputs_once() {
+    fn test_partitioned_program_with_residual_policy_preserves_region_outputs() {
         // The branches of a condition map `x` to `(sin(x), x)`, so the second output of the condition forwards `x`,
-        // which the residual program also reads directly. Residual work reads `x` for the forwarded output too, so `x`
-        // is saved once rather than once more as the output that forwards it.
+        // which the residual program also reads directly. Provenance alone cannot prove that a region input keeps its
+        // initial value (e.g., loop carries evolve), so both the condition output and the direct input remain edges.
         let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
         let a = branch.add_input(scalar_type());
         let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![a]);
@@ -3344,31 +4125,31 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1), Unknown(2)],
                 ]
                 known={
                     lambda %0:bool[], %1:f64[] .
-                    let %2:f64[] = condition %0 %1 [
+                    let %2:f64[], %3:f64[] = condition %0 %1 [
                         true={
                             lambda %0:f64[] .
                             let %1:f64[] = sin %0
-                            in (%1)
+                            in (%1, %0)
                         },
                         false={
                             lambda %0:f64[] .
                             let %1:f64[] = sin %0
-                            in (%1)
+                            in (%1, %0)
                         },
                     ]
-                    in (%2, %1)
+                    in (%2, %3, %1)
                 }
                 residual={
-                    lambda %0:f64[], %1:f64[], %2:f64[] .
-                    let %3:f64[] = mul %1 %0
-                        %4:f64[] = mul %2 %0
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
                         %5:f64[] = mul %2 %0
-                    in (%3, %4, %5)
+                        %6:f64[] = mul %3 %0
+                    in (%4, %5, %6)
                 }"},
         );
         let inputs = vec![
@@ -3377,6 +4158,28 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
         assert_eq!(run(&partition, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_partitioned_program_with_residual_policy_rejects_forwarded_partitions() {
+        // `(x, t) ↦ x · t` with `x` known saves `x`, which forwarding then feeds to the residual program directly.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let x = builder.add_input(scalar_type());
+        let t = builder.add_input(scalar_type());
+        let product = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![x, t]);
+        let program = build(builder, vec![product]);
+        let forwarded = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            forwarded.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::KnownInput(0)],
+        );
+        assert_eq!(
+            forwarded.with_residual_policy(&save_everything()).map(|partition| partition.to_string()),
+            Err(ResidualPolicyError::Program(ProgramError::InvalidArgument {
+                message: "cannot place the residuals of a partition whose residual inputs are already forwarded"
+                    .to_string(),
+            })),
+        );
     }
 
     #[test]
@@ -3407,7 +4210,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0)],
                 ]
                 known={
@@ -3443,7 +4246,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0)],
                 ]
                 known={
@@ -3473,13 +4276,24 @@ mod tests {
         let partition = program.partition(&[true, false]).unwrap();
         let expected = partition.to_string();
         assert_eq!(partition.with_rounded_residuals(|_| None, |_| false).unwrap().to_string(), expected);
+
+        // Forwarding would feed `x` to the residual program without passing through the edge that rounds it, so
+        // rounding must precede forwarding.
+        let forwarded = program.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        assert!(forwarded.has_forwarded_residual_inputs());
+        assert_eq!(
+            forwarded.with_rounded_residuals(rounding, |_| false).map(|partition| partition.to_string()),
+            Err(ProgramError::InvalidArgument {
+                message: "cannot round the residuals of a partition whose residual inputs are already forwarded"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
     fn test_residual_policy_reference_place_residuals() {
-        // Placing residuals for a split rule saves the outputs of the condition instead of replaying it as a whole when
-        // the policy would save a value that its branches compute (here, the value tagged `second`), because a split
-        // rule may already have placed the residuals of its branches with the same policy.
+        // Each demanded condition output preserves its own nested cuts: the second stays saved, while the first
+        // recomputes only its sine and tag. A saved sibling does not force the first output across the boundary.
         let program = condition_program(true);
         let placed = save_names(&["second"], &[])
             .place_residuals(program.partition(&[true, true, false]).unwrap())
@@ -3489,36 +4303,46 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1), ResidualEdge(2)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
                     lambda %0:bool[], %1:f64[] .
-                    let %2:f64[], %3:f64[] = condition %0 %1 [
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
+                        },
+                    ]
+                    in (%2, %0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
+                    let %4:f64[] = condition %2 %3 [
                         true={
                             lambda %0:f64[] .
                             let %1:f64[] = sin %0
                                 %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            in (%2)
                         },
                         false={
                             lambda %0:f64[] .
                             let %1:f64[] = sin %0
                                 %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            in (%2)
                         },
                     ]
-                    in (%2, %3)
-                }
-                residual={
-                    lambda %0:f64[], %1:f64[], %2:f64[] .
-                    let %3:f64[] = mul %1 %0
-                        %4:f64[] = mul %2 %0
-                    in (%3, %4)
+                        %5:f64[] = mul %4 %0
+                        %6:f64[] = mul %1 %0
+                    in (%5, %6)
                 }"},
         );
         let inputs = vec![
@@ -3535,7 +4359,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
@@ -3568,5 +4392,1210 @@ mod tests {
                 }"},
         );
         assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_propagates_rejection() {
+        let program = condition_program(true).with_outputs(&[0]).unwrap();
+        let reject =
+            policy("reject_first", |candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "first")
+                }) {
+                    Err(ResidualRejection::new("the first result cannot cross this boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Recompute)
+                }
+            });
+        let expected = ResidualPolicyError::Rejected {
+            policy: "reject_first".to_owned(),
+            rejection: ResidualRejection::new("the first result cannot cross this boundary"),
+        };
+        assert_eq!(
+            program.partition(&[true, true, false]).unwrap().with_residual_policy(&reject).map(|_| ()),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            program
+                .partition_with_residual_policy(&[true, true, false], &reject)
+                .map(|_| ())
+                .map_err(ResidualPolicyError::from),
+            Err(expected),
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_rejects_after_saved_result() {
+        let program = condition_program(true);
+        let reject =
+            policy("save_first_reject_second", |candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "second")
+                }) {
+                    Err(ResidualRejection::new("the second result cannot cross this boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Save)
+                }
+            });
+        assert_eq!(
+            program
+                .partition_with_residual_policy(&[true, true, false], &reject)
+                .map(|_| ())
+                .map_err(ResidualPolicyError::from),
+            Err(ResidualPolicyError::Rejected {
+                policy: "save_first_reject_second".to_owned(),
+                rejection: ResidualRejection::new("the second result cannot cross this boundary"),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_rejects_after_saved_interior_producer() {
+        // The demanded condition output is recomputed, so replay checks the live producers inside the branches. The
+        // sine is saved and the later cosine is rejected: a saved interior producer must not hide that rejection.
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = branch.add_input(scalar_type());
+        let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![input]);
+        let cosine = add(&mut branch, CosOperation::<ArrayType>::new().into(), vec![sine]);
+        let terminal = add(&mut branch, TagOperation::<ArrayType>::new("terminal").into(), vec![cosine]);
+        let branch = build(branch, vec![terminal]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+        let program = build(builder, vec![output]);
+        let policy = policy("save_sine_reject_cosine", |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<CosOperation<ArrayType>>().is_some()) {
+                Err(ResidualRejection::new("the cosine cannot cross this boundary"))
+            } else if candidate
+                .producers()
+                .iter()
+                .any(|producer| producer.payload::<SinOperation<ArrayType>>().is_some())
+            {
+                Ok(ResidualDecision::<NoStorage>::Save)
+            } else {
+                Ok(ResidualDecision::Recompute)
+            }
+        });
+        assert_eq!(
+            program
+                .partition_with_residual_policy(&[true, true, false], &policy)
+                .map(|_| ())
+                .map_err(ResidualPolicyError::from),
+            Err(ResidualPolicyError::Rejected {
+                policy: "save_sine_reject_cosine".to_owned(),
+                rejection: ResidualRejection::new("the cosine cannot cross this boundary"),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_unused_result() {
+        // The second branch output is primal work only. Recomputing the first output must neither classify it nor
+        // retain its cosine and tag in the replayed branches.
+        let program = condition_program(true).with_outputs(&[0]).unwrap();
+        let reject =
+            policy("reject_unused_second", |candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "second")
+                }) {
+                    Err(ResidualRejection::new("the second result cannot cross this boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Recompute)
+                }
+            });
+        let placed = program.partition_with_residual_policy(&[true, true, false], &reject).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                    ]
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_unused_nested_result() {
+        // The `linear_call` inside the branches keeps its unused tagged output, because its boundary cannot be pruned.
+        // Only the sine-scaled input feeds the demanded output, so replay must not classify the unused cosine-scaled
+        // output and reject it.
+        let program = linear_call_condition_program();
+        let placed = program
+            .partition_with_residual_policy(&[true, true, false], &reject_name("reject_unused", "unused"))
+            .unwrap();
+        check_linear_call_condition_partition(&placed);
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_dormant_derivative_regions() {
+        // Replaying the branches executes the forward region of their `linear_call` but never its transpose rule, so
+        // the rejected producer in that rule region is not residual demand.
+        let program = linear_call_condition_program();
+        let placed = program
+            .partition_with_residual_policy(&[true, true, false], &reject_name("reject_rule", "rule"))
+            .unwrap();
+        check_linear_call_condition_partition(&placed);
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(false).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_dormant_rules_of_opaque_regions() {
+        // A nested region carrier that declares no output provenance conservatively demands every output of its
+        // computation regions, but still never its dormant rule regions, so the rejected `add` in the rule region of
+        // the nested carrier is not classified.
+        /// Region-machinery fixture that optionally declares that its outputs are those of its first region.
+        #[derive(Clone)]
+        struct Carrier {
+            /// Fixture with the ordinary region contract.
+            operation: TestRegionOperation,
+
+            /// Whether each output is the corresponding output of the first region.
+            provenance: bool,
+        }
+
+        impl Operation for Carrier {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                self.operation.name()
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                self.operation.region_slots()
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                self.operation.infer_output_types(input_types, region_interfaces)
+            }
+
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+                InputRegionProvenance::Input { index: input_index }
+            }
+
+            fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+                if self.provenance {
+                    vec![OutputRegionProvenance { region_index: 0, output_index }]
+                } else {
+                    Vec::new()
+                }
+            }
+
+            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
+                self.provenance.then_some(RegionDataflow::Ordinary)
+            }
+        }
+
+        impl OperationPayloadProjection for Carrier {
+            fn project_payload(&self, _payload: TypeId) -> Option<&dyn Any> {
+                None
+            }
+
+            fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+                Err(payload)
+            }
+        }
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let region = |output: fn(&mut ProgramBuilder<Array, Carrier>, AtomId) -> AtomId| {
+            let mut builder = ProgramBuilder::<Array, Carrier>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let output = output(&mut builder, input);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let computation = region(|_, input| input);
+        let rule = region(|builder, input| {
+            let operation = Carrier { operation: TestRegionOperation::Add, provenance: false };
+            builder.add_instruction(operation, Vec::new(), vec![input, input], None).unwrap()[0]
+        });
+        let mut body = ProgramBuilder::<Array, Carrier>::new();
+        let input = body.add_input(scalar_type.clone());
+        let computation = body.import_program(computation);
+        let rule = body.import_program(rule);
+        let slots = const { &[RegionSlot::computation("body"), RegionSlot::rule("rule")] };
+        let nested = Carrier { operation: TestRegionOperation::WithRegions(slots), provenance: false };
+        let output = body.add_instruction(nested, vec![computation, rule], vec![input], None).unwrap()[0];
+        let body = body.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut known = ProgramBuilder::<Array, Carrier>::new();
+        let input = known.add_input(scalar_type.clone());
+        let body = known.import_program(body);
+        let slots = const { &[RegionSlot::computation("body")] };
+        let carrier = Carrier { operation: TestRegionOperation::WithRegions(slots), provenance: true };
+        let output = known.add_instruction(carrier, vec![body], vec![input], None).unwrap()[0];
+        let known = known.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut residual = ProgramBuilder::<Array, Carrier>::new();
+        residual.add_input(scalar_type.clone());
+        let edge = residual.add_input(scalar_type);
+        let residual = residual
+            .build::<Vec<Array>, Vec<Array>>(vec![edge], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = PartitionedProgram::from_parts(
+            known,
+            residual,
+            2,
+            vec![0],
+            vec![ResidualInputSource::UnknownInput(1), ResidualInputSource::ResidualEdge(0)],
+            vec![PartialEvaluationOutput::Unknown(0)],
+        )
+        .unwrap();
+        let policy = ResidualPolicyReference::new(TestPolicy {
+            name: "reject_add",
+            classify: |candidate: &ResidualCandidate<'_, ArrayType>| {
+                if candidate.producers().iter().any(|producer| producer.name() == "add") {
+                    Err(ResidualRejection::new("the `add` result cannot cross this boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Recompute)
+                }
+            },
+        });
+
+        // The carrier is replayed by the residual program, so the known program computes nothing.
+        let placed = policy.place_residuals(partition).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    in (%0)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = with_regions %1 [
+                        body={
+                            lambda %0:f64[] .
+                            let %1:f64[] = with_regions %0 [
+                                body={
+                                    lambda %0:f64[] .
+                                    in (%0)
+                                },
+                                rule={
+                                    lambda %0:f64[] .
+                                    let %1:f64[] = add %0 %0
+                                    in (%1)
+                                },
+                            ]
+                            in (%1)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_memoizes_shared_regions() {
+        // Every condition attaches the same child twice. Source size grows with depth, while enumerating attachment
+        // paths would classify the one sine 2^depth times. This exercises the replay guard, not just provenance.
+        let depth = 12;
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let sine = add(&mut builder, SinOperation::<ArrayType>::new().into(), vec![input]);
+        let mut body = build(builder, vec![sine]);
+        for _ in 0..depth {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let input = builder.add_input(scalar_type());
+            let child = builder.import_program(body);
+            let output = builder
+                .add_instruction(ConditionOperation::new(), vec![child, child], vec![predicate, predicate, input], None)
+                .unwrap()[0];
+            body = build(builder, vec![output]);
+        }
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let output = builder.splice_program(&body, &[predicate, input]).unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+        let program = build(builder, vec![output]);
+        assert_eq!(program.entry_region_ref().instructions_in_closure().count(), depth + 2);
+
+        let classifications = Arc::new(AtomicUsize::new(0));
+        let counter = classifications.clone();
+        let policy = policy("count_sines", move |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<SinOperation<ArrayType>>().is_some()) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ResidualDecision::<NoStorage>::Recompute)
+        });
+        let placed = program.partition_with_residual_policy(&[true, true, false], &policy).unwrap();
+        let classifications = classifications.load(Ordering::Relaxed);
+        // One outer candidate and the two known-side branch origins each classify the shared sine once.
+        assert_eq!(classifications, 3);
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), vec![ArrayIrValue::Array(Array::scalar(2f64 * 0.5f64.sin()).unwrap())]);
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_distinguishes_shared_region_output_demands() {
+        // Two calls share a body whose coupled boundary stays intact, but consume different outputs. Their distinct
+        // inputs prevent common-subexpression elimination from merging the calls. Check both orders so caching only
+        // by region cannot reuse the non-rejecting output's result for the rejected output in either traversal order.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type());
+        let first = add(&mut builder, SinOperation::<ArrayType>::new().into(), vec![input]);
+        let cosine = add(&mut builder, CosOperation::<ArrayType>::new().into(), vec![input]);
+        let second = add(&mut builder, TagOperation::<ArrayType>::new("second").into(), vec![cosine]);
+        let body = build(builder, vec![first, second]);
+        for selected_outputs in [[0, 1], [1, 0]] {
+            let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+            let inputs = [branch.add_input(scalar_type()), branch.add_input(scalar_type())];
+            let body = branch.import_program(body.clone());
+            let mut outputs = Vec::new();
+            for (input, output_index) in inputs.into_iter().zip(selected_outputs) {
+                let call = TestOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Primal,
+                    false,
+                ));
+                outputs.push(branch.add_instruction(call, vec![body], vec![input], None).unwrap()[output_index]);
+            }
+            let sum = add(&mut branch, AddOperation::<ArrayType>::new().into(), outputs);
+            let branch = build(branch, vec![sum]);
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let first = builder.add_input(scalar_type());
+            let second = builder.add_input(scalar_type());
+            let unknown = builder.add_input(scalar_type());
+            let branch = builder.import_program(branch);
+            let output = builder
+                .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, first, second], None)
+                .unwrap()[0];
+            let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+            let program = build(builder, vec![output]);
+            assert_eq!(
+                program
+                    .partition_with_residual_policy(
+                        &[true, true, true, false],
+                        &reject_name("reject_second", "second"),
+                    )
+                    .map(|_| ())
+                    .map_err(ResidualPolicyError::from),
+                Err(ResidualPolicyError::Rejected {
+                    policy: "reject_second".to_owned(),
+                    rejection: ResidualRejection::new("the `second` result cannot cross this boundary"),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_rejects_scan_feedback() {
+        // The ordinary attachment is visited first and can replay its selected input without executing a dot. The
+        // same body attached to a scan needs both carry updates before it can produce that input's later values.
+        // Caching only by region and output would reuse the ordinary attachment's successful replay decision.
+        let reject = policy("reject_dots", |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
+                Err(ResidualRejection::new("the feedback dot cannot be replayed"))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        });
+        assert_eq!(
+            reject.place_residuals(feedback_partition(3, &[0, 1])).map(|_| ()),
+            Err(ProgramError::from(ResidualPolicyError::Rejected {
+                policy: "reject_dots".to_owned(),
+                rejection: ResidualRejection::new("the feedback dot cannot be replayed"),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_unused_scan_result() {
+        let reject =
+            policy("reject_unused", |candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "unused")
+                }) {
+                    Err(ResidualRejection::new("the unused result is not residual demand"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Recompute)
+                }
+            });
+        let placed = reject.place_residuals(feedback_partition(3, &[1])).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = tag [key=initial] %1
+                        %3:f64[], %4:f64[], %5:f64[3] = scan [carry_count=2, length=3, reverse=false] %2 %1 [
+                            body={
+                                lambda %0:i64[], %1:f64[], %2:f64[] .
+                                let %3:f64[] = dot [
+                                    dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                ] %1 %1
+                                    %4:f64[] = sin %3
+                                in (%2, %4, %1)
+                            },
+                        ]
+                        %6:f64[3] = mul %5 %0
+                    in (%6)
+                }"},
+        );
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(3f64).unwrap()),
+        ];
+        assert_eq!(
+            run(&placed, &inputs),
+            vec![ArrayIrValue::Array(Array::vector(vec![6f64, 6.0, 3.0 * 4f64.sin()]).unwrap())],
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_empty_scan_body() {
+        let reject = policy("reject_dots", |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
+                Err(ResidualRejection::new("the unexecuted dot is not residual demand"))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        });
+        let placed = reject.place_residuals(feedback_partition(0, &[2])).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = tag [key=initial] %1
+                        %3:f64[], %4:f64[] = scan [carry_count=2, length=0, reverse=false] %2 %1 [
+                            body={
+                                lambda %0:i64[], %1:f64[], %2:f64[] .
+                                let %3:f64[] = dot [
+                                    dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                ] %1 %1
+                                    %4:f64[] = sin %3
+                                in (%2, %4)
+                            },
+                        ]
+                        %5:f64[] = mul %3 %0
+                    in (%5)
+                }"},
+        );
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(3f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), vec![ArrayIrValue::Array(Array::scalar(6f64).unwrap())]);
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_nested_empty_scan_body() {
+        let reject = policy("reject_dots", |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
+                Err(ResidualRejection::new("the executed dot cannot be replayed"))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        });
+        let program = nested_scan_program(0, false);
+        let placed = reject.place_residuals(program.partition(&[true, true, false]).unwrap()).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = scan [carry_count=1, length=0, reverse=false] %0 [
+                                body={
+                                    lambda %0:i64[], %1:f64[] .
+                                    let %2:f64[] = dot [
+                                        dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                    ] %1 %1
+                                    in (%2)
+                                },
+                            ]
+                                %2:f64[] = sin %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = scan [carry_count=1, length=0, reverse=false] %0 [
+                                body={
+                                    lambda %0:i64[], %1:f64[] .
+                                    let %2:f64[] = dot [
+                                        dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                    ] %1 %1
+                                    in (%2)
+                                },
+                            ]
+                                %2:f64[] = sin %1
+                            in (%2)
+                        },
+                    ]
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+        for predicate in [true, false] {
+            let inputs = vec![
+                ArrayIrValue::Array(Array::scalar(predicate).unwrap()),
+                ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2f64).unwrap()),
+            ];
+            assert_eq!(run(&placed, &inputs), vec![ArrayIrValue::Array(Array::scalar(2f64 * 0.5f64.sin()).unwrap())]);
+            assert_eq!(run(&placed, &inputs), program.interpret(inputs).unwrap());
+        }
+
+        // Executed attachments still demand the dot, including an ordinary call of the empty scan's shared body.
+        let expected = Err(ProgramError::from(ResidualPolicyError::Rejected {
+            policy: "reject_dots".to_owned(),
+            rejection: ResidualRejection::new("the executed dot cannot be replayed"),
+        }));
+        assert_eq!(
+            reject
+                .place_residuals(nested_scan_program(1, false).partition(&[true, true, false]).unwrap())
+                .map(|_| ()),
+            expected,
+        );
+        assert_eq!(
+            reject
+                .place_residuals(nested_scan_program(0, true).partition(&[true, true, false]).unwrap())
+                .map(|_| ()),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_rejects_while_condition() {
+        let mut condition = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = condition.add_input(scalar_type());
+        let product = add(
+            &mut condition,
+            DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![])).into(),
+            vec![input, input],
+        );
+        let predicate =
+            add(&mut condition, CompareOperation::new(ComparisonDirection::Equal).into(), vec![product, product]);
+        let condition = build(condition, vec![predicate]);
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = body.add_input(scalar_type());
+        let output = add(&mut body, SinOperation::<ArrayType>::new().into(), vec![input]);
+        let body = build(body, vec![output]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let output = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap(),
+                vec![condition, body],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let output = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![output, unknown]);
+        let program = build(builder, vec![output]);
+        let reject = policy("reject_dots", |candidate| {
+            if candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
+                Err(ResidualRejection::new("the predicate dot cannot be replayed"))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        });
+        assert_eq!(
+            reject.place_residuals(program.partition(&[true, false]).unwrap()).map(|_| ()),
+            Err(ProgramError::from(ResidualPolicyError::Rejected {
+                policy: "reject_dots".to_owned(),
+                rejection: ResidualRejection::new("the predicate dot cannot be replayed"),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_residual_replay_analysis_allows_replay() {
+        let mut first = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = first.add_input(scalar_type());
+        let output = add(&mut first, TagOperation::<ArrayType>::new("first").into(), vec![input]);
+        let first = build(first, vec![output]);
+        let mut second = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = second.add_input(scalar_type());
+        let output = add(&mut second, TagOperation::<ArrayType>::new("second").into(), vec![input]);
+        let second = build(second, vec![output]);
+
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = body.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = body.add_input(scalar_type());
+        let first = body.import_program(first);
+        let second = body.import_program(second);
+        let output = body
+            .add_instruction(ConditionOperation::new(), vec![first, second], vec![predicate, input], None)
+            .unwrap()[0];
+        let body = build(body, vec![output]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let body = builder.import_program(body);
+        let output = builder
+            .add_instruction(
+                RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable)),
+                vec![body],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap()[0];
+        let program = build(builder, vec![output]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = rematerialize %0 %1 [
+                    body={
+                        lambda %0:bool[], %1:f64[] .
+                        let %2:f64[] = condition %0 %1 [
+                            true={
+                                lambda %0:f64[] .
+                                let %1:f64[] = tag [key=first] %0
+                                in (%1)
+                            },
+                            false={
+                                lambda %0:f64[] .
+                                let %1:f64[] = tag [key=second] %0
+                                in (%1)
+                            },
+                        ]
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
+        let save_nothing = save_nothing();
+        let mut replay = ResidualReplayAnalysis::new(&program, &save_nothing);
+        assert_eq!(replay.allows_replay(0, 0), Ok(true));
+
+        // The root has one computation region; rejection order therefore comes from its nested branch dependencies.
+        // Both descendants reject, and a LIFO traversal must still visit the first declared branch before the second.
+        let reject = policy("reject_tags", |candidate| {
+            if let Some(tag) = candidate.producers()[0].payload::<TagOperation<ArrayType>>() {
+                Err(ResidualRejection::new(format!("the `{}` branch cannot be replayed", tag.key())))
+            } else {
+                Ok(ResidualDecision::<NoStorage>::Recompute)
+            }
+        });
+        let mut replay = ResidualReplayAnalysis::new(&program, &reject);
+        assert_eq!(
+            replay.allows_replay(0, 0),
+            Err(ResidualPolicyError::Rejected {
+                policy: "reject_tags".to_owned(),
+                rejection: ResidualRejection::new("the `first` branch cannot be replayed"),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_memoizes_shared_diamonds() {
+        // Every condition reaches the same symbolic input through two paths, and forty conditions form a shared
+        // diamond at each of two differently tagged callers. Expansion paths grow exponentially; distinct values do
+        // not. Tags also ensure that the fixture cannot bypass provenance resolution by forwarding an original input.
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = branch.add_input(scalar_type());
+        let branch = build(branch, vec![input]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let unknown = builder.add_input(scalar_type());
+        let first = add(&mut builder, TagOperation::<ArrayType>::new("first").into(), vec![input]);
+        let second = add(&mut builder, TagOperation::<ArrayType>::new("second").into(), vec![input]);
+        let branch = builder.import_program(branch);
+        let mut values = [first, second];
+        for _ in 0..40 {
+            for value in &mut values {
+                *value = builder
+                    .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, *value], None)
+                    .unwrap()[0];
+            }
+        }
+        let outputs =
+            values.map(|value| add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![value, unknown]));
+        let program = build(builder, outputs.to_vec());
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        for (value, producer) in values.into_iter().zip([first, second]) {
+            assert_eq!(
+                provenance.resolve(ValueId::new(program.entry(), value)).unwrap(),
+                vec![ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), producer))],
+            );
+        }
+        assert_eq!(provenance.resolved.len(), 83);
+        let resolved = provenance.resolved.clone();
+        let candidate = provenance.candidate(ValueId::new(program.entry(), values[0]), scalar_type()).unwrap().unwrap();
+        assert_eq!(candidate.producers().len(), 1);
+        assert_eq!(candidate.producers()[0].payload::<TagOperation<ArrayType>>().unwrap().key(), "first");
+        assert_eq!(provenance.resolved, resolved);
+
+        let placed = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&["first"], &[]))
+            .unwrap();
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(false).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+        assert_eq!(placed.known_program().output_ids().len(), 3);
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_memoizes_operation_queries() {
+        /// Canonical region fixture observing semantic queries without instrumenting the production resolver.
+        #[derive(Clone)]
+        struct CountedOperation {
+            /// Operation whose region and type contracts the fixture reuses.
+            operation: TestRegionOperation,
+
+            /// Shared count of queries across the program's distinct operation applications.
+            queries: Arc<AtomicUsize>,
+        }
+
+        impl Operation for CountedOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                self.operation.name()
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                self.operation.region_slots()
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                self.operation.infer_output_types(input_types, region_interfaces)
+            }
+
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+                InputRegionProvenance::Input { index: input_index }
+            }
+
+            fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+                (0..self.region_slots().len())
+                    .map(|region_index| OutputRegionProvenance { region_index, output_index })
+                    .collect()
+            }
+
+            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
+                let queries = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
+                // Bound work deterministically: a cache regression must fail before unfolding the diamond's paths.
+                assert!(queries <= 82, "shared provenance must not repeat operation queries");
+                (!self.region_slots().is_empty()).then_some(RegionDataflow::Ordinary)
+            }
+        }
+
+        impl OperationPayloadProjection for CountedOperation {
+            fn project_payload(&self, _payload: TypeId) -> Option<&dyn Any> {
+                None
+            }
+
+            fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+                Err(payload)
+            }
+        }
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut branch = ProgramBuilder::<Array, CountedOperation>::new();
+        let input = branch.add_input(scalar_type.clone());
+        let branch = branch.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let leaf = CountedOperation { operation: TestRegionOperation::Add, queries: queries.clone() };
+        let carrier = CountedOperation {
+            operation: TestRegionOperation::WithRegions(
+                const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+            ),
+            queries: queries.clone(),
+        };
+        let mut builder = ProgramBuilder::<Array, CountedOperation>::new();
+        let first_input = builder.add_input(scalar_type.clone());
+        let second_input = builder.add_input(scalar_type.clone());
+        let first = builder.add_instruction(leaf.clone(), Vec::new(), vec![first_input, first_input], None).unwrap()[0];
+        let second = builder.add_instruction(leaf, Vec::new(), vec![second_input, second_input], None).unwrap()[0];
+        let branch = builder.import_program(branch);
+        let mut values = [first, second];
+        for _ in 0..40 {
+            for value in &mut values {
+                *value = builder.add_instruction(carrier.clone(), vec![branch, branch], vec![*value], None).unwrap()[0];
+            }
+        }
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(values.to_vec(), vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(program.entry_region_ref().instructions_in_closure().count(), 82);
+        queries.store(0, Ordering::Relaxed);
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), values[0])),
+            Ok(vec![ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), first))]),
+        );
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), values[1])),
+            Ok(vec![ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), second))]),
+        );
+        assert_eq!(queries.load(Ordering::Relaxed), 82);
+        assert_eq!(provenance.resolved.len(), 83);
+
+        // Repeating a resolution and asking for its candidate must use the already cached symbolic summary.
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), values[0])),
+            Ok(vec![ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), first))]),
+        );
+        let candidate = provenance.candidate(ValueId::new(program.entry(), values[0]), scalar_type).unwrap().unwrap();
+        assert_eq!(candidate.producers().len(), 1);
+        assert_eq!(candidate.producers()[0].name(), "add");
+        assert_eq!(queries.load(Ordering::Relaxed), 82);
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_preserves_alternative_order() {
+        // The first branch reaches its tagged producer through a forwarded input, while the second reaches its
+        // producer immediately. Traversal must complete each declared alternative before starting its sibling.
+        let mut first = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = first.add_input(scalar_type());
+        let first = build(first, vec![input]);
+        let mut second = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = second.add_input(scalar_type());
+        let sine = add(&mut second, SinOperation::<ArrayType>::new().into(), vec![input]);
+        let second = build(second, vec![sine]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let tagged = add(&mut builder, TagOperation::<ArrayType>::new("first").into(), vec![input]);
+        let first = builder.import_program(first);
+        let second = builder.import_program(second);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![first, second], vec![predicate, tagged], None)
+            .unwrap()[0];
+        let program = build(builder, vec![output]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = tag [key=first] %1
+                    %3:f64[] = condition %0 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            in (%0)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                    ]
+                in (%3)"},
+        );
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), output)),
+            Ok(vec![
+                ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), tagged)),
+                ResidualProvenanceLeaf::Producer(ValueId::new(second, sine)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_loop_feedback() {
+        // The first carry reaches the dot only through the second carry's back edge. The same body attached to a
+        // condition remains an ordinary call, and a zero-trip scan returns its own initial carry without feedback.
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let first = body.add_input(scalar_type());
+        let second = body.add_input(scalar_type());
+        let dot = add(
+            &mut body,
+            DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![])).into(),
+            vec![first, first],
+        );
+        let body = build(body, vec![second, dot, first]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type());
+        let first = add(&mut builder, TagOperation::<ArrayType>::new("first").into(), vec![input]);
+        let second = add(&mut builder, TagOperation::<ArrayType>::new("second").into(), vec![input]);
+        let index = builder.add_constant(ArrayIrValue::Array(Array::scalar(0i64).unwrap()));
+        let body = builder.import_program(body);
+        let scan = builder
+            .add_instruction(ScanOperation::<ArrayIrType>::new(2, 2), vec![body], vec![first, second], None)
+            .unwrap()
+            .to_vec();
+        let empty = builder
+            .add_instruction(ScanOperation::<ArrayIrType>::new(2, 0), vec![body], vec![first, second], None)
+            .unwrap()
+            .to_vec();
+        let ordinary = builder
+            .add_instruction(ConditionOperation::new(), vec![body, body], vec![predicate, index, first, second], None)
+            .unwrap()
+            .to_vec();
+        let program = build(builder, [scan.clone(), empty.clone(), ordinary.clone()].concat());
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        let first = ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), first));
+        let second = ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), second));
+        let dot = ResidualProvenanceLeaf::Producer(ValueId::new(body, dot));
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), scan[0])).unwrap(), vec![first, second, dot]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), scan[1])).unwrap(), vec![second, dot]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), scan[2])).unwrap(), vec![first, second, dot]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), empty[0])).unwrap(), vec![first]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), empty[1])).unwrap(), vec![second]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), empty[2])).unwrap(), vec![]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), ordinary[0])).unwrap(), vec![second]);
+        assert_eq!(provenance.resolve(ValueId::new(program.entry(), ordinary[2])).unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_while_feedback() {
+        let mut condition = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition.add_input(scalar_type());
+        condition.add_input(scalar_type());
+        let predicate = condition.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        let condition = build(condition, vec![predicate]);
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = body.add_input(scalar_type());
+        let second = body.add_input(scalar_type());
+        let dot = add(
+            &mut body,
+            DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![])).into(),
+            vec![first, first],
+        );
+        let body = build(body, vec![second, dot]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type());
+        let first = add(&mut builder, TagOperation::<ArrayType>::new("first").into(), vec![input]);
+        let second = add(&mut builder, TagOperation::<ArrayType>::new("second").into(), vec![input]);
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let outputs = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap(),
+                vec![condition, body],
+                vec![first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = build(builder, outputs.clone());
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), outputs[0])).unwrap(),
+            vec![
+                ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), first)),
+                ResidualProvenanceLeaf::Producer(ValueId::new(program.entry(), second)),
+                ResidualProvenanceLeaf::Producer(ValueId::new(body, dot)),
+            ],
+        );
+        // The condition happens to be false, illustrating why the initial carry remains in the conservative union.
+        let input = ArrayIrValue::Array(Array::scalar(3f64).unwrap());
+        assert_eq!(program.interpret(vec![input.clone()]).unwrap(), vec![input.clone(), input]);
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_rejects_malformed_provenance() {
+        /// Region-machinery fixture with deliberately invalid provenance, leaving slot and type validation intact.
+        #[derive(Clone)]
+        struct MalformedProvenance {
+            /// Fixture whose ordinary region contract is valid.
+            operation: TestRegionOperation,
+
+            /// Declared source of the body input.
+            input: InputRegionProvenance,
+
+            /// Declared source of the instruction output.
+            output: OutputRegionProvenance,
+        }
+
+        impl Operation for MalformedProvenance {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "test.provenance"
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                self.operation.region_slots()
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                self.operation.infer_output_types(input_types, region_interfaces)
+            }
+
+            fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> InputRegionProvenance {
+                self.input
+            }
+
+            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
+                Some(RegionDataflow::Ordinary)
+            }
+
+            fn output_region_provenance(&self, _output_index: usize) -> Vec<OutputRegionProvenance> {
+                vec![self.output]
+            }
+        }
+
+        impl OperationPayloadProjection for MalformedProvenance {
+            fn project_payload(&self, _payload: TypeId) -> Option<&dyn Any> {
+                None
+            }
+
+            fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+                Err(payload)
+            }
+        }
+
+        for (input, output, message) in [
+            (
+                InputRegionProvenance::Input { index: 0 },
+                OutputRegionProvenance { region_index: 1, output_index: 0 },
+                "operation `test.provenance` declares region 1 but has 1 attached regions",
+            ),
+            (
+                InputRegionProvenance::Input { index: 0 },
+                OutputRegionProvenance { region_index: 0, output_index: 1 },
+                "operation `test.provenance` declares output 1 of region 0 with 1 outputs",
+            ),
+            (
+                InputRegionProvenance::Input { index: 1 },
+                OutputRegionProvenance { region_index: 0, output_index: 0 },
+                "operation `test.provenance` declares instruction input 1 but has 1 inputs",
+            ),
+        ] {
+            let mut body = ProgramBuilder::<Array, MalformedProvenance>::new();
+            let value = body.add_input(ArrayType::scalar(DataType::F64));
+            let body = body.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap();
+            let mut known = ProgramBuilder::<Array, MalformedProvenance>::new();
+            let value = known.add_input(ArrayType::scalar(DataType::F64));
+            let body = known.import_program(body);
+            let output = known
+                .add_instruction(
+                    MalformedProvenance {
+                        operation: TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                        input,
+                        output,
+                    },
+                    vec![body],
+                    vec![value],
+                    None,
+                )
+                .unwrap()[0];
+            let known =
+                known.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+            let mut provenance = ResidualProvenanceAnalysis::new(&known);
+            assert_eq!(
+                provenance
+                    .candidate(ValueId::new(known.entry(), output), ArrayType::scalar(DataType::F64))
+                    .map(|_| ()),
+                Err(ProgramError::MalformedProgram(message.to_owned())),
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_provenance_analysis_resolve_rejects_invalid_values() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type());
+        let program = build(builder, vec![input]);
+        let mut provenance = ResidualProvenanceAnalysis::new(&program);
+        let missing = AtomId::new(1);
+        assert_eq!(
+            provenance.resolve(ValueId::new(program.entry(), missing)),
+            Err(ProgramError::UnboundAtomId { id: missing }),
+        );
     }
 }
