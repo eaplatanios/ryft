@@ -525,21 +525,29 @@ impl<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary> Man
         // inserted for it. A name that the context does not bind at all belongs to a trace staged outside of the
         // original manual region (e.g., the fresh trace of `Region` transposition), and the varying input's type
         // is evidence that an enclosing manual region binds it, so the transition uses that input's mesh.
-        let mut axes = BTreeMap::<String, LogicalMesh>::new();
-        for input in inputs {
-            if let Some(sharding) = input.r#type().sharding() {
-                for axis in sharding.varying_manual_axes() {
-                    axes.entry(axis.clone()).or_insert_with(|| sharding.mesh().clone());
-                }
+        let types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        vary_over_missing_manual_axes(inputs.to_vec(), &types, &manual_variation_axes(&types), |input, axis, mesh| {
+            match input.domain().named_axis(axis) {
+                Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
+                Some(NamedAxis::Batched { .. }) => Ok(input),
+                None => input.parallel_vary_on_mesh(axis, mesh),
             }
-        }
-        vary_over_manual_axes(inputs, &axes)
+        })
     }
 
     #[inline]
     fn align_manual_variation_to(inputs: &[Self], target: &Sharding) -> Result<Vec<Self>, ProgramError> {
         let axes = target.varying_manual_axes().iter().map(|axis| (axis.clone(), target.mesh().clone())).collect();
-        vary_over_manual_axes(inputs, &axes)
+        let types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        // Resolve each axis in the input's context, skipping names shadowed by a batch level and using the target's
+        // mesh when the context does not bind the name.
+        vary_over_missing_manual_axes(inputs.to_vec(), &types, &axes, |input, axis, mesh| {
+            match input.domain().named_axis(axis) {
+                Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
+                Some(NamedAxis::Batched { .. }) => Ok(input),
+                None => input.parallel_vary_on_mesh(axis, mesh),
+            }
+        })
     }
 }
 
@@ -569,28 +577,41 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Manual
     }
 }
 
-/// Weakens each of `inputs` to vary over every axis in `axes` that it does not already vary over, staging a
-/// [`ParallelVaryOperation`] per missing axis. Each input resolves an axis name against its own context: a name that a
-/// `batch` level binds shadows the mesh axis and is skipped, and a name that the context does not bind uses the mesh
-/// recorded for it in `axes` (refer to [`ParallelVary::parallel_vary_on_mesh`]).
-fn vary_over_manual_axes<V: Value<Type = ArrayType, Domain: Context + NamedAxes> + ParallelVary>(
-    inputs: &[V],
+/// Returns the manual mesh axes that any of `types` varies over, each with the mesh of the first type that varies over
+/// it, which is the variation that aligning values of these types makes every one of them carry. Both the value-level
+/// [`ManualVariationAlignment`] and the operation-level alignment of array reference discharge compute it here.
+pub(crate) fn manual_variation_axes<'t, T: IntoIterator<Item = &'t ArrayType>>(
+    types: T,
+) -> BTreeMap<String, LogicalMesh> {
+    let mut axes = BTreeMap::<String, LogicalMesh>::new();
+    for sharding in types.into_iter().filter_map(ArrayType::sharding) {
+        for axis in sharding.varying_manual_axes() {
+            axes.entry(axis.clone()).or_insert_with(|| sharding.mesh().clone());
+        }
+    }
+    axes
+}
+
+/// Weakens each of `values`, whose types are the corresponding entries of `types`, to vary over every axis in `axes`
+/// that its type does not vary over, by calling `vary` with the value, the axis name, and the mesh recorded for that
+/// axis once per missing axis, in axis name order. This is the alignment loop shared by the value-level
+/// [`ManualVariationAlignment`], which resolves each axis name against the value's own context, and the operation-level
+/// alignment of array reference discharge, which binds the transitions directly into its discharge context.
+pub(crate) fn vary_over_missing_manual_axes<V, F: Fn(V, &str, &LogicalMesh) -> Result<V, ProgramError>>(
+    values: Vec<V>,
+    types: &[ArrayType],
     axes: &BTreeMap<String, LogicalMesh>,
+    vary: F,
 ) -> Result<Vec<V>, ProgramError> {
-    inputs
-        .iter()
-        .map(|input| {
-            let context = input.domain();
-            let input_type = input.r#type().into_owned();
+    values
+        .into_iter()
+        .zip(types)
+        .map(|(value, r#type)| {
             axes.iter()
                 .filter(|(axis, _)| {
-                    !input_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
+                    !r#type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
                 })
-                .try_fold(input.clone(), |input, (axis, mesh)| match context.named_axis(axis) {
-                    Some(NamedAxis::Mesh { .. }) => input.parallel_vary(axis),
-                    Some(NamedAxis::Batched { .. }) => Ok(input),
-                    None => input.parallel_vary_on_mesh(axis, mesh),
-                })
+                .try_fold(value, |value, (axis, mesh)| vary(value, axis, mesh))
         })
         .collect()
 }
