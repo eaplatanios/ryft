@@ -603,6 +603,9 @@ mod tests {
     use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;
+    use crate::operations::references::tests::{
+        VARYING_INDEX_MUTATION_ERROR, manual_array_type, manual_reference_type,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder};
@@ -690,6 +693,67 @@ mod tests {
         assert_eq!(descriptor.transforms(), operation.transforms());
         assert_eq!(descriptor.bindings(), 2..3);
         assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_type_inference_manual_variation() {
+        // Inside a manual region, an atomic update at an index that varies along a manual axis would update a
+        // different element on every device, so it is rejected unless the referent varies along that axis as well.
+        // A varying referent accepts updates at an invariant index, while a varying update of an invariant referent
+        // is rejected by the addition that combines them.
+        let operation =
+            TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]);
+        let invariant_index = manual_array_type(DataType::I32, &[], false);
+        let varying_index = manual_array_type(DataType::I32, &[], true);
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], false),
+                        manual_array_type(DataType::F32, &[], false),
+                        invariant_index.clone(),
+                    ],
+                    output_types = [],
+                },
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], true),
+                        manual_array_type(DataType::F32, &[], true),
+                        varying_index.clone(),
+                    ],
+                    output_types = [],
+                },
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], false),
+                        manual_array_type(DataType::F32, &[], false),
+                        varying_index,
+                    ],
+                    error = VARYING_INDEX_MUTATION_ERROR,
+                },
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], true),
+                        manual_array_type(DataType::F32, &[], true),
+                        invariant_index.clone(),
+                    ],
+                    output_types = [],
+                },
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], false),
+                        manual_array_type(DataType::F32, &[], true),
+                        invariant_index,
+                    ],
+                    error = "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                             that lack an axis, as `align_manual_variation` does",
+                },
+            ],
+        );
     }
 
     #[test]

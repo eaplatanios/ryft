@@ -56,12 +56,14 @@
 //!
 //! # Nested Regions
 //!
-//! Every [`Context::bind`] receives one instruction-scoped [`BindingRegionDriver`](crate::BindingRegionDriver). Eager
-//! binding adapts that driver into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications
-//! use an empty driver. Higher-order eager rules select attached regions by index and recursively replay them through
-//! the same active context. Borrowed regions remain in the source arena, and shared replay mappings preserve repeated
-//! roots and descendants when another active context stages them into a destination arena. No standalone program is
-//! materialized for recursive eager interpretation.
+//! Every [`Context::bind`] receives one instruction-scoped [`BindingRegionDriver`]. Eager binding adapts that driver
+//! into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications use an empty driver.
+//! Higher-order eager rules select attached regions by index and recursively replay them through the same active
+//! context. Borrowed regions remain in the source arena, and shared replay mappings preserve repeated roots and
+//! descendants when another active context stages them into a destination arena. No standalone program is materialized
+//! for recursive eager interpretation. Rules that execute nested work instruction by instruction instead of replaying
+//! a region verbatim (e.g., the `shard_map` rule, which emulates one replay per device) bind each operation through
+//! [`InterpretationDriver::bind`], which applies it through the active context on their behalf.
 //!
 //! # Composite and Projected Operations
 //!
@@ -86,8 +88,8 @@ use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
-    Atom, AtomId, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver,
+    RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
     TypeRefinements, Typed, Value, ValueProjection,
 };
 
@@ -131,6 +133,38 @@ pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> 
     /// program interpreter, and returns the region's output values.
     fn interpret_region(&self, context: &C, index: usize, inputs: Vec<C::Value>)
     -> Result<Vec<C::Value>, ProgramError>;
+
+    /// Binds `operation`, together with the provided attached `regions`, through the active interpretation context
+    /// and returns its output values. This is the operation-level counterpart of [`Self::interpret_region`]: a
+    /// higher-order rule that executes nested work itself instead of replaying one of its regions verbatim (e.g., the
+    /// `shard_map` rule, which replays its body once per device and binds each body instruction separately) applies
+    /// those instructions through this function. Rules cannot call [`Context::bind`] themselves, because
+    /// [`InterpretableOperation`] is bounded by [`Domain`] rather than by [`Context`] (refer to its documentation for
+    /// why reaching [`Context`] from a rule would make [`EagerContext`]'s own obligation recursive). The driver is
+    /// constructed where the context's [`Context`] implementation is already in scope, so it can bind on the rule's
+    /// behalf without that cycle.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Interpretation [`Domain`] that the rule received, through which the operation is bound.
+    ///   - `operation`: [`Operation`] being applied.
+    ///   - `regions`: Application-scoped [`BindingRegionDriver`] providing the complete ordered
+    ///     [`Region`](crate::Region)s of this application (e.g., a [`ReplayRegionDriver`] over the attached regions
+    ///     of a nested [`Instruction`]).
+    ///   - `inputs`: Input values supplied to the operation, in operation-defined order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of binding `operation` through the active context, and [`ProgramError::UnsupportedOperation`]
+    /// when this driver has no active context to bind through (e.g., [`EmptyRegionDriver`], which is used for direct
+    /// rule invocations).
+    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
+        &self,
+        context: &C,
+        operation: C::Operation,
+        regions: R,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError>;
 }
 
 impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
@@ -143,11 +177,27 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
     ) -> Result<Vec<C::Value>, ProgramError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot interpret a region".to_string()))
     }
+
+    #[inline]
+    fn bind<R: BindingRegionDriver<C::Constant, C::Operation>>(
+        &self,
+        _context: &C,
+        operation: C::Operation,
+        _regions: R,
+        _inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "cannot bind `{}` through an empty region driver, which has no active interpretation context",
+                operation.name(),
+            ),
+        })
+    }
 }
 
-/// Adapts the [`BindingRegionDriver`](crate::BindingRegionDriver) supplied to one eager [`Context::bind`] operation
-/// application to the interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly
-/// the nested computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a
+/// Adapts the [`BindingRegionDriver`] supplied to one eager [`Context::bind`] operation application to the
+/// interpretation-specific recursion provided by [`InterpretationDriver`]. Its regions are exactly the nested
+/// computations supplied to that application, and [`EagerInterpretationDriver::interpret_region`] replays a
 /// selected region through the [`EagerContext`] without taking ownership of it.
 pub(crate) struct EagerInterpretationDriver<'r, D> {
     /// Binding [`RegionDriver`] supplied to the active [`Operation`] application.
@@ -187,6 +237,17 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
     ) -> Result<Vec<V>, ProgramError> {
         self.region(index)?.interpret_in_context(context, inputs)
     }
+
+    #[inline]
+    fn bind<R: BindingRegionDriver<V, O>>(
+        &self,
+        context: &EagerContext<V, O>,
+        operation: O,
+        regions: R,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        context.bind(operation, regions, inputs)
+    }
 }
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
@@ -197,7 +258,8 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
 /// source of the input, output, and attached-region value families. Implementations add only the capabilities they
 /// actually consume, such as zero construction for a nullary rule. The contract requires [`Domain`] rather than
 /// [`Context`] because [`EagerContext`]'s [`Context`] implementation itself requires `O: InterpretableOperation<Self>`;
-/// reaching [`Context`] through this trait would make that obligation recursive.
+/// reaching [`Context`] through this trait would make that obligation recursive. Rules that need to apply operations
+/// themselves bind them through [`InterpretationDriver::bind`] instead.
 ///
 /// # Type Compatibility
 ///
@@ -1118,6 +1180,39 @@ mod tests {
             Err(error) if error == expected_region,
         ));
         assert_eq!(EmptyRegionDriver.interpret_region(&context, 0, Vec::<Array>::new()), Err(expected));
+    }
+
+    #[test]
+    fn test_empty_region_driver_bind() {
+        // An empty region driver serves direct rule invocations, which have no active interpretation context to bind
+        // through.
+        let context = TestArrayContext::new();
+        let input = Array::scalar(2.0f32).unwrap();
+        assert_eq!(
+            EmptyRegionDriver.bind(&context, AddOperation::new().into(), Vec::new(), &[input.clone(), input]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot bind `add` through an empty region driver, which has no active interpretation \
+                          context"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_eager_interpretation_driver_bind() {
+        // The eager driver binds through the eager context that it serves, which interprets the operation.
+        let context = TestArrayContext::new();
+        let regions = Vec::<Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>>>::new();
+        let driver = EagerInterpretationDriver::new(&regions);
+        let input = Array::scalar(2.0f32).unwrap();
+        assert_eq!(
+            driver.bind(&context, AddOperation::new().into(), Vec::new(), &[input.clone(), input]),
+            Ok(vec![Array::scalar(4.0f32).unwrap()]),
+        );
+        assert_eq!(
+            driver.bind(&context, AddOperation::new().into(), Vec::new(), &[Array::scalar(2.0f32).unwrap()]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+        );
     }
 
     #[test]
