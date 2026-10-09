@@ -309,7 +309,7 @@ impl<T: Type, V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -326,7 +326,7 @@ mod tests {
     use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Program, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -344,9 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn test_print_with_effect_class() {
+    fn test_print_effect_classes() {
+        // Every non-default class is declared as the operation's effect and rendered, and restoring the default class
+        // omits it from the rendering again.
         let operation = PrintOperation::<ArrayType>::new("x");
-        assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
         for effect_class in [EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo] {
             let operation = operation.clone().with_effect_class(effect_class);
             assert_eq!(operation.effect_class(), effect_class);
@@ -399,54 +400,20 @@ mod tests {
         );
     }
 
-    /// Array value that binds its capabilities through an eager domain, as backend values that execute operation by
-    /// operation do (e.g., the XLA backend's arrays).
-    #[derive(Clone, Debug, PartialEq)]
-    struct EagerDomainValue(Array);
-
-    impl Display for EagerDomainValue {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "{}", self.0)
-        }
-    }
-
-    impl Parameter for EagerDomainValue {}
-
-    impl Typed for EagerDomainValue {
-        type Type = ArrayType;
-
-        fn r#type(&self) -> Cow<'_, ArrayType> {
-            self.0.r#type()
-        }
-    }
-
-    impl Value for EagerDomainValue {
-        type Dispatch = ValueDomainDispatch;
-        type Domain = EagerContext<Self, PrintOperation<ArrayType>>;
-
-        fn domain(&self) -> Self::Domain {
-            EagerContext::new()
-        }
-    }
-
-    #[test]
-    fn test_print_interpretation_in_eager_value_domains() {
-        // The `Print` capability of a domain-dispatched value binds a `PrintOperation` through its eager domain, which
-        // interprets it. Interpretation prints directly, so it does not re-enter the capability.
-        let value = EagerDomainValue(Array::vector(vec![1.0f32, 2.0]).unwrap());
-        assert_eq!(value.clone().print("x"), Ok(value.clone()));
-        assert_eq!(
-            value.domain().bind(PrintOperation::new("x"), Vec::new(), std::slice::from_ref(&value)),
-            Ok(vec![value]),
-        );
-    }
-
     #[test]
     fn test_print_partial_evaluation() {
+        // Known inputs are printed while partially evaluating, and unknown inputs leave the print in the residual.
         check_operation_partial_evaluation!(
             operation = PrintOperation::new("x"),
-            inputs = [Array::scalar(3.0).unwrap()],
-            expected = Array::scalar(3.0).unwrap(),
+            cases = [{
+                inputs = [(@known, Array::scalar(3.0).unwrap())],
+                outputs = [(@known, Array::scalar(3.0).unwrap())],
+                residual_instructions = 0,
+            }, {
+                inputs = [(@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.0).unwrap()))],
+                outputs = [(@residual, Array::scalar(3.0).unwrap())],
+                residual_instructions = 1,
+            }],
         );
     }
 
@@ -492,7 +459,10 @@ mod tests {
                 in (%1)"},
         );
         assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+    }
 
+    #[test]
+    fn test_print_batching_staged_unused_output() {
         // A print whose output nothing consumes stays in the batched program because of its effect.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -598,26 +568,27 @@ mod tests {
             )
             .unwrap()
             .into_parts();
+        let global_sharding = "{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}";
+        let global_type = format!("f32[3, 4][sharding={global_sharding}]");
+        let local_type =
+            "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], varying_manual={'x'}}]";
         assert_eq!(
             batched.to_string(),
-            indoc! {"
+            formatdoc! {"
                 lambda %0:dimension<3>, %1:f32[3, 4] .
-                let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}] = shard_map [
+                let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
-                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                    in_shardings=[{global_sharding}],
+                    out_shardings=[{global_sharding}],
                     manual_axes=['x'],
-                    global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
-                    global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
+                    global_input_types=[{global_type}],
+                    global_output_types=[{global_type}],
                 ] %1 [
-                    body={
-                        lambda \
-                    %0:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], \
-                                varying_manual={'x'}}] .
-                        let %1:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], \
-                            varying_manual={'x'}}] = print [label=body, effect_class=device_ordered_io] %0
+                    body={{
+                        lambda %0:{local_type} .
+                        let %1:{local_type} = print [label=body, effect_class=device_ordered_io] %0
                         in (%1)
-                    },
+                    }},
                 ]
                 in (%0, %2)"},
         );
@@ -668,16 +639,24 @@ mod tests {
         )
         .unwrap();
         let linearization = program.to_flat_program().linearize().unwrap();
-        let prints = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
-            program
-                .instructions()
-                .iter()
-                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))
-                .count()
-        };
-        assert_eq!(prints(linearization.primal()), 1);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x] %0
+                    %2:f64[] = mul %0 %0
+                in (%2, %0)"},
+        );
         assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
-        assert_eq!(prints(linearization.tangent()), 0);
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = mul %1 %0
+                    %4:f64[] = add %2 %3
+                in (%4)"},
+        );
         assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
     }
 
@@ -707,38 +686,12 @@ mod tests {
     }
 
     #[test]
-    fn test_print_array() {
+    fn test_array_print() {
         // A concrete array prints immediately and returns itself unchanged for every effect class. The printed text
         // goes to standard error, which unit tests cannot capture, so only the returned value is asserted.
         let array = Array::vector(vec![1.0, 2.0]).unwrap();
         assert_eq!(array.clone().print("x"), Ok(array.clone()));
         assert_eq!(array.clone().print_with_effect_class("x", EffectClass::UnorderedIo), Ok(array));
-    }
-
-    #[test]
-    fn test_print_composite() {
-        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        // Composite tracers stage the print as an array-member instruction that keeps its label and effect class,
-        // so the staged program declares the selected effect.
-        let (_, program) = CompositeContext::trace(
-            |input: Tracer<CompositeContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
-            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
-                in (%1)"
-            },
-        );
-        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-
-        // A concrete composite value prints its array member immediately and returns itself unchanged.
-        let value = ArrayIrValue::Array(Array::scalar(2.0f64).unwrap());
-        assert_eq!(value.clone().print("x"), Ok(value));
     }
 
     #[test]
@@ -778,5 +731,73 @@ mod tests {
                 in (%1)"},
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_print_composite() {
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Composite tracers stage the print as an array-member instruction that keeps its label and effect class,
+        // so the staged program declares the selected effect.
+        let (_, program) = CompositeContext::trace(
+            |input: Tracer<CompositeContext>| input.print_with_effect_class("x", EffectClass::UnorderedIo),
+            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+
+        // A concrete composite value prints its array member immediately and returns itself unchanged.
+        let value = ArrayIrValue::Array(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value));
+    }
+
+    #[test]
+    fn test_print_eager_value_domains() {
+        /// Array value that binds its capabilities through an eager domain, as backend values that execute operation
+        /// by operation do (e.g., the XLA backend's arrays).
+        #[derive(Clone, Debug, PartialEq)]
+        struct EagerDomainValue(Array);
+
+        impl Display for EagerDomainValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+
+        impl Parameter for EagerDomainValue {}
+
+        impl Typed for EagerDomainValue {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                self.0.r#type()
+            }
+        }
+
+        impl Value for EagerDomainValue {
+            type Dispatch = ValueDomainDispatch;
+            type Domain = EagerContext<Self, PrintOperation<ArrayType>>;
+
+            fn domain(&self) -> Self::Domain {
+                EagerContext::new()
+            }
+        }
+
+        // The `Print` capability of a domain-dispatched value binds a `PrintOperation` through its eager domain, which
+        // interprets it. Interpretation prints directly, so it does not re-enter the capability.
+        let value = EagerDomainValue(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value.clone()));
+        assert_eq!(
+            value.domain().bind(PrintOperation::new("x"), Vec::new(), std::slice::from_ref(&value)),
+            Ok(vec![value]),
+        );
     }
 }

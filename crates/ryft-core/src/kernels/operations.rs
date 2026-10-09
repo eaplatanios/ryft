@@ -32,7 +32,8 @@ use crate::partial::{
 use crate::programs::{
     Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
     OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming,
+    ReferenceAccessOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
+    TypeIdentityRenaming,
 };
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
@@ -326,6 +327,21 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
             Self::MaskedStore(operation) => operation.output_region_provenance(output_index),
             Self::MaskedSwap(operation) => operation.output_region_provenance(output_index),
             Self::Extension(operation) => operation.output_region_provenance(output_index),
+        }
+    }
+
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        match self {
+            Self::Portable(operation) => operation.region_data_flow(),
+            Self::Call(operation) => operation.region_data_flow(),
+            Self::Scratch(operation) => operation.region_data_flow(),
+            Self::TileLoad(operation) => operation.region_data_flow(),
+            Self::AsyncCopy(operation) => operation.region_data_flow(),
+            Self::Wait(operation) => operation.region_data_flow(),
+            Self::MaskedLoad(operation) => operation.region_data_flow(),
+            Self::MaskedStore(operation) => operation.region_data_flow(),
+            Self::MaskedSwap(operation) => operation.region_data_flow(),
+            Self::Extension(operation) => operation.region_data_flow(),
         }
     }
 
@@ -794,7 +810,7 @@ mod tests {
 
     use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, TagOperation};
+    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, ScanOperation, TagOperation};
     use crate::programs::{EmptyRegionDriver, ReferenceType};
     use crate::tracing::TracingContext;
 
@@ -831,6 +847,32 @@ mod tests {
         let operation = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
         let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
         assert_eq!(operation.infer_output_types(&[r#type.clone(), r#type.clone()], &[]), Ok(vec![r#type]));
+    }
+
+    #[test]
+    fn test_kernel_operation_region_data_flow() {
+        let opaque = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let ordinary = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Condition(ConditionOperation::new()));
+        assert!(matches!(opaque.region_data_flow(), RegionDataFlow::Opaque));
+        assert!(matches!(ordinary.region_data_flow(), RegionDataFlow::Provenance));
+
+        let recurrent = ArrayIrOperation::<Array>::from(ArrayOperation::Scan(ScanOperation::new(2, 3usize)));
+        for operation in [
+            KernelOperation::<ArrayIrOperation<Array>>::Portable(recurrent.clone()),
+            KernelOperation::Extension(recurrent),
+        ] {
+            let payload = match &operation {
+                KernelOperation::Portable(payload) | KernelOperation::Extension(payload) => payload,
+                _ => unreachable!(),
+            };
+            let RegionDataFlow::Custom(expected) = payload.region_data_flow() else {
+                panic!("a scan must declare its custom region data flow");
+            };
+            let RegionDataFlow::Custom(forwarded) = operation.region_data_flow() else {
+                panic!("kernel dispatch must retain custom region data flow");
+            };
+            assert!(std::ptr::eq(forwarded, expected));
+        }
     }
 
     #[test]

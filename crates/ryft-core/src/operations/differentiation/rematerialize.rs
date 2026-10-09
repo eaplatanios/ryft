@@ -19,15 +19,15 @@ use crate::operations::manipulation::conversions::ReducePrecisionOperation;
 use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::references::ReferenceNewOperation;
 use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram, ResidualPolicyReference,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource, ResidualPolicyReference,
 };
 use crate::programs::{
     CalleeRegionDriver, ErasedOperation, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
     OperationFormatter, OperationPayloadProjection, OperationProvider, OutputRegionProvenance, ProgramError,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceMemberType, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
-    Typed, Value, discharge_positional_region_operation,
+    ReferenceDischargeableOperation, ReferenceMemberType, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
+    Type, TypeError, Typed, Value, discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -190,28 +190,23 @@ impl<T: Type> RematerializeOperation<T> {
 
     /// Returns this [`RematerializeOperation`] with its [optimization barrier](Self::optimization_barrier) selection
     /// remapped onto the inputs of the residual program of `partition`, whose partitioned program has the inputs of
-    /// this call. An unknown input keeps its selection, and so does a known input that the known program forwards to
-    /// the residual program unchanged, while every residual that the known program computes is selected, so that the
-    /// recomputation stays separate from the computation of the values that it starts from.
+    /// this call and whose residuals are [forwarded](PartitionedProgram::forward_residuals). An unknown input keeps
+    /// its selection, and so does a known input that the residual program receives directly, while every residual
+    /// that the known program computes is selected, so that the recomputation stays separate from the computation
+    /// of the values that it starts from.
     fn with_residual_optimization_barrier<V: Value<Type = T>, O: Operation<Type = T>>(
         &self,
         partition: &PartitionedProgram<V, O>,
     ) -> Self {
         self.with_remapped_optimization_barrier(|selected| {
-            let known_program = partition.known_program();
-            let known_output_count = partition.outputs().iter().filter(|output| output.is_known()).count();
             partition
                 .residual_inputs()
                 .iter()
-                .map(|input| match input {
-                    PartialEvaluationInput::Unknown(index) => selected[*index],
-                    PartialEvaluationInput::Known(index) => {
-                        let output = known_program.output_ids()[known_output_count + index];
-                        match known_program.input_ids().iter().position(|input| *input == output) {
-                            Some(position) => selected[partition.known_input_indices()[position]],
-                            None => true,
-                        }
+                .map(|source| match *source {
+                    ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                        selected[index]
                     }
+                    ResidualInputSource::KnownOutput(_) | ResidualInputSource::ResidualEdge(_) => true,
                 })
                 .collect()
         })
@@ -310,6 +305,11 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
     }
 
     fn prune_boundary(
@@ -431,22 +431,25 @@ where
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
 
-        // Look through memory transfers and round before offloading, so known consumers and derivative
-        // consumers use the same rounded value. Rounding after the transfer would leave known consumers
-        // using the value computed with excess precision.
+        // Look through memory transfers and round before offloading, so known consumers and derivative consumers use
+        // the same rounded value. Rounding after the transfer would leave known consumers using the value computed with
+        // excess precision. Forwarding comes last: it feeds the residual call the known inputs and outputs that edges
+        // would merely repeat, which rounding and placement must still see as edges.
         let partition = driver
             .partition_program(&context.clone().with_residual_policy(&self.policy), body, &input_known)?
             .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
                 operation.projected_payload::<TransferToMemoryOperation>().is_some()
-            })?;
+            })?
+            .forward_residuals()?;
         let residual_operation = self.with_residual_optimization_barrier(&partition).with_differentiated(true);
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
 
-        // The known program returns the known outputs of the body followed by the values that the residual program
-        // receives, which are therefore offset by the number of known outputs. An eager known-side context may be
-        // unable to execute some pure operations (e.g., operations that only a backend can execute), which keeps the
-        // call whole as for any other operation. Known inputs that the known program forwards keep their original
-        // values, so that they are materialized in the residual program as they would be without the call.
+        // The known program returns the known outputs of the body followed by the residual edges, which are therefore
+        // offset by the number of known outputs. An eager known-side context may be unable to execute some pure
+        // operations (e.g., operations that only a backend can execute), which keeps the call whole as for any other
+        // operation. Known inputs that the known program returns unchanged as known outputs keep their original
+        // values, as do the known inputs that the residual program receives directly, so that they are materialized
+        // in the residual program as they would be without the call.
         let known_inputs = known_input_indices.iter().map(|&index| inputs[index].as_known().cloned().unwrap());
         let known_outputs = match known_program.interpret_in_context(context.parent(), known_inputs.collect()) {
             Err(ProgramError::UnsupportedOperation { .. }) => {
@@ -467,8 +470,11 @@ where
         let residual_inputs = residual_inputs
             .iter()
             .map(|input| match input {
-                PartialEvaluationInput::Unknown(index) => inputs[*index].clone(),
-                PartialEvaluationInput::Known(index) => known_outputs[known_output_count + index].clone(),
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    inputs[*index].clone()
+                }
+                ResidualInputSource::KnownOutput(index) => known_outputs[*index].clone(),
+                ResidualInputSource::ResidualEdge(index) => known_outputs[known_output_count + index].clone(),
             })
             .collect::<Vec<_>>();
         let residual_outputs =
@@ -610,10 +616,12 @@ where
 
             // Look through memory transfers and round before offloading, so known consumers and derivative consumers
             // use the same rounded value. Rounding after the transfer would leave known consumers using the value
-            // computed with excess precision.
-            let partition = partition.with_rounded_residuals(Self::excess_precision_rounding, |operation| {
-                operation.projected_payload::<TransferToMemoryOperation>().is_some()
-            })?;
+            // computed with excess precision. Forwarding comes last, as for partial evaluation.
+            let partition = partition
+                .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
+                    operation.projected_payload::<TransferToMemoryOperation>().is_some()
+                })?
+                .forward_residuals()?;
             let residual_operation =
                 fused_operation.with_residual_optimization_barrier(&partition).with_differentiated(true);
             partition.interpret_in_context_with(context, fused_inputs.as_slice(), output_count, |program, inputs| {
@@ -766,12 +774,17 @@ mod tests {
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        CotangentDestination, CotangentSeed, DotsSavable, EverythingSavable, NothingSavable,
-        OffloadDotsWithNoBatchDimensions, SaveOnlyTheseNames, differentiate_at, rematerialize,
+        CotangentDestination, CotangentSeed, DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable,
+        NothingSavable, OffloadDotsWithNoBatchDimensions, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+        SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, differentiate_at, rematerialize,
     };
+    use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::one_like::OneLike;
+    use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
     use crate::operations::custom_functions::functions::custom_function;
@@ -798,12 +811,12 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+    type TestProgram = Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>;
 
-    // The transform tests below stage complete programs rather than using the `check_operation_*` macros, because their
-    // subject is the transformation of the attached body region, for which those macros recommend explicit setup. They
-    // also compare derivatives with analytic values rather than with `check_gradient!`, which instantiates the function
-    // under test over both linearization tracers and concrete arrays, while a rematerialized function fixes the type of
-    // its tracer input.
+    // The transform tests below stage complete programs rather than using the `check_operation_*` macros, because
+    // their subject is the transformation of the attached body region, for which those macros recommend explicit
+    // setup. Replaying a program in its input's domain also lets `check_gradient!` evaluate the same boundary
+    // with both linearization tracers and concrete arrays.
 
     /// Returns a [`RematerializeOperation`] over [`ArrayType`] with the default [`NothingSavable`] policy.
     fn rematerialize_operation() -> RematerializeOperation<ArrayType> {
@@ -866,6 +879,74 @@ mod tests {
         let (value, pullback) = differentiate_at(x).vjp(|x| function.call(x)).unwrap();
         let gradient = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap();
         (value, gradient, pullback.residuals().to_vec())
+    }
+
+    /// Builds `(a, b) ↦ c₀²`, where `c` is the result of swapping the two scan carries twice.
+    fn swapping_scan_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let _index = body.add_input(ArrayType::scalar(DataType::I64));
+        let first = body.add_input(scalar_type.clone());
+        let second = body.add_input(scalar_type.clone());
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![second, first], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let first = builder.add_input(scalar_type.clone());
+        let second = builder.add_input(scalar_type);
+        let output =
+            builder.add_instruction(ScanOperation::new(2, 2), vec![body], vec![first, second], None).unwrap()[0];
+        let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![output, output], None).unwrap()[0];
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![square], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Wraps `body` in one rematerialization boundary using `policy`, preserving its flat parameter structure.
+    fn rematerialized_program(body: &TestProgram, policy: ResidualPolicyReference<ArrayType>) -> TestProgram {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let region = builder.import_program(body.clone());
+        let inputs = body.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect();
+        let outputs = builder
+            .add_instruction(RematerializeOperation::new(policy), vec![region], inputs, None)
+            .unwrap()
+            .to_vec();
+        builder
+            .build(outputs, vec![Placeholder; body.input_ids().len()], vec![Placeholder; body.output_ids().len()])
+            .unwrap()
+    }
+
+    /// Checks that one residual policy preserves the primal, a nonzero tangent direction, and a unit-seeded pullback.
+    fn assert_rematerialized_derivatives(
+        body: &TestProgram,
+        inputs: &[Array],
+        policy: ResidualPolicyReference<ArrayType>,
+    ) {
+        let name = policy.name().to_owned();
+        let program = rematerialized_program(body, policy);
+        let expected = body.interpret(inputs.to_vec()).unwrap();
+        assert_eq!(program.interpret(inputs.to_vec()), Ok(expected.clone()), "policy `{name}`");
+        let tangents = inputs.iter().map(|input| input.one_like().unwrap()).collect::<Vec<_>>();
+        let plain_jvp = differentiate_at(inputs.to_vec())
+            .jvp(tangents.clone(), |inputs| body.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        let rematerialized_jvp = differentiate_at(inputs.to_vec())
+            .jvp(tangents, |inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        assert_eq!(plain_jvp.0, expected);
+        assert_eq!(rematerialized_jvp, plain_jvp, "policy `{name}`");
+        let (plain_value, plain_pullback) = differentiate_at(inputs.to_vec())
+            .vjp(|inputs| body.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        let (rematerialized_value, rematerialized_pullback) = differentiate_at(inputs.to_vec())
+            .vjp(|inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        assert_eq!(plain_value, expected);
+        assert_eq!(rematerialized_value, expected, "policy `{name}`");
+        let cotangents = expected.iter().map(|output| output.one_like().unwrap()).collect::<Vec<_>>();
+        let expected_gradient = plain_pullback.apply(cotangents.clone()).unwrap();
+        assert_eq!(rematerialized_pullback.apply(cotangents), Ok(expected_gradient), "policy `{name}`",);
     }
 
     #[test]
@@ -1019,6 +1100,18 @@ mod tests {
                     },
                 ]
                 in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_region_data_flow() {
+        let operation = rematerialize_operation();
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
+        assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::None);
+        assert_eq!(
+            operation.output_region_provenance(1),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
         );
     }
 
@@ -1181,7 +1274,11 @@ mod tests {
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[3] .
                     in (%0)
@@ -1206,7 +1303,11 @@ mod tests {
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[3] .
                     let %1:f64[] = dot [
@@ -1261,7 +1362,11 @@ mod tests {
         assert_eq!(
             sine_of_dot_program(operation).partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[3] .
                     in (%0)
@@ -1287,7 +1392,11 @@ mod tests {
         assert_eq!(
             sine_of_dot_program(operation).partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[3] .
                     let %1:f64[] = dot [
@@ -1337,7 +1446,11 @@ mod tests {
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:ref<f32[]> .
                     in (%0)
@@ -1379,7 +1492,11 @@ mod tests {
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[] .
                     in (%0)
@@ -1955,6 +2072,73 @@ mod tests {
             (value.clone(), gradient.clone(), vec![vector.clone(), dot.transfer_to_memory(host).unwrap()]),
         );
         assert_eq!(tagged_sine_of_dot_vjp(SaveOnlyTheseNames::new(["dot"])), (value, gradient, vec![vector, dot]));
+
+        // All built-in policies preserve the complete differentiation contract, including the policies that select
+        // names negatively, combine decisions, or move their saved values through host memory.
+        let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<TestTracer>| Ok(vec![tagged_sine_of_dot(inputs[0].clone())?]),
+            vec![ArrayType::new_static(DataType::F64, [3])],
+        )
+        .unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[] = dot [
+                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                ] %0 %0
+                    %2:f64[] = tag [key=dot] %1
+                    %3:f64[] = sin %2
+                in (%3)"},
+        );
+        let inputs = [Array::vector(vec![0.1f64, 0.2, 0.3]).unwrap()];
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(EverythingSavable));
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(DotsSavable));
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(DotsWithNoBatchDimensionsSavable),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(OffloadDotsWithNoBatchDimensions::new(host)),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(SaveOnlyTheseNames::new(["dot"])),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(SaveAnyNamesButThese::new(["other"])),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(SaveAnythingExceptTheseNames::new(["dot"])),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(SaveAndOffloadOnlyTheseNames::new(["other"], ["dot"], host).unwrap()),
+        );
+        assert_rematerialized_derivatives(
+            &body,
+            &inputs,
+            ResidualPolicyReference::new(SaveFromBothPolicies::new(DotsSavable, SaveOnlyTheseNames::new(["dot"]))),
+        );
+
+        // The same rematerialized program can be replayed with arrays for finite differences and with tracers for AD.
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(DotsSavable));
+        check_gradient!(
+            |input| program.interpret_in_context(&input.domain(), vec![input]).map(|mut outputs| outputs.remove(0)),
+            at = inputs[0].clone(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
     }
 
     #[test]
@@ -2002,6 +2186,188 @@ mod tests {
             (Array::scalar(0.5f64.sin()).unwrap(), Array::scalar(2.0 * 0.5f64.cos()).unwrap()),
         );
         assert_eq!(differentiate_at(x).gradient(|x| function.call(x)), Ok(Array::scalar(3.0 * 0.5f64.cos()).unwrap()));
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_call_body() {
+        // A call with derivatives derived from its primal keeps the same values and derivatives inside a checkpoint.
+        let sine = custom_function(|x: TestTracer| Ok(x.sin()?)).with_jvp_from_primal();
+        let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<TestTracer>| Ok(vec![sine.call(inputs[0].clone())?]),
+            vec![ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = custom_function [name=\"custom_function\"] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+        let inputs = [Array::scalar(0.5f64).unwrap()];
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(EverythingSavable));
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_call_body_offload() {
+        // Differentiating only x makes g(w) an all-known call. Its returned scale still follows the enclosing
+        // checkpoint's storage decision, even though the callee itself needs no partial-evaluation split.
+        let scale = custom_function(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?]),
+            vec![scalar_type.clone(); 2],
+        )
+        .unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = custom_function [name=\"custom_function\"] %1 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = tag [key=scale] %1
+                        in (%2)
+                    },
+                ]
+                    %3:f64[] = mul %0 %2
+                in (%3)"},
+        );
+        let host = Memory::Host { pinned: true };
+        let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["scale"], host).unwrap();
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(policy));
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(&linearization.primal().output_types()[1..], &[scalar_type.with_memory(host)]);
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = custom_function [name=\"custom_function\"] %1 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = tag [key=scale] %1
+                        in (%2)
+                    },
+                ]
+                    %3:f64[] = mul %0 %2
+                    %4:f64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %2
+                in (%3, %4)
+                lambda %0:f64[], %1:f64[]@Host[Pinned] .
+                let %2:f64[] = rematerialize [policy=\"save_and_offload_only_these_names\", differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[]@Host[Pinned] .
+                        let %2:f64[] = transfer_to_memory [destination=Device] %1
+                            %3:f64[] = mul %2 %0
+                        in (%3)
+                    },
+                ]
+                in (%2)"},
+        );
+        let primal = linearization
+            .primal()
+            .interpret(vec![Array::scalar(2f64).unwrap(), Array::scalar(0.5f64).unwrap()])
+            .unwrap();
+        let scale = Array::scalar(0.5f64.sin()).unwrap();
+        assert_eq!(primal, vec![Array::scalar(2.0 * 0.5f64.sin()).unwrap(), scale.transfer_to_memory(host).unwrap()]);
+        let inputs = vec![Array::scalar(1f64).unwrap(), primal[1].clone()];
+        assert_eq!(linearization.tangent().interpret(inputs.clone()), Ok(vec![scale.clone()]));
+        assert_eq!(linearization.pullback().unwrap().interpret(inputs), Ok(vec![scale]));
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_nested_policies() {
+        // The inner checkpoint saves everything while either outer policy recomputes its nonlinear body.
+        let inner = rematerialize(|x: TestTracer| Ok(x.clone() * x)).with_policy(EverythingSavable);
+        let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<TestTracer>| Ok(vec![inner.call(inputs[0].clone())?.sin()?]),
+            vec![ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize [policy=\"everything_savable\"] %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                    %2:f64[] = sin %1
+                in (%2)"},
+        );
+        let inputs = [Array::scalar(0.5f64).unwrap()];
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(DotsSavable));
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_condition_body() {
+        // The predicate depends on the primal. Exercise each nonlinear branch without crossing its discontinuity.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let (_, square) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x: TestTracer| Ok(x.clone() * x),
+            scalar_type.clone(),
+        )
+        .unwrap();
+        let (_, cube) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x: TestTracer| Ok(x.clone() * x.clone() * x),
+            scalar_type.clone(),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let square = builder.import_program(square);
+        let cube = builder.import_program(cube);
+        let input = builder.add_input(scalar_type);
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![input, zero],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![square, cube], vec![predicate, input], None)
+            .unwrap()[0];
+        let body = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = zero_like %0
+                    %2:bool[] = compare [direction=GreaterThan] %0 %1
+                    %3:f64[] = condition %2 %0 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = mul %0 %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = mul %0 %0
+                                %2:f64[] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%3)"},
+        );
+        let positive = [Array::scalar(2f64).unwrap()];
+        let negative = [Array::scalar(-2f64).unwrap()];
+        assert_rematerialized_derivatives(&body, &positive, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&body, &negative, ResidualPolicyReference::new(EverythingSavable));
     }
 
     #[test]
@@ -2243,6 +2609,136 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_differentiation_dynamic_batching_combined_policy() {
+        // Mapping only x in f(x, w) = x sin(w) introduces a dynamic broadcast of the replicated scale. Its dimension
+        // input does not project into ArrayType, so a lifted composite policy must use its children's native policies.
+        let function =
+            rematerialize(|inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * inputs[1].sin()?.tag("scale")?]))
+                .with_policy(SaveFromBothPolicies::new(DotsSavable, SaveOnlyTheseNames::new(["scale"])));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs| function.call(inputs),
+            vec![ArrayType::scalar(DataType::F64); 2],
+        )
+        .unwrap();
+        let program = program.into_unprojected::<TestIrValue, TestIrOperation>().unwrap();
+        let extent_type = DimensionType::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
+        let (program, output_axes) = program
+            .batched_with_threaded_extent(
+                extent_type.clone(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f64[batch], %2:f64[] .
+                let %3:f64[batch] = rematerialize [policy=\"save_from_both_policies\"] %0 %1 %2 [
+                    body={
+                        lambda %0:dimension<batch ∈ [1, 4)>, %1:f64[batch], %2:f64[] .
+                        let %3:f64[] = sin %2
+                            %4:f64[] = tag [key=scale] %3
+                            %5:f64[batch] = broadcast [output_axes=[]] %4 %0
+                            %6:f64[batch] = mul %1 %5
+                        in (%6)
+                    },
+                ]
+                in (%0, %3)"},
+        );
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f64[batch], %2:f64[] .
+                let %3:f64[] = sin %2
+                    %4:f64[] = tag [key=scale] %3
+                    %5:f64[batch] = broadcast [output_axes=[]] %4 %0
+                    %6:f64[batch] = mul %1 %5
+                in (%0, %6, %0, %1, %2, %4)
+                lambda %0:f64[batch], %1:f64[], %2:dimension<batch ∈ [1, 4)>, %3:f64[batch], %4:f64[], %5:f64[] .
+                let %6:f64[batch] = rematerialize [policy=\"save_from_both_policies\", differentiated=true] %0 %1 %2 %3 %4 %5 [
+                    body={
+                        lambda %0:f64[batch], %1:f64[], %2:dimension<batch ∈ [1, 4)>, %3:f64[batch], %4:f64[], %5:f64[] .
+                        let %6:f64[batch] = broadcast [output_axes=[]] %5 %2
+                            %7:f64[batch] = mul %6 %0
+                            %8:f64[] = cos %4
+                            %9:f64[] = mul %8 %1
+                            %10:f64[batch] = broadcast [output_axes=[]] %9 %2
+                            %11:f64[batch] = mul %3 %10
+                            %12:f64[batch] = add %7 %11
+                        in (%12)
+                    },
+                ]
+                in (%6)"},
+        );
+        let extent = TestIrValue::Dimension(DimensionValue::new(extent_type, 2).unwrap());
+        let primal = linearization
+            .primal()
+            .interpret(vec![
+                extent.clone(),
+                TestIrValue::Array(Array::vector(vec![2f64, 3.0]).unwrap()),
+                TestIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            &primal[..2],
+            &[extent, TestIrValue::Array(Array::vector(vec![2.0 * 0.5f64.sin(), 3.0 * 0.5f64.sin()]).unwrap())],
+        );
+        let mut tangents = vec![
+            TestIrValue::Array(Array::vector(vec![1f64, 1.0]).unwrap()),
+            TestIrValue::Array(Array::scalar(1f64).unwrap()),
+        ];
+        tangents.extend(primal.into_iter().skip(2));
+        assert_eq!(
+            linearization.tangent().interpret(tangents),
+            Ok(vec![TestIrValue::Array(
+                Array::vector(vec![0.5f64.sin() + 2.0 * 0.5f64.cos(), 0.5f64.sin() + 3.0 * 0.5f64.cos(),]).unwrap()
+            )]),
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_swapping_scan_carries() {
+        // A carry's region-input provenance is not its runtime identity after several iterations. After two swaps,
+        // the first carry is the original first input, even though the body forwards its second input to that output.
+        let program = swapping_scan_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[], %3:f64[] = scan [carry_count=2, length=2, reverse=false] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[] .
+                        in (%2, %1)
+                    },
+                ]
+                    %4:f64[] = mul %2 %2
+                in (%4)"},
+        );
+        let inputs = vec![Array::scalar(2f64).unwrap(), Array::scalar(7f64).unwrap()];
+        let expected_value = vec![Array::scalar(4f64).unwrap()];
+        let expected_gradient = vec![Array::scalar(4f64).unwrap(), Array::scalar(0f64).unwrap()];
+        let cotangent = vec![Array::scalar(1f64).unwrap()];
+        let (value, pullback) = differentiate_at(inputs.clone())
+            .vjp(|inputs| program.interpret_in_context(&inputs[0].domain(), inputs))
+            .unwrap();
+        assert_eq!(value, expected_value);
+        assert_eq!(pullback.apply(cotangent.clone()), Ok(expected_gradient.clone()));
+        let function =
+            rematerialize(|inputs: Vec<TestTracer>| program.interpret_in_context(&inputs[0].domain(), inputs))
+                .with_policy(EverythingSavable);
+        let (value, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs)).unwrap();
+        assert_eq!(value, expected_value);
+        assert_eq!(pullback.apply(cotangent), Ok(expected_gradient));
+        let inputs = [Array::scalar(2f64).unwrap(), Array::scalar(7f64).unwrap()];
+        assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(EverythingSavable));
+    }
+
+    #[test]
     fn test_rematerialize_differentiation_scan_body() {
         // The body scans `c * cos(dot(x, x))` over the rows `x` of `xs`. Saving dot products applies to every iteration
         // of the scan: the primal scan stacks the dot products, and the differentiated call recomputes their cosines.
@@ -2325,6 +2821,86 @@ mod tests {
                 ]
                 in (%5)"},
         );
+
+        // For rows [1, 0, 0] and [2, 0, 0], the result is c cos(1) cos(4). Check both directions against its
+        // analytic derivatives while executing the exact residual boundary asserted above.
+        let inputs =
+            vec![Array::scalar(2f64).unwrap(), Array::matrix(2, 3, vec![1f64, 0.0, 0.0, 2.0, 0.0, 0.0]).unwrap()];
+        let primal = linearization.primal().interpret(inputs).unwrap();
+        assert_eq!(primal[0], Array::scalar((2.0 * 1f64.cos()) * 4f64.cos()).unwrap());
+        let carry_gradient = 1f64.cos() * 4f64.cos();
+        let first_row_gradient = -4.0 * 1f64.sin() * 4f64.cos();
+        let second_row_gradient = -8.0 * 1f64.cos() * 4f64.sin();
+        let mut tangent_inputs = vec![Array::scalar(1f64).unwrap(), Array::matrix(2, 3, vec![1f64; 6]).unwrap()];
+        tangent_inputs.extend(primal.iter().skip(1).cloned());
+        let tangent = linearization.tangent().interpret(tangent_inputs).unwrap();
+        let expected_tangent = carry_gradient + first_row_gradient + second_row_gradient;
+        assert!((tangent[0].elements::<f64>().unwrap()[0] - expected_tangent).abs() < 1e-12);
+        let mut pullback_inputs = vec![Array::scalar(1f64).unwrap()];
+        pullback_inputs.extend(primal.into_iter().skip(1));
+        let gradient = linearization.pullback().unwrap().interpret(pullback_inputs).unwrap();
+        assert_eq!(gradient.len(), 2);
+        assert!((gradient[0].elements::<f64>().unwrap()[0] - carry_gradient).abs() < 1e-12);
+        let row_gradients = gradient[1].elements::<f64>().unwrap();
+        assert_eq!(row_gradients.len(), 6);
+        for (actual, expected) in
+            row_gradients.iter().zip([first_row_gradient, 0.0, 0.0, second_row_gradient, 0.0, 0.0])
+        {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_bounded_while_body() {
+        // The predicate remains true, so the semantic bound ends the loop after two squarings: x ↦ x⁴.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut condition = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = condition.add_input(scalar_type.clone());
+        let predicate = condition
+            .add_instruction(CompareOperation::new(ComparisonDirection::Equal), Vec::new(), vec![input, input], None)
+            .unwrap()[0];
+        let condition = condition
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let (_, square) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x: TestTracer| Ok(x.clone() * x),
+            scalar_type.clone(),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let condition = builder.import_program(condition);
+        let square = builder.import_program(square);
+        let input = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                WhileOperation::new().with_iteration_bound(2).unwrap(),
+                vec![condition, square],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let body = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = while [iteration_bound=2] %0 [
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:bool[] = compare [direction=Equal] %0 %0
+                        in (%1)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+        let inputs = [Array::scalar(2f64).unwrap()];
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(NothingSavable));
+        assert_rematerialized_derivatives(&body, &inputs, ResidualPolicyReference::new(EverythingSavable));
     }
 
     #[test]
@@ -2369,6 +2945,13 @@ mod tests {
             jvp.interpret(vec![Array::scalar(2.0f64).unwrap(), Array::scalar(1.0f64).unwrap()]),
             Ok(vec![Array::scalar(16.0f64).unwrap(), Array::scalar(32.0f64).unwrap()]),
         );
+        assert!(matches!(
+            program.linearize().unwrap().pullback(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message
+                == "`while` does not support transposition (reverse-mode differentiation through staged unbounded \
+                    `while` loops is not supported; eager differentiation executes concrete duals, and loops built \
+                    with `with_iteration_bound` stage a transposable masked scan)",
+        ));
     }
 
     #[test]

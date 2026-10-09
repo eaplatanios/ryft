@@ -49,15 +49,15 @@ use crate::operations::manipulation::transposition::{Transpose, TransposeOperati
 use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
     OperationBoundaryPruning, OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder,
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionInterface, RegionLiveness,
-    RegionSlot, Type, TypeError, Typed, Value, ValueProjection, discharge_positional_region_operation,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionDataFlow, RegionInterface,
+    RegionLiveness, RegionSlot, Type, TypeError, Typed, Value, ValueProjection, discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -252,6 +252,11 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         ]
     }
 
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
+    }
+
     fn prune_boundary(
         &self,
         input_count: usize,
@@ -280,6 +285,15 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
 // outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
 // therefore receive one shared state boundary: every root either branch touches enters, and only the roots one of them
 // mutates are published back, so a condition whose branches merely read keeps its source boundary unchanged.
+//
+// Inside a manual region, a predicate that varies over manual mesh axes lets devices take different branches, so a
+// branch that mutates a reference input or a captured reference updates it on only some of those devices. The referent
+// must therefore vary over every such axis, exactly like a condition output (refer to
+// `ConditionType::validate_condition_output`), which the published final state becomes. Reference analysis rather than
+// the interface types of the branches decides which references a branch mutates, so this rule rejects such a mutation
+// precisely before rewriting the branches, instead of letting the rebuilt condition fail with a diagnostic about one of
+// its added outputs. A `while` loop needs no such
+// rule, because its type inference already requires every reference state to vary over the axes of its predicate.
 impl<C, P> ReferenceDischargeableOperation<C, P> for ConditionOperation<C::Type>
 where
     C: Context<Type: ConditionType, Operation: From<ConditionOperation<C::Type>>>,
@@ -292,6 +306,50 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        if let Some(predicate) = inputs.first() {
+            let predicate_type = predicate.try_as_value("a condition predicate")?.r#type().into_owned();
+            for region_index in 0..driver.region_count() {
+                let branch = driver.region(region_index)?;
+                // Branches inherit lexical captures unless the operation declares a fresh capture prefix. Analyze
+                // that open scope directly instead of treating inherited captures as an empty explicit scope.
+                let analysis = branch.reference_analysis_with_configuration(
+                    self.region_capture_input_count(region_index),
+                    true,
+                    &[],
+                )?;
+                // Mutated captured references (i.e., the external roots of the open scope) are published back like
+                // mutated reference inputs, so their referents are subject to the same requirement.
+                let mut mutated_references = Vec::new();
+                for (input_index, input_type) in branch.input_types().iter().enumerate() {
+                    let root = ReferenceRoot::RegionInput { region: branch.id(), input_index };
+                    if input_type.is_reference() && analysis.is_mutated(root) {
+                        mutated_references.push((format!("reference input {}", input_index + 1), input_type.clone()));
+                    }
+                }
+                for root in analysis.roots() {
+                    if let ReferenceRoot::Constant { value } = root
+                        && analysis.is_mutated(root)
+                    {
+                        let owner = branch.with_id(value.region())?;
+                        if let Some(constant) = owner.atoms()[value.atom().index()].as_constant() {
+                            mutated_references
+                                .push(("a captured reference".to_string(), constant.r#type().into_owned()));
+                        }
+                    }
+                }
+                for (description, reference_type) in mutated_references {
+                    if reference_type.validate_condition_output(&predicate_type).is_err() {
+                        return Err(TypeError::invalid(format!(
+                            "`{CONDITION_OPERATION_NAME}` branch {region_index} mutates {description} of type \
+                             `{reference_type}`, whose referent does not vary over every manual axis that the \
+                             predicate `{predicate_type}` varies over, so devices that take different branches would \
+                             leave it different across devices; vary the referent over those axes",
+                        ))
+                        .into());
+                    }
+                }
+            }
+        }
         discharge_positional_region_operation(self, context, driver, inputs, 1, |_| *self)
     }
 }
@@ -975,16 +1033,17 @@ where
                 partitions.push(PartitionedProgram::from_parts(
                     Arc::unwrap_or_clone(primal),
                     tangent.with_outputs(&live_tangent_slots)?,
+                    primal_input_count + live_input_count,
                     (0..primal_input_count).collect(),
                     (primal_input_count..primal_input_count + live_input_count)
-                        .map(PartialEvaluationInput::Unknown)
-                        .chain((0..residual_count).map(PartialEvaluationInput::Known))
+                        .map(ResidualInputSource::UnknownInput)
+                        .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
                         .collect(),
                     (0..output_count)
                         .map(PartialEvaluationOutput::Known)
                         .chain((0..tangent_output_count).map(PartialEvaluationOutput::Unknown))
                         .collect(),
-                ));
+                )?);
             }
             let input_known = (0..primal_input_count + live_input_count)
                 .map(|index| index < primal_input_count)
@@ -1445,8 +1504,8 @@ struct ConditionBranchSplit<V: Value, O: Operation<Type = V::Type>> {
     /// Residual-side program produced by partitioning the branch.
     residual_program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Source of each residual-program input.
-    residual_inputs: Vec<PartialEvaluationInput<usize>>,
+    /// Source of each residual-program input, which is either an original unknown input or a residual edge.
+    residual_inputs: Vec<ResidualInputSource>,
 
     /// Source of each original branch output.
     outputs: Vec<PartialEvaluationOutput<usize>>,
@@ -1614,6 +1673,15 @@ where
     // Collect each branch's residual edges: its known feeders plus the instantiated folded values of residual-owned
     // outputs.
     let collect_branch = |partition: PartitionedProgram<V, O>| -> Result<ConditionBranchSplit<V, O>, ProgramError> {
+        // Each branch passes its known feeders through its own residual edges, which the split assembles into one
+        // residual signature. Forwarded wiring would require reconciling branch-specific sources instead, so branch
+        // partitions must keep their residual edges.
+        if partition.has_forwarded_residual_inputs() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{CONDITION_OPERATION_NAME}` branch partition forwards residual inputs, but splitting branches \
+                 requires residual edges",
+            )));
+        }
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
         check_count!("output", outputs, output_count, ProgramError);
         let expected_known_input_indices = input_known
@@ -1632,14 +1700,14 @@ where
         let known_result_count =
             outputs.iter().filter(|output| matches!(output, PartialEvaluationOutput::Known(_))).count();
         let feeder_edge_count =
-            residual_inputs.iter().filter(|input| matches!(input, PartialEvaluationInput::Known(_))).count();
+            residual_inputs.iter().filter(|input| matches!(input, ResidualInputSource::ResidualEdge(_))).count();
         check_count!("output", known_program.output_ids(), known_result_count + feeder_edge_count, ProgramError);
         let known_program_output_types = known_program.output_types();
 
         let mut edge_types = Vec::new();
         let mut edge_program_outputs = Vec::new();
         for input in residual_inputs.iter() {
-            if let PartialEvaluationInput::Known(edge) = input {
+            if let ResidualInputSource::ResidualEdge(edge) = input {
                 if *edge != edge_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{CONDITION_OPERATION_NAME}` branch partition reported residual edge {edge} out of order",
@@ -1863,19 +1931,22 @@ where
             let mut spliced_inputs = Vec::with_capacity(own.residual_inputs.len());
             for input in own.residual_inputs.iter() {
                 match input {
-                    PartialEvaluationInput::Unknown(index) => {
+                    ResidualInputSource::UnknownInput(index) => {
                         spliced_inputs.push(unknown_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "`{CONDITION_OPERATION_NAME}` known-ness split saw a residual feeder for a known input",
                             ))
                         })?);
                     }
-                    PartialEvaluationInput::Known(edge) => {
+                    ResidualInputSource::ResidualEdge(edge) => {
                         spliced_inputs.push(*own_edge_atoms.get(*edge).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "`{CONDITION_OPERATION_NAME}` known-ness split lost a residual edge"
                             ))
                         })?)
+                    }
+                    ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                        unreachable!("forwarded branch partitions are rejected when collecting branches")
                     }
                 }
             }
@@ -2225,7 +2296,7 @@ mod tests {
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
-    use crate::partial::PartialEvaluation;
+    use crate::partial::{PartialEvaluation, PartialEvaluationInput};
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
         ReferenceAnalysisError, ReferenceDischargeResult, ReferenceSource, ReferenceType, ReferenceView, RegionDriver,
@@ -2903,6 +2974,21 @@ mod tests {
                 &[identity_branch.interface(), identity_branch.interface()],
             ),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
+        );
+    }
+
+    #[test]
+    fn test_condition_region_data_flow() {
+        let operation = ConditionOperation::<ArrayType>::new();
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 2 });
+        assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::Input { index: 2 });
+        assert_eq!(
+            operation.output_region_provenance(1),
+            vec![
+                OutputRegionProvenance { region_index: 0, output_index: 1 },
+                OutputRegionProvenance { region_index: 1, output_index: 1 },
+            ],
         );
     }
 
@@ -4178,6 +4264,122 @@ mod tests {
         );
     }
 
+    /// Returns the `f32[2]` type replicated on a two-device manual mesh over `x`, varying along `x` when `varying` is
+    /// set, together with the `bool[]` predicate type on that mesh that varies along `x`.
+    fn manual_mutation_types(varying: bool) -> (ArrayType, ArrayType) {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(varying.then_some("x"));
+        let referent_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.unwrap()).unwrap();
+        let predicate_sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(predicate_sharding).unwrap();
+        (referent_type, predicate_type)
+    }
+
+    /// Returns a branch with no outputs that doubles the referent of `reference` in place when `mutate` is set and
+    /// only reads it otherwise.
+    fn manual_mutation_branch<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
+        builder: &mut ProgramBuilder<V, O>,
+        reference: AtomId,
+        mutate: bool,
+    ) where
+        O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+            + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+            + From<AddOperation<ArrayIrType>>,
+    {
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        if mutate {
+            let doubled = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_rejects_mutated_reference_inputs_under_varying_predicates() {
+        // A predicate that varies along `x` lets the devices take different branches, so a branch that mutates a
+        // reference input is accepted only when the referent varies along `x` as well.
+        let program = |varying: bool| {
+            let (referent_type, predicate_type) = manual_mutation_types(varying);
+            let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type));
+            let branch = |mutate: bool| {
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let reference = builder.add_input(reference_type.clone());
+                manual_mutation_branch(&mut builder, reference, mutate);
+                builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap()
+            };
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let branches = vec![builder.import_program(branch(true)), builder.import_program(branch(false))];
+            let predicate = builder.add_input(predicate_type.into());
+            let reference = builder.add_input(reference_type.clone());
+            builder
+                .add_instruction(ConditionOperation::<ArrayIrType>::new(), branches, vec![predicate, reference], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+                .unwrap()
+        };
+        assert!(program(true).discharge_references(0).is_ok());
+        assert_eq!(
+            program(false).discharge_references(0).map(|_| ()),
+            Err(TypeError::invalid(
+                "`condition` branch 0 mutates reference input 1 of type \
+                 `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
+                 axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
+                 over, so devices that take different branches would leave it different across devices; vary the \
+                 referent over those axes",
+            )
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_rejects_mutated_captured_references_under_varying_predicates() {
+        // Branches that capture a reference instead of receiving it as an input are subject to the same requirement,
+        // because discharge publishes the captured reference's final state back exactly like that of an input.
+        let closed_program = |varying: bool| {
+            let (referent_type, predicate_type) = manual_mutation_types(varying);
+            let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+            let branch = |mutate: bool| {
+                let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+                let reference = builder.add_constant(DischargeCapture::new(0, reference_type.clone()));
+                manual_mutation_branch(&mut builder, reference, mutate);
+                builder
+                    .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), Vec::new(), Vec::new())
+                    .unwrap()
+            };
+            let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+            let branches = vec![
+                builder.import_region(branch(true).entry_region_ref()),
+                builder.import_region(branch(false).entry_region_ref()),
+            ];
+            let predicate = builder.add_input(predicate_type.into());
+            builder
+                .add_instruction(ConditionOperation::<ArrayIrType>::new(), branches, vec![predicate], None)
+                .unwrap();
+            let program = builder
+                .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), vec![Placeholder], Vec::new())
+                .unwrap();
+            let referent = Array::from_elements(referent_type, &[1.0f32, 2.0]).unwrap();
+            ClosedProgram::new(program, vec![ArrayIrValue::Reference(ArrayReference::new(referent))]).unwrap()
+        };
+        assert!(closed_program(true).discharge_references().is_ok());
+        assert_eq!(
+            closed_program(false).discharge_references().map(|_| ()),
+            Err(TypeError::invalid(
+                "`condition` branch 0 mutates a captured reference of type \
+                 `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
+                 axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
+                 over, so devices that take different branches would leave it different across devices; vary the \
+                 referent over those axes",
+            )
+            .into()),
+        );
+    }
+
     #[test]
     fn test_condition_reference_discharge_matches_eager_reference_execution() {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
@@ -4916,6 +5118,44 @@ mod tests {
             assert_eq!(program.interpret(arguments), Ok(expected.clone()));
             assert_eq!(evaluation.program.interpret(residual_arguments), Ok(expected));
         }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_rejects_forwarded_branch_partitions() {
+        // `(a, x) ↦ a · x` with `a` known saves `a`, which forwarding then feeds to the residual branch directly.
+        // Splitting assembles one residual signature from the residual edges of both branches, so it rejects the
+        // forwarded partitions before binding anything.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(scalar_type.clone());
+        let x = builder.add_input(scalar_type.clone());
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
+        let branch = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = || branch.partition(&[true, false]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            partition().residual_inputs(),
+            &[ResidualInputSource::UnknownInput(1), ResidualInputSource::KnownInput(0)],
+        );
+        assert_eq!(
+            reconstruct_partitioned_condition(
+                &ArrayType::scalar(DataType::Boolean),
+                &[scalar_type.clone(), scalar_type],
+                1,
+                &[Array::scalar(true).unwrap(), Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()],
+                &[true, false],
+                partition(),
+                partition(),
+                |_, _, _| panic!("a rejected split builds no placeholders"),
+                |_, _, _| panic!("a rejected split binds no known condition"),
+                |_, _, _| panic!("a rejected split binds no residual condition"),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "`condition` branch partition forwards residual inputs, but splitting branches requires residual edges"
+                    .to_string(),
+            )),
+        );
     }
 
     #[test]

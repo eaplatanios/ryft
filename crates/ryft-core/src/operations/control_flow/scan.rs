@@ -47,7 +47,7 @@ use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
 };
 use crate::programs::{
     Atom, AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
@@ -55,7 +55,8 @@ use crate::programs::{
     ProgramError, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena, RegionInterface,
+    ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena, RegionDataFlow,
+    RegionDataFlowBoundary, RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface,
     RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
     ValueProjection, rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
@@ -205,6 +206,25 @@ impl<T: Type> ScanOperation<T> {
         })?;
         Ok(Self { carry_count, ..self.clone() })
     }
+
+    /// Validates the instruction and body positions used by the producer-source and execution-demand contracts.
+    fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
+        let runtime_length_count = usize::from(self.length.variable().is_some());
+        if boundary.regions.len() != 1
+            || boundary.output_count < self.carry_count
+            || boundary.regions[0].output_count != boundary.output_count
+            || boundary.regions[0].input_count.checked_sub(1).is_none_or(|count| {
+                count < self.carry_count || count.checked_add(runtime_length_count) != Some(boundary.input_count)
+            })
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow requires an index followed by {} carries and stacked inputs, \
+                 matching body outputs and instruction inputs",
+                self.carry_count,
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<T: ScanType> Display for ScanOperation<T> {
@@ -303,6 +323,11 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Custom(self)
+    }
+
     fn prune_boundary(
         &self,
         input_count: usize,
@@ -387,6 +412,89 @@ impl<T: ScanType> Operation for ScanOperation<T> {
             }
             Ok(())
         })
+    }
+}
+
+impl<T: ScanType> RegionDataFlowRule for ScanOperation<T> {
+    fn input_sources(
+        &self,
+        region_index: usize,
+        input_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if region_index != 0 || input_index >= boundary.regions[0].input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow input {input_index} in region {region_index} is out of \
+                 bounds",
+            )));
+        }
+        // The loop creates its index. Other body inputs come from caller inputs; carries additionally receive the
+        // matching body output on later iterations. These are possible producers, independently of reference identity.
+        let sources = if input_index == 0 {
+            Vec::new()
+        } else if input_index <= self.carry_count && self.length.value() != Some(0) {
+            vec![
+                RegionDataFlowSource::InstructionInput(input_index - 1),
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance {
+                    region_index: 0,
+                    output_index: input_index - 1,
+                }),
+            ]
+        } else {
+            vec![RegionDataFlowSource::InstructionInput(input_index - 1)]
+        };
+        Ok(RegionDataFlowSources::Known(sources))
+    }
+
+    fn output_sources(
+        &self,
+        output_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if output_index >= boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow output {output_index} is out of bounds",
+            )));
+        }
+        // A statically empty scan bypasses its body, forwarding initial carries and creating empty stacked results.
+        // Otherwise a carry may come from its initial binding or any body iteration, modeled through its body input.
+        let sources = if self.length.value() == Some(0) {
+            if output_index < self.carry_count {
+                vec![RegionDataFlowSource::InstructionInput(output_index)]
+            } else {
+                Vec::new()
+            }
+        } else if output_index < self.carry_count {
+            vec![RegionDataFlowSource::RegionInput { region_index: 0, input_index: output_index + 1 }]
+        } else {
+            vec![RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index })]
+        };
+        Ok(RegionDataFlowSources::Known(sources))
+    }
+
+    fn execution_demands(
+        &self,
+        used_outputs: &[bool],
+        boundary: RegionDataFlowBoundary<'_>,
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Vec<Option<Vec<bool>>>, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if used_outputs.len() != boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` region data flow expects used outputs for {} positions but got {}",
+                boundary.output_count,
+                used_outputs.len(),
+            )));
+        }
+        if self.length.value() == Some(0) {
+            return Ok(vec![None]);
+        }
+        // Boundary pruning already computes the carry fixed point, including inputs demanded by retained effects.
+        // Reusing its kept outputs keeps replay demand and boundary pruning governed by one operation-owned rule.
+        let pruning = self.prune_boundary(boundary.input_count, used_outputs, regions)?.unwrap();
+        Ok(vec![Some(pruning.kept_outputs)])
     }
 }
 
@@ -1885,11 +1993,11 @@ where
                 input_known.iter().enumerate().filter_map(|(index, &known)| known.then_some(index)).collect();
             let residual_inputs = (0..live_input_count)
                 .map(|index| {
-                    PartialEvaluationInput::Unknown(
+                    ResidualInputSource::UnknownInput(
                         input_order.iter().position(|&source| source == body_input_count + index).unwrap(),
                     )
                 })
-                .chain((0..residual_count).map(PartialEvaluationInput::Known))
+                .chain((0..residual_count).map(ResidualInputSource::ResidualEdge))
                 .collect();
             let partition_outputs = output_order
                 .iter()
@@ -1904,10 +2012,11 @@ where
             let partition = PartitionedProgram::from_parts(
                 Arc::unwrap_or_clone(primal_program),
                 tangent_program,
+                input_known.len(),
                 known_input_indices,
                 residual_inputs,
                 partition_outputs,
-            );
+            )?;
             reconstruct_partitioned_scan(
                 &fused_scan,
                 &reordered_input_types,
@@ -3019,6 +3128,16 @@ where
     KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
     ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
 {
+    // The split classifies each residual edge of the body partition by its role across iterations (e.g., the index,
+    // an invariant carry, a stacked input slice, or a value to stack). Forwarding identifies a residual input with a
+    // body input or output of a single iteration instead, which is not a value of the enclosing `scan` (e.g., a carry
+    // changes across iterations), so forwarded body partitions are rejected.
+    if partition.has_forwarded_residual_inputs() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "`{SCAN_OPERATION_NAME}` body partition forwards residual inputs, but splitting a scan requires residual \
+             edges",
+        )));
+    }
     let carry_count = scan.carry_count;
     let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len() - 1);
     let contains_reference_constants =
@@ -3058,7 +3177,7 @@ where
         .filter(|output| matches!(output, PartialEvaluationOutput::Known(_)))
         .count();
     let feeder_edge_count =
-        residual_inputs.iter().filter(|input| matches!(input, PartialEvaluationInput::Known(_))).count();
+        residual_inputs.iter().filter(|input| matches!(input, ResidualInputSource::ResidualEdge(_))).count();
     check_count!("output", known_program.output_ids(), known_result_count + feeder_edge_count, ProgramError);
     let known_program_output_types = known_program.output_types();
 
@@ -3141,7 +3260,7 @@ where
     let mut edge_stacked_inputs = Vec::with_capacity(residual_inputs.len());
     for input in residual_inputs.iter() {
         match input {
-            PartialEvaluationInput::Known(edge) => {
+            ResidualInputSource::ResidualEdge(edge) => {
                 if *edge != edge_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{SCAN_OPERATION_NAME}` body partition reported residual edge {edge} out of order",
@@ -3203,7 +3322,10 @@ where
                     known_program_output_edges.push(Some(*edge));
                 }
             }
-            PartialEvaluationInput::Unknown(_) => feeder_edge_positions.push(None),
+            ResidualInputSource::UnknownInput(_) => feeder_edge_positions.push(None),
+            ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                unreachable!("forwarded body partitions are rejected before splitting")
+            }
         }
     }
     let mut instantiated_edge_positions = vec![None; carry_count];
@@ -3422,19 +3544,22 @@ where
         let mut spliced_inputs = Vec::with_capacity(residual_inputs.len());
         for input in residual_inputs.iter() {
             match input {
-                PartialEvaluationInput::Unknown(index) => {
+                ResidualInputSource::UnknownInput(index) => {
                     spliced_inputs.push(unknown_body_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "`{SCAN_OPERATION_NAME}` known-ness split saw a residual feeder for a known body input"
                         ))
                     })?);
                 }
-                PartialEvaluationInput::Known(edge) => {
+                ResidualInputSource::ResidualEdge(edge) => {
                     spliced_inputs.push(*edge_input_atoms.get(*edge).ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "`{SCAN_OPERATION_NAME}` known-ness split lost a residual edge"
                         ))
                     })?)
+                }
+                ResidualInputSource::KnownInput(_) | ResidualInputSource::KnownOutput(_) => {
+                    unreachable!("forwarded body partitions are rejected before splitting")
                 }
             }
         }
@@ -4415,7 +4540,7 @@ mod tests {
     use crate::partial::PartialTracer;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceSource, ReferenceType, ReferenceView,
-        RegionDriver,
+        RegionDataFlowRegionBoundary, RegionDriver,
     };
     use crate::tracing::{DomainTracingContext, NestedTracingContext, Tracer, TracingContext};
 
@@ -5726,6 +5851,153 @@ mod tests {
                  whose leading dimension is not refined to extent 4",
             )),
         );
+    }
+
+    #[test]
+    fn test_scan_region_data_flow() {
+        assert!(matches!(TestScanOperation::new(2, 3).region_data_flow(), RegionDataFlow::Custom(_)));
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_input_sources() {
+        let operation = TestScanOperation::new(2, 3);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        assert_eq!(operation.input_sources(0, 0, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
+        assert_eq!(
+            operation.input_sources(0, 2, boundary),
+            Ok(RegionDataFlowSources::Known(vec![
+                RegionDataFlowSource::InstructionInput(1),
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index: 1 }),
+            ])),
+        );
+        assert_eq!(
+            operation.input_sources(0, 3, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
+        );
+        assert_eq!(
+            operation.input_sources(1, 0, boundary),
+            Err(ProgramError::MalformedProgram(
+                "`scan` region data flow input 0 in region 1 is out of bounds".to_owned(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_output_sources() {
+        let operation = TestScanOperation::new(2, 3);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        assert_eq!(
+            operation.output_sources(1, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput {
+                region_index: 0,
+                input_index: 2,
+            }])),
+        );
+        assert_eq!(
+            operation.output_sources(2, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionOutput(OutputRegionProvenance {
+                region_index: 0,
+                output_index: 2,
+            })])),
+        );
+        assert_eq!(
+            operation.output_sources(3, boundary),
+            Err(ProgramError::MalformedProgram("`scan` region data flow output 3 is out of bounds".to_owned())),
+        );
+        let empty = TestScanOperation::new(2, 0);
+        assert_eq!(
+            empty.output_sources(1, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(1)])),
+        );
+        assert_eq!(empty.output_sources(2, boundary), Ok(RegionDataFlowSources::Known(Vec::new())));
+
+        // A dynamic trip count can be zero, so its carried outputs retain the initial input source through feedback.
+        let length = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic = ScanOperation::<ArrayIrType>::new(2, Dimension::Dynamic(length));
+        let dynamic_boundary = RegionDataFlowBoundary { input_count: 4, ..boundary };
+        assert_eq!(dynamic.output_sources(1, dynamic_boundary), operation.output_sources(1, boundary));
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_execution_demands() {
+        /// Liveness of a body whose stacked result uses its first carry, which in turn uses its second carry.
+        #[derive(Default)]
+        struct CarryChain {
+            /// Used outputs queried while extending the demanded outputs over the carries.
+            queries: Vec<Vec<bool>>,
+        }
+
+        impl RegionLiveness for CarryChain {
+            fn used_region_inputs(
+                &mut self,
+                region_index: usize,
+                used_outputs: &[bool],
+            ) -> Result<Vec<bool>, ProgramError> {
+                assert_eq!(region_index, 0);
+                self.queries.push(used_outputs.to_vec());
+                Ok(vec![false, used_outputs[2], used_outputs[0], used_outputs[2]])
+            }
+        }
+
+        let operation = TestScanOperation::new(2, 3);
+        let regions = [RegionDataFlowRegionBoundary { input_count: 4, output_count: 3 }];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 3, regions: &regions };
+        let mut liveness = CarryChain::default();
+        assert_eq!(
+            operation.execution_demands(&[false, false, true], boundary, &mut liveness),
+            Ok(vec![Some(vec![true, true, true])]),
+        );
+        assert_eq!(liveness.queries, vec![vec![false, false, true], vec![true, false, true], vec![true, true, true]],);
+        liveness.queries.clear();
+        assert_eq!(
+            TestScanOperation::new(2, 0).execution_demands(&[true, true, true], boundary, &mut liveness),
+            Ok(vec![None]),
+        );
+        assert!(liveness.queries.is_empty());
+        assert_eq!(
+            operation.execution_demands(&[true], boundary, &mut liveness),
+            Err(ProgramError::MalformedProgram(
+                "`scan` region data flow expects used outputs for 3 positions but got 1".to_owned(),
+            )),
+        );
+        let malformed = RegionDataFlowBoundary { input_count: 2, ..boundary };
+        assert_eq!(
+            operation.execution_demands(&[true, true, true], malformed, &mut liveness),
+            Err(ProgramError::MalformedProgram(
+                "`scan` region data flow requires an index followed by 2 carries and stacked inputs, \
+                 matching body outputs and instruction inputs"
+                    .to_owned(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_scan_region_data_flow_execution_demands_retained_effects() {
+        /// Liveness of a body with no outputs whose retained effect consumes its stacked input.
+        struct EffectOnlyBody;
+
+        impl RegionLiveness for EffectOnlyBody {
+            fn used_region_inputs(
+                &mut self,
+                region_index: usize,
+                used_outputs: &[bool],
+            ) -> Result<Vec<bool>, ProgramError> {
+                assert_eq!(region_index, 0);
+                assert_eq!(used_outputs, &[] as &[bool]);
+                Ok(vec![false, true])
+            }
+        }
+
+        let regions = [RegionDataFlowRegionBoundary { input_count: 2, output_count: 0 }];
+        let boundary = RegionDataFlowBoundary { input_count: 1, output_count: 0, regions: &regions };
+        // Some(empty) still executes retained body work, whereas None would skip the body altogether.
+        assert_eq!(
+            TestScanOperation::new(0, 3).execution_demands(&[], boundary, &mut EffectOnlyBody),
+            Ok(vec![Some(Vec::new())]),
+        );
+        assert_eq!(TestScanOperation::new(0, 0).execution_demands(&[], boundary, &mut EffectOnlyBody), Ok(vec![None]),);
     }
 
     #[test]
@@ -9280,6 +9552,37 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_partial_evaluation_rejects_forwarded_body_partitions() {
+        // Forwarding would feed the carry `c` of a single iteration to the residual body directly, but the residual
+        // `scan` needs the value of `c` at every iteration, so the split rejects the partition before binding anything.
+        let partition = product_body().partition(&[true, true, false]).unwrap().forward_residuals().unwrap();
+        assert_eq!(
+            partition.residual_inputs(),
+            &[ResidualInputSource::UnknownInput(2), ResidualInputSource::KnownInput(1)],
+        );
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        assert_eq!(
+            reconstruct_partitioned_scan(
+                &TestScanOperation::new(1, 3),
+                &[ArrayType::scalar(DataType::I64), scalar_type.clone(), scalar_type],
+                2,
+                &Vec::<Array>::new(),
+                &[true, true, false],
+                &[true],
+                false,
+                partition,
+                |_| panic!("a rejected split lifts no known values"),
+                |_, _, _| panic!("a rejected split binds no known scan"),
+                |_, _, _| panic!("a rejected split binds no residual scan"),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "`scan` body partition forwards residual inputs, but splitting a scan requires residual edges"
+                    .to_string(),
+            )),
+        );
+    }
+
+    #[test]
     fn test_scan_partial_evaluation_residualizes_zero_length_scans_without_probing_the_body() {
         // A zero-length scan runs no iteration, so partial evaluation must not probe or specialize its body. The
         // division by the known zero carry stays in the residual body; signed array division by zero would yield -1,
@@ -10305,7 +10608,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[1, 2],
-                    residual_inputs=[Unknown(0), Known(0)],
+                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
                     outputs=[Unknown(0), Known(0)],
                 ]
                 known={

@@ -36,6 +36,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for array-valued gradient
   rules, including functions over rank-zero arrays.
 - Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
+- Keep test-only instrumentation out of production types and functions. Prefer observing existing behavior through
+  test fixtures (e.g., counting operation queries) and inspecting actual caches in colocated tests instead of adding
+  conditional counter fields or increments to production analysis.
 
 ## Structure
 

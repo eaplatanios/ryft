@@ -35,8 +35,8 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance,
     ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef,
-    RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow,
+    RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
     discharge_local_reference_operation, discharge_reference_free_operation,
 };
 
@@ -731,6 +731,11 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         // Interpretation replays the primal region, whose outputs are the call's outputs one for one.
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
     }
 
     fn rename_type_identities(
@@ -4857,6 +4862,18 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_region_data_flow() {
+        let operation = ArrayCustomFunction::from_rule_regions(CustomFunctionJvpRule::Explicit, true);
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
+        assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::None);
+        assert_eq!(
+            operation.output_region_provenance(1),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
+        );
+    }
+
+    #[test]
     fn test_custom_function_reference_discharge_jvp_rule() {
         // Discharge preserves both a read of the accumulator and a consuming freeze.
         check_custom_jvp_reference_discharge(false);
@@ -8406,6 +8423,16 @@ mod tests {
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
         assert_eq!(counters.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_function_transpose_region_data_flow() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let operation = ArrayCustomFunctionTranspose::from_backward_region(0, vec![scalar.clone()], vec![scalar]);
+        // The backward region is deferred transformation work rather than a declared ordinary computation source.
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Opaque));
+        assert_eq!(operation.region_slots(), &[RegionSlot::deferred_rule("backward")]);
+        assert_eq!(operation.output_region_provenance(0), Vec::new());
     }
 
     #[test]

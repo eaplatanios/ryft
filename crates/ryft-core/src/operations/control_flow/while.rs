@@ -60,8 +60,9 @@ use crate::programs::{
     OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
     ReferenceAccessMode, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
-    Typed, Value, ValueProjection,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionDataFlow, RegionDataFlowBoundary,
+    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRef,
+    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -168,6 +169,22 @@ impl<T: Type> WhileOperation<T> {
     pub fn iteration_bound(&self) -> Option<usize> {
         self.iteration_bound
     }
+
+    /// Validates the shared state positions and the condition's predicate boundary used by region data flow.
+    fn validate_data_flow_boundary(&self, boundary: RegionDataFlowBoundary<'_>) -> Result<(), ProgramError> {
+        if boundary.regions.len() != 2
+            || boundary.input_count != boundary.output_count
+            || boundary.regions[0].input_count != boundary.input_count
+            || boundary.regions[0].output_count != 1
+            || boundary.regions[1].input_count != boundary.input_count
+            || boundary.regions[1].output_count != boundary.output_count
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{WHILE_OPERATION_NAME}` region data flow requires matching state boundaries and one condition output",
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<T: Type> Copy for WhileOperation<T> {}
@@ -253,6 +270,11 @@ impl<T: WhileType> Operation for WhileOperation<T> {
     }
 
     #[inline]
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Custom(self)
+    }
+
+    #[inline]
     fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
         // Every `while` output is a loop carry aligned with the same-position input, so the allocation constraint maps
         // positionally for any output the operation actually declares.
@@ -278,6 +300,67 @@ impl<T: WhileType> Operation for WhileOperation<T> {
             }
             None => Ok(()),
         }
+    }
+}
+
+impl<T: WhileType> RegionDataFlowRule for WhileOperation<T> {
+    fn input_sources(
+        &self,
+        region_index: usize,
+        input_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if region_index >= 2 || input_index >= boundary.input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{WHILE_OPERATION_NAME}` region data flow input {input_index} in region {region_index} \
+                 is out of bounds",
+            )));
+        }
+        // Both condition and body see the initial state or a state produced by the preceding body invocation.
+        // Producer correspondence does not alter the separate reference-access and output-identity contracts.
+        Ok(RegionDataFlowSources::Known(vec![
+            RegionDataFlowSource::InstructionInput(input_index),
+            RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 1, output_index: input_index }),
+        ]))
+    }
+
+    fn output_sources(
+        &self,
+        output_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if output_index >= boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{WHILE_OPERATION_NAME}` region data flow output {output_index} is out of bounds",
+            )));
+        }
+        // A condition that is initially false forwards the initial state. Expanding the body input also accounts for
+        // every later state through its feedback source, without assuming any particular number of iterations.
+        Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput {
+            region_index: 1,
+            input_index: output_index,
+        }]))
+    }
+
+    fn execution_demands(
+        &self,
+        used_outputs: &[bool],
+        boundary: RegionDataFlowBoundary<'_>,
+        _regions: &mut dyn RegionLiveness,
+    ) -> Result<Vec<Option<Vec<bool>>>, ProgramError> {
+        self.validate_data_flow_boundary(boundary)?;
+        if used_outputs.len() != boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{WHILE_OPERATION_NAME}` region data flow expects used outputs for {} positions but got {}",
+                boundary.output_count,
+                used_outputs.len(),
+            )));
+        }
+        // The predicate executes even though it supplies no instruction output. While preserves its complete state
+        // boundary, so replay must classify every body result, including results the surrounding region does not use.
+        Ok(vec![Some(vec![true]), Some(vec![true; boundary.output_count])])
     }
 }
 
@@ -3210,9 +3293,11 @@ mod tests {
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Parameter;
+    use crate::partial::ResidualInputSource;
     use crate::programs::{
         BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
-        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, ValueDirectDispatch,
+        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary,
+        ValueDirectDispatch,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -4099,6 +4184,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_types, vec![ArrayIrType::Array(state_type); 2]);
+    }
+
+    #[test]
+    fn test_while_region_data_flow() {
+        assert!(matches!(WhileOperation::<ArrayType>::new().region_data_flow(), RegionDataFlow::Custom(_)));
+    }
+
+    #[test]
+    fn test_while_region_data_flow_input_sources() {
+        let operation = WhileOperation::<ArrayType>::new();
+        let regions = [
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 2, output_count: 2, regions: &regions };
+        let sources = Ok(RegionDataFlowSources::Known(vec![
+            RegionDataFlowSource::InstructionInput(1),
+            RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 1, output_index: 1 }),
+        ]));
+        assert_eq!(operation.input_sources(0, 1, boundary), sources);
+        assert_eq!(operation.input_sources(1, 1, boundary), sources);
+        assert_eq!(
+            operation.input_sources(1, 2, boundary),
+            Err(ProgramError::MalformedProgram(
+                "`while` region data flow input 2 in region 1 is out of bounds".to_owned(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_while_region_data_flow_output_sources() {
+        let operation = WhileOperation::<ArrayType>::new();
+        let regions = [
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 2, output_count: 2, regions: &regions };
+        assert_eq!(
+            operation.output_sources(1, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::RegionInput {
+                region_index: 1,
+                input_index: 1,
+            }])),
+        );
+        assert_eq!(
+            operation.output_sources(2, boundary),
+            Err(ProgramError::MalformedProgram("`while` region data flow output 2 is out of bounds".to_owned())),
+        );
+    }
+
+    #[test]
+    fn test_while_region_data_flow_execution_demands() {
+        /// Liveness callback that fails if while data flow attempts to prune its complete state boundary.
+        struct CompleteBoundary;
+
+        impl RegionLiveness for CompleteBoundary {
+            fn used_region_inputs(
+                &mut self,
+                _region_index: usize,
+                _used_outputs: &[bool],
+            ) -> Result<Vec<bool>, ProgramError> {
+                panic!("while data flow must retain the complete state boundary")
+            }
+        }
+
+        let operation = WhileOperation::<ArrayType>::new();
+        let regions = [
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 2, output_count: 2, regions: &regions };
+        // The condition's predicate is an execution-only root and every state output stays demanded even when the
+        // instruction is retained solely for effects. An iteration bound leaves these conservative roots intact.
+        assert_eq!(
+            operation.execution_demands(&[false, true], boundary, &mut CompleteBoundary),
+            Ok(vec![Some(vec![true]), Some(vec![true, true])]),
+        );
+        assert_eq!(
+            operation.with_iteration_bound(3).unwrap().execution_demands(
+                &[false, false],
+                boundary,
+                &mut CompleteBoundary,
+            ),
+            Ok(vec![Some(vec![true]), Some(vec![true, true])]),
+        );
+        assert_eq!(
+            operation.execution_demands(&[true], boundary, &mut CompleteBoundary),
+            Err(ProgramError::MalformedProgram(
+                "`while` region data flow expects used outputs for 2 positions but got 1".to_owned()
+            )),
+        );
+        let malformed_regions = [
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 },
+        ];
+        assert_eq!(
+            operation.execution_demands(
+                &[true, true],
+                RegionDataFlowBoundary { regions: &malformed_regions, ..boundary },
+                &mut CompleteBoundary,
+            ),
+            Err(ProgramError::MalformedProgram(
+                "`while` region data flow requires matching state boundaries and one condition output".to_owned(),
+            )),
+        );
     }
 
     #[test]
@@ -7361,9 +7551,10 @@ mod tests {
         let residual_inputs = partition
             .residual_inputs()
             .iter()
-            .map(|input| match input {
-                PartialEvaluationInput::Known(index) => known_outputs[known_output_count + index].clone(),
-                PartialEvaluationInput::Unknown(index) => arguments[*index].clone(),
+            .map(|source| match source {
+                ResidualInputSource::ResidualEdge(index) => known_outputs[known_output_count + index].clone(),
+                ResidualInputSource::UnknownInput(index) => arguments[*index].clone(),
+                source => panic!("ordinary partitions have no `{source:?}` sources"),
             })
             .collect();
         let residual_outputs = partition.residual_program().interpret(residual_inputs).unwrap();

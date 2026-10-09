@@ -181,7 +181,7 @@ in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, 
 | Primitive (JAX) | Used by | State | Notes |
 |---|---|---|---|
 | mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ConstrainShardingOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
-| `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/shard_map.rs`) |
+| `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/lowering.rs`) |
 | `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `ParallelReduceOperation` with any `ReductionKind` (incl. `Min`) |
 | `lax.all_gather` | tensor-parallel gathers | ✅ | `ParallelAllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
 | reduce-scatter | ZeRO-style gradient sharding | ✅ | `ParallelSumScatterOperation` |
@@ -1604,10 +1604,10 @@ choices (attention projections FP8, MLP NVFP4, §4.4) so call sites stay clean.
   share one retained artifact. A naive extent-specialized implementation (mirroring the ~70-line
   `.jvp()` shape around the core `batch` transform, one compilation per axis size) is a few
   days of work; the intended runtime-extent design is weeks, but overlaps the dynamic-shapes
-  work already in flight. Independent gap either way: `shard_map`/`linear_shard_map` have no
-  batching rules yet. Not on the training critical path (data batching is just the leading
-  axis inside the traced loss); it matters for vmap-of-jit workflows (ensembles, multi-seed,
-  per-example gradients).
+  work already in flight. Independent gap for the runtime-extent design: `shard_map` batches
+  mapped inputs only for a static extent (its boundary types are static). Not on the training critical path (data
+  batching is just the leading axis inside the traced loss); it matters for vmap-of-jit
+  workflows (ensembles, multi-seed, per-example gradients).
 
 ---
 

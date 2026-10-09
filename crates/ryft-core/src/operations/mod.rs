@@ -155,8 +155,8 @@ pub use references::{
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
     REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
     ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceOperations, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation,
+    ReferenceOperations, ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
 };
 pub use rounding::{
     CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,
