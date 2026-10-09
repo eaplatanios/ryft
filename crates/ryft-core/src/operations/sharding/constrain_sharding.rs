@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use ryft_macros::capability;
-
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, MeshAxisType, Sharding,
     ShardingDimension,
@@ -16,14 +14,15 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::sharding::reshard::RESHARD_OPERATION_NAME;
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
-    ValueDomainDispatch,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+    ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
 };
 
 #[cfg(doc)]
-use crate::operations::sharding::reshard::ReshardOperation;
+use crate::operations::sharding::reshard::{Reshard, ReshardOperation};
 
 /// Canonical operation name for [`ConstrainShardingOperation`].
 pub const CONSTRAIN_SHARDING_OPERATION_NAME: &str = "constrain_sharding";
@@ -298,20 +297,29 @@ impl_differentiable_operation! {
     },
 }
 
-/// Represents the ability to constrain the placement of a value over auto mesh axes. [`ConstrainSharding`] stages a
-/// [`ConstrainShardingOperation`], which is an identity function whose constraint is enforced when a backend lowers
-/// the program. Concrete single-device values are returned unchanged, and context-carrying values stage the operation
-/// instead, so that transforms that apply operations through interpretation preserve the constraint. Every
-/// implementation validates the constraint exactly like [`ConstrainShardingOperation`] type inference does,
-/// so that eager and staged evaluation accept the same programs.
+/// Executes one [`ConstrainShardingOperation`] for a value through its [`Value::Dispatch`] policy. This backend
+/// extension point separates primitive leaf execution from the structural [`ConstrainSharding`] capability.
+/// Domain-dispatched array values bind the operation in their own context while direct eager arrays execute its checked
+/// semantics without binding it again. Backend authors can implement this trait on [`ValueDirectDispatch`] for their
+/// own value types. Implementations must validate targets through the operation's type inference contract and preserve
+/// the input's elements, shape, data type, and domain. Composite implementations project the array member and lift the
+/// result back, so dimensions and references retain their existing projection diagnostics.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
-#[capability(projection(ArrayIrType => ArrayType))]
-pub trait ConstrainSharding<T = <Self as Capability>::Universe>: Capability + Clone {
-    /// Constrains the placement of `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid
-    /// constraint for `self` or the constraint cannot be recorded in the value's context.
-    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
+/// `T` is the value's type descriptor, and `V` is its representation. Including `T` keeps dispatch over homogeneous
+/// arrays and composite array IR values disjoint.
+pub trait ConstrainShardingDispatch<T: Type, V: Value<Type = T>> {
+    /// Applies the primitive sharding operation to `input` and returns its value.
+    fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError>;
+}
+
+impl ConstrainShardingDispatch<ArrayType, Array> for ValueDirectDispatch {
+    fn constrain_sharding(input: &Array, sharding: &Sharding) -> Result<Array, ProgramError> {
+        // The constraint is untracked, and so the output of a concrete single-device value is the value itself
+        // once the `ConstrainShardingOperation` type inference rule has accepted the constraint for its type.
+        let input_type = input.r#type().into_owned();
+        ConstrainShardingOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
+        Ok(input.clone())
+    }
 }
 
 impl<
@@ -320,46 +328,117 @@ impl<
             Dispatch = ValueDomainDispatch,
             Domain: Context<Type = ArrayType, Operation: From<ConstrainShardingOperation>>,
         >,
-> ConstrainSharding<ArrayType> for V
+> ConstrainShardingDispatch<ArrayType, V> for ValueDomainDispatch
 {
-    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        // Any context-carrying value constrains its sharding by binding a `ConstrainShardingOperation` through its own
-        // context. The `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the
-        // capability directly, so it covers the transform tracers without conflicting with the concrete
-        // implementations.
-        let mut outputs = self.domain().bind(
+    fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+        // Staging and transform values bind through their domain; direct eager execution uses the separate policy below.
+        let mut outputs = input.domain().bind(
             ConstrainShardingOperation::new(sharding.clone()),
             Vec::new(),
-            std::slice::from_ref(self),
+            std::slice::from_ref(input),
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl ConstrainSharding for Array {
-    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        // The constraint is untracked, and so the output of a concrete single-device value is the value itself
-        // once the `ConstrainShardingOperation` type inference rule has accepted the constraint for its type.
-        let input_type = self.r#type().into_owned();
-        ConstrainShardingOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
-        Ok(self.clone())
+impl<
+    V: Value<Type = ArrayIrType>
+        + ValueProjection<
+            ArrayType,
+            Projected: Value<Type = ArrayType, Dispatch: ConstrainShardingDispatch<ArrayType, V::Projected>>,
+        >,
+> ConstrainShardingDispatch<ArrayIrType, V> for V::Dispatch
+{
+    #[inline]
+    fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+        let input = input.clone().into_projected()?;
+        let output = <V::Projected as Value>::Dispatch::constrain_sharding(&input, sharding)?;
+        Ok(V::from_projected(output))
+    }
+}
+
+// TODO(eaplatanios): The type bounds on the trait function look a bit weird. Can we put the `Parameterized` bound
+//  on the trait itself instead of on the function that it owns?
+/// Constrains the placement of the leaves of a [`Parameterized`] receiver over [`Auto`](MeshAxisType::Auto) mesh axes
+/// to the corresponding [`Sharding`]s. This preserves each leaf's elements, shape, data type, and tracked sharding
+/// while recording a [`ConstrainShardingOperation`] that backend lowering must enforce. Lowering merges the requested
+/// auto-axis placement with the input's tracked placement (refer to [`ConstrainShardingOperation::lowered_sharding`]),
+/// so the compiler must honor both and remains free where placement is unconstrained. To perform a tracked transition
+/// over [`Explicit`](MeshAxisType::Explicit) axes, use [`Reshard::reshard`].
+///
+/// Concrete single-device arrays are returned unchanged after type validation. Context-carrying values stage the
+/// operation, preserving the constraint through interpretation and transformations. Differentiation applies the
+/// same constraint to tangents and cotangents; the input's tracked sharding is not consulted for the transpose.
+///
+/// The leaf parameter `P` defaults to `Self`: a value is a one-leaf structure accepting one `Sharding`, while nested
+/// tuples, vectors, maps, and custom structures accept the corresponding `Self::To<Sharding>`. Parameter paths must
+/// agree, and the receiver's structure and static fields are preserved without requiring the receiver to be `Clone`.
+/// Homogeneous and composite array values share this API through their [`ConstrainShardingDispatch`] implementations.
+///
+/// The universe parameter `T` defaults to the leaf's [`Capability`] universe, so that homogeneous array leaves use
+/// [`ArrayType`] and composite array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
+/// Implementations tie `T` to that universe, which selects their primitive dispatch family; specifying a different
+/// universe does not grant the capability. The universe is distinct from `P`, which identifies the structural leaves.
+pub trait ConstrainSharding<P: Parameter + Capability = Self, T = <P as Capability>::Universe>: Sized {
+    /// Applies the sharding operation to every leaf with its corresponding [`Sharding`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `shardings`: Shardings with the same ordered parameter paths as the receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] before executing any leaf if the parameter paths differ, and the
+    /// primitive dispatch's type-inference, projection, or execution errors otherwise.
+    fn constrain_sharding(&self, shardings: &<Self as Parameterized<P>>::To<Sharding>) -> Result<Self, ProgramError>
+    where
+        Self: Parameterized<P, Family: ParameterizedFamily<Sharding>>;
+}
+
+// The `Universe = T` constraint selects the leaf's actual execution family; its type view drives primitive dispatch.
+// Keep the structural bound on the function as putting it on the trait shadows the concrete leaf family in generic
+// `V: Value + ConstrainSharding` code, preventing its target from normalizing to a single `Sharding`.
+impl<T, P: Value<Dispatch: ConstrainShardingDispatch<P::Type, P>> + Capability<Universe = T>, S: Parameterized<P>>
+    ConstrainSharding<P, T> for S
+{
+    #[inline]
+    fn constrain_sharding(&self, shardings: &S::To<Sharding>) -> Result<Self, ProgramError>
+    where
+        S::Family: ParameterizedFamily<Sharding>,
+    {
+        if !self.parameter_paths().eq(shardings.parameter_paths()) {
+            return Err(ProgramError::InvalidArgument {
+                message: "receiver and `shardings` must have the same parameter structure".to_string(),
+            });
+        }
+        let outputs = self
+            .parameters()
+            .zip(shardings.parameters())
+            .map(|(input, sharding)| P::Dispatch::constrain_sharding(input, sharding))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_parameters(self.parameter_structure(), outputs)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis, RaggedAxis, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
+        RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::programs::{EffectClasses, EmptyRegionDriver, ValueProjection};
+    use crate::parameters::Placeholder;
+    use crate::programs::{EffectClasses, EmptyRegionDriver};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -783,5 +862,184 @@ mod tests {
                 "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank (2) does not match the input rank (1)",
             )))),
         );
+    }
+
+    #[test]
+    fn test_constrain_sharding_structured() {
+        // Every leaf of a structured value is constrained by its own sharding, and its tracked type is unchanged.
+        let mesh = mesh();
+        let tracked = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let input_types = (
+            ArrayType::new_static(DataType::F32, [8]).with_sharding(tracked).unwrap(),
+            ArrayType::new_static(DataType::F32, [4]),
+        );
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs| inputs.constrain_sharding(&(constraint.clone(), constraint.clone())),
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(output_types, input_types);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}], %1:f32[4] .
+                let %2:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] = \
+                        constrain_sharding [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]}] %0
+                    %3:f32[4] = \
+                        constrain_sharding [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]}] %1
+                in (%2, %3)"
+            },
+        );
+
+        // A constraint whose rank differs from the rank of its leaf is rejected before anything is staged.
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.constrain_sharding(&Sharding::replicated(mesh, 2)),
+            ArrayType::new_static(DataType::F32, [8]),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(error))
+                if error.to_string() == "`constrain_sharding` rank (2) does not match the input rank (1)",
+        ));
+    }
+
+    #[test]
+    fn test_constrain_sharding_structured_composite_tracing() {
+        // Every leaf of a structured value is constrained by its own sharding, and its tracked type is unchanged.
+        let mesh = mesh();
+        let tracked = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let input_types = (
+            ArrayType::new_static(DataType::F32, [8]).with_sharding(tracked).unwrap(),
+            ArrayType::new_static(DataType::F32, [4]),
+        );
+        let (output_types, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs| inputs.constrain_sharding(&(constraint.clone(), constraint.clone())),
+            (ArrayIrType::Array(input_types.0.clone()), ArrayIrType::Array(input_types.1.clone())),
+        )
+        .unwrap();
+        assert_eq!(output_types, (input_types.0.into(), input_types.1.into()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}], %1:f32[4] .
+                let %2:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] = \
+                        constrain_sharding [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]}] %0
+                    %3:f32[4] = \
+                        constrain_sharding [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]}] %1
+                in (%2, %3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_constrain_sharding_structured_projection_errors() {
+        let sharding = Sharding::replicated(mesh(), 0);
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
+        assert!(matches!(
+            dimension.constrain_sharding(&sharding),
+            Err(ProgramError::Type(error)) if error.to_string() == "expected array type but got dimension type",
+        ));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        assert!(matches!(
+            reference.constrain_sharding(&sharding),
+            Err(ProgramError::Type(error)) if error.to_string() == "expected array type but got reference type",
+        ));
+    }
+
+    #[test]
+    fn test_constrain_sharding_structured_eager() {
+        /// Structured arrays with a static field that sharding operations must preserve.
+        #[derive(ryft_macros::Parameterized)]
+        struct Inputs<P: Parameter> {
+            /// Array leaves in a nested tuple and vector.
+            values: (P, Vec<P>),
+
+            /// Static label belonging to the receiver.
+            label: &'static str,
+        }
+
+        // Only the placeholder structure is cloned; the array-containing receiver intentionally is not Clone.
+        impl Clone for Inputs<Placeholder> {
+            fn clone(&self) -> Self {
+                Self { values: self.values.clone(), label: self.label }
+            }
+        }
+
+        /// Exercises the public capability through an ordinary generic leaf bound.
+        fn apply_leaf<V: Value + ConstrainSharding>(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+            input.constrain_sharding(sharding)
+        }
+
+        /// Exercises the same capability through a domain's generic value type.
+        fn apply_domain<C: Domain<Value: ConstrainSharding>>(
+            input: &C::Value,
+            sharding: &Sharding,
+        ) -> Result<C::Value, ProgramError> {
+            input.constrain_sharding(sharding)
+        }
+
+        let mesh = mesh();
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let scalar = Array::scalar(3.0f32).unwrap();
+        let inputs = Inputs { values: (input.clone(), vec![scalar.clone()]), label: "input" };
+        let shardings = Inputs { values: (constraint.clone(), vec![replicated.clone()]), label: "shardings" };
+        let outputs = inputs.constrain_sharding(&shardings).unwrap();
+        assert_eq!(outputs.label, "input");
+        assert_eq!(outputs.values.0, input);
+        assert_eq!(outputs.values.1[0], scalar);
+
+        assert_eq!(apply_leaf(&input, &constraint), input.constrain_sharding(&constraint));
+        assert_eq!(
+            apply_domain::<EagerContext<Array, ArrayOperation<Array>>>(&input, &constraint),
+            input.constrain_sharding(&constraint),
+        );
+
+        // Composite array members dispatch through the same leaf capability.
+        let inputs = vec![ArrayIrValue::Array(input)];
+        let expected = vec![inputs[0].constrain_sharding(&constraint).unwrap()];
+        assert_eq!(inputs.constrain_sharding(&vec![constraint]).unwrap(), expected);
+
+        assert!(Vec::<Array>::new().constrain_sharding(&Vec::new()).unwrap().is_empty());
+        assert_eq!(<() as ConstrainSharding<Array>>::constrain_sharding(&(), &()), Ok(()));
+    }
+
+    #[test]
+    fn test_constrain_sharding_structured_mismatched_parameter_paths() {
+        let input = Array::scalar(1.0f32).unwrap();
+        let sharding = Sharding::replicated(mesh(), 0);
+        let missing = vec![input.clone(), input.clone()].constrain_sharding(&vec![sharding.clone()]);
+        assert!(matches!(
+            missing,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+        let extra = vec![input.clone()].constrain_sharding(&vec![sharding.clone(), sharding.clone()]);
+        assert!(matches!(
+            extra,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+
+        // Matching leaf counts do not imply matching paths.
+        let inputs = BTreeMap::from([("left", input.clone())]);
+        let shardings = BTreeMap::from([("right", sharding)]);
+        assert!(matches!(
+            inputs.constrain_sharding(&shardings),
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+
+        // Structure validation happens before rank validation or leaf dispatch.
+        let invalid = Sharding::replicated(mesh(), 1);
+        let result = vec![input.clone(), input].constrain_sharding(&vec![invalid]);
+        assert!(matches!(
+            result,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
     }
 }
