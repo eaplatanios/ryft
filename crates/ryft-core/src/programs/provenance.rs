@@ -93,7 +93,7 @@ impl Display for ProvenanceNode {
 
 /// Persistent, hierarchical, non-semantic origin of one [`Instruction`](crate::Instruction). Despite the related
 /// name, this is unrelated to [`OutputRegionProvenance`](crate::OutputRegionProvenance), which describes the _semantic_
-/// dataflow origin of an operation output. Provenance records _where_ an instruction came from (e.g., the framework
+/// data flow origin of an operation output. Provenance records _where_ an instruction came from (e.g., the framework
 /// facility that staged it, or the source instructions a transform generated it from) without adding a Single Static
 /// Assignment (SSA) value, a data dependency, or any semantic behavior. It is purely diagnostic (i.e., type inference,
 /// effects, differentiation, batching, interpretation, optimization legality, and the canonical semantic
@@ -162,12 +162,8 @@ impl Provenance {
                         }
                     }
                 }
-                Some(_) => {
-                    if !normalized.contains(&origin) {
-                        normalized.push(origin);
-                    }
-                }
-                None => {}
+                Some(_) if !normalized.contains(&origin) => normalized.push(origin),
+                _ => {}
             }
         }
         match normalized.len() {

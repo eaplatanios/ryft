@@ -1973,9 +1973,14 @@ pub enum RegionDataFlow<'o> {
     /// region outputs that [`Operation::output_region_provenance`] names, without feedback or bypasses.
     Provenance,
 
-    // TODO(eaplatanios): Does this need to be a trait object or can we make it generic? And should we?
     /// Borrows the operation's own [`RegionDataFlowRule`] for recurrences, bypasses, or regions that execute without
     /// producing any output of the operation (e.g., the condition of a `while` loop).
+    ///
+    /// Note that rules are trait objects rather than a generic parameter because a generic rule type would require an
+    /// associated rule type on every `Operation` implementation (associated type defaults are unstable), a generated
+    /// rule enum for every derived operation enum whose variants carry different rules, and a type parameter on every
+    /// consumer of this declaration. Rules are queried once per instruction during analyses, so dynamic dispatch costs
+    /// nothing measurable.
     Custom(&'o dyn RegionDataFlowRule),
 }
 
@@ -3148,14 +3153,25 @@ mod tests {
     }
 
     #[test]
-    fn test_region_arena_effects() {
-        let (arena, [_, _, _, root]) = diamond_closure_arena();
-        let summary = arena.effects(root).unwrap();
-        let expected_classes =
-            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState));
-        assert_eq!(summary.classes(), expected_classes);
-        assert!(summary.has_observable_effects_when_unused());
-        assert_eq!(arena.effects(RegionId::new(arena.len())), None);
+    fn test_region_arena_rejects_unsealed_region_reference() {
+        let input = AtomId::new(0);
+        let output = AtomId::new(1);
+        let region: Region<Array, TestRegionOperation> = Region::new(
+            vec![Atom::Variable(ArrayType::scalar(DataType::F64)), Atom::Variable(ArrayType::scalar(DataType::F64))],
+            vec![input],
+            vec![output],
+            vec![Instruction::new(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![input],
+                vec![output],
+                vec![RegionId::new(0)],
+            )],
+        );
+        assert!(matches!(
+            RegionArena::from_regions(vec![region]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction references region ^0 which has not been sealed yet",
+        ));
     }
 
     #[test]
@@ -3199,6 +3215,17 @@ mod tests {
     }
 
     #[test]
+    fn test_region_arena_effects() {
+        let (arena, [_, _, _, root]) = diamond_closure_arena();
+        let summary = arena.effects(root).unwrap();
+        let expected_classes =
+            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState));
+        assert_eq!(summary.classes(), expected_classes);
+        assert!(summary.has_observable_effects_when_unused());
+        assert_eq!(arena.effects(RegionId::new(arena.len())), None);
+    }
+
+    #[test]
     fn test_region_arena_sealing_retains_transform_caches_only_for_identity_rebuilds() {
         let program = program_with_reused_region();
         let leaf_artifact = program.region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
@@ -3226,28 +3253,6 @@ mod tests {
         let root_id = arena.push_preserving_transform_cache(root.clone()).unwrap();
         let artifact = RegionRef::new(&arena, root_id).unwrap().retained_identity_transform();
         assert!(Arc::ptr_eq(&artifact, &root_artifact));
-    }
-
-    #[test]
-    fn test_region_arena_rejects_unsealed_region_reference() {
-        let input = AtomId::new(0);
-        let output = AtomId::new(1);
-        let region: Region<Array, TestRegionOperation> = Region::new(
-            vec![Atom::Variable(ArrayType::scalar(DataType::F64)), Atom::Variable(ArrayType::scalar(DataType::F64))],
-            vec![input],
-            vec![output],
-            vec![Instruction::new(
-                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
-                vec![input],
-                vec![output],
-                vec![RegionId::new(0)],
-            )],
-        );
-        assert!(matches!(
-            RegionArena::from_regions(vec![region]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "instruction references region ^0 which has not been sealed yet",
-        ));
     }
 
     #[test]
@@ -3311,6 +3316,31 @@ mod tests {
         assert!(lifecycle(false).entry_region_ref().contains_references_in_closure());
         assert!(!lifecycle(false).entry_region_ref().contains_reference_accesses_in_closure());
         assert!(lifecycle(true).entry_region_ref().contains_reference_accesses_in_closure());
+    }
+
+    #[test]
+    fn test_region_ref_rejects_out_of_range_id() {
+        let program = identity_program(ArrayType::scalar(DataType::F64));
+        assert!(matches!(
+            RegionRef::new(program.regions(), RegionId::new(42)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
+        ));
+    }
+
+    #[test]
+    fn test_region_ref_with_id() {
+        let program = program_with_reused_region();
+        let entry = program.entry_region_ref();
+        let nested_id = entry.instructions()[0].regions()[0];
+        let nested = entry.with_id(nested_id).unwrap();
+        assert_eq!(nested.id(), nested_id);
+        assert!(std::ptr::eq(nested.arena(), entry.arena()));
+        assert_eq!(nested.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(nested.output_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert!(matches!(
+            entry.with_id(RegionId::new(42)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
+        ));
     }
 
     #[test]
@@ -3628,31 +3658,6 @@ mod tests {
             )
             .unwrap();
         assert!(access.entry_region_ref().has_observable_effects_in_closure());
-    }
-
-    #[test]
-    fn test_region_ref_with_id() {
-        let program = program_with_reused_region();
-        let entry = program.entry_region_ref();
-        let nested_id = entry.instructions()[0].regions()[0];
-        let nested = entry.with_id(nested_id).unwrap();
-        assert_eq!(nested.id(), nested_id);
-        assert!(std::ptr::eq(nested.arena(), entry.arena()));
-        assert_eq!(nested.input_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert_eq!(nested.output_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert!(matches!(
-            entry.with_id(RegionId::new(42)),
-            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
-        ));
-    }
-
-    #[test]
-    fn test_region_ref_rejects_out_of_range_id() {
-        let program = identity_program(ArrayType::scalar(DataType::F64));
-        assert!(matches!(
-            RegionRef::new(program.regions(), RegionId::new(42)),
-            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
-        ));
     }
 
     #[test]
