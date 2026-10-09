@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use ryft_macros::capability;
-
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, MeshAxisType, Sharding,
     ShardingDimension,
@@ -17,14 +15,15 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
-    ValueDomainDispatch,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+    ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
 };
 
 #[cfg(doc)]
-use crate::operations::sharding::constrain_sharding::ConstrainShardingOperation;
+use crate::operations::sharding::constrain_sharding::{ConstrainSharding, ConstrainShardingOperation};
 
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";
@@ -273,20 +272,32 @@ impl_differentiable_operation! {
     },
 }
 
-/// Represents the ability to reshard a value to a target [`Sharding`]. [`Reshard`] stages a [`ReshardOperation`],
-/// which is an identity function on the array's elements whose output type carries the target sharding. Concrete
-/// single-device values record the target on their type and leave their payload untouched, and context-carrying values
-/// stage the operation instead, so that transforms that apply operations through interpretation (e.g., program batching
-/// and re-tracing) preserve the resharding. Every implementation validates the target exactly like [`ReshardOperation`]
-/// type inference does, so that eager and staged evaluation accept the same programs.
+/// Executes one [`ReshardOperation`] for a value through its [`Value::Dispatch`] policy. This backend extension point
+/// separates primitive leaf execution from the structural [`Reshard`] capability. Domain-dispatched array values bind
+/// the operation in their own context while direct eager arrays execute its checked semantics without binding it again.
+/// Backend authors can implement this trait on [`ValueDirectDispatch`] for their own value types. Implementations must
+/// validate targets through the operation's type inference contract and preserve the input's elements, shape, data
+/// type, and domain. Composite implementations project the array member and lift the result back, so dimensions and
+/// references retain their existing projection diagnostics.
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
-/// values implement this capability for [`ArrayType`] and composite array IR values implement it for [`ArrayIrType`].
-#[capability(projection(ArrayIrType => ArrayType))]
-pub trait Reshard<T = <Self as Capability>::Universe>: Capability + Clone {
-    /// Reshards `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid target for `self` or
-    /// the resharding cannot be recorded in the value's context.
-    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
+/// `T` is the value's type descriptor, and `V` is its representation. Including `T` keeps dispatch over homogeneous
+/// arrays and composite array IR values disjoint.
+pub trait ReshardDispatch<T: Type, V: Value<Type = T>> {
+    /// Applies the primitive sharding operation to `input` and returns its value.
+    fn reshard(input: &V, sharding: &Sharding) -> Result<V, ProgramError>;
+}
+
+impl ReshardDispatch<ArrayType, Array> for ValueDirectDispatch {
+    fn reshard(input: &Array, sharding: &Sharding) -> Result<Array, ProgramError> {
+        // An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records
+        // the target, and the output type comes from the `ReshardOperation` type inference rule itself, so that eager
+        // evaluation validates the target and carries the input's varying manual axes over exactly like staged programs
+        // do.
+        let input_type = input.r#type().into_owned();
+        let mut output_types = ReshardOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        Ok(Array::new_unchecked(output_types.remove(0), input.shared_storage_bytes().clone()))
+    }
 }
 
 impl<
@@ -295,46 +306,115 @@ impl<
             Dispatch = ValueDomainDispatch,
             Domain: Context<Type = ArrayType, Operation: From<ReshardOperation>>,
         >,
-> Reshard<ArrayType> for V
+> ReshardDispatch<ArrayType, V> for ValueDomainDispatch
 {
-    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        // Any context-carrying value reshards by binding a `ReshardOperation` through its own context. The
-        // `ValueDomainDispatch` marker makes this disjoint from the eager value types, which implement the capability
-        // directly, so it covers the transform tracers without conflicting with the concrete implementations.
+    fn reshard(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+        // Staging and transform values bind through their domain while direct eager execution
+        // uses the separate policy above.
         let mut outputs =
-            self.domain()
-                .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))?;
+            input
+                .domain()
+                .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(input))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl Reshard for Array {
-    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        // An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records
-        // the target, and the output type comes from the `ReshardOperation` type inference rule itself, so that eager
-        // evaluation validates the target and carries the input's varying manual axes over exactly like staged programs
-        // do.
-        let input_type = self.r#type().into_owned();
-        let mut output_types = ReshardOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
-        check_count!("output", output_types, 1, ProgramError);
-        Ok(Self::new_unchecked(output_types.remove(0), self.shared_storage_bytes().clone()))
+impl<
+    V: Value<Type = ArrayIrType>
+        + ValueProjection<
+            ArrayType,
+            Projected: Value<Type = ArrayType, Dispatch: ReshardDispatch<ArrayType, V::Projected>>,
+        >,
+> ReshardDispatch<ArrayIrType, V> for V::Dispatch
+{
+    fn reshard(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+        let input = input.clone().into_projected()?;
+        let output = <V::Projected as Value>::Dispatch::reshard(&input, sharding)?;
+        Ok(V::from_projected(output))
+    }
+}
+
+/// Reshards the leaves of a [`Parameterized`] receiver to the corresponding target [`Sharding`]s, a tracked transition
+/// over the [`Explicit`](MeshAxisType::Explicit) mesh axes. Each leaf preserves its elements, shape, and data type
+/// while replacing its tracked sharding with the target, extended with its manual variation and reduction facts.
+/// Target partitioning and reduction state use explicit mesh axes; placement over [`Auto`](MeshAxisType::Auto) axes
+/// is constrained through [`ConstrainSharding::constrain_sharding`].
+///
+/// Concrete single-device arrays record the target on their type without changing their payload. Context-carrying
+/// values stage a [`ReshardOperation`], so interpretation over staging and transform values preserves the transition.
+/// Differentiation reshards tangents to the same target; transposition reshards cotangents to the dual of the input's
+/// sharding. Cross-mesh reshards are not representable inside one staged program: backends transfer values between
+/// placements outside traced programs.
+///
+/// The leaf parameter `P` defaults to `Self`: a value is a one-leaf structure accepting one `Sharding`, while nested
+/// tuples, vectors, maps, and custom structures accept the corresponding `Self::To<Sharding>`. Parameter paths must
+/// agree, and the receiver's structure and static fields are preserved without requiring the receiver to be `Clone`.
+/// Homogeneous and composite array values share this API through their primitive [`ReshardDispatch`] implementations.
+///
+/// The universe parameter `T` defaults to the leaf's [`Capability`] universe, so that homogeneous array leaves use
+/// [`ArrayType`] and composite array IR leaves use [`ArrayIrType`]. A structure uses the same universe as its leaves.
+/// Implementations tie `T` to that universe, which selects their primitive dispatch family; specifying a different
+/// universe does not grant the capability. The universe is distinct from `P`, which identifies the structural leaves.
+pub trait Reshard<P: Parameter + Capability = Self, T = <P as Capability>::Universe>: Sized {
+    /// Applies the sharding operation to every leaf with its corresponding [`Sharding`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `shardings`: Shardings with the same ordered parameter paths as the receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] before executing any leaf if the parameter paths differ, and the
+    /// primitive dispatch's type-inference, projection, or execution errors otherwise.
+    fn reshard(&self, shardings: &<Self as Parameterized<P>>::To<Sharding>) -> Result<Self, ProgramError>
+    where
+        Self: Parameterized<P, Family: ParameterizedFamily<Sharding>>;
+}
+
+// The `Universe = T` constraint selects the leaf's actual execution family; its type view drives primitive dispatch.
+// Keep the structural bound on the function as putting it on the trait shadows the concrete leaf family in generic
+// `V: Value + Reshard` code, preventing its target from normalizing to a single `Sharding`.
+impl<T, P: Value<Dispatch: ReshardDispatch<P::Type, P>> + Capability<Universe = T>, S: Parameterized<P>> Reshard<P, T>
+    for S
+{
+    #[inline]
+    fn reshard(&self, shardings: &<S as Parameterized<P>>::To<Sharding>) -> Result<Self, ProgramError>
+    where
+        <S as Parameterized<P>>::Family: ParameterizedFamily<Sharding>,
+    {
+        if !self.parameter_paths().eq(shardings.parameter_paths()) {
+            return Err(ProgramError::InvalidArgument {
+                message: "receiver and `shardings` must have the same parameter structure".to_string(),
+            });
+        }
+        let outputs = self
+            .parameters()
+            .zip(shardings.parameters())
+            .map(|(input, sharding)| P::Dispatch::reshard(input, sharding))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_parameters(self.parameter_structure(), outputs)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis, RaggedAxis, Shape, f8e8m0fnu,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
+        RaggedAxis, Shape, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::programs::{EffectClasses, EmptyRegionDriver, ValueProjection};
+    use crate::parameters::Placeholder;
+    use crate::programs::{EffectClasses, EmptyRegionDriver};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -697,5 +777,186 @@ mod tests {
                 "`{RESHARD_OPERATION_NAME}` target sharding rank (2) does not match the input rank (1)",
             )))),
         );
+    }
+
+    #[test]
+    fn test_reshard_structured() {
+        // Every leaf of a structured value is resharded to its own target, which replaces the leaf's tracked sharding.
+        let mesh = mesh();
+        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let input_types = (ArrayType::new_static(DataType::F32, [8]), ArrayType::scalar(DataType::F32));
+        let (output_types, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs| inputs.reshard(&(target.clone(), replicated.clone())),
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            output_types,
+            (input_types.0.with_sharding(target).unwrap(), input_types.1.with_sharding(replicated).unwrap()),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8], %1:f32[] .
+                let %2:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] = \
+                        reshard [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] %0
+                    %3:f32[][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, []}] = \
+                        reshard [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, []}] %1
+                in (%2, %3)"
+            },
+        );
+
+        // A target whose rank differs from the rank of its leaf is rejected before anything is staged.
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.reshard(&Sharding::replicated(mesh, 2)),
+            ArrayType::new_static(DataType::F32, [8]),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(error))
+                if error.to_string() == "`reshard` target sharding rank (2) does not match the input rank (1)",
+        ));
+    }
+
+    #[test]
+    fn test_reshard_structured_composite_tracing() {
+        // Every leaf of a structured value is resharded to its own target, which replaces the leaf's tracked sharding.
+        let mesh = mesh();
+        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let input_types = (ArrayType::new_static(DataType::F32, [8]), ArrayType::scalar(DataType::F32));
+        let (output_types, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs| inputs.reshard(&(target.clone(), replicated.clone())),
+            (ArrayIrType::Array(input_types.0.clone()), ArrayIrType::Array(input_types.1.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            output_types,
+            (
+                ArrayIrType::Array(input_types.0.with_sharding(target).unwrap()),
+                ArrayIrType::Array(input_types.1.with_sharding(replicated).unwrap()),
+            ),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[8], %1:f32[] .
+                let %2:f32[8][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] = \
+                        reshard [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'x'}]}] %0
+                    %3:f32[][sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, []}] = \
+                        reshard [sharding={mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, []}] %1
+                in (%2, %3)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_reshard_structured_projection_errors() {
+        let sharding = Sharding::replicated(mesh(), 0);
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
+        assert!(matches!(
+            dimension.reshard(&sharding),
+            Err(ProgramError::Type(error)) if error.to_string() == "expected array type but got dimension type",
+        ));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        assert!(matches!(
+            reference.reshard(&sharding),
+            Err(ProgramError::Type(error)) if error.to_string() == "expected array type but got reference type",
+        ));
+    }
+
+    #[test]
+    fn test_reshard_structured_eager() {
+        /// Structured arrays with a static field that sharding operations must preserve.
+        #[derive(ryft_macros::Parameterized)]
+        struct Inputs<P: Parameter> {
+            /// Array leaves in a nested tuple and vector.
+            values: (P, Vec<P>),
+
+            /// Static label belonging to the receiver.
+            label: &'static str,
+        }
+
+        // Only the placeholder structure is cloned; the array-containing receiver intentionally is not Clone.
+        impl Clone for Inputs<Placeholder> {
+            fn clone(&self) -> Self {
+                Self { values: self.values.clone(), label: self.label }
+            }
+        }
+
+        /// Exercises the public capability through an ordinary generic leaf bound.
+        fn apply_leaf<V: Value + Reshard>(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+            input.reshard(sharding)
+        }
+
+        /// Exercises the same capability through a domain's generic value type.
+        fn apply_domain<C: Domain<Value: Reshard>>(
+            input: &C::Value,
+            sharding: &Sharding,
+        ) -> Result<C::Value, ProgramError> {
+            input.reshard(sharding)
+        }
+
+        let mesh = mesh();
+        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let scalar = Array::scalar(3.0f32).unwrap();
+        let inputs = Inputs { values: (input.clone(), vec![scalar.clone()]), label: "input" };
+        let shardings = Inputs { values: (target.clone(), vec![replicated.clone()]), label: "shardings" };
+        let outputs = inputs.reshard(&shardings).unwrap();
+        assert_eq!(outputs.label, "input");
+        assert_eq!(outputs.values.0.r#type().sharding(), Some(&target));
+        assert_eq!(outputs.values.1[0].r#type().sharding(), Some(&replicated));
+        assert_eq!(outputs.values.0, input.reshard(&target).unwrap());
+        assert_eq!(outputs.values.1[0], scalar.reshard(&replicated).unwrap());
+
+        assert_eq!(apply_leaf(&input, &target), input.reshard(&target));
+        assert_eq!(apply_domain::<EagerContext<Array, ArrayOperation<Array>>>(&input, &target), input.reshard(&target),);
+
+        // Composite array members dispatch through the same leaf capability.
+        let inputs = vec![ArrayIrValue::Array(input)];
+        let expected = vec![inputs[0].reshard(&target).unwrap()];
+        assert_eq!(inputs.reshard(&vec![target]).unwrap(), expected);
+
+        assert!(Vec::<Array>::new().reshard(&Vec::new()).unwrap().is_empty());
+        assert_eq!(<() as Reshard<Array>>::reshard(&(), &()), Ok(()));
+    }
+
+    #[test]
+    fn test_reshard_structured_mismatched_parameter_paths() {
+        let input = Array::scalar(1.0f32).unwrap();
+        let sharding = Sharding::replicated(mesh(), 0);
+        let missing = vec![input.clone(), input.clone()].reshard(&vec![sharding.clone()]);
+        assert!(matches!(
+            missing,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+        let extra = vec![input.clone()].reshard(&vec![sharding.clone(), sharding.clone()]);
+        assert!(matches!(
+            extra,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+
+        // Matching leaf counts do not imply matching paths.
+        let inputs = BTreeMap::from([("left", input.clone())]);
+        let shardings = BTreeMap::from([("right", sharding)]);
+        assert!(matches!(
+            inputs.reshard(&shardings),
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
+
+        // Structure validation happens before rank validation or leaf dispatch.
+        let invalid = Sharding::replicated(mesh(), 1);
+        let result = vec![input.clone(), input].reshard(&vec![invalid]);
+        assert!(matches!(
+            result,
+            Err(ProgramError::InvalidArgument { message, .. })
+                if message == "receiver and `shardings` must have the same parameter structure",
+        ));
     }
 }

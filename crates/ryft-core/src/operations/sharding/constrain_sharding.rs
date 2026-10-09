@@ -331,7 +331,8 @@ impl<
 > ConstrainShardingDispatch<ArrayType, V> for ValueDomainDispatch
 {
     fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
-        // Staging and transform values bind through their domain; direct eager execution uses the separate policy below.
+        // Staging and transform values bind through their domain while direct eager execution
+        // uses the separate policy above.
         let mut outputs = input.domain().bind(
             ConstrainShardingOperation::new(sharding.clone()),
             Vec::new(),
@@ -350,7 +351,6 @@ impl<
         >,
 > ConstrainShardingDispatch<ArrayIrType, V> for V::Dispatch
 {
-    #[inline]
     fn constrain_sharding(input: &V, sharding: &Sharding) -> Result<V, ProgramError> {
         let input = input.clone().into_projected()?;
         let output = <V::Projected as Value>::Dispatch::constrain_sharding(&input, sharding)?;
@@ -358,8 +358,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): The type bounds on the trait function look a bit weird. Can we put the `Parameterized` bound
-//  on the trait itself instead of on the function that it owns?
 /// Constrains the placement of the leaves of a [`Parameterized`] receiver over [`Auto`](MeshAxisType::Auto) mesh axes
 /// to the corresponding [`Sharding`]s. This preserves each leaf's elements, shape, data type, and tracked sharding
 /// while recording a [`ConstrainShardingOperation`] that backend lowering must enforce. Lowering merges the requested
