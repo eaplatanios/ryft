@@ -61,14 +61,14 @@ use ryft_core::{
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransform,
-    ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewOverlap, ReferenceWrite,
-    ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation,
-    ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer, TracingContext, TransposableOperation,
-    TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueDomainDispatch,
-    ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
-    discharge_reference_free_operation, infer_reference_view_type, jvp_projected_operation,
-    transpose_projected_operation, validate_reference_boundary,
+    ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSource, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
+    ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot,
+    ReshapeOperation, ReshardOperation, ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer,
+    TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, Typed, Value, ValueDomainDispatch, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation,
+    batch, check_count, differentiate_at, discharge_reference_free_operation, infer_reference_view_type,
+    jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -532,6 +532,10 @@ impl From<ZeroOperation<RegisterIrType>> for RegisterOperation {
 
 // Register zeros need no runtime geometry, so this universe opts into the input-free residual defaults.
 impl ResidualZeroProvider<RegisterIrType> for RegisterOperation {}
+
+// A register read selects bits without changing type metadata, so its cotangent accumulates through the read's own
+// path, which is the default transposition of a read.
+impl ReferenceReadTransposition<RegisterIrType> for RegisterOperation {}
 
 impl OperationProvider<RegisterIrType, OneOperation<RegisterIrType>> for RegisterOperation {
     type Operation = Self;

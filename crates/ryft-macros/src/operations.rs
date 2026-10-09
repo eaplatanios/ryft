@@ -1017,6 +1017,7 @@ impl OperationEnum {
             self.operation_forwarding_arms(quote!(input_region_provenance), quote!(, region_index, input_index));
         let output_region_provenance_arms =
             self.operation_forwarding_arms(quote!(output_region_provenance), quote!(, output_index));
+        let region_data_flow_arms = self.operation_forwarding_arms(quote!(region_data_flow), quote!());
         let prune_boundary_arms = self.variants.iter().map(|variant| {
             // Boundary pruning exchanges only liveness flags, so every variant class delegates to the payload's own
             // hook and wraps the pruned payload back into its variant.
@@ -1106,6 +1107,10 @@ impl OperationEnum {
                     output_index: usize,
                 ) -> ::std::vec::Vec<#ryft::OutputRegionProvenance> {
                     match self { #(#output_region_provenance_arms)* }
+                }
+
+                fn region_data_flow(&self) -> #ryft::RegionDataFlow<'_> {
+                    match self { #(#region_data_flow_arms)* }
                 }
 
                 fn prune_boundary(
@@ -3370,6 +3375,17 @@ mod tests {
              (operation,context,driver,inputs,outputs,accumulators)",
         ));
         assert!(generated.contains("Self::Dimension(_)=>{::std::result::Result::Ok(())}"));
+
+        // Region data flow carries no member type, so every role borrows its own payload's declaration directly.
+        for payload in [
+            "ArrayOperation<A>",
+            "DimensionOperation",
+            "ParallelAllGatherOperation",
+            "ZeroOperation<ArrayType>",
+            "NativeOperation<ArrayIrType>",
+        ] {
+            assert!(generated.contains(&format!("<{payload}asryft::Operation>::region_data_flow(operation)")));
+        }
 
         // Mixed payloads use their parent-universe contracts, while native payloads continue to delegate directly.
         assert!(generated.contains("MemberOperation<ArrayIrType>>::infer_parent_output_types"));

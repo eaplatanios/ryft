@@ -98,6 +98,25 @@ struct OutputRegionProvenance {
     output_index: usize,
 }
 
+/// Stand-in for `ryft_core::RegionDataFlow`, the type-independent semantic declaration forwarded by operation derives.
+#[derive(Copy, Clone)]
+enum RegionDataFlow<'o> {
+    /// Declares nothing beyond the operation's provenance declarations.
+    Opaque,
+
+    /// Uses the operation's existing provenance declarations as its data flow.
+    Provenance,
+
+    /// Borrows operation-owned custom semantics.
+    Custom(&'o dyn RegionDataFlowRule),
+}
+
+/// Stand-in custom rule whose observable result proves that forwarding retains the borrowed payload.
+trait RegionDataFlowRule {
+    /// Returns the payload-specific marker.
+    fn marker(&self) -> &'static str;
+}
+
 /// Stand-in for `ryft_core::RegionLiveness`.
 trait RegionLiveness {}
 
@@ -327,6 +346,11 @@ trait Operation: Clone {
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
         Vec::new()
+    }
+
+    /// Defaults to opaque data flow so generated forwarding can distinguish an absent hook.
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Opaque
     }
 
     fn prune_boundary(
@@ -1121,6 +1145,10 @@ impl Operation for AddOperation {
         "add"
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[DataType],
@@ -1205,6 +1233,10 @@ impl Operation for PrintOperation {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Custom(self)
+    }
+
     fn prune_boundary(
         &self,
         _input_count: usize,
@@ -1243,6 +1275,12 @@ impl Operation for PrintOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         write!(formatter, "{:indentation$}rendered print", "")
+    }
+}
+
+impl RegionDataFlowRule for PrintOperation {
+    fn marker(&self) -> &'static str {
+        "print"
     }
 }
 
@@ -1395,12 +1433,23 @@ impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
     ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
         Ok(input_types.to_vec())
     }
+
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        if MEMBER == 0 { RegionDataFlow::Custom(self) } else { RegionDataFlow::Provenance }
+    }
+
     fn fold(
         &self,
         input_types: &[Self::Type],
         _region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         Ok((MEMBER == 0).then(|| (0..input_types.len()).map(OperationFoldOutput::Input).collect()))
+    }
+}
+
+impl<const MEMBER: u8> RegionDataFlowRule for ProjectedMemberOperation<MEMBER> {
+    fn marker(&self) -> &'static str {
+        "projected"
     }
 }
 
@@ -1560,12 +1609,22 @@ impl<T: Type, V: Clone> Operation for CustomJvpOperation<T, V> {
         "custom_jvp"
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Custom(self)
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<T: Type, V> RegionDataFlowRule for CustomJvpOperation<T, V> {
+    fn marker(&self) -> &'static str {
+        self.tag
     }
 }
 
@@ -1689,6 +1748,32 @@ fn test_operation_generates_operation_forwarding() {
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));
     assert_eq!(print.to_string(), "rendered print");
+}
+
+#[test]
+fn test_operation_generates_region_data_flow_forwarding() {
+    let ordinary = DataOperation::<ScalarFactor>::from(AddOperation);
+    let opaque = DataOperation::<ScalarFactor>::from(ZeroOperation { r#type: DataType });
+    let native = DataOperation::<ScalarFactor>::from(PrintOperation);
+    let boxed = DataOperation::<ScalarFactor>::from(CustomJvpOperation { tag: "boxed", marker: PhantomData });
+    let projected = ProjectedProgramOperation::<ProjectedMemberValue<0>>::from(ProjectedMemberOperation::<0>);
+    let structural = ProjectedProgramOperation::<ProjectedMemberValue<0>>::from(ProjectedMemberOperation::<2>);
+    let extension = ArrayOperation::<Factor, SpecialOperation>::Backend(SpecialOperation);
+
+    assert!(matches!(ordinary.region_data_flow(), RegionDataFlow::Provenance));
+    assert!(matches!(opaque.region_data_flow(), RegionDataFlow::Opaque));
+    assert!(matches!(structural.region_data_flow(), RegionDataFlow::Provenance));
+    for (data_flow, expected) in [
+        (native.region_data_flow(), "print"),
+        (boxed.region_data_flow(), "boxed"),
+        (projected.region_data_flow(), "projected"),
+        (extension.region_data_flow(), "extension"),
+    ] {
+        let RegionDataFlow::Custom(rule) = data_flow else {
+            panic!("the generated dispatcher must retain the payload's custom rule");
+        };
+        assert_eq!(rule.marker(), expected);
+    }
 }
 
 #[test]
@@ -1849,6 +1934,10 @@ mod mixed_members {
             "interleaved"
         }
 
+        fn region_data_flow(&self) -> ryft::RegionDataFlow<'_> {
+            ryft::RegionDataFlow::Provenance
+        }
+
         fn infer_output_types(
             &self,
             input_types: &[ArrayType],
@@ -1972,6 +2061,10 @@ mod mixed_members {
 
         fn name(&self) -> &'static str {
             "mixed_universe_constructor"
+        }
+
+        fn region_data_flow(&self) -> ryft::RegionDataFlow<'_> {
+            ryft::RegionDataFlow::Provenance
         }
 
         fn infer_output_types(
@@ -2194,6 +2287,7 @@ mod mixed_members {
         let (array_type, dimension_type) = fixture_types();
         let operation = Operation::from(InterleavedOperation);
         assert_eq!(operation.name(), "interleaved");
+        assert!(matches!(operation.region_data_flow(), ryft::RegionDataFlow::Provenance));
         assert_eq!(
             operation.infer_output_types(
                 &[
@@ -2299,6 +2393,7 @@ mod mixed_members {
             r#type: array_type.clone(),
             dimension_type: dimension_type.clone(),
         });
+        assert!(matches!(operation.region_data_flow(), ryft::RegionDataFlow::Provenance));
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let duals = operation.jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &[]).unwrap();
 
@@ -2416,12 +2511,22 @@ impl Operation for SpecialOperation {
         "special"
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Custom(self)
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl RegionDataFlowRule for SpecialOperation {
+    fn marker(&self) -> &'static str {
+        "extension"
     }
 }
 
