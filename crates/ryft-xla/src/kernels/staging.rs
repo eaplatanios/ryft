@@ -19,9 +19,9 @@ use ryft_core::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionLiveness, RegionSlot,
-    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionDataFlow, RegionInterface, RegionLiveness,
+    RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::XlaTarget;
@@ -185,6 +185,13 @@ impl Operation for XlaKernelExtension {
         }
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.region_data_flow(),
+        }
+    }
+
     fn prune_boundary(
         &self,
         _input_count: usize,
@@ -259,6 +266,8 @@ impl Operation for XlaKernelExtension {
 /// The payload contains only operation metadata. Its computations remain ordinary attached regions of the XLA
 /// program, so effect, reference, identity, and structural validation continue to inspect the actual current body.
 /// Generic differentiation and reference discharge require an owner-supported kernel rule and reject this carrier.
+/// [`Operation::region_data_flow`] forwards the payload's declaration unchanged, including custom rules and opaque
+/// reference-publishing carriers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaKernelOperation(pub(crate) KernelOperation<XlaKernelExtension>);
 
@@ -323,6 +332,10 @@ impl Operation for XlaKernelOperation {
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.0.output_region_provenance(output_index)
+    }
+
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        self.0.region_data_flow()
     }
 
     fn prune_boundary(
@@ -1182,8 +1195,8 @@ pub(crate) fn select_kernels(
 pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CustomCallOperation, EffectClass};
     use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
+    use ryft_core::{CustomCallOperation, EffectClass};
 
     use crate::experimental::ops::XlaProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
@@ -1397,6 +1410,36 @@ pub(crate) mod tests {
         assert_eq!(carrier.name(), definition.operation().name());
         assert_eq!(carrier.region_slots(), definition.operation().region_slots());
         assert_eq!(carrier.input_region_provenance(0, 0), InputRegionProvenance::Local);
+    }
+
+    #[test]
+    fn test_xla_kernel_operation_region_data_flow() {
+        use ryft_core::{ArrayIrOperation, ArrayOperation, ConditionOperation, ScanOperation};
+
+        let definition = crate::kernels::tests::definition();
+        let opaque = XlaKernelOperation::new(KernelOperation::Call(definition.operation().clone()));
+        assert!(matches!(opaque.region_data_flow(), RegionDataFlow::Opaque));
+        let ordinary =
+            XlaKernelOperation::new(KernelOperation::from(ArrayOperation::Condition(ConditionOperation::new())));
+        assert!(matches!(ordinary.region_data_flow(), RegionDataFlow::Provenance));
+
+        let recurrent = XlaKernelOperation::new(KernelOperation::Portable(ArrayIrOperation::<Array>::from(
+            ArrayOperation::Scan(ScanOperation::new(2, 3usize)),
+        )));
+        let RegionDataFlow::Custom(expected) = recurrent.0.region_data_flow() else {
+            panic!("a scan must declare its custom region data flow");
+        };
+        let RegionDataFlow::Custom(forwarded) = recurrent.region_data_flow() else {
+            panic!("the XLA kernel carrier must retain custom region data flow");
+        };
+        assert!(std::ptr::eq(forwarded, expected));
+
+        #[cfg(feature = "mosaic-gpu")]
+        assert!(
+            XlaKernelExtension::Mosaic(ryft_mosaic::kernels::gpu::GpuOperation::Wgmma)
+                .region_data_flow()
+                .is_none()
+        );
     }
 
     #[test]

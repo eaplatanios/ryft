@@ -24,17 +24,17 @@ use ryft_core::{
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, ImaginaryOperation, Instruction,
     IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
     LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
-    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, Parameterized, PowOperation,
-    Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME,
-    RaggedDotMode, RaggedDotOperation, RandomAlgorithm, RealOperation, ReducePrecisionOperation, ReductionKind,
-    RegionId, RegionRef, RemOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation,
-    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME,
-    SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
-    ShardMap, ShardMapError, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation,
-    SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation, TanOperation, TanhOperation,
-    TracedShardMap, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
-    WhileOperation,
+    OperationPayloadProjection, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
+    ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation,
+    ParallelVaryOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
+    REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, RandomAlgorithm,
+    RealOperation, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
+    RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RngBitGeneratorOperation, RoundOperation,
+    RsqrtOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation,
+    ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, ShardMap, ShardMapError, Sharding,
+    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
+    SortOrdering, SqrtOperation, SubOperation, TanOperation, TanhOperation, TracedShardMap, TransposeOperation,
+    Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -175,6 +175,18 @@ pub enum LoweringError {
         value_index: usize,
         axis_name: String,
     },
+
+    /// Error returned when [`to_mlir_module`] lowers a traced shard map whose body applies a collective (e.g.,
+    /// `parallel_reduce` or `axis_index`) along a manual mesh axis that neither the shard map nor a shard map nested in
+    /// its body makes manual. Only an enclosing manual region makes such an axis manual (e.g., for a body traced with
+    /// [`ryft_core::trace_shard_map_with_named_axes`]), even when the boundary of the shard map does not vary along it
+    /// (e.g., for a reduction of an invariant input), and the standalone module that [`to_mlir_module`] produces has
+    /// none.
+    #[error(
+        "`{operation_name}` in the body of a standalone `shard_map` communicates along mesh axis `{axis_name}`, which \
+         is not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
+    )]
+    StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name: &'static str, axis_name: String },
 
     /// Underlying program error returned while replaying a staged program through the generic
     /// [`Program::interpret_with`] domain, or raised directly by lowering for a program that it cannot lower (e.g., a
@@ -4777,7 +4789,7 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
 ///   : (tensor<...>, !stablehlo.token) -> !stablehlo.token
 /// ```
 ///
-/// The custom call's only result is the continuation token; the `print` operation's dataflow output is the
+/// The custom call's only result is the continuation token; the `print` operation's data flow output is the
 /// forwarded input value, which the caller returns directly.
 fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     label: &str,
@@ -6401,9 +6413,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 }
                 Ok(vec![input_values[0]])
             }
-            // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback
+            // `print` is the identity on its data flow output; its observable effect lowers to a host-callback
             // custom call that consumes and produces a StableHLO token, so the effect ordering rides the scope's
-            // token chain instead of the value dataflow.
+            // token chain instead of the value data flow.
             ArrayOperation::Assert(operation) => {
                 lower_assert_to_custom_call(
                     operation.name(),
@@ -7803,8 +7815,11 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 /// names such an axis. A traced shard map whose global input or output type varies along a mesh axis that is not one
 /// of its own manual axes (e.g., one traced with [`ryft_core::trace_shard_map_with_named_axes`] inside an enclosing
 /// manual region) is rejected with [`LoweringError::StandaloneShardMapVariesAlongEnclosingManualAxis`], because the
-/// standalone module has no enclosing manual region that makes such an axis manual. Other [`LoweringError`]s report
-/// failures to lower the traced body (e.g., for operations that the backend cannot lower or invalid tensor types).
+/// standalone module has no enclosing manual region that makes such an axis manual. For the same reason, a body that
+/// applies a collective (including `axis_index`) along such an axis is rejected with
+/// [`LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis`], even when the boundary does not vary
+/// along it. Other [`LoweringError`]s report failures to lower the traced body (e.g., for operations that the backend
+/// cannot lower or invalid tensor types).
 pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>, S: AsRef<str>>(
     traced_shard_map: &TracedShardMap<XlaDomain<'static>, Input, Output>,
     function_name: S,
@@ -7829,6 +7844,16 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
             }
         }
     }
+    // A collective in the body can communicate along an enclosing manual axis even when the boundary does not vary
+    // along it (e.g., a reduction of an invariant input), and the standalone module has no manual region for it either.
+    if let Some((operation_name, axis_name)) = find_collective_along_enclosing_manual_axis(
+        program,
+        program.entry_region_ref().id(),
+        shard_map.mesh(),
+        shard_map.manual_axes(),
+    ) {
+        return Err(LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name, axis_name });
+    }
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
     if contains_unresolved_references(program) {
@@ -7845,6 +7870,67 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
         traced_shard_map.global_output_types().parameters().cloned().collect(),
         function_name.as_ref(),
     )
+}
+
+/// Returns the name of the first collective (including `axis_index`) of `region` in `program`, or of one of its nested
+/// regions, that names a manual axis of `mesh` outside of `manual_axes`, together with that axis's name. Every nested
+/// shard map adds its own manual axes to `manual_axes` for its body.
+fn find_collective_along_enclosing_manual_axis(
+    program: &FlatXlaProgram,
+    region: RegionId,
+    mesh: &LogicalMesh,
+    manual_axes: &[String],
+) -> Option<(&'static str, String)> {
+    for instruction in program.regions()[region.index()].instructions() {
+        let operation = instruction.operation();
+        let axis_name = operation
+            .projected_payload::<AxisIndexOperation>()
+            .map(AxisIndexOperation::axis_name)
+            .or_else(|| {
+                operation.projected_payload::<ParallelReduceOperation>().map(ParallelReduceOperation::axis_name)
+            })
+            .or_else(|| operation.projected_payload::<ParallelVaryOperation>().map(ParallelVaryOperation::axis_name))
+            .or_else(|| {
+                operation
+                    .projected_payload::<ParallelAllGatherOperation>()
+                    .map(ParallelAllGatherOperation::axis_name)
+            })
+            .or_else(|| {
+                operation
+                    .projected_payload::<ParallelSumScatterOperation>()
+                    .map(ParallelSumScatterOperation::axis_name)
+            })
+            .or_else(|| {
+                operation.projected_payload::<ParallelAllToAllOperation>().map(ParallelAllToAllOperation::axis_name)
+            })
+            .or_else(|| {
+                operation.projected_payload::<ParallelPermuteOperation>().map(ParallelPermuteOperation::axis_name)
+            })
+            .or_else(|| {
+                operation
+                    .projected_payload::<ParallelRaggedAllToAllOperation>()
+                    .map(ParallelRaggedAllToAllOperation::axis_name)
+            });
+        if let Some(axis_name) = axis_name
+            && mesh.axis_type(axis_name) == Some(MeshAxisType::Manual)
+            && !manual_axes.iter().any(|manual_axis| manual_axis == axis_name)
+        {
+            return Some((operation.name(), axis_name.to_string()));
+        }
+        let nested_manual_axes = match operation {
+            XlaOperation::ShardMap(nested) => {
+                Cow::Owned(manual_axes.iter().chain(nested.shard_map().manual_axes()).cloned().collect::<Vec<_>>())
+            }
+            _ => Cow::Borrowed(manual_axes),
+        };
+        for &nested_region in instruction.regions() {
+            let found = find_collective_along_enclosing_manual_axis(program, nested_region, mesh, &nested_manual_axes);
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    None
 }
 
 /// Lowers the shard-map `program` over its flat boundary types to a textual StableHLO/Shardy MLIR module (refer to
@@ -19736,7 +19822,7 @@ pub(crate) mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_named_axes(
-            |y: XlaArrayTracer| y.clone() + y,
+            |_, y: XlaArrayTracer| y.clone() + y,
             input_type,
             mesh.clone(),
             sharded.clone(),
@@ -19758,6 +19844,52 @@ pub(crate) mod tests {
             error.to_string(),
             "input type #0 of a standalone `shard_map` varies along mesh axis `x`, which is not one of its manual axes; \
              lower it as part of the program whose manual region makes that axis manual",
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_rejects_shard_maps_communicating_along_enclosing_manual_axes() {
+        use ryft_core::ParallelReduce;
+
+        // A body traced for the named-axis scope of an enclosing manual region over `x` can reduce an input that does
+        // not vary along `x` over `x`, so its boundary does not vary along `x` although the body communicates along it.
+        // A standalone module has no manual region that makes `x` manual, so lowering the traced shard map on its own
+        // is rejected. Collectives along the shard map's own manual axis `y` remain accepted.
+        let mesh = test_logical_mesh_2x2();
+        let sharded = test_sharding(&mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let replicated = test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![]);
+        let trace = |axis_name: &'static str, out_sharding: Sharding| {
+            let traced: TracedShardMap<XlaDomain<'static>, ArrayType, ArrayType> = trace_shard_map_with_named_axes(
+                |_, y: XlaArrayTracer| y.parallel_reduce(ReductionKind::Sum, axis_name).unwrap(),
+                input_type.clone(),
+                mesh.clone(),
+                sharded.clone(),
+                out_sharding,
+                Vec::new(),
+                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            )
+            .unwrap();
+            traced
+        };
+        assert!(to_mlir_module(&trace("y", replicated), "main").is_ok());
+        let error = to_mlir_module(&trace("x", sharded.clone()), "main").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { axis_name, .. }
+                    if axis_name == "x",
+            ),
+            "{error:?}",
+        );
+        assert!(
+            error.to_string().ends_with(
+                "in the body of a standalone `shard_map` communicates along mesh axis `x`, which is not one of its \
+                 manual axes; lower it as part of the program whose manual region makes that axis manual",
+            ),
+            "{error}",
         );
     }
 
@@ -25468,7 +25600,7 @@ pub(crate) mod tests {
 
         // Two prints in one flat program: the token chain is created lazily by one zero-operand
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
-        // each print's dataflow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
+        // each print's data flow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
         // call results).
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
@@ -28025,7 +28157,7 @@ pub(crate) mod tests {
         // Both prints fire in program order, and the printed values are the forwarded operands.
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);
 
-        // The compiled function still computes its dataflow output (each print is the identity on its operand).
+        // The compiled function still computes its data flow output (each print is the identity on its operand).
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let output_bytes = output
             .device_shard(device_id)

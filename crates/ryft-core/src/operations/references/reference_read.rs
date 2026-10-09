@@ -1,11 +1,12 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use ryft_macros::capability;
 
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, Sharding};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -18,18 +19,23 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::Capability;
+use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+use crate::operations::constants::zero::ZeroOperation;
+use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
+use crate::operations::reductions::ReductionKind;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
+use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceTransform, Concretizable, EffectClasses, Effects, MaybeZero, NoReferenceTransform, Operation,
-    OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
-    ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
-    ValueDomainDispatch, ValueProjection, batch_reference_transforms, infer_reference_view_type,
+    OperationFormatter, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
+    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceEffect, ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed,
+    Value, ValueDomainDispatch, ValueProjection, batch_reference_transforms, infer_reference_view_type,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -313,7 +319,8 @@ impl<
     V: Value<Type = U>,
     O: Operation<Type = U>
         + ResidualZeroProvider<U, Operation = O>
-        + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>,
+        + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>
+        + ReferenceReadTransposition<U>,
 > TransposableOperation<V, O> for ReferenceReadOperation<T, U, Transform>
 where
     ReferenceReadOperation<T, U, Transform>: Operation<Type = U>,
@@ -328,8 +335,9 @@ where
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         // A read is the identity map from the referenced state to its output, so its transpose accumulates the output's
-        // cotangent into the cotangent reference of the read root, viewed exactly as the input views it. The reference
-        // input carries no value cotangent of its own; its state cotangent lives in that accumulator.
+        // cotangent into the cotangent reference of the read root, viewed exactly as the input views it, through the
+        // operation family's `ReferenceReadTransposition`. The reference input carries no value cotangent of its own;
+        // its state cotangent lives in that accumulator.
         check_count!("input", inputs, 1 + self.binding_count(), ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -343,9 +351,146 @@ where
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            reference.add_update_through(cotangent, &self.transforms, &bindings)?;
+            O::accumulate_read_cotangent(context, &reference, cotangent, &self.transforms, &bindings)?;
         }
         Ok(())
+    }
+}
+
+/// Operation family hook that accumulates the cotangent of a [`ReferenceReadOperation`] into the cotangent reference
+/// of the read's root in the [`Type`] universe `T`. The transposition of a read delegates to it, because the adjoint
+/// of a read depends on how the universe types the value that the read selects. In most universes, a read through a
+/// path selects part of the referent without changing its type metadata, and its adjoint adds the cotangent into the
+/// cotangent reference through the same path and bindings (i.e., an indexed `reference_add_update`), which is what the
+/// default implementation of [`accumulate_read_cotangent`](Self::accumulate_read_cotangent) stages. Operation families
+/// of such universes opt in with an empty implementation.
+///
+/// [`ArrayIrType`] families (served by a blanket implementation) refine this inside manual regions (e.g., the body
+/// of a [`ShardMapOperation`](crate::ShardMapOperation)). There, a read of a referent that is invariant along a manual
+/// mesh axis through a dynamic index that varies along it selects a different element on every device, so the value
+/// read varies along that axis (refer to [`ReferenceTransform::access_type`]). Such a read implicitly treats the one
+/// shared referent as per-device copies before selecting from them, which is the linear map that `parallel_vary` stages
+/// explicitly for values, and whose adjoint sums the per-device cotangents back into one. The cotangent of the root is
+/// therefore the sum over devices of what every device scatters at its own index. Accumulating the varying cotangent
+/// directly through the varying index would instead update a different element on every device of a cotangent reference
+/// that is typed as identical across them, which the mutation rule rejects. The [`ArrayIrType`] implementation
+/// therefore scatters the cotangent into a local zero buffer that varies along the axes that the read's view varies
+/// over beyond the root, sums the dense buffer over those axes with mesh-form [`ParallelReduceOperation`]s, and adds
+/// the resulting invariant contribution into the complete root cotangent reference. Reads whose views vary over no
+/// additional axes keep the indexed accumulation of the default implementation.
+///
+/// Note that JAX does not propagate the manual variation of indices through reference accesses. Specifically, the
+/// abstract evaluation of its `get` primitive gives the value read the variation of the reference regardless of the
+/// indices, and its transpose is an indexed `addupdate` into the cotangent reference. Inside `shard_map`, a read of an
+/// invariant reference at a device-varying index is therefore typed as invariant even though it differs across devices,
+/// and its transpose adds the cotangent of every device into that device's own copy of the cotangent reference without
+/// a cross-device sum. Ryft types the value read as varying and transposes it into the cross-device sum above instead.
+pub trait ReferenceReadTransposition<T: Type>: Operation<Type = T> + Sized {
+    /// Accumulates `cotangent`, the cotangent of a read through `transforms` and `bindings`, into `reference`,
+    /// the cotangent reference of the read's root, staging the accumulation into `context`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`TracingContext`] that the transposed program is staged into.
+    ///   - `reference`: Cotangent reference of the root of the read being transposed.
+    ///   - `cotangent`: Cotangent of the value read, which has the cotangent type of the read's output.
+    ///   - `transforms`: Transforms that the read applies in order to its root.
+    ///   - `bindings`: Dynamic inputs of the read's transforms in transform order, which must be known values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if staging the accumulation fails.
+    fn accumulate_read_cotangent<V: Value<Type = T>, Transform: ReferenceTransform<Type = T>>(
+        _context: &TracingContext<V, Self>,
+        reference: &Tracer<TracingContext<V, Self>>,
+        cotangent: &Tracer<TracingContext<V, Self>>,
+        transforms: &[Transform],
+        bindings: &[Tracer<TracingContext<V, Self>>],
+    ) -> Result<(), ProgramError>
+    where
+        Tracer<TracingContext<V, Self>>: ReferenceAddUpdate<Transform>,
+    {
+        reference.add_update_through(cotangent, transforms, bindings)
+    }
+}
+
+impl<
+    O: Operation<Type = ArrayIrType>
+        + OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>, Operation = O>
+        + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>
+        + OperationProjection<ArrayType, Projected: From<BroadcastOperation> + From<ParallelReduceOperation>>,
+> ReferenceReadTransposition<ArrayIrType> for O
+{
+    fn accumulate_read_cotangent<V: Value<Type = ArrayIrType>, Transform: ReferenceTransform<Type = ArrayIrType>>(
+        context: &TracingContext<V, Self>,
+        reference: &Tracer<TracingContext<V, Self>>,
+        cotangent: &Tracer<TracingContext<V, Self>>,
+        transforms: &[Transform],
+        bindings: &[Tracer<TracingContext<V, Self>>],
+    ) -> Result<(), ProgramError>
+    where
+        Tracer<TracingContext<V, Self>>: ReferenceAddUpdate<Transform>,
+    {
+        // Composite array IR families sum the cotangent of a read whose view varies over manual axes beyond its root
+        // over those axes before accumulating it (refer to the documentation of `ReferenceReadTransposition`).
+
+        // The axes that the cotangent (and thus the value read) varies over and the root does not are the axes along
+        // which the read implicitly varied the root. Without such axes, the indexed accumulation is the exact adjoint.
+        let reference_type = reference.r#type();
+        let referent = <&ReferenceType<ArrayType>>::try_from(reference_type.as_ref())?.referent();
+        let cotangent_type = cotangent.r#type();
+        let Some(cotangent_sharding) = <&ArrayType>::try_from(cotangent_type.as_ref())?.sharding() else {
+            return reference.add_update_through(cotangent, transforms, bindings);
+        };
+        let axes = cotangent_sharding
+            .varying_manual_axes()
+            .iter()
+            .filter(|axis| !referent.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis)))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if axes.is_empty() {
+            return reference.add_update_through(cotangent, transforms, bindings);
+        }
+
+        // Scatter the cotangent into a dense local buffer of the root's type that additionally varies over those axes,
+        // so that every device accumulates its own contribution at its own index. The zero that initializes the buffer
+        // is a non-differentiable constant, so it is created with that manual variation directly rather than through
+        // `parallel_vary`. The buffer of a root without a sharding is placed on the cotangent's mesh, like the value
+        // read.
+        let mesh = cotangent_sharding.mesh();
+        let mut sharding =
+            referent.sharding().cloned().unwrap_or_else(|| Sharding::replicated(mesh.clone(), referent.rank()));
+        sharding
+            .extend_varying_manual_axes(axes.iter())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let buffer_type =
+            referent.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let zero = context.bind(O::provide(ZeroOperation::new(buffer_type.into()), &[])?, Vec::new(), &[])?.remove(0);
+        let buffer =
+            context.bind(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), &[zero])?.remove(0);
+        buffer.add_update_through(cotangent, transforms, bindings)?;
+        let mut contribution = context
+            .bind(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), &[buffer])?
+            .remove(0);
+
+        // The adjoint of the implicit per-device copies sums the dense contributions over the axes, one mesh-form
+        // `parallel_reduce` per axis, which leaves a contribution that is invariant over them like the root.
+        for axis in axes {
+            let operation = ParallelReduceOperation::new(ReductionKind::Sum, axis).with_mesh(mesh.clone());
+            let operation = <O as OperationProjection<ArrayType>>::Projected::from(operation);
+            contribution = context.bind(operation, Vec::new(), &[contribution])?.remove(0);
+        }
+
+        // The read placed a root without a sharding on the mesh before varying it, like the placement-only `broadcast`
+        // that precedes `parallel_vary` for values, so the adjoint of that placement restores the root's type.
+        if referent.sharding().is_none() {
+            let operation = BroadcastOperation::new(referent.clone(), (0..referent.rank()).collect());
+            let operation = <O as OperationProjection<ArrayType>>::Projected::from(operation);
+            contribution = context.bind(operation, Vec::new(), &[contribution])?.remove(0);
+        }
+
+        reference.add_update(&contribution)
     }
 }
 
@@ -441,7 +586,7 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -611,6 +756,39 @@ mod tests {
         assert_eq!(descriptor.transforms(), operation.transforms());
         assert_eq!(descriptor.bindings(), 1..2);
         assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
+    fn test_reference_read_type_inference_manual_variation() {
+        // Inside a manual region, an index that varies along a manual axis selects a different element on every
+        // device, so the value read varies along that axis even when the referent does not.
+        let operation = TestIrReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Dynamic,
+        }]);
+        let invariant_index = manual_array_type(DataType::I32, &[], false);
+        let varying_index = manual_array_type(DataType::I32, &[], true);
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [manual_reference_type(DataType::F32, &[2], false), invariant_index.clone()],
+                    output_types = [manual_array_type(DataType::F32, &[], false)],
+                },
+                {
+                    input_types = [manual_reference_type(DataType::F32, &[2], false), varying_index.clone()],
+                    output_types = [manual_array_type(DataType::F32, &[], true)],
+                },
+                {
+                    input_types = [manual_reference_type(DataType::F32, &[2], true), invariant_index],
+                    output_types = [manual_array_type(DataType::F32, &[], true)],
+                },
+                {
+                    input_types = [manual_reference_type(DataType::F32, &[2], true), varying_index],
+                    output_types = [manual_array_type(DataType::F32, &[], true)],
+                },
+            ],
+        );
     }
 
     #[test]
@@ -1052,6 +1230,76 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "reference transform bindings must be known when transposing an access",
         ));
+    }
+
+    #[test]
+    fn test_reference_read_transposition_manual_variation() {
+        // Inside a manual region, a read of a referent that is invariant along `x` at an index that varies along `x`
+        // implicitly varies the referent along `x` before selecting from it, so its transpose sums what every device
+        // scatters at its own index: it adds the cotangent into a zero buffer that varies along `x`, sums the buffer
+        // over `x`, and adds that invariant sum into the cotangent reference of the complete referent. A referent that
+        // already varies along `x` keeps the indexed accumulation into its cotangent reference. A referent without a
+        // sharding is placed on the mesh of the index by the read, so the sum is placed back before it is accumulated.
+        let transpose = |referent: ArrayIrType| {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let initial = builder.add_input(referent);
+            let index = builder.add_input(manual_array_type(DataType::I32, &[], true));
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+            let operation = TestIrReferenceReadOperation::new().with_transforms(vec![transform]);
+            let outputs =
+                builder.add_instruction(operation, Vec::new(), vec![reference, index], None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 1])
+                .unwrap();
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string()
+        };
+        let invariant = "f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let varying = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        let cotangent = "f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let index = "i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        assert_eq!(
+            transpose(manual_array_type(DataType::F32, &[2], false)),
+            formatdoc! {"
+                lambda %0:{cotangent}, %1:{index} .
+                let %2:{invariant} = zero [type={invariant}]
+                    %3:ref<{invariant}> = reference_new %2
+                    %4:{varying} = zero [type={varying}]
+                    %5:ref<{varying}> = reference_new %4
+                    () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %5 %0 %1
+                    %6:{varying} = reference_freeze %5
+                    %7:{invariant} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %6
+                    () = reference_add_update %3 %7
+                    %8:{invariant} = reference_freeze %3
+                in (%8)"},
+        );
+        assert_eq!(
+            transpose(manual_array_type(DataType::F32, &[2], true)),
+            formatdoc! {"
+                lambda %0:{cotangent}, %1:{index} .
+                let %2:{varying} = zero [type={varying}]
+                    %3:ref<{varying}> = reference_new %2
+                    () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %3 %0 %1
+                    %4:{varying} = reference_freeze %3
+                in (%4)"},
+        );
+        assert_eq!(
+            transpose(ArrayType::new_static(DataType::F32, [2]).into()),
+            formatdoc! {"
+                lambda %0:{cotangent}, %1:{index} .
+                let %2:f32[2] = zero [type=f32[2]]
+                    %3:ref<f32[2]> = reference_new %2
+                    %4:{varying} = zero [type={varying}]
+                    %5:ref<{varying}> = reference_new %4
+                    () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %5 %0 %1
+                    %6:{varying} = reference_freeze %5
+                    %7:{invariant} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %6
+                    %8:f32[2] = broadcast [output_type=f32[2], output_axes=[0]] %7
+                    () = reference_add_update %3 %8
+                    %9:f32[2] = reference_freeze %3
+                in (%9)"},
+        );
     }
 
     #[test]

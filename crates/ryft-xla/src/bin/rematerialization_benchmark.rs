@@ -12,9 +12,11 @@
 //!     temporary memory and the peak memory from the memory statistics of the compiled executable) and its execution
 //!     time, without rematerialization and with rematerialized layers under several policies.
 //!
-//! Every rematerialized gradient is checked against the gradient without rematerialization.
+//! Every rematerialized gradient is checked against the gradient without rematerialization. Deterministic centered
+//! weights have variance `1 / fan_in`, and every parameter matrix must have a finite, nonzero gradient norm.
 //!
 //! Run it with `cargo run --release -p ryft-xla --features performance-benchmarking --bin rematerialization_benchmark`.
+//! Append `-- --smoke` to use small dimensions and two timed executions while retaining every benchmark variant.
 
 use std::env;
 use std::time::{Duration, Instant};
@@ -24,8 +26,8 @@ use ryft_core::{
     ArrayIrType, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh, Dimension,
     DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory, MeshAxis,
     MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
-    RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Value,
-    ValueProjection, differentiate_at, rematerialize, stage_function,
+    RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Typed,
+    Value, ValueProjection, differentiate_at, rematerialize, stage_function,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
@@ -37,11 +39,8 @@ type BenchmarkOutput = (ArrayIrType, ArrayIrType);
 type BenchmarkStagedFunction<'c> = StagedFunction<XlaDomain<'c>, BenchmarkInput, BenchmarkOutput>;
 type BenchmarkCompiledFunction<'c> = CompiledFunction<XlaDomain<'c>, BenchmarkInput, BenchmarkOutput>;
 
-/// Number of timed executions of each compiled gradient.
-const EXECUTION_COUNT: usize = 10;
-
 /// Rematerialization of a layer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Copy, Clone, Debug)]
 enum Checkpointing {
     /// The layer is not rematerialized.
     None,
@@ -69,7 +68,7 @@ impl Checkpointing {
 }
 
 /// Shape of a benchmarked multilayer perceptron.
-#[derive(Clone, Copy, Debug)]
+#[derive(Copy, Clone, Debug)]
 struct Model {
     /// Number of examples in a batch.
     batch_size: usize,
@@ -193,10 +192,24 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
         .unwrap()
 }
 
-/// Returns an array of the provided shape that is replicated over `mesh` with deterministic small values.
-fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize]) -> XlaArray<'c> {
+/// Returns an array replicated over `mesh` with deterministic centered values of variance `1 / fan_in`.
+/// Distinct seeds separate inputs and parameter matrices; the generator continues across stacked layers so that
+/// their weights differ. Reusing the same seed and shape reproduces identical inputs across benchmark variants.
+fn array<'c>(domain: &XlaDomain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> XlaArray<'c> {
     let size = shape.iter().product::<usize>();
-    let bytes = (0..size).flat_map(|index| ((index % 97) as f32 / 970.0).to_ne_bytes()).collect::<Vec<_>>();
+    let scale = (3.0 / fan_in as f32).sqrt();
+    let bytes = (0..size)
+        .flat_map(|_| {
+            // SplitMix64 supplies reproducible, decorrelated samples without a benchmark-only dependency.
+            seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+            let mut sample = seed;
+            sample = (sample ^ (sample >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            sample = (sample ^ (sample >> 27)).wrapping_mul(0x94d049bb133111eb);
+            sample ^= sample >> 31;
+            let unit = (sample >> 40) as f32 / (1u32 << 24) as f32;
+            ((2.0 * unit - 1.0) * scale).to_ne_bytes()
+        })
+        .collect::<Vec<_>>();
     XlaArray::from_host_buffer(domain, replicated_array_type(mesh, shape), mesh.clone(), bytes.as_slice()).unwrap()
 }
 
@@ -297,6 +310,7 @@ fn measure<'c>(
     staged: BenchmarkStagedFunction<'c>,
     trace: Duration,
     inputs: (XlaArray<'c>, XlaArray<'c>, XlaArray<'c>),
+    execution_count: usize,
 ) -> Measurement<'c> {
     let start = Instant::now();
     let lowered = domain.lower(staged).unwrap();
@@ -314,7 +328,7 @@ fn measure<'c>(
         gradients
     };
     let gradients = execute();
-    let mut executions = (0..EXECUTION_COUNT)
+    let mut executions = (0..execution_count)
         .map(|_| {
             let start = Instant::now();
             execute();
@@ -329,7 +343,7 @@ fn measure<'c>(
         operation_count,
         temporary_bytes: memory.map(|memory| memory.device_temporary_size_in_bytes),
         peak_bytes: memory.map(|memory| memory.device_peak_memory_in_bytes),
-        execution: executions[EXECUTION_COUNT / 2],
+        execution: executions[execution_count / 2],
         gradients: gradients.into(),
     }
 }
@@ -339,21 +353,104 @@ fn mebibytes(bytes: Option<usize>) -> String {
     bytes.map_or_else(|| "n/a".to_owned(), |bytes| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)))
 }
 
-/// Prints `measurement` as a table row and checks that its gradients match the ones of `reference` up to the absolute
-/// difference that reordering `f32` arithmetic can introduce.
-fn report(client: &Client<'_>, name: &str, measurement: &Measurement<'_>, reference: &Measurement<'_>) {
-    let difference = measurement
-        .gradients
-        .iter()
-        .zip(&reference.gradients)
-        .flat_map(|(actual, expected)| {
-            values(client, actual)
-                .into_iter()
-                .zip(values(client, expected))
-                .map(|(actual, expected)| (actual - expected).abs())
-        })
-        .fold(0.0f32, f32::max);
-    assert!(difference <= 1e-4, "the gradients of `{name}` differ from the reference ones by {difference}");
+/// Validates gradient structure, finite values, and agreement within `1e-5 + 1e-4 * |expected|`, returning the maximum
+/// absolute difference. Reports the element with the largest excess over its tolerance when agreement fails.
+/// Each gradient contains `parameter_layer_count` contiguous parameter matrices, each with a nonzero finite norm;
+/// scanned parameters use the model's layer count, while shared parameters and single-layer workloads use one.
+fn validate_gradients(
+    actual: &[(Shape, Vec<f32>)],
+    expected: &[(Shape, Vec<f32>)],
+    parameter_layer_count: usize,
+) -> Result<f64, ProgramError> {
+    if actual.len() != expected.len() {
+        return Err(ProgramError::InvalidArgument {
+            message: format!("gradient count mismatch: expected {}, got {}", expected.len(), actual.len()),
+        });
+    }
+    let mut maximum_difference = 0f64;
+    let mut worst_mismatch: Option<(f64, usize, usize, f32, f32)> = None;
+    for (gradient_index, ((actual_shape, actual), (expected_shape, expected))) in
+        actual.iter().zip(expected).enumerate()
+    {
+        if actual_shape != expected_shape {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "gradient {gradient_index} shape mismatch: expected `{expected_shape}`, got `{actual_shape}`",
+                ),
+            });
+        }
+        if actual.len() != expected.len() || actual_shape.element_count()? != Some(actual.len()) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "gradient {gradient_index} element count mismatch for shape `{actual_shape}`: \
+                     actual {}, expected {}",
+                    actual.len(),
+                    expected.len(),
+                ),
+            });
+        }
+        if parameter_layer_count == 0 || actual.is_empty() || actual.len() % parameter_layer_count != 0 {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("gradient {gradient_index} cannot be split into {parameter_layer_count} layers"),
+            });
+        }
+        for (element_index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if !actual.is_finite() || !expected.is_finite() {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "gradient {gradient_index} element {element_index} is not finite: \
+                         actual `{actual}`, expected `{expected}`",
+                    ),
+                });
+            }
+            let difference = (f64::from(actual) - f64::from(expected)).abs();
+            let tolerance = 1e-5 + 1e-4 * f64::from(expected).abs();
+            maximum_difference = maximum_difference.max(difference);
+            if difference > tolerance && worst_mismatch.is_none_or(|(excess, ..)| difference - tolerance > excess) {
+                worst_mismatch = Some((difference - tolerance, gradient_index, element_index, actual, expected));
+            }
+        }
+        for (role, values) in [("actual", actual), ("expected", expected)] {
+            for (layer, values) in values.chunks_exact(values.len() / parameter_layer_count).enumerate() {
+                let squared_norm = values.iter().map(|&value| f64::from(value).powi(2)).sum::<f64>();
+                if !squared_norm.is_finite() || squared_norm == 0.0 {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "{role} gradient {gradient_index} layer {layer} has a zero or nonfinite squared norm",
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    if let Some((_, gradient_index, element_index, actual, expected)) = worst_mismatch {
+        return Err(ProgramError::InvalidArgument {
+            message: format!(
+                "gradient {gradient_index} element {element_index} exceeds tolerance: \
+                 actual `{actual}`, expected `{expected}`",
+            ),
+        });
+    }
+    Ok(maximum_difference)
+}
+
+/// Validates `measurement` against `reference` and prints it as a table row. Copies and validation are outside the
+/// timed executions. Refer to [`validate_gradients`] for the tolerance and `parameter_layer_count` semantics.
+fn report(
+    client: &Client<'_>,
+    name: &str,
+    measurement: &Measurement<'_>,
+    reference: &Measurement<'_>,
+    parameter_layer_count: usize,
+) -> Result<(), ProgramError> {
+    let read = |measurement: &Measurement<'_>| {
+        measurement
+            .gradients
+            .iter()
+            .map(|array| (array.r#type().shape().clone(), values(client, array)))
+            .collect::<Vec<_>>()
+    };
+    let difference = validate_gradients(&read(measurement), &read(reference), parameter_layer_count)?;
     println!(
         "| {name} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.2} | {difference:.1e} |",
         measurement.trace.as_secs_f64() * 1e3,
@@ -364,6 +461,7 @@ fn report(client: &Client<'_>, name: &str, measurement: &Measurement<'_>, refere
         mebibytes(measurement.peak_bytes),
         measurement.execution.as_secs_f64() * 1e3,
     );
+    Ok(())
 }
 
 /// Prints the header of a table of measurements.
@@ -396,7 +494,22 @@ fn client() -> Client<'static> {
     }
 }
 
-fn main() {
+/// Runs every benchmark variant with full or smoke dimensions.
+fn main() -> Result<(), ProgramError> {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let smoke = match arguments.as_slice() {
+        [] => false,
+        [argument] if argument == "--smoke" => true,
+        _ => {
+            return Err(ProgramError::InvalidArgument { message: "expected no arguments or `--smoke`".to_owned() });
+        }
+    };
+    let execution_count = if smoke { 2 } else { 10 };
+    let model = if smoke {
+        Model { batch_size: 4, width: 8, expanded_width: 16, layer_count: 3 }
+    } else {
+        Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 }
+    };
     let client = Box::leak(Box::new(client()));
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -405,12 +518,11 @@ fn main() {
     println!("platform: {}", client.platform_name().unwrap());
 
     // Runtime of a model that scans over its layers.
-    let model = Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 };
     let inputs = || {
         (
-            array(&domain, &mesh, &[model.batch_size, model.width]),
-            array(&domain, &mesh, &[model.layer_count, model.width, model.expanded_width]),
-            array(&domain, &mesh, &[model.layer_count, model.expanded_width, model.width]),
+            array(&domain, &mesh, &[model.batch_size, model.width], 1, 1),
+            array(&domain, &mesh, &[model.layer_count, model.width, model.expanded_width], model.width, 2),
+            array(&domain, &mesh, &[model.layer_count, model.expanded_width, model.width], model.expanded_width, 3),
         )
     };
     print_header(&format!("Scan over layers ({model:?})"));
@@ -420,20 +532,25 @@ fn main() {
     {
         let start = Instant::now();
         let staged = stage_scanned_gradient(&domain, &mesh, model, checkpointing);
-        let measurement = measure(&domain, staged, start.elapsed(), inputs());
-        report(client, checkpointing.name(), &measurement, reference.as_ref().unwrap_or(&measurement));
+        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
+        report(
+            client,
+            checkpointing.name(),
+            &measurement,
+            reference.as_ref().unwrap_or(&measurement),
+            model.layer_count,
+        )?;
         reference.get_or_insert(measurement);
     }
 
     // Staging cost of repeated calls of a layer.
-    let model = Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 };
     let up_shape = [model.width, model.expanded_width];
     let down_shape = [model.expanded_width, model.width];
     let inputs = || {
         (
-            array(&domain, &mesh, &[model.batch_size, model.width]),
-            array(&domain, &mesh, &up_shape),
-            array(&domain, &mesh, &down_shape),
+            array(&domain, &mesh, &[model.batch_size, model.width], 1, 1),
+            array(&domain, &mesh, &up_shape, model.width, 2),
+            array(&domain, &mesh, &down_shape, model.expanded_width, 3),
         )
     };
     print_header(&format!("Repeated calls ({model:?})"));
@@ -443,6 +560,7 @@ fn main() {
         (Checkpointing::NothingSavable, true),
         (Checkpointing::NothingSavable, false),
         (Checkpointing::DotsSavable, true),
+        (Checkpointing::OffloadDots, true),
     ] {
         let start = Instant::now();
         let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
@@ -450,12 +568,12 @@ fn main() {
                 checkpointed_layer(checkpointing, optimization_barrier, hidden, up.clone(), down.clone())
             })
         });
-        let measurement = measure(&domain, staged, start.elapsed(), inputs());
+        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
         let name = match (checkpointing, optimization_barrier) {
             (Checkpointing::None, _) | (_, true) => checkpointing.name().to_owned(),
             (_, false) => format!("{} without an optimization barrier", checkpointing.name()),
         };
-        report(client, &name, &measurement, reference.as_ref().unwrap_or(&measurement));
+        report(client, &name, &measurement, reference.as_ref().unwrap_or(&measurement), 1)?;
         reference.get_or_insert(measurement);
     }
 
@@ -467,8 +585,116 @@ fn main() {
         let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
             nested_layer(depth, hidden, up, down)
         });
-        let measurement = measure(&domain, staged, start.elapsed(), inputs());
-        report(client, &format!("depth {depth}"), &measurement, reference.as_ref().unwrap_or(&measurement));
+        let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
+        report(client, &format!("depth {depth}"), &measurement, reference.as_ref().unwrap_or(&measurement), 1)?;
         reference.get_or_insert(measurement);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_validate_gradients() {
+        let shape = Shape::new(vec![2.into()]);
+        let expected = vec![(shape.clone(), vec![1.0, 100.0])];
+        assert_eq!(validate_gradients(&expected, &expected, 1), Ok(0.0));
+        let actual = vec![(shape, vec![1.00001, 100.005])];
+        let difference = validate_gradients(&actual, &expected, 1).unwrap();
+        assert!((difference - 0.005).abs() < 1e-5);
+
+        let shape = Shape::new(vec![2.into(), 2.into()]);
+        let expected = vec![(shape.clone(), vec![1.0, 2.0, 3.0, 4.0])];
+        let corrupted = vec![(shape, vec![1.0, 2.01, 3.0, 5.0])];
+        assert!(matches!(
+            validate_gradients(&corrupted, &expected, 2),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "gradient 0 element 3 exceeds tolerance: actual `5`, expected `4`"
+        ));
+    }
+
+    #[test]
+    fn test_validate_gradients_structure() {
+        let shape = Shape::new(vec![2.into()]);
+        let expected = vec![(shape.clone(), vec![1.0, 2.0])];
+        let cases = [
+            (Vec::new(), "gradient count mismatch: expected 1, got 0", "gradient count mismatch: expected 0, got 1"),
+            (
+                vec![(Shape::new(vec![1.into(), 2.into()]), vec![1.0, 2.0])],
+                "gradient 0 shape mismatch: expected `[2]`, got `[1, 2]`",
+                "gradient 0 shape mismatch: expected `[1, 2]`, got `[2]`",
+            ),
+            (
+                vec![(shape.clone(), vec![1.0])],
+                "gradient 0 element count mismatch for shape `[2]`: actual 1, expected 2",
+                "gradient 0 element count mismatch for shape `[2]`: actual 2, expected 1",
+            ),
+            (
+                vec![(shape.clone(), vec![1.0, 2.0, 3.0])],
+                "gradient 0 element count mismatch for shape `[2]`: actual 3, expected 2",
+                "gradient 0 element count mismatch for shape `[2]`: actual 2, expected 3",
+            ),
+        ];
+        for (actual, diagnostic, reverse_diagnostic) in cases {
+            assert!(matches!(
+                validate_gradients(&actual, &expected, 1),
+                Err(ProgramError::InvalidArgument { message }) if message == diagnostic
+            ));
+            assert!(matches!(
+                validate_gradients(&expected, &actual, 1),
+                Err(ProgramError::InvalidArgument { message }) if message == reverse_diagnostic
+            ));
+        }
+        let truncated = vec![(shape, vec![1.0])];
+        assert!(matches!(
+            validate_gradients(&truncated, &truncated, 1),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "gradient 0 element count mismatch for shape `[2]`: actual 1, expected 1"
+        ));
+        for layer_count in [0, 3] {
+            assert!(matches!(
+                validate_gradients(&expected, &expected, layer_count),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == format!("gradient 0 cannot be split into {layer_count} layers")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_gradients_nonfinite() {
+        let shape = Shape::new(vec![2.into()]);
+        let expected = vec![(shape.clone(), vec![1.0, 2.0])];
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let actual = vec![(shape.clone(), vec![1.0, nonfinite])];
+            for (actual, expected) in [(&actual, &expected), (&expected, &actual)] {
+                assert!(matches!(
+                    validate_gradients(actual, expected, 1),
+                    Err(ProgramError::InvalidArgument { message })
+                        if message == format!(
+                            "gradient 0 element 1 is not finite: actual `{}`, expected `{}`",
+                            actual[0].1[1], expected[0].1[1],
+                        )
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_gradients_norms() {
+        let shape = Shape::new(vec![2.into(), 2.into()]);
+        let gradients = vec![(shape.clone(), vec![1.0, 0.0, 0.0, 2.0])];
+        assert_eq!(validate_gradients(&gradients, &gradients, 2), Ok(0.0));
+        let zero_layer = vec![(shape, vec![1.0, 0.0, 0.0, -0.0])];
+        for (actual, expected, role) in [(&zero_layer, &gradients, "actual"), (&gradients, &zero_layer, "expected")] {
+            assert!(matches!(
+                validate_gradients(actual, expected, 2),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == format!("{role} gradient 0 layer 1 has a zero or nonfinite squared norm")
+            ));
+        }
     }
 }

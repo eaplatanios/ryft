@@ -652,7 +652,7 @@ fn balanced_extremum_weight<
     let wins = lexicographic_comparison(candidate, other, direction)?;
     let ties = lexicographic_comparison(candidate, other, ComparisonDirection::Equal)?;
 
-    // Derive the half-weight from the candidate so runtime dimensions and placement stay in dataflow.
+    // Derive the half-weight from the candidate so runtime dimensions and placement stay in data flow.
     let one = candidate.one_like()?;
     let half = one.div(&one.add(&one)?)?;
     wins.select(&one, &ties.select(&half, &candidate.zero_like()?)?)

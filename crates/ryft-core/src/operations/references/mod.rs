@@ -1,7 +1,7 @@
 //! Operations over _references_ (i.e., handles to mutable state that programs allocate, read, update in place, and
 //! finally consume). A reference has a [`ReferenceType`](crate::ReferenceType) naming the referent it stores. Reads
 //! and updates declare reference effects, so a program that touches state keeps its accesses in order and its
-//! reference discharge can later turn that state into explicit dataflow for backends without mutable buffers.
+//! reference discharge can later turn that state into explicit data flow for backends without mutable buffers.
 //!
 //! The core operations are:
 //!
@@ -80,7 +80,9 @@ pub use reference_atomic_add_update::{
 };
 pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
 pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
-pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
+pub use reference_read::{
+    REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition,
+};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};
 
@@ -123,6 +125,7 @@ pub(crate) mod tests {
 
     use ryft_macros::Parameter;
 
+    use crate::arrays::{ArrayIrType, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
@@ -775,4 +778,31 @@ pub(crate) mod tests {
         let reference = allocated[0].try_as_reference("the allocated reference").unwrap().clone();
         (context, reference)
     }
+
+    /// Returns the [`ArrayType`] of `data_type` and static `shape` placed replicated on a two-device manual mesh over
+    /// `x`, varying along `x` when `varying` is set, as the values of a manual region over that mesh are typed.
+    pub(crate) fn manual_type(data_type: DataType, shape: &[usize], varying: bool) -> ArrayType {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, shape.len()).with_varying_manual_axes(varying.then_some("x"));
+        ArrayType::new_static(data_type, shape.to_vec()).with_sharding(sharding.unwrap()).unwrap()
+    }
+
+    /// Returns the [`ArrayIrType`] of an array of type [`manual_type`].
+    pub(crate) fn manual_array_type(data_type: DataType, shape: &[usize], varying: bool) -> ArrayIrType {
+        ArrayIrType::Array(manual_type(data_type, shape, varying))
+    }
+
+    /// Returns the [`ArrayIrType`] of a reference to a referent of type [`manual_type`].
+    pub(crate) fn manual_reference_type(data_type: DataType, shape: &[usize], varying: bool) -> ArrayIrType {
+        ArrayIrType::Reference(ReferenceType::new(manual_type(data_type, shape, varying)))
+    }
+
+    /// Error that a mutating access reports for an `i32` index that varies along `x` into the invariant `f32[2]`
+    /// referent of [`manual_reference_type`], whose devices would otherwise update different elements of a referent
+    /// that is typed as identical across them.
+    pub(crate) const VARYING_INDEX_MUTATION_ERROR: &str = "reference transform index \
+        `i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies over manual axis `x` but the \
+        referent `f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]` does not, so a mutation through it would update a \
+        different element on every device of a referent that is identical across them; vary the referent over that \
+        axis or use an invariant index";
 }

@@ -35,14 +35,14 @@ use ryft_core::{
     ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness, RegionSlot, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot,
+    RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
     RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation,
     SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation,
     SubOperation, TagOperation, TanOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
     TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
     TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch,
-    ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    ValueProjection, ValueResolution, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
     discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
@@ -1025,6 +1025,10 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract each.
 /// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in
 /// operation equality and callee-deduplication identity and scopes reference-capture resolution during analysis.
+///
+/// [`Operation::region_data_flow`] declares ordinary callee data flow: callee inputs receive instruction inputs
+/// positionally and instruction outputs originate from the corresponding callee outputs. Capture-prefix retention
+/// remains an independent boundary-pruning requirement.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JitCallOperation<T: Type> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
@@ -1134,6 +1138,10 @@ impl<T: Type> Operation for JitCallOperation<T> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
+    }
+
     fn prune_boundary(
         &self,
         input_count: usize,
@@ -1190,10 +1198,16 @@ where
 // rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
 // sides.
 //
-// The split fires only when some known call input does *not* [`resolve`](Context::resolve) to a program constant in
-// the known-side context — i.e., a genuine tracer into a live outer trace, the mixed-online case this
-// rule exists for. All-known, all-unknown, and constant-resolved calls defer to the default fold-or-residualize
-// behavior, which preserves the original boundary (and today's eager behavior) exactly.
+// The split fires whenever the known-ness of the call inputs is mixed (i.e., some inputs are known and some are not).
+// All-unknown calls preserve the original boundary. All-known calls normally do too, except that a residual policy
+// can inline a pure callee into a live known-side trace. This exposes its intermediate producers to demand-driven
+// residual placement, so a policy can save a compact intermediate rather than the callee's expanded output. Eager
+// calls and callees with references, captures, or nominal type identities keep their boundary. Whether the mixed
+// call's known inputs are concrete values of an eager known-side context or tracers into a live
+// outer trace does not matter, as in JAX's call partial-evaluation rules, which always bind the known call: the known
+// side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
+// (e.g., [`XlaDomain`](crate::XlaDomain)) and stages it into the outer program under a staging context. The `shard_map`
+// rule follows the same policy.
 //
 // When the split fires, the callee is split through the shared
 // [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
@@ -1217,9 +1231,17 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // Split only a mixed call with at least one known-but-symbolic input; everything else keeps the default
-        // fold-or-residualize behavior and therefore the original boundary.
-        if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
+        let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
+        // Inlining an all-known callee exposes its producers to the policy only when they can be staged into the
+        // known-side trace. Keep eager calls whole instead of replacing one compiled call with per-operation dispatch.
+        let inline_known = all_known
+            && context.residual_policy().is_some()
+            && inputs.iter().any(|input| {
+                input
+                    .as_known()
+                    .is_some_and(|value| matches!(context.parent().resolve(value), ValueResolution::Staged(_)))
+            });
+        if (all_known && !inline_known) || inputs.iter().all(PartialEvaluationValue::is_unknown) {
             return context.fold_or_residualize(
                 XlaOperation::JitCall(*self),
                 driver.regions().map(|region| region.to_program()).collect(),
@@ -1254,6 +1276,18 @@ where
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
             return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+        }
+        if all_known {
+            // Keep effectful work and nominally scoped types behind their validated call boundary. The pure,
+            // identity-free case can replay into this context directly; placement still happens only when residual
+            // work actually demands a value, so unused outputs cannot trigger policy decisions or rejections.
+            if !callee.effects().classes().is_empty()
+                || inputs.iter().any(|input| input.r#type().identities().next().is_some())
+                || callee.contains_atom_type_in_closure(|r#type| r#type.identities().next().is_some())
+            {
+                return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+            }
+            return driver.partially_evaluate_region(context, 0, inputs.to_vec());
         }
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
         let partition = driver.partition_program(context, callee, input_known.as_slice())?;
@@ -1797,7 +1831,7 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
@@ -1812,12 +1846,12 @@ mod tests {
         OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
         ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
-        RegionRef, RematerializationOptimizationBarrier, RematerializeOperation, ResidualCandidate, ResidualDecision,
-        ResidualPolicy, ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer, TracingContext,
-        TransferToMemoryOperation, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-        ValueResolution, WhileOperation, ZeroOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDataFlow, RegionDriver,
+        RegionInterface, RegionRef, RematerializationOptimizationBarrier, RematerializeOperation, ResidualCandidate,
+        ResidualDecision, ResidualPolicy, ResidualPolicyReference, ResidualRejection, ResidualZeroProvider,
+        ScanOperation, Shape, Sharding, ShardingDimension, SinOperation, StagingContext, TagOperation, Tracer,
+        TracingContext, TransferToMemoryOperation, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
+        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::XlaArray;
@@ -1863,6 +1897,84 @@ mod tests {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
     }
 
+    /// Compiles and executes an array-only `f32` fixture using its declared unsharded program signature.
+    fn execute_f32_program(
+        client: &ryft_pjrt::Client<'_>,
+        program: &XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+        values: Vec<Vec<f32>>,
+    ) -> Vec<Vec<f32>> {
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
+        use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
+
+        use crate::experimental::lowering::to_mlir_module_for_program;
+        use crate::tests::{values_from_bytes, values_to_bytes};
+
+        let array_type = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(r#type) => r#type.clone(),
+            _ => panic!("expected an array signature"),
+        };
+        let input_types = program.input_types().iter().map(array_type).collect::<Vec<_>>();
+        let output_types = program.output_types().iter().map(array_type).collect::<Vec<_>>();
+        let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let executable = client
+            .compile(
+                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                &CompilationOptions {
+                    executable_build_options: Some(ExecutableCompilationOptions {
+                        device_ordinal: -1,
+                        replica_count: 1,
+                        partition_count: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        assert_eq!(values.len(), program.input_count());
+        let inputs = values
+            .into_iter()
+            .zip(program.input_types())
+            .map(|(values, r#type)| {
+                let ArrayIrType::Array(r#type) = r#type else {
+                    panic!("expected an array input");
+                };
+                assert_eq!(r#type.data_type(), DataType::F32);
+                let dimensions =
+                    r#type.static_shape().unwrap().dimensions().iter().map(|value| *value as u64).collect::<Vec<_>>();
+                let buffer = client
+                    .buffer(
+                        values_to_bytes(&values).as_slice(),
+                        BufferType::F32,
+                        &dimensions,
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap();
+                ExecutionInput { buffer: Arc::new(buffer), donatable: false }
+            })
+            .collect::<Vec<_>>();
+        executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap()
+            .remove(0)
+            .outputs
+            .iter()
+            .map(|output| values_from_bytes::<f32>(&output.copy_to_host(None).unwrap().r#await().unwrap()))
+            .collect()
+    }
+
     #[test]
     fn test_jit_call_reference_provenance_is_positional() {
         // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
@@ -1880,6 +1992,14 @@ mod tests {
             operation.output_region_provenance(2),
             vec![OutputRegionProvenance { region_index: 0, output_index: 2 }],
         );
+    }
+
+    #[test]
+    fn test_jit_call_region_data_flow() {
+        let operation = JitCallOperation::<ArrayIrType>::new(2);
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        let dispatched = XlaOperation::<XlaConstant>::from(operation);
+        assert!(matches!(dispatched.region_data_flow(), RegionDataFlow::Provenance));
     }
 
     #[test]
@@ -2511,8 +2631,8 @@ mod tests {
         use ryft_core::{NothingSavable, rematerialize};
 
         // A rematerialized body squares its input inside a jitted call and squares the result of the call outside of
-        // it. Linearizing it with the default policy, which saves nothing, saves only the input: the call, whose inputs
-        // are all known, is recomputed by the differentiated call rather than saved.
+        // it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure all-known
+        // call is inlined into the policy walk; the differentiated call recomputes that multiplication.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
             let mut builder = XlaProgramBuilder::new();
@@ -2538,27 +2658,15 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[] .
-                        let %1:f64[] = mul %0 %0
-                        in (%1)
-                    },
-                ]
+                let %1:f64[] = mul %0 %0
                     %2:f64[] = mul %1 %1
                 in (%2, %0)
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
                     body={
                         lambda %0:f64[], %1:f64[] .
-                        let %2:f64[], %3:f64[] = jit_call %1 [
-                            callee={
-                                lambda %0:f64[] .
-                                let %1:f64[] = mul %0 %0
-                                in (%1, %0)
-                            },
-                        ]
-                            %4:f64[] = jit_call %0 %3 [
+                        let %2:f64[] = mul %1 %1
+                            %3:f64[] = jit_call %0 %1 [
                                 callee={
                                     lambda %0:f64[], %1:f64[] .
                                     let %2:f64[] = mul %1 %0
@@ -2567,10 +2675,10 @@ mod tests {
                                     in (%4)
                                 },
                             ]
-                            %5:f64[] = mul %2 %4
-                            %6:f64[] = mul %2 %4
-                            %7:f64[] = add %5 %6
-                        in (%7)
+                            %4:f64[] = mul %2 %3
+                            %5:f64[] = mul %2 %3
+                            %6:f64[] = add %4 %5
+                        in (%6)
                     },
                 ]
                 in (%2)"},
@@ -3759,6 +3867,98 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_partial_evaluation_splits_concrete_known_inputs() {
+        use ryft_core::{Device, DeviceMesh, PartialEvaluationInput, PartialEvaluationOutput};
+
+        use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+        use crate::{FromPjrt, XlaSession, XlaValue};
+
+        // Partial evaluation splits a mixed `jit_call` whose known inputs are concrete arrays of the eager XLA domain
+        // exactly as it splits one whose known inputs are symbolic: the known-side call compiles and executes
+        // immediately, so the output `a + a` is known and concrete, and the residual call keeps only `(a + a) * x`,
+        // fed by that known output (JAX's `out_fwd`).
+        let client = execution_client();
+        let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
+        let r#type = ArrayIrType::Array(array_type.clone());
+
+        // Callee `f(a, x) = (a + a, (a + a) * x)` over a known `a` and an unknown `x`.
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let a = builder.add_input(r#type.clone());
+            let x = builder.add_input(r#type.clone());
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+            let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![doubled, x], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![doubled, product],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let a = builder.add_input(r#type.clone());
+        let x = builder.add_input(r#type.clone());
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![a, x], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let array = |values: &[f64]| {
+            let bytes = values_to_bytes::<f64>(values);
+            XlaValue::Array(XlaArray::from_host_buffer(&domain, array_type.clone(), mesh.clone(), bytes).unwrap())
+        };
+        let read = |value: &XlaValue<'_>| {
+            let XlaValue::Array(array) = value else {
+                panic!("expected an array value");
+            };
+            let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
+            values_from_bytes::<f64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice())
+        };
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &domain,
+                &[PartialValue::Known(array(&[1.0, 2.0, 3.0, 4.0])), PartialValue::Unknown(r#type.clone())],
+            )
+            .unwrap();
+        let [PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(residual)] = evaluation.inputs() else {
+            panic!("expected the unknown input followed by the forwarded known output");
+        };
+        let [PartialEvaluationOutput::Known(doubled), PartialEvaluationOutput::Unknown(0)] = evaluation.outputs()
+        else {
+            panic!("expected one known output followed by one unknown output");
+        };
+        assert_eq!(read(doubled), vec![2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(read(residual), vec![2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            formatdoc! {"
+                lambda %0:{array_type}, %1:{array_type} .
+                let %2:{array_type} = jit_call %0 %1 [
+                    callee={{
+                        lambda %0:{array_type}, %1:{array_type} .
+                        let %2:{array_type} = mul %1 %0
+                        in (%2)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let outputs = evaluation.interpret(&domain, &[array(&[5.0, 6.0, 7.0, 8.0])]).unwrap();
+        assert_eq!(
+            outputs.iter().map(read).collect::<Vec<_>>(),
+            vec![vec![2.0, 4.0, 6.0, 8.0], vec![10.0, 24.0, 42.0, 64.0]],
+        );
+    }
+
+    #[test]
     fn test_jit_call_partial_evaluation_forwards_known_output_residuals() {
         // The callee `f(a, x) = (sin(a), sin(a) * x)` partitioned with `a` known and `x` unknown: the residual call
         // needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is fed
@@ -3795,7 +3995,7 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0],
-                    residual_inputs=[Unknown(1), Known(0)],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
                     outputs=[Known(0), Unknown(0)],
                 ]
                 known={
@@ -4018,7 +4218,11 @@ mod tests {
         assert_eq!(
             partition.to_string(),
             indoc! {"
-                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
                 known={
                     lambda %0:f64[4] .
                     let %1:f64[] = jit_call %0 [
@@ -4045,6 +4249,313 @@ mod tests {
                     in (%2)
                 }"},
         );
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_places_all_known_callee_intermediates() {
+        use ryft_core::{BroadcastOperation, Linearization, SaveOnlyTheseNames};
+
+        use crate::tests::execution_client;
+
+        // Only the expanded activation is needed by the tangent. Its all-known call must expose the compact tagged
+        // scale to the policy, saving 4 KiB instead of 256 KiB and replaying only the broadcast.
+        let compact_type = ArrayType::new_static(DataType::F32, [1024]);
+        let expanded_type = ArrayType::new_static(DataType::F32, [64, 1024]);
+        let mut builder = XlaProgramBuilder::new();
+        let weights = builder.add_input(compact_type.clone().into());
+        let scale = builder.add_instruction(SinOperation::new(), Vec::new(), vec![weights], None).unwrap()[0];
+        let scale = builder
+            .add_instruction(TagOperation::<ArrayType>::new("scale"), Vec::new(), vec![scale], None)
+            .unwrap()[0];
+        let expanded = builder
+            .add_instruction(BroadcastOperation::new(expanded_type.clone(), vec![1]), Vec::new(), vec![scale], None)
+            .unwrap()[0];
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(expanded_type.clone().into());
+        let weights = builder.add_input(compact_type.clone().into());
+        let callee = builder.import_program(callee);
+        let scale = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![weights], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, scale], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Ordinary partial evaluation preserves the original compiled-call boundary and expanded residual.
+        let ordinary = program.partition(&[false, true]).unwrap();
+        assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
+        assert!(matches!(ordinary.known_program().instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert_eq!(expanded_type.element_count().unwrap().unwrap() * size_of::<f32>(), 262_144);
+
+        let policy = ResidualPolicyReference::new(SaveOnlyTheseNames::new(["scale"]));
+        let placed = program.partition_with_residual_policy(&[false, true], &policy).unwrap();
+        assert_eq!(placed.known_program().output_types(), vec![ArrayIrType::from(compact_type.clone())]);
+        assert_eq!(compact_type.element_count().unwrap().unwrap() * size_of::<f32>(), 4096);
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[1],
+                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[1024] .
+                    let %1:f32[1024] = sin %0
+                        %2:f32[1024] = tag [key=scale] %1
+                    in (%2)
+                }
+                residual={
+                    lambda %0:f32[64, 1024], %1:f32[1024] .
+                    let %2:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %1
+                        %3:f32[64, 1024] = mul %0 %2
+                    in (%3)
+                }"},
+        );
+
+        // The same cut survives the rematerialization wrapper's linearization, where the original output remains a
+        // known primal result and the expanded scale is needed only by the derivative with respect to the activation.
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(expanded_type.clone().into());
+        let weights = builder.add_input(compact_type.clone().into());
+        let plain_linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let body = builder.import_program(program);
+        let output = builder
+            .add_instruction(RematerializeOperation::new(policy), vec![body], vec![input, weights], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(
+            linearization.primal().output_types(),
+            vec![ArrayIrType::from(expanded_type.clone()), ArrayIrType::from(compact_type.clone())],
+        );
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[64, 1024], %1:f32[1024] .
+                let %2:f32[1024] = sin %1
+                    %3:f32[1024] = tag [key=scale] %2
+                    %4:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %3
+                    %5:f32[64, 1024] = mul %0 %4
+                in (%5, %3)
+                lambda %0:f32[64, 1024], %1:f32[1024] .
+                let %2:f32[64, 1024] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f32[64, 1024], %1:f32[1024] .
+                        let %2:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %1
+                            %3:f32[64, 1024] = mul %2 %0
+                        in (%3)
+                    },
+                ]
+                in (%2)"},
+        );
+
+        let client = execution_client();
+        let inputs = vec![vec![2f32; 64 * 1024], (0..1024).map(|index| 0.1f32 + index as f32 * 1e-4).collect()];
+        let direction = vec![0.75f32; 64 * 1024];
+        let cotangent = vec![1.5f32; 64 * 1024];
+        let evaluate = |linearization: &Linearization<XlaConstant, XlaOperation>| {
+            let mut primal = execute_f32_program(&client, linearization.primal(), inputs.clone());
+            let value = primal.remove(0);
+            let tangent_inputs = std::iter::once(direction.clone()).chain(primal.clone()).collect();
+            let tangent = execute_f32_program(&client, linearization.tangent(), tangent_inputs);
+            let pullback_inputs = std::iter::once(cotangent.clone()).chain(primal).collect();
+            let pullback = execute_f32_program(&client, &linearization.pullback().unwrap(), pullback_inputs);
+            vec![value, tangent[0].clone(), pullback[0].clone()]
+        };
+        let actual = evaluate(&linearization);
+        assert_eq!(actual, evaluate(&plain_linearization));
+        assert!(actual.iter().flatten().all(|value| value.is_finite() && *value != 0.0));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_ignores_known_outputs_without_residual_demand() {
+        use ryft_core::{RematerializationPolicyFn, ResidualPolicyError};
+
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar_type.clone());
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let needed = builder
+            .add_instruction(TagOperation::<ArrayType>::new("needed"), Vec::new(), vec![sine], None)
+            .unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let unused = builder
+            .add_instruction(TagOperation::<ArrayType>::new("unused"), Vec::new(), vec![cosine], None)
+            .unwrap()[0];
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let known = builder.add_input(scalar_type.clone());
+        let unknown = builder.add_input(scalar_type.clone());
+        let callee = builder.import_program(callee);
+        let called = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![known], None)
+            .unwrap()
+            .to_vec();
+        let first =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![called[0], unknown], None).unwrap()[0];
+        let second =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![called[1], unknown], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![first, second, called[1]],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let policy =
+            ResidualPolicyReference::new(RematerializationPolicyFn::new::<ArrayIrType>(|candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "unused")
+                }) {
+                    Err(ResidualRejection::new("the unused result must not cross the residual boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Save)
+                }
+            }));
+
+        // The second call output remains a primal result. Its presence must not classify it as a residual.
+        let primal_only = program.with_outputs(&[0, 2]).unwrap();
+        let placed = primal_only.partition_with_residual_policy(&[true, false], &policy).unwrap();
+        assert_eq!(placed.known_program().output_types(), vec![scalar_type.clone(), scalar_type]);
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0), Known(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    let %1:f32[] = cos %0
+                        %2:f32[] = tag [key=unused] %1
+                        %3:f32[] = sin %0
+                        %4:f32[] = tag [key=needed] %3
+                    in (%2, %4)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = mul %1 %0
+                    in (%2)
+                }"},
+        );
+
+        // Requiring the same result in residual work must propagate the original rejection instead.
+        assert_eq!(
+            program
+                .with_outputs(&[0, 1])
+                .unwrap()
+                .partition_with_residual_policy(&[true, false], &policy)
+                .map(|_| ())
+                .map_err(ResidualPolicyError::from),
+            Err(ResidualPolicyError::Rejected {
+                policy: policy.name().to_owned(),
+                rejection: ResidualRejection::new("the unused result must not cross the residual boundary"),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_preserves_guarded_known_callees() {
+        use ryft_core::{NothingSavable, PartialEvaluationContext};
+
+        let policy = ResidualPolicyReference::new(NothingSavable);
+        let check_boundary = |callee: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, capture_count: usize| {
+            let mut builder = XlaProgramBuilder::new();
+            let inputs = callee.input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let input_count = inputs.len();
+            let callee = builder.import_program(callee);
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::JitCall(JitCallOperation::new(capture_count)),
+                    vec![callee],
+                    inputs,
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let output_count = outputs.len();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    outputs,
+                    vec![Placeholder; input_count],
+                    vec![Placeholder; output_count],
+                )
+                .unwrap();
+            let partition = program.partition_with_residual_policy(&vec![true; input_count], &policy).unwrap();
+            assert_eq!(partition.known_program().to_string(), program.to_string());
+            assert_eq!(partition.residual_program().instructions().len(), 0);
+        };
+
+        // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
+        let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(dynamic_type.into());
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        check_boundary(
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+            0,
+        );
+
+        // An ordered assertion must keep the same owning call and execution order.
+        let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
+        let mut builder = XlaProgramBuilder::new();
+        let predicate = builder.add_input(predicate_type.clone());
+        builder
+            .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
+            .unwrap();
+        check_boundary(
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+            0,
+        );
+
+        // Reference handles and retained capture constants keep their existing boundary semantics too.
+        let mut builder = XlaProgramBuilder::new();
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        check_boundary(
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+            0,
+        );
+        let mut builder = XlaProgramBuilder::new();
+        builder.add_input(predicate_type.clone());
+        let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_type.clone())));
+        check_boundary(
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![captured], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+            1,
+        );
+
+        // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
+        // concrete eager calls whole; using a literal in a live trace makes the retained call directly observable.
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(predicate_type);
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let context = PartialEvaluationContext::new(outer.clone()).with_residual_policy(&policy);
+        let input = context.lift(XlaConstant::Boolean(true)).unwrap();
+        context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], &[input]).unwrap();
+        assert_eq!(outer.builder().borrow().instructions().len(), 1);
+        assert!(matches!(outer.builder().borrow().instructions()[0].operation(), XlaOperation::JitCall(_)));
     }
 
     #[test]

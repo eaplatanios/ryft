@@ -6816,27 +6816,28 @@ mod tests {
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::{
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
-        ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation,
-        Atan2Operation, BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference,
-        CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
-        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension, DimensionAddOperation,
-        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
-        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
-        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
-        DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
-        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, RngBitGeneratorOperation, ScaledDotOperation,
-        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-        SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation, SortDirection,
-        SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch,
-        shard_map, try_jit_with_options,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert,
+        AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation, BatchingContext,
+        CalleeRegionDriver, CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection,
+        CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher, ConcatenateOperation,
+        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind,
+        CumulativeOperation, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension,
+        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+        DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
+        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice,
+        DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+        EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing,
+        IotaOperation, Linearization, MulOperation, NegOperation, OneOperation, ParallelAllGatherOperation,
+        ParallelAllGatherOutputVariance, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelReduceOperation,
+        ParallelVaryOperation, PrintOperation, Program, ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation,
+        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape,
+        ReshapeOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding,
+        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext, StaticShape, SubOperation,
+        TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7490,6 +7491,412 @@ mod tests {
                 vec![Placeholder; 5],
             )
             .unwrap()
+    }
+
+    /// Kind of `shard_map` program that [`shard_map_differential_program`] builds to compare the reference backend's
+    /// emulation of `shard_map` with its execution through XLA.
+    #[derive(Copy, Clone, Debug)]
+    enum ShardMapDifferentialCase {
+        /// Tiled identity of an input sharded along the manual axis `x`, together with its sum across `x`.
+        IdentityAndSum,
+
+        /// Coordinate of every device along the manual axis `x`.
+        AxisIndex,
+
+        /// Invariant tiled all-gather across the manual axis `x`.
+        AllGather,
+
+        /// Tiled all-to-all across the manual axis `x` that moves a row-sharded matrix to a column-sharded one.
+        AllToAll,
+
+        /// Permutation across the manual axis `x` that sends the shard of device 0 to device 1 and zeros to device 0.
+        Permute,
+
+        /// Map over the manual axis `x` whose body maps over the manual axis `y` and sums across the enclosing axis
+        /// `x`.
+        Nested,
+
+        /// Map that adds its shard of an update into its shard of a caller-allocated reference and reads it back.
+        Reference,
+
+        /// Map that reads a reference replicated along the manual axis `x` at the coordinate of every device along `x`.
+        VaryingIndexReference,
+
+        /// Map that doubles a reference replicated along the manual axis `x` on every device and reads it back.
+        ReplicatedReference,
+    }
+
+    /// Builds a program over `input_types` whose outputs are the atoms that `build` adds to it.
+    fn build_differential_program<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
+        input_types: Vec<ArrayIrType>,
+        build: impl FnOnce(&mut ProgramBuilder<V, O>, &[AtomId]) -> Vec<AtomId>,
+    ) -> Program<V, O, Vec<V>, Vec<V>> {
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = build(&mut builder, &inputs);
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count]).unwrap()
+    }
+
+    /// Builds the program of `case` over any operation family `O` that lifts the array IR family over `A`, so that the
+    /// reference backend's emulation (over [`ArrayIrOperation<Array>`]) and XLA execution (over [`XlaOperation`]) run
+    /// the same program. Every program input and output is an array: the reference of
+    /// [`ShardMapDifferentialCase::Reference`] is allocated from a program input, and its final value is frozen into a
+    /// trailing program output.
+    fn shard_map_differential_program<A, V, O>(case: ShardMapDifferentialCase) -> Program<V, O, Vec<V>, Vec<V>>
+    where
+        A: Value<Type = ArrayType>,
+        V: Value<Type = ArrayIrType>,
+        O: Operation<Type = ArrayIrType> + From<ArrayIrOperation<A>>,
+    {
+        let array_operation = ArrayIrOperation::<A>::from;
+        let mesh = match case {
+            ShardMapDifferentialCase::Nested => LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            ]),
+            _ => LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]),
+        }
+        .unwrap();
+        let sharded = |axis: &str| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded([axis])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let f32_type = |shape: &[usize], sharding: &Sharding| {
+            ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding.clone()).unwrap()
+        };
+        let sum_over_x = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+        let (shard_map, global_input_types, body) = match case {
+            ShardMapDifferentialCase::IdentityAndSum => {
+                let shard_map =
+                    ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x"), replicated], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
+                    vec![inputs[0], builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap()[0]]
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AxisIndex => {
+                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[2], &sharded("x"));
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, _| {
+                    let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                    let index = array_operation(ArrayOperation::AxisIndex(index));
+                    let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
+                    let reshape = ReshapeOperation::new(Shape::new(vec![Dimension::Static(1)]));
+                    let reshape = array_operation(ArrayOperation::Reshape(reshape));
+                    builder.add_instruction(reshape, Vec::new(), vec![index], None).unwrap().to_vec()
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AllGather => {
+                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let gather = ParallelAllGatherOperation::new(
+                        "x".to_string(),
+                        2,
+                        0,
+                        CollectiveOptions::tiled(),
+                        ParallelAllGatherOutputVariance::Invariant,
+                    );
+                    let gather = array_operation(ArrayOperation::ParallelAllGather(gather.with_mesh(mesh.clone())));
+                    builder.add_instruction(gather, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::AllToAll => {
+                let rows =
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+                let columns =
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
+                let (rows, columns) = (rows.unwrap(), columns.unwrap());
+                let shard_map = ShardMap::new(mesh.clone(), vec![rows.clone()], vec![columns], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[2, 4], &rows);
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let exchange = ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::tiled());
+                    let exchange = array_operation(ArrayOperation::ParallelAllToAll(exchange.with_mesh(mesh.clone())));
+                    builder.add_instruction(exchange, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Permute => {
+                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![sharded("x")], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let permute = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]);
+                    let permute = array_operation(ArrayOperation::ParallelPermute(permute.with_mesh(mesh.clone())));
+                    builder.add_instruction(permute, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Nested => {
+                let shard_map = ShardMap::new(mesh.clone(), vec![sharded("x")], vec![replicated], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let outer_local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let inner_shard_map =
+                    ShardMap::new(mesh.clone(), vec![sharded("y")], vec![sharded("y")], vec!["y".into()]).unwrap();
+                let inner_local_type = inner_shard_map.local_input_type(0, &outer_local_type).unwrap();
+                let inner_body =
+                    build_differential_program::<V, O>(vec![inner_local_type.into()], |builder, inputs| {
+                        let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
+                        builder.add_instruction(sum, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                    });
+                let inner_operation = ShardMapOperation::from_program(
+                    &inner_body,
+                    vec![outer_local_type.clone().into()],
+                    inner_shard_map,
+                )
+                .unwrap();
+                let body = build_differential_program::<V, O>(vec![outer_local_type.into()], |builder, inputs| {
+                    let inner_body = builder.import_program(inner_body);
+                    let inner_operation = ArrayIrOperation::<A>::from(inner_operation);
+                    builder.add_instruction(inner_operation, vec![inner_body], inputs.to_vec(), None).unwrap().to_vec()
+                });
+                (shard_map, vec![global_type.into()], body)
+            }
+            ShardMapDifferentialCase::Reference => {
+                let shard_map =
+                    ShardMap::new(mesh.clone(), vec![sharded("x"); 2], vec![sharded("x")], vec!["x".into()]).unwrap();
+                let global_type = f32_type(&[4], &sharded("x"));
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type.clone()).into(), local_type.into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let add_update =
+                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ArrayIrOperation::<A>::from(add_update);
+                    builder.add_instruction(add_update, Vec::new(), inputs.to_vec(), None).unwrap();
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ArrayIrOperation::<A>::from(read);
+                    builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+                });
+                (shard_map, vec![ReferenceType::new(global_type.clone()).into(), global_type.into()], body)
+            }
+            ShardMapDifferentialCase::VaryingIndexReference => {
+                let table_sharding = Sharding::replicated(mesh.clone(), 2);
+                let shard_map =
+                    ShardMap::new(mesh.clone(), vec![table_sharding.clone()], vec![sharded("x")], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[2, 3], &table_sharding);
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type).into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                    let index = array_operation(ArrayOperation::AxisIndex(index));
+                    let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                        .with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]);
+                    let read = ArrayIrOperation::<A>::from(read);
+                    builder.add_instruction(read, Vec::new(), vec![inputs[0], index], None).unwrap().to_vec()
+                });
+                (shard_map, vec![ReferenceType::new(global_type).into()], body)
+            }
+            ShardMapDifferentialCase::ReplicatedReference => {
+                let shard_map =
+                    ShardMap::new(mesh.clone(), vec![replicated.clone()], vec![sharded("x")], vec!["x".into()]);
+                let shard_map = shard_map.unwrap();
+                let global_type = f32_type(&[2], &replicated);
+                let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+                let input_types = vec![ReferenceType::new(local_type).into()];
+                let body = build_differential_program::<V, O>(input_types, |builder, inputs| {
+                    let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let read = ArrayIrOperation::<A>::from(read);
+                    let state = builder.add_instruction(read.clone(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                    let add_update =
+                        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    let add_update = ArrayIrOperation::<A>::from(add_update);
+                    builder.add_instruction(add_update, Vec::new(), vec![inputs[0], state], None).unwrap();
+                    let state = builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                    let vary = array_operation(ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".into())));
+                    builder.add_instruction(vary, Vec::new(), vec![state], None).unwrap().to_vec()
+                });
+                (shard_map, vec![ReferenceType::new(global_type).into()], body)
+            }
+        };
+        let operation = ShardMapOperation::from_program(&body, global_input_types, shard_map).unwrap();
+
+        // Reference inputs of the map are allocated from the corresponding program inputs and frozen after the map.
+        let program_input_types = operation
+            .global_input_types()
+            .iter()
+            .map(|r#type| match r#type {
+                ArrayIrType::Reference(reference) => ArrayIrType::Array(reference.referent().clone()),
+                r#type => r#type.clone(),
+            })
+            .collect();
+        build_differential_program::<V, O>(program_input_types, |builder, inputs| {
+            let mut map_inputs = inputs.to_vec();
+            let mut references = Vec::new();
+            for (input, r#type) in map_inputs.iter_mut().zip(operation.global_input_types()) {
+                if r#type.is_reference() {
+                    let new = ArrayIrOperation::<A>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+                    *input = builder.add_instruction(new, Vec::new(), vec![*input], None).unwrap()[0];
+                    references.push(*input);
+                }
+            }
+            let body = builder.import_program(body);
+            let operation = ArrayIrOperation::<A>::from(operation);
+            let mut outputs = builder.add_instruction(operation, vec![body], map_inputs, None).unwrap().to_vec();
+            for reference in references {
+                let freeze = ArrayIrOperation::<A>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new());
+                outputs.push(builder.add_instruction(freeze, Vec::new(), vec![reference], None).unwrap()[0]);
+            }
+            outputs
+        })
+    }
+
+    /// Runs the program of `case` (refer to [`shard_map_differential_program`]) through the reference backend's
+    /// emulation and through XLA execution on all devices of `client`, which must match the devices of the mesh of
+    /// `case`, over the same integer-valued inputs, and checks that both produce exactly the same outputs, including
+    /// their types.
+    fn assert_shard_map_emulation_matches_xla_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+        type XlaArrayMember = <XlaConstant as ValueProjection<ArrayType>>::Projected;
+        let emulated_program =
+            shard_map_differential_program::<Array, ArrayIrValue<Array>, ArrayIrOperation<Array>>(case);
+        let xla_program = shard_map_differential_program::<XlaArrayMember, XlaConstant, XlaOperation>(case);
+        let input_types = xla_program
+            .input_types()
+            .into_iter()
+            .map(|r#type| match r#type {
+                ArrayIrType::Array(r#type) => r#type,
+                r#type => panic!("differential programs have array inputs only but got `{type}`"),
+            })
+            .collect::<Vec<_>>();
+        let input_bytes = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| {
+                let element_count = r#type.static_shape().unwrap().dimensions().iter().product::<usize>();
+                let elements = (0..element_count).map(|element| (100 * index + element + 1) as f32).collect::<Vec<_>>();
+                values_to_bytes::<f32>(&elements)
+            })
+            .collect::<Vec<_>>();
+
+        // The reference backend emulates every device of the map on the host.
+        let emulated_inputs = input_types
+            .iter()
+            .zip(&input_bytes)
+            .map(|(r#type, bytes)| ArrayIrValue::Array(Array::from_logical_bytes(r#type.clone(), bytes).unwrap()))
+            .collect();
+        let emulated_outputs = emulated_program.interpret(emulated_inputs).unwrap();
+
+        // XLA compiles the map into one manual computation and executes it on the devices of `client`.
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
+        let domain = XlaSession::new(client).domain();
+        let inputs = input_types
+            .into_iter()
+            .zip(input_bytes)
+            .map(|(r#type, bytes)| XlaArray::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+            .collect();
+        let lowered = domain.lower_xla_program(&xla_program, 0, &XlaOptions::new(mesh)).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, inputs).unwrap();
+        let outputs = outputs
+            .iter()
+            .map(|output| {
+                let bytes = materialize_dense_array_bytes(output).unwrap();
+                ArrayIrValue::Array(Array::from_logical_bytes(output.r#type().into_owned(), &bytes).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, emulated_outputs, "`{case:?}` outputs differ between XLA and the emulation");
+    }
+
+    /// Linearizes the program of `case` (refer to [`shard_map_differential_program`]) with respect to its first input
+    /// and runs its primal program and then its pullback through the reference backend's emulation and through XLA
+    /// execution on all devices of `client`, which must match the devices of the mesh of `case`, over the same
+    /// integer-valued inputs and output seeds, and checks that both produce exactly the same input cotangent, including
+    /// its type. The pullback consumes the residuals of the primal program of the same backend.
+    fn assert_shard_map_pullback_emulation_matches_xla_execution(client: &Client<'_>, case: ShardMapDifferentialCase) {
+        type XlaArrayMember = <XlaConstant as ValueProjection<ArrayType>>::Projected;
+        let emulated_program =
+            shard_map_differential_program::<Array, ArrayIrValue<Array>, ArrayIrOperation<Array>>(case);
+        let xla_program = shard_map_differential_program::<XlaArrayMember, XlaConstant, XlaOperation>(case);
+        let emulated = emulated_program.entry_region_ref().linearize(&[0]).unwrap();
+        let xla = xla_program.entry_region_ref().linearize(&[0]).unwrap();
+        let array_types = |types: Vec<ArrayIrType>| {
+            types
+                .into_iter()
+                .map(|r#type| match r#type {
+                    ArrayIrType::Array(r#type) => r#type,
+                    r#type => panic!("differential programs have array inputs and outputs only but got `{type}`"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let input_types = array_types(xla_program.input_types());
+        let output_types = array_types(xla_program.output_types());
+        let bytes = |offset: usize, r#type: &ArrayType| {
+            let element_count = r#type.static_shape().unwrap().dimensions().iter().product::<usize>();
+            let elements = (0..element_count).map(|element| (offset + element + 1) as f32).collect::<Vec<_>>();
+            values_to_bytes::<f32>(&elements)
+        };
+        let input_bytes =
+            input_types.iter().enumerate().map(|(index, r#type)| bytes(100 * index, r#type)).collect::<Vec<_>>();
+        let seed_bytes = output_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| bytes(1000 + 100 * index, r#type))
+            .collect::<Vec<_>>();
+
+        // The reference backend emulates every device of both maps on the host.
+        let emulated_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
+            types
+                .iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| ArrayIrValue::Array(Array::from_logical_bytes(r#type.clone(), bytes).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let mut primal_outputs = emulated.primal().interpret(emulated_values(&input_types, &input_bytes)).unwrap();
+        let residuals = primal_outputs.split_off(primal_outputs.len() - emulated.residual_count());
+        let mut pullback_inputs = emulated_values(&output_types, &seed_bytes);
+        pullback_inputs.extend(residuals);
+        let emulated_cotangents = emulated.pullback().unwrap().interpret(pullback_inputs).unwrap();
+
+        // XLA compiles each map into one manual computation and executes it on the devices of `client`.
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(input_types[0].sharding().unwrap().mesh().clone(), devices).unwrap();
+        let domain = XlaSession::new(client).domain();
+        let xla_values = |types: &[ArrayType], bytes: &[Vec<u8>]| {
+            types
+                .iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| {
+                    XlaArray::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let execute = |program: &FlatXlaProgram, inputs: Vec<_>| {
+            let lowered = domain.lower_xla_program(program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            domain.execute_xla_program(&compiled, inputs).unwrap()
+        };
+        let mut primal_outputs = execute(xla.primal(), xla_values(&input_types, &input_bytes));
+        let residuals = primal_outputs.split_off(primal_outputs.len() - xla.residual_count());
+        let mut pullback_inputs = xla_values(&output_types, &seed_bytes);
+        pullback_inputs.extend(residuals);
+        let cotangents = execute(&xla.pullback().unwrap(), pullback_inputs)
+            .iter()
+            .map(|cotangent| {
+                let bytes = materialize_dense_array_bytes(cotangent).unwrap();
+                ArrayIrValue::Array(Array::from_logical_bytes(cotangent.r#type().into_owned(), &bytes).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cotangents, emulated_cotangents, "`{case:?}` cotangents differ between XLA and the emulation");
     }
 
     #[test]
@@ -13590,6 +13997,108 @@ mod tests {
     }
 
     #[test]
+    fn test_xla_lowering_executes_gradients_through_body_allocated_reference_residuals_of_shard_maps() {
+        use ryft_core::{Cos, Differentiate, ParallelReduce, Reduce, Sin, custom_function};
+
+        // The body allocates `r = reference_new(x)`, calls a custom `sin` whose reverse-mode rule saves `r` as a
+        // residual and whose backward rule scales the cotangent by the state that it reads from `r`, and then writes
+        // `x * x` into `r`. The reference crosses from the primal `shard_map` to the tangent `shard_map` as a snapshot
+        // of its final state, from which the tangent body allocates its own reference, so the gradient of
+        // `sum(sin(x))` is `cos(x) * x * x`, as it is outside `shard_map`. Both bodies discharge their allocations.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 0);
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        type BodyTracer = XlaTracer<'static>;
+        let function = custom_function(|(_, x): (BodyTracer, BodyTracer)| {
+            Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
+        })
+        .with_non_differentiated_count(1)
+        .with_vjp(
+            |(r, x): (BodyTracer, BodyTracer)| {
+                let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                Ok((x.sin()?.into_value(), (r, x.cos()?.into_value())))
+            },
+            |(r, cosine): (BodyTracer, BodyTracer), cotangent: BodyTracer| {
+                let state = ValueProjection::<ArrayType>::into_projected(r.read()?)?;
+                let cosine = ValueProjection::<ArrayType>::into_projected(cosine)?;
+                let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+                Ok((r, (cosine * cotangent * state).into_value()))
+            },
+        );
+        let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |inputs: Vec<XlaTracer<'static>>| {
+                let (value, gradient) = inputs[0]
+                    .domain()
+                    .differentiate_at(inputs[0].clone())
+                    .value_and_gradient(|x| {
+                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                        Ok(shard_map(
+                            |local_x: XlaArrayTracer| {
+                                let value = local_x.clone().into_value();
+                                let reference = value.reference_new().unwrap();
+                                let output = function.call((reference.clone(), value)).unwrap();
+                                reference.write(&(local_x.clone() * local_x).into_value()).unwrap();
+                                ValueProjection::<ArrayType>::into_projected(output)
+                                    .unwrap()
+                                    .reduce(&[0], ReductionKind::Sum)
+                                    .unwrap()
+                                    .parallel_reduce(ReductionKind::Sum, "x")
+                                    .unwrap()
+                            },
+                            x,
+                            logical_mesh.clone(),
+                            sharded.clone(),
+                            replicated.clone(),
+                        )
+                        .unwrap()
+                        .into_value())
+                    })
+                    .unwrap();
+                Ok(vec![value, gradient])
+            },
+            vec![ArrayIrType::Array(input_type.clone())],
+        )
+        .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let inputs = [0.25f32, 0.5, 1.0, 2.0];
+        let input =
+            XlaArray::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&inputs).as_slice()).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input]).unwrap();
+        let shards = |array: &XlaArray<'_>| {
+            array
+                .addressable_shards()
+                .map(|shard| {
+                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+        let value = inputs.iter().map(|&input| f32::sin(input)).sum::<f32>();
+        for shard in shards(&outputs[0]) {
+            assert!((shard[0] - value).abs() <= 1e-5, "{shard:?}");
+        }
+        let gradient = shards(&outputs[1]).concat();
+        assert_eq!(gradient.len(), inputs.len());
+        for (gradient, input) in gradient.into_iter().zip(inputs) {
+            assert!((gradient - f32::cos(input) * input * input).abs() <= 1e-5, "{gradient} for {input}");
+        }
+    }
+
+    #[test]
     fn test_xla_lowering_executes_shard_map_transpositions_for_callers_placed_along_manual_axes() {
         // The caller places its input along the manual axis `x` and the explicit axis `y`, while the map places it
         // along `x` only, so the transposed map assembles the cotangent along `x`. One placement-only `broadcast`
@@ -16002,6 +16511,54 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_emulation_matches_xla_execution_on_cpu() {
+        // The reference backend's lockstep emulation of `shard_map` and XLA's manual computation agree exactly on
+        // boundary splitting and assembly, on every collective over the manual axis, and on reference accesses and
+        // write-back (including reads of a replicated reference at device-varying indices and invariant mutations of a
+        // replicated reference).
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::IdentityAndSum);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::AxisIndex);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::AllGather);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::AllToAll);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::Permute);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::Reference);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::VaryingIndexReference);
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::ReplicatedReference);
+    }
+
+    #[test]
+    fn test_shard_map_pullback_emulation_matches_xla_execution_on_cpu() {
+        // The pullback of a read of a replicated reference at device-varying indices scatters each device's cotangent
+        // into a local buffer that varies along `x`, sums the buffers across `x`, and adds the sum into the replicated
+        // cotangent reference, both in the emulation and in XLA's manual computation. The pullbacks of an update of a
+        // sharded reference and of an invariant mutation of a replicated reference agree as well.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_pullback_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::Reference);
+        let case = ShardMapDifferentialCase::VaryingIndexReference;
+        assert_shard_map_pullback_emulation_matches_xla_execution(&client, case);
+        let case = ShardMapDifferentialCase::ReplicatedReference;
+        assert_shard_map_pullback_emulation_matches_xla_execution(&client, case);
+    }
+
+    #[test]
+    fn test_nested_shard_map_emulation_matches_xla_execution_on_cpu() {
+        // A nested map whose inner body sums across the enclosing manual axis runs on all four devices of a 2×2 mesh,
+        // both in the emulation and in XLA's nested manual computations.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        assert_shard_map_emulation_matches_xla_execution(&client, ShardMapDifferentialCase::Nested);
+    }
+
+    #[test]
     fn test_eager_bind_rejects_collective_outside_a_mapping_context() {
         use ryft_core::{ParallelReduceOperation, ReductionKind};
 
@@ -16401,6 +16958,51 @@ mod tests {
             .r#await()
             .unwrap();
         assert_eq!(values_from_bytes::<f64>(bytes.as_slice()), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn test_batched_print_executes_on_cpu() {
+        use ryft_core::Print;
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let input = f64_vector(&domain, &mesh, &[1.5, 2.5]);
+
+        // Eager batching binds one print of the whole batch through the `@ryft.print` host callback.
+        let (output, lines) = with_captured_prints(|| {
+            batch(|item| item.print("x"), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap()
+        });
+        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
+        assert_eq!(read_f64s(&client, &output), vec![1.5, 2.5]);
+
+        // Batching under a staging parent keeps the print in the staged program, which prints the whole batch once
+        // per execution.
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| {
+                let output =
+                    batch(|item| item.print("x"), inputs[0].clone(), BatchAxis::new(0), BatchAxis::new(0), None);
+                vec![output.unwrap()]
+            },
+            vec![input.r#type().into_owned()],
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let lowered = domain.lower_xla_program(staged.source_program().program(), 0, &XlaOptions::new(mesh)).unwrap();
+        assert!(lowered.stable_hlo().contains("@ryft.print"), "{}", lowered.stable_hlo());
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let (outputs, lines) = with_captured_prints(|| domain.execute_xla_program(&compiled, vec![input]).unwrap());
+        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(read_f64s(&client, &outputs[0]), vec![1.5, 2.5]);
     }
 
     #[test]

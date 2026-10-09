@@ -58,11 +58,15 @@ use std::marker::PhantomData;
 
 use ryft_macros::capability;
 
-use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType};
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType,
+};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::{Capability, ElementwiseOperation};
+use crate::operations::Capability;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
@@ -86,9 +90,11 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// through without printing it. Whole-program transposition rejects effectful linear instructions, so reverse
 /// differentiation transposes the print-free tangent program.
 ///
-/// Eager interpretation prints directly. The XLA backend lowers this operation to a StableHLO host-callback custom
-/// call (i.e., `@ryft.print`), using a token chain for ordered I/O to preserve execution order within one dispatch,
-/// including through `if`/`while` regions.
+/// Eager interpretation prints directly. Batching re-binds the print over the whole batch through the parent context of
+/// the batching level, so an eager parent prints the batch at once while a staging parent keeps the instruction and its
+/// effect class in the program that it produces. The XLA backend lowers this operation to a StableHLO host-callback
+/// custom call (i.e., `@ryft.print`), using a token chain for ordered I/O to preserve execution order within one
+/// dispatch, including through `if`/`while` regions.
 ///
 /// The `T` parameter fixes this payload's type universe, so each concrete [`PrintOperation`] implements exactly one
 /// [`Operation`] contract.
@@ -177,13 +183,6 @@ impl<T: Type> Operation for PrintOperation<T> {
     }
 }
 
-impl ElementwiseOperation for PrintOperation<ArrayType> {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
 impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -191,6 +190,10 @@ impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Interpretation prints directly instead of going through the `Print` capability, because a value whose
+        // capability binds a `PrintOperation` through its own domain would otherwise re-enter this rule when that
+        // domain interprets operations eagerly. Rules that must keep the print in a staged program (e.g., batching)
+        // re-bind it through their parent context instead of interpreting it.
         check_count!("input", inputs, 1, ProgramError);
         eprintln!("{}: {}", self.label, inputs[0]);
         Ok(vec![inputs[0].clone()])
@@ -200,6 +203,25 @@ impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
 impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
     C::Operation: From<PrintOperation<C::Type>>
 {
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<PrintOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for PrintOperation<ArrayType>
+{
+    #[inline]
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Batching re-binds the print through the parent context over the packed value and keeps the input's batch
+        // metadata, so the whole batch is printed at once. Interpreting the print against the parent instead would
+        // print the parent's input at transformation time and drop the instruction and its effect from the programs
+        // that a staging parent produces.
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
+    }
 }
 
 impl_differentiable_elementwise_operation! {
@@ -290,15 +312,21 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, DataType};
+    use crate::arrays::{
+        Array, ArrayOperation, DataType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
+    };
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
     };
+    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Program};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Program, ProgramBuilder, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -312,7 +340,6 @@ mod tests {
         assert_eq!(operation.label(), "x");
         assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
-        assert_eq!(operation.input_count(), 1);
         assert_eq!(operation.to_string(), "print [label=x]");
     }
 
@@ -372,6 +399,48 @@ mod tests {
         );
     }
 
+    /// Array value that binds its capabilities through an eager domain, as backend values that execute operation by
+    /// operation do (e.g., the XLA backend's arrays).
+    #[derive(Clone, Debug, PartialEq)]
+    struct EagerDomainValue(Array);
+
+    impl Display for EagerDomainValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.0)
+        }
+    }
+
+    impl Parameter for EagerDomainValue {}
+
+    impl Typed for EagerDomainValue {
+        type Type = ArrayType;
+
+        fn r#type(&self) -> Cow<'_, ArrayType> {
+            self.0.r#type()
+        }
+    }
+
+    impl Value for EagerDomainValue {
+        type Dispatch = ValueDomainDispatch;
+        type Domain = EagerContext<Self, PrintOperation<ArrayType>>;
+
+        fn domain(&self) -> Self::Domain {
+            EagerContext::new()
+        }
+    }
+
+    #[test]
+    fn test_print_interpretation_in_eager_value_domains() {
+        // The `Print` capability of a domain-dispatched value binds a `PrintOperation` through its eager domain, which
+        // interprets it. Interpretation prints directly, so it does not re-enter the capability.
+        let value = EagerDomainValue(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        assert_eq!(value.clone().print("x"), Ok(value.clone()));
+        assert_eq!(
+            value.domain().bind(PrintOperation::new("x"), Vec::new(), std::slice::from_ref(&value)),
+            Ok(vec![value]),
+        );
+    }
+
     #[test]
     fn test_print_partial_evaluation() {
         check_operation_partial_evaluation!(
@@ -392,6 +461,167 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
             }],
         );
+    }
+
+    #[test]
+    fn test_print_batching_staged() {
+        // Batching a staged program re-binds the print over the whole batch instead of printing the input tracer at
+        // batching time, so the batched program keeps the instruction and its effect class.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                PrintOperation::<ArrayType>::new("x").with_effect_class(EffectClass::DeviceOrderedIo),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2] = print [label=x, effect_class=device_ordered_io] %0
+                in (%1)"},
+        );
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
+
+        // A print whose output nothing consumes stays in the batched program because of its effect.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("x"), Vec::new(), vec![input], None)
+            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, _) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2] = print [label=x] %0
+                in (%0)"},
+        );
+    }
+
+    #[test]
+    fn test_print_batching_under_staging() {
+        // Value-level batching under a staging parent stages the print of the whole batch into the enclosing trace.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input: Tracer<TracingContext<Array, ArrayOperation<Array>>>| {
+                Ok(batch(|item| item.print("x"), input, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            },
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:f64[2, 3] = print [label=x] %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+
+        // Composite values stage the print through their array member. Composite batching also stages the batch extent
+        // as a first-class dimension constant, which nothing here consumes.
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let (_, program) = CompositeContext::trace(
+            |input: Tracer<CompositeContext>| {
+                Ok(batch(
+                    |item| item.print_with_effect_class("x", EffectClass::UnorderedIo),
+                    input,
+                    BatchAxis::new(1),
+                    BatchAxis::new(1),
+                    None,
+                )?)
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3] .
+                let %1:dimension<3> = constant [value=3]
+                    %2:f64[2, 3] = print [label=x, effect_class=unordered_io] %0
+                in (%2)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+    }
+
+    #[test]
+    fn test_print_batching_in_shard_map_bodies() {
+        // Batching a `shard_map` batches its body under a staging parent, so a per-device print in the body prints
+        // the local value of the whole batch and the batched program keeps the `DeviceOrderedIo` effect. The batch
+        // axis is placed on the free mesh axis `y`, which a body with this effect allows.
+        type CompositeContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let (_, program) = CompositeContext::trace(
+            |input: Tracer<CompositeContext>| {
+                let output = shard_map(
+                    |local: ShardMapTracer<CompositeContext>| {
+                        local.print_with_effect_class("body", EffectClass::DeviceOrderedIo).unwrap()
+                    },
+                    ValueProjection::<ArrayType>::into_projected(input)?,
+                    mesh,
+                    sharding.clone(),
+                    sharding,
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+        )
+        .unwrap();
+        let (batched, _) = program
+            .to_flat_program()
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["y"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 4] .
+                let %2:f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:explicit],
+                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
+                    global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {'x'}]}]],
+                ] %1 [
+                    body={
+                        lambda \
+                    %0:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], \
+                                varying_manual={'x'}}] .
+                        let %1:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:explicit]>, [{'y'}, {}], \
+                            varying_manual={'x'}}] = print [label=body, effect_class=device_ordered_io] %0
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)"},
+        );
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::DeviceOrderedIo));
     }
 
     #[test]

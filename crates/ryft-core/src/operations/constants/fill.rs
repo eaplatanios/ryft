@@ -22,7 +22,7 @@ use crate::tracing::Tracer;
 /// Represents the ability to synthesize a value filled with one typed host literal. [`ArrayType`] implementations
 /// encode the literal as a rank-zero array, convert it to the requested element [`DataType`](crate::DataType) and
 /// [`Memory`](crate::Memory), and use ordinary broadcasting for every rank-positive result. This keeps the fill value
-/// explicit in Static Single Assignment (SSA) dataflow and avoids the need for a separate array fill operation type.
+/// explicit in Static Single Assignment (SSA) data flow and avoids the need for a separate array fill operation type.
 ///
 /// The rank-zero literal carries the rank-zero form of the requested [`Sharding`](crate::Sharding) (i.e., its mesh,
 /// reduced axes, and varying manual axes), so a fill of a type that varies over manual mesh axes (e.g., inside
@@ -33,7 +33,7 @@ use crate::tracing::Tracer;
 ///
 /// For a fill value that is already an array or a tracer, compose [`ConvertElementType::convert_element_type`] with
 /// [`Broadcast::broadcast`] or [`Broadcast::broadcast_to`]. A scalar fills the whole result; array inputs follow the
-/// same trailing-axis alignment and size-one expansion as any other broadcast. The value stays in dataflow, so its
+/// same trailing-axis alignment and size-one expansion as any other broadcast. The value stays in data flow, so its
 /// tangent is broadcast and its cotangent sums contributions from the replicated axes. If placement differs, compose
 /// [`TransferToMemory::transfer_to_memory`] before broadcasting.
 ///
