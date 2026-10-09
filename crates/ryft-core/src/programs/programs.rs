@@ -14,7 +14,8 @@ use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::{Operation, OperationBoundaryPruning};
 use crate::programs::regions::{
-    Region, RegionArena, RegionId, RegionInterface, RegionLiveness, RegionRef, reachable_region_mask,
+    Region, RegionArena, RegionDataFlowRegionBoundary, RegionId, RegionInterface, RegionLiveness, RegionRef,
+    reachable_region_mask,
 };
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
@@ -463,7 +464,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// The analysis is conservative. It never reports an output as independent when it may depend on a selected input,
     /// but it may report a dependence that does not exist. Every output of an [`Instruction`] counts as dependent on
     /// all of its inputs, including instructions with nested regions, whose region contents are not inspected. Values
-    /// can also flow through writes into and reads from references, which dataflow alone does not track, so every
+    /// can also flow through writes into and reads from references, which data flow alone does not track, so every
     /// output of a program whose entry region holds a reference counts as dependent.
     ///
     /// For example, forward-mode differentiation rules use this function on a derived program, whose tangent inputs
@@ -1335,6 +1336,33 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Ok(self.filtered(self.input_ids(), &output_ids, self.input_ids())?.0)
     }
 
+    /// Returns the input and output counts of each [`Region`] that `instruction`, an instruction
+    /// of this [`Program`], attaches, in [`Instruction::regions`] order. These are the region boundaries that
+    /// a [`RegionDataFlowBoundary`](crate::RegionDataFlowBoundary) of the instruction requires when querying the
+    /// [`RegionDataFlow`](crate::RegionDataFlow) of its operation. They are read from the attached regions themselves,
+    /// without pruning the regions or changing their order. [`RegionId`]s are positions in the region arena of this
+    /// program, so the regions of an instruction of another program may resolve to unrelated regions of this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when an attached [`RegionId`] is out of range for this [`Program`].
+    pub(crate) fn region_data_flow_boundaries(
+        &self,
+        instruction: &Instruction<O>,
+    ) -> Result<Vec<RegionDataFlowRegionBoundary>, ProgramError> {
+        instruction
+            .regions()
+            .iter()
+            .map(|&region| {
+                let region = self.region_ref(region)?;
+                Ok(RegionDataFlowRegionBoundary {
+                    input_count: region.input_ids().len(),
+                    output_count: region.output_ids().len(),
+                })
+            })
+            .collect()
+    }
+
     /// Analyzes entry-region liveness for a filtered program boundary. `inputs` must be a deduplicated collection of
     /// [`Atom::Variable`]s. Reverse reachability begins at `outputs`, the provided `keep_alive` atoms, and every
     /// instruction with observable effects or deferred work, including instructions without outputs. Reaching a
@@ -1763,7 +1791,7 @@ impl ProgramLiveSets {
 
 /// Demand-specific boundary-pruning analysis of one borrowed [`RegionArena`]. Queries account for nested boundary
 /// pruning and instructions retained for their effects or deferred work, and keep the original region, atom, and
-/// instruction identifiers. Each region's pruning plan is memoized by its demanded-output mask, so one instance can
+/// instruction identifiers. Each region's pruning plan is memoized by its set of used outputs, so one instance can
 /// serve a complete traversal, including repeated queries and loop-feedback iterations. The arena is immutable for
 /// the lifetime of the analysis and its cache is local to this instance and cannot mix results from different arenas.
 ///
@@ -1773,7 +1801,7 @@ pub(crate) struct RegionPruningAnalysis<'o, V: Value, O: Operation<Type = V::Typ
     /// Immutable source arena whose original identifiers index every query and result.
     arena: &'o RegionArena<V, O>,
 
-    /// Pruning of each region under each demanded-output mask queried so far.
+    /// Pruning of each region under each set of used outputs queried so far.
     prunings: HashMap<(RegionId, Vec<bool>), Rc<RegionPruning<O>>>,
 }
 
@@ -1811,6 +1839,13 @@ impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O>
             .map(|instruction| !matches!(instruction, InstructionPruning::Removed))
             .collect();
         Ok(ProgramLiveSets::new(pruning.live_atoms.clone(), instructions))
+    }
+
+    /// Returns the [`RegionLiveness`] of the regions that one [`Instruction`] attaches, given in
+    /// [`Instruction::regions`] order, backed by this analysis and its cache. Operations use it to compute their own
+    /// boundary pruning or execution demand (e.g., the fixed point of the carries of a `scan`).
+    pub(crate) fn attached_region_liveness<'a>(&'a mut self, regions: &'a [RegionId]) -> impl 'a + RegionLiveness {
+        AttachedRegionLiveness { analysis: self, regions }
     }
 
     /// Returns the pruning of `region` when only the outputs of it that `used_outputs` marks are used.
@@ -2090,12 +2125,12 @@ impl RegionSimplificationShape {
 /// (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterward). A reachable variable
 /// that is neither mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
 ///
-/// The traversal is a post-order walk of the use-def graph — the standard dataflow view in which each consumed [`Atom`]
-/// (i.e., a _use_) points back at the [`Instruction`] that produces it (i.e., its _definition_) — so an instruction's
-/// inputs are cloned left-to-right before the instruction itself is emitted. The walk is driven by an explicit worklist
-/// rather than recursion, because its depth grows with the length of the longest instruction chain and recursing would
-/// overflow the stack for programs with a few hundred chained instructions. Sealing a [`Region`] does not reject a
-/// cyclic use-def graph, so the walk tracks the instructions it scheduled and reports a
+/// The traversal is a post-order walk of the use-def graph — the standard data flow view in which each consumed
+/// [`Atom`] (i.e., a _use_) points back at the [`Instruction`] that produces it (i.e., its _definition_) — so an
+/// instruction's inputs are cloned left-to-right before the instruction itself is emitted. The walk is driven by an
+/// explicit worklist rather than recursion, because its depth grows with the length of the longest instruction chain
+/// and recursing would overflow the stack for programs with a few hundred chained instructions. Sealing a [`Region`]
+/// does not reject a cyclic use-def graph, so the walk tracks the instructions it scheduled and reports a
 /// [`ProgramError::MalformedProgram`] instead of looping forever when it reaches one twice.
 fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
@@ -2544,7 +2579,7 @@ struct AttachedRegionLiveness<'a, 'o, V: Value, O: Operation<Type = V::Type>> {
     analysis: &'a mut RegionPruningAnalysis<'o, V, O>,
 
     /// Regions attached to the instruction, in [`Instruction::regions`] order.
-    regions: &'o [RegionId],
+    regions: &'a [RegionId],
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLiveness<'_, '_, V, O> {
@@ -3128,7 +3163,7 @@ mod tests {
                 if message == "input index 3 is out of range for a program with 3 inputs",
         ));
 
-        // Values can flow through writes into references, which dataflow does not track, so every output of a program
+        // Values can flow through writes into references, which data flow does not track, so every output of a program
         // that holds a reference counts as dependent, including `index`, which reads no selected input.
         let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
         let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -5155,6 +5190,41 @@ mod tests {
     }
 
     #[test]
+    fn test_program_region_data_flow_boundaries() {
+        // The counts come from the attached regions in attachment order, and an instruction without regions has none.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let true_branch = builder.import_program(pruning_branch(false));
+        let false_branch = builder.import_program(pruning_branch(true));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, input, negated],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let boundary = RegionDataFlowRegionBoundary { input_count: 2, output_count: 2 };
+        assert_eq!(program.region_data_flow_boundaries(&program.instructions()[1]), Ok(vec![boundary, boundary]));
+        assert_eq!(program.region_data_flow_boundaries(&program.instructions()[0]), Ok(Vec::new()));
+
+        // A program with a single region cannot resolve the identifiers of both branches.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let other = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            other.region_data_flow_boundaries(&program.instructions()[1]),
+            Err(ProgramError::MalformedProgram("region ^1 is out of range".to_string())),
+        );
+    }
+
+    #[test]
     fn test_region_pruning_analysis_new() {
         let program = pruning_branch(false);
         let analysis = RegionPruningAnalysis::new(&program.regions);
@@ -5341,6 +5411,36 @@ mod tests {
         let key = (pure.entry(), vec![true, false]);
         assert!(!Rc::ptr_eq(&pure_analysis.prunings[&key], &effectful_analysis.prunings[&key]));
         assert_eq!(pure_analysis.live_sets(pure.entry(), &[0]), Ok(pure_live));
+    }
+
+    #[test]
+    fn test_region_pruning_analysis_attached_region_liveness() {
+        // Each branch reads its first input only for its first output and its second input only for its second output.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let first = builder.add_input(ArrayType::scalar(DataType::F64));
+        let second = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(false));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<ArrayType>::new(),
+                vec![branch, branch],
+                vec![predicate, first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let mut analysis = RegionPruningAnalysis::new(&program.regions);
+        let mut liveness = analysis.attached_region_liveness(program.instructions()[0].regions());
+        assert_eq!(liveness.used_region_inputs(0, &[true, false]), Ok(vec![true, false]));
+        assert_eq!(liveness.used_region_inputs(1, &[false, true]), Ok(vec![false, true]));
+        assert_eq!(
+            liveness.used_region_inputs(2, &[true, true]),
+            Err(ProgramError::MalformedProgram("the instruction has no attached region 2".to_string())),
+        );
     }
 
     #[test]
