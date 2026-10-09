@@ -1,7 +1,7 @@
 //! Contains machinery related to _reference discharge_, which rewrites a [`Program`] so that the mutable state behind
-//! its references becomes explicit immutable dataflow.
+//! its references becomes explicit immutable data flow.
 //!
-//! A program that uses references is not purely functional dataflow. A read depends on the latest write to the same
+//! A program that uses references is not purely functional data flow. A read depends on the latest write to the same
 //! allocation, but that dependency travels through a reference handle rather than through an instruction input that
 //! carries the current value. Many transforms and backends need the dependency to be explicit. Discharge makes it
 //! explicit by replaying the program while replacing each selected allocation with an immutable value that is threaded

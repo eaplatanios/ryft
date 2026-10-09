@@ -67,7 +67,7 @@
 //! [`EffectsSummary`] also accounts for attached computation regions. [`Program::effects`] summarizes the entry
 //! computation recursively, excluding dormant rule regions. These declarations preserve dependencies that are not
 //! expressed by immutable value inputs, such as a read following a write to the same reference. The [`references`]
-//! module provides the reference model, validation, and conversion of mutable state into explicit value dataflow.
+//! module provides the reference model, validation, and conversion of mutable state into explicit value data flow.
 //!
 //! [`Program::live_sets`] computes dependencies of the program outputs; [`Program::live_sets_for_atoms`] accepts other
 //! roots. [`Program::simplified`] removes unused work while retaining instructions with observable consequences even
@@ -153,8 +153,9 @@ pub use references::{
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionKey, RegionLiveness, RegionRef,
-    RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
+    RegionArena, RegionArenaIterator, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRegionBoundary,
+    RegionDataFlowRule, RegionDataFlowSource, RegionDataFlowSources, RegionDriver, RegionId, RegionInterface,
+    RegionKey, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

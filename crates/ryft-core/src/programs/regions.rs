@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
 use std::rc::{Rc, Weak};
@@ -1899,7 +1899,7 @@ struct InstantiatedRegionMapping<T: Type> {
 
 /// Describes how an [`Operation`] supplies an attached [`Region`] input. The region and its input are selected by
 /// [`Operation::input_region_provenance`]. Input indices in [`InputRegionProvenance::Input`] refer to the attaching
-/// instruction's inputs. This describes semantic dataflow, independently of diagnostic
+/// instruction's inputs. This describes semantic data flow, independently of diagnostic
 /// [`Provenance`](crate::Provenance).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InputRegionProvenance {
@@ -1926,7 +1926,7 @@ pub enum InputRegionProvenance {
 /// and [`output_index`](Self::output_index) selects an output of that attached region. Refer to
 /// [`Operation::output_region_provenance`] for how operations provide this kind of provenance information. Despite
 /// the related name, this is unrelated to the non-semantic diagnostic [`Provenance`](crate::Provenance) recorded on
-/// instructions; this type instead describes real dataflow that transforms rely on.
+/// instructions; this type instead describes real data flow that transforms rely on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OutputRegionProvenance {
     /// Index of the attached [`Region`] in the [`Operation`]-defined region order.
@@ -1945,6 +1945,514 @@ pub trait RegionLiveness {
     /// region-carrying instructions nested in the region. Answers are memoized, so repeated queries (e.g.,
     /// while a `scan` operation computes the fixed point of its carries) are cheap.
     fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError>;
+}
+
+/// Producer and execution semantics of the regions attached to one [`Operation`], layered on top of its boundary
+/// provenance. [`Operation::input_region_provenance`] and [`Operation::output_region_provenance`] declare only which
+/// instruction inputs correspond to region inputs and which region outputs may supply instruction outputs, which is
+/// what reference analyses, builders, and boundary pruning need. A region data flow declaration additionally states
+/// which values produce each boundary value and which region outputs executing the operation demands. The two layers
+/// can differ: the provenance of a `while` loop correctly maps each body input to the corresponding instruction input,
+/// but the body also receives the outputs of its previous iteration, and so its data flow is [`Custom`](Self::Custom).
+/// Kernel calls, in turn, declare operation-local region inputs while their data flow is [`Opaque`](Self::Opaque).
+///
+/// No declaration implies equal runtime values or reference identity; reference contracts remain separate. Pass
+/// the declaration returned by [`Operation::region_data_flow`] to queries with that same operation and its actual
+/// application boundary. Note that combining a declaration with another operation does not preserve its semantic
+/// contract.
+#[derive(Copy, Clone)]
+pub enum RegionDataFlow<'o> {
+    /// Declares nothing beyond the boundary provenance. Analyses must not infer single-invocation semantics,
+    /// the absence of producers, or permission to replay the operation, and so the query functions report
+    /// [`Unknown`](RegionDataFlowSources::Unknown) sources and demand every output of every computation region.
+    Opaque,
+
+    /// Declares that the boundary provenance of the operation is exactly its data flow: each computation
+    /// region executes once per application, its inputs are produced by the instruction inputs that
+    /// [`Operation::input_region_provenance`] names, and each instruction output is produced by the
+    /// region outputs that [`Operation::output_region_provenance`] names, without feedback or bypasses.
+    Provenance,
+
+    // TODO(eaplatanios): Does this need to be a trait object or can we make it generic? And should we?
+    /// Borrows the operation's own [`RegionDataFlowRule`] for recurrences, bypasses, or regions that execute without
+    /// producing any output of the operation (e.g., the condition of a `while` loop).
+    Custom(&'o dyn RegionDataFlowRule),
+}
+
+impl RegionDataFlow<'_> {
+    /// Returns the validated producer sources of one input of an attached computation region. For
+    /// [`Provenance`](Self::Provenance) declarations, the sources come from [`Operation::input_region_provenance`],
+    /// and an input without declared provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, like every
+    /// input of an [`Opaque`](Self::Opaque) declaration.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation whose region roles and provenance declarations supply the contract.
+    ///   - `region_index`: Attached computation-region position.
+    ///   - `input_index`: Position in that region's input boundary.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] for invalid positions, roles, or declarations, and the errors of
+    /// custom rules.
+    pub fn input_sources<O: Operation>(
+        self,
+        operation: &O,
+        region_index: usize,
+        input_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        Self::validate_boundary(operation, boundary)?;
+        let region = Self::validate_region(operation, region_index, boundary)?;
+        if input_index >= region.input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares input {} of region {} with {} inputs",
+                operation.name(),
+                input_index,
+                region_index,
+                region.input_count,
+            )));
+        }
+        let sources = match self {
+            Self::Opaque => RegionDataFlowSources::Unknown,
+            Self::Provenance => match operation.input_region_provenance(region_index, input_index) {
+                InputRegionProvenance::None => RegionDataFlowSources::Unknown,
+                InputRegionProvenance::Local => RegionDataFlowSources::Known(Vec::new()),
+                InputRegionProvenance::Input { index } => {
+                    RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(index)])
+                }
+            },
+            Self::Custom(rule) => rule.input_sources(region_index, input_index, boundary)?,
+        };
+        Self::validate_sources(operation, &sources, boundary)?;
+        Ok(sources)
+    }
+
+    /// Returns the validated producer sources of one instruction output. For [`Provenance`](Self::Provenance)
+    /// declarations, the sources come from [`Operation::output_region_provenance`], and an output without declared
+    /// provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, because the operation itself produces it.
+    /// Every output of an [`Opaque`](Self::Opaque) declaration also has unknown sources. Only a custom rule can
+    /// declare that an output has no producers, by returning an empty source list.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation whose region roles and provenance declarations supply the contract.
+    ///   - `output_index`: Position in the instruction's output boundary.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] for invalid positions, roles, or declarations, and the errors of
+    /// custom rules.
+    pub fn output_sources<O: Operation>(
+        self,
+        operation: &O,
+        output_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError> {
+        Self::validate_boundary(operation, boundary)?;
+        if output_index >= boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares output {} with {} outputs",
+                operation.name(),
+                output_index,
+                boundary.output_count,
+            )));
+        }
+        let sources = match self {
+            Self::Opaque => RegionDataFlowSources::Unknown,
+            Self::Provenance => {
+                let origins = operation.output_region_provenance(output_index);
+                if origins.is_empty() {
+                    RegionDataFlowSources::Unknown
+                } else {
+                    RegionDataFlowSources::Known(origins.into_iter().map(RegionDataFlowSource::RegionOutput).collect())
+                }
+            }
+            Self::Custom(rule) => rule.output_sources(output_index, boundary)?,
+        };
+        Self::validate_sources(operation, &sources, boundary)?;
+        Ok(sources)
+    }
+
+    /// Returns the validated demanded outputs of each attached region, as described by
+    /// [`RegionDataFlowRule::execution_demands`]. For [`Provenance`](Self::Provenance) declarations, each used
+    /// instruction output demands the region outputs that its [`Operation::output_region_provenance`] names, every
+    /// computation region executes the work that it retains for its effects, and rule regions never execute. When
+    /// a used output has no declared provenance, every output of every computation region is demanded. Every output
+    /// of every computation region is also demanded for [`Opaque`](Self::Opaque) declarations, used outputs or not,
+    /// because their regions may execute for their effects. Both cases over-approximate the executed work rather
+    /// than describing it precisely.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Operation whose region roles and provenance declarations supply the contract.
+    ///   - `used_outputs`: Used instruction outputs, marked in output order. No output may be marked for an
+    ///     instruction that is retained only for its effects.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///   - `regions`: Liveness of the attached regions, which custom rules use to extend the demanded outputs to
+    ///     everything that the operation's own semantics need.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] for invalid boundaries, roles, or demanded outputs, and the errors of
+    /// custom rules and region liveness queries.
+    pub fn execution_demands<O: Operation>(
+        self,
+        operation: &O,
+        used_outputs: &[bool],
+        boundary: RegionDataFlowBoundary<'_>,
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Vec<Option<Vec<bool>>>, ProgramError> {
+        Self::validate_boundary(operation, boundary)?;
+        if used_outputs.len() != boundary.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` receives used outputs for {} positions but has {} outputs",
+                operation.name(),
+                used_outputs.len(),
+                boundary.output_count,
+            )));
+        }
+
+        let demand = match self {
+            Self::Opaque | Self::Provenance => {
+                let mut demand = boundary
+                    .regions
+                    .iter()
+                    .enumerate()
+                    .map(|(region_index, region)| {
+                        (operation.region_role(region_index) == Some(RegionRole::Computation))
+                            .then(|| vec![false; region.output_count])
+                    })
+                    .collect::<Vec<_>>();
+
+                // Opaque declarations demand everything, even for instructions retained only for their effects.
+                let mut unknown = matches!(self, Self::Opaque);
+                for (output_index, used) in used_outputs.iter().enumerate() {
+                    if !used {
+                        continue;
+                    }
+
+                    match self.output_sources(operation, output_index, boundary)? {
+                        RegionDataFlowSources::Unknown => unknown = true,
+                        RegionDataFlowSources::Known(sources) => {
+                            for source in sources {
+                                if let RegionDataFlowSource::RegionOutput(origin) = source {
+                                    // Validated sources only name computation regions, which always have demand.
+                                    demand[origin.region_index].as_mut().unwrap()[origin.output_index] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if unknown {
+                    for demanded_outputs in demand.iter_mut().flatten() {
+                        demanded_outputs.fill(true);
+                    }
+                }
+
+                demand
+            }
+            Self::Custom(rule) => {
+                let mut regions = ValidatedDataFlowLiveness { operation, boundary, regions };
+                rule.execution_demands(used_outputs, boundary, &mut regions)?
+            }
+        };
+
+        if demand.len() != boundary.regions.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares demanded outputs for {} regions but has {} regions",
+                operation.name(),
+                demand.len(),
+                boundary.regions.len(),
+            )));
+        }
+
+        for (region_index, demanded_outputs) in demand.iter().enumerate() {
+            if let Some(demanded_outputs) = demanded_outputs {
+                let region = Self::validate_region(operation, region_index, boundary)?;
+                if demanded_outputs.len() != region.output_count {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` declares demanded outputs for {} positions of region {} with {} outputs",
+                        operation.name(),
+                        demanded_outputs.len(),
+                        region_index,
+                        region.output_count,
+                    )));
+                }
+            }
+        }
+
+        Ok(demand)
+    }
+
+    /// Validates that the instruction has one boundary for every declared region slot.
+    fn validate_boundary<O: Operation>(
+        operation: &O,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<(), ProgramError> {
+        if boundary.regions.len() != operation.region_slots().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` has {} attached region boundaries but declares {} regions",
+                operation.name(),
+                boundary.regions.len(),
+                operation.region_slots().len(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the validated [`RegionDataFlowRegionBoundary`] of an attached computation region.
+    fn validate_region<O: Operation>(
+        operation: &O,
+        region_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowRegionBoundary, ProgramError> {
+        let region = boundary.regions.get(region_index).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "operation `{}` declares region {} but has {} attached regions",
+                operation.name(),
+                region_index,
+                boundary.regions.len(),
+            ))
+        })?;
+        if operation.region_role(region_index) != Some(RegionRole::Computation) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares data flow through non-computation region {}",
+                operation.name(),
+                region_index,
+            )));
+        }
+        Ok(*region)
+    }
+
+    /// Validates every declared source before a consumer indexes instruction or region boundaries.
+    fn validate_sources<O: Operation>(
+        operation: &O,
+        sources: &RegionDataFlowSources,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<(), ProgramError> {
+        let RegionDataFlowSources::Known(sources) = sources else {
+            return Ok(());
+        };
+        for source in sources {
+            match *source {
+                RegionDataFlowSource::InstructionInput(index) if index >= boundary.input_count => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` declares instruction input {} but has {} inputs",
+                        operation.name(),
+                        index,
+                        boundary.input_count,
+                    )));
+                }
+                RegionDataFlowSource::InstructionInput(_) => {}
+                RegionDataFlowSource::RegionInput { region_index, input_index } => {
+                    let region = Self::validate_region(operation, region_index, boundary)?;
+                    if input_index >= region.input_count {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "operation `{}` declares input {} of region {} with {} inputs",
+                            operation.name(),
+                            input_index,
+                            region_index,
+                            region.input_count,
+                        )));
+                    }
+                }
+                RegionDataFlowSource::RegionOutput(origin) => {
+                    let region = Self::validate_region(operation, origin.region_index, boundary)?;
+                    if origin.output_index >= region.output_count {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "operation `{}` declares output {} of region {} with {} outputs",
+                            operation.name(),
+                            origin.output_index,
+                            origin.region_index,
+                            region.output_count,
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Debug for RegionDataFlow<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque => formatter.write_str("Opaque"),
+            Self::Provenance => formatter.write_str("Provenance"),
+            Self::Custom(_) => {
+                // Custom rules are trait objects without a `Debug` bound, so only their variant is shown.
+                formatter.debug_tuple("Custom").finish_non_exhaustive()
+            }
+        }
+    }
+}
+
+/// Input and output counts of one attached region, in its declared boundary order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RegionDataFlowRegionBoundary {
+    /// Number of region inputs.
+    pub input_count: usize,
+
+    /// Number of region outputs.
+    pub output_count: usize,
+}
+
+/// Counts for one operation application supplied to context-independent [`RegionDataFlowRule`]s. Callers derive
+/// these counts from the actual instruction and its attached regions, without pruning or changing their order.
+#[derive(Copy, Clone, Debug)]
+pub struct RegionDataFlowBoundary<'o> {
+    /// Number of instruction inputs.
+    pub input_count: usize,
+
+    /// Number of instruction outputs.
+    pub output_count: usize,
+
+    /// Region boundary counts, in the operation's declared region-slot order.
+    pub regions: &'o [RegionDataFlowRegionBoundary],
+}
+
+/// One possible producer source relative to an operation application. These edges describe producer ancestry,
+/// including sliced inputs and values from other iterations, rather than runtime equality or reference aliasing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RegionDataFlowSource {
+    /// An input of the attaching instruction.
+    InstructionInput(usize),
+
+    /// An attached region input whose initial and feedback sources the rule describes separately.
+    RegionInput {
+        /// Position of the attached computation region.
+        region_index: usize,
+
+        /// Position in that region's input boundary.
+        input_index: usize,
+    },
+
+    /// An output of an attached computation region.
+    RegionOutput(OutputRegionProvenance),
+}
+
+/// Possible producer sources of an instruction output or attached region input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegionDataFlowSources {
+    /// No complete declaration is available. Analyses keep the region-carrying operation itself as a possible producer.
+    Unknown,
+
+    /// Ordered alternative sources. An empty list declares an input that the operation creates or a known empty set
+    /// of producers. It is distinct from an undeclared source and from an empty [`Operation::output_region_provenance`]
+    /// list.
+    Known(Vec<RegionDataFlowSource>),
+}
+
+/// Context-independent producer and execution semantics owned by an operation payload. Rules contain no residual
+/// policy, storage, or emission decisions. Analyses query rules through the functions of [`RegionDataFlow`], which
+/// validate boundary positions, computation roles, and the demanded outputs that rules return before an analysis
+/// traverses the returned edges. Rules must return deterministic declarations for the same operation metadata and
+/// boundary, independently of residual policy or storage decisions. Custom rules must validate their own
+/// operation-specific boundary layout before indexing it, while [`RegionDataFlow`] validates generic positions,
+/// computation roles, and the demanded outputs that rules return.
+pub trait RegionDataFlowRule {
+    /// Returns initial and feedback producer sources of one attached computation-region input. Initial sources may
+    /// be instruction inputs; feedback may name inputs or outputs in any attached computation region.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region_index`: Attached computation-region position.
+    ///   - `input_index`: Position in that region's input boundary.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a boundary incompatible with the operation's semantic layout.
+    fn input_sources(
+        &self,
+        region_index: usize,
+        input_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError>;
+
+    /// Returns possible producer sources of an instruction output. Include initial or bypass sources when they can
+    /// supply the output; retain declared alternative order. Known empty sources must be stated explicitly.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_index`: Position in the instruction's output boundary.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a boundary incompatible with the operation's semantic layout.
+    fn output_sources(
+        &self,
+        output_index: usize,
+        boundary: RegionDataFlowBoundary<'_>,
+    ) -> Result<RegionDataFlowSources, ProgramError>;
+
+    /// Returns the demanded outputs of each attached region, in region order, when only the instruction outputs that
+    /// `used_outputs` marks are used. `None` means that the region does not execute, and `Some(demanded_outputs)` means
+    /// that it computes the outputs that `demanded_outputs` marks, together with the work that it retains for its
+    /// effects, even when no output is marked. Use `regions` to extend the demanded outputs to everything that the
+    /// operation's own semantics need (e.g., the carries that later iterations of a loop read). Rule regions must
+    /// remain `None`, and so must a region that the operation statically bypasses, including its effects.
+    ///
+    /// # Parameters
+    ///
+    ///   - `used_outputs`: Used instruction outputs, marked in output order. No output may be marked
+    ///     for an instruction that is retained only for its effects.
+    ///   - `boundary`: Actual instruction and attached-region boundary counts.
+    ///   - `regions`: Region-local liveness, including work retained for effects and nested boundary pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from boundary validation or region liveness.
+    fn execution_demands(
+        &self,
+        used_outputs: &[bool],
+        boundary: RegionDataFlowBoundary<'_>,
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Vec<Option<Vec<bool>>>, ProgramError>;
+}
+
+/// [`RegionLiveness`] that validates the queries of a custom [`RegionDataFlowRule`] and the answers that it receives,
+/// so that the rule can index them without further checks.
+struct ValidatedDataFlowLiveness<'a, 'o, O: Operation> {
+    /// Operation declaring region roles and semantic data flow.
+    operation: &'o O,
+
+    /// Actual instruction and region boundary counts.
+    boundary: RegionDataFlowBoundary<'o>,
+
+    /// Liveness of the attached regions, which answers the validated queries.
+    regions: &'a mut dyn RegionLiveness,
+}
+
+impl<O: Operation> RegionLiveness for ValidatedDataFlowLiveness<'_, '_, O> {
+    fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError> {
+        let region = RegionDataFlow::validate_region(self.operation, region_index, self.boundary)?;
+        if used_outputs.len() != region.output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` queries liveness with used outputs for {} positions of region {} with {} outputs",
+                self.operation.name(),
+                used_outputs.len(),
+                region_index,
+                region.output_count,
+            )));
+        }
+        let used_inputs = self.regions.used_region_inputs(region_index, used_outputs)?;
+        if used_inputs.len() != region.input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` receives liveness for {} inputs of region {} with {} inputs",
+                self.operation.name(),
+                used_inputs.len(),
+                region_index,
+                region.input_count,
+            )));
+        }
+        Ok(used_inputs)
+    }
 }
 
 /// One cached source view for a complete replay [`TypeIdentityRenaming`]. The replay cache and its instruction drivers
@@ -2012,6 +2520,147 @@ mod tests {
     use super::*;
 
     type TestProgram = Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>>;
+
+    /// Provenance-only wrapper around the canonical region fixture for ordinary data flow tests.
+    #[derive(Clone, Debug)]
+    struct DataFlowOperation {
+        /// Canonical fixture supplying region slots and the operation name.
+        operation: TestRegionOperation,
+
+        /// Input correspondence in attached-region order.
+        inputs: Vec<Vec<InputRegionProvenance>>,
+
+        /// Alternative output origins in instruction-output order.
+        outputs: Vec<Vec<OutputRegionProvenance>>,
+    }
+
+    impl DataFlowOperation {
+        /// Creates two computation slots and one dormant rule with deliberately non-positional input correspondence.
+        fn new() -> Self {
+            Self {
+                operation: TestRegionOperation::WithRegions(
+                    const {
+                        &[RegionSlot::computation("first"), RegionSlot::computation("second"), RegionSlot::rule("rule")]
+                    },
+                ),
+                inputs: vec![
+                    vec![
+                        InputRegionProvenance::Input { index: 2 },
+                        InputRegionProvenance::Local,
+                        InputRegionProvenance::None,
+                    ],
+                    vec![InputRegionProvenance::Input { index: 0 }],
+                    Vec::new(),
+                ],
+                outputs: vec![
+                    vec![
+                        OutputRegionProvenance { region_index: 1, output_index: 0 },
+                        OutputRegionProvenance { region_index: 0, output_index: 1 },
+                    ],
+                    Vec::new(),
+                ],
+            }
+        }
+    }
+
+    impl Operation for DataFlowOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            self.operation.name()
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            self.operation.region_slots()
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            self.operation.infer_output_types(input_types, region_interfaces)
+        }
+
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+            self.inputs[region_index][input_index]
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            self.outputs[output_index].clone()
+        }
+    }
+
+    /// Custom rule returning explicit declarations, optionally querying liveness to exercise its validated boundary.
+    #[derive(Default)]
+    struct DataFlowRuleFixture {
+        /// Possible sources shared by the fixture's input and output queries.
+        sources: Option<RegionDataFlowSources>,
+
+        /// Declared execution demand in attached-region order.
+        demands: Vec<Option<Vec<bool>>>,
+
+        /// Optional region-local liveness query issued before returning execution demand.
+        query: Option<(usize, Vec<bool>)>,
+    }
+
+    impl RegionDataFlowRule for DataFlowRuleFixture {
+        fn input_sources(
+            &self,
+            _region_index: usize,
+            _input_index: usize,
+            _boundary: RegionDataFlowBoundary<'_>,
+        ) -> Result<RegionDataFlowSources, ProgramError> {
+            Ok(self.sources.clone().unwrap_or(RegionDataFlowSources::Unknown))
+        }
+
+        fn output_sources(
+            &self,
+            _output_index: usize,
+            _boundary: RegionDataFlowBoundary<'_>,
+        ) -> Result<RegionDataFlowSources, ProgramError> {
+            Ok(self.sources.clone().unwrap_or(RegionDataFlowSources::Unknown))
+        }
+
+        fn execution_demands(
+            &self,
+            _used_outputs: &[bool],
+            _boundary: RegionDataFlowBoundary<'_>,
+            regions: &mut dyn RegionLiveness,
+        ) -> Result<Vec<Option<Vec<bool>>>, ProgramError> {
+            if let Some((region_index, used_outputs)) = &self.query {
+                regions.used_region_inputs(*region_index, used_outputs)?;
+            }
+            Ok(self.demands.clone())
+        }
+    }
+
+    /// Records actual liveness callbacks and returns configurable live inputs or an analysis error.
+    #[derive(Default)]
+    struct DataFlowLivenessFixture {
+        /// Returned region input liveness.
+        inputs: Vec<bool>,
+
+        /// Region positions and used outputs queried by custom rules.
+        queries: Vec<(usize, Vec<bool>)>,
+
+        /// Optional region-analysis error propagated through the contract.
+        error: Option<ProgramError>,
+    }
+
+    impl RegionLiveness for DataFlowLivenessFixture {
+        fn used_region_inputs(
+            &mut self,
+            region_index: usize,
+            used_outputs: &[bool],
+        ) -> Result<Vec<bool>, ProgramError> {
+            self.queries.push((region_index, used_outputs.to_vec()));
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.inputs.clone()),
+            }
+        }
+    }
 
     /// Nominal identity used by the structural closure prototype.
     #[derive(Clone, Debug, Parameter)]
@@ -3389,6 +4038,402 @@ mod tests {
         assert_eq!(entries[&input], 1);
         assert_eq!(entries[&local], 2);
         assert_eq!(entries[&InputRegionProvenance::None], 3);
+    }
+
+    #[test]
+    fn test_region_data_flow_input_sources() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Opaque));
+        assert_eq!(
+            RegionDataFlow::Provenance.input_sources(&operation, 0, 0, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
+        );
+        assert_eq!(
+            RegionDataFlow::Provenance.input_sources(&operation, 0, 1, boundary),
+            Ok(RegionDataFlowSources::Known(Vec::new())),
+        );
+        assert_eq!(
+            RegionDataFlow::Provenance.input_sources(&operation, 0, 2, boundary),
+            Ok(RegionDataFlowSources::Unknown),
+        );
+        assert_eq!(
+            RegionDataFlow::Provenance.input_sources(&operation, 1, 0, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(0)])),
+        );
+        // Opaque declarations ignore the declared provenance.
+        assert_eq!(
+            RegionDataFlow::Opaque.input_sources(&operation, 0, 0, boundary),
+            Ok(RegionDataFlowSources::Unknown),
+        );
+
+        // Noncontiguous, cross-region feedback preserves declared source order alongside the initial binding.
+        let sources = RegionDataFlowSources::Known(vec![
+            RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 1, output_index: 0 }),
+            RegionDataFlowSource::InstructionInput(2),
+            RegionDataFlowSource::RegionInput { region_index: 0, input_index: 1 },
+        ]);
+        let rule = DataFlowRuleFixture { sources: Some(sources.clone()), ..Default::default() };
+        assert_eq!(RegionDataFlow::Custom(&rule).input_sources(&operation, 0, 2, boundary), Ok(sources));
+    }
+
+    #[test]
+    fn test_region_data_flow_input_sources_invalid_positions() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        let rule = DataFlowRuleFixture::default();
+        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+            for (region_index, input_index, message) in [
+                (3, 0, "operation `with_regions` declares region 3 but has 3 attached regions"),
+                (2, 0, "operation `with_regions` declares data flow through non-computation region 2"),
+                (0, 3, "operation `with_regions` declares input 3 of region 0 with 3 inputs"),
+            ] {
+                assert_eq!(
+                    data_flow.input_sources(&operation, region_index, input_index, boundary),
+                    Err(ProgramError::MalformedProgram(message.to_owned())),
+                );
+            }
+            assert_eq!(
+                data_flow.input_sources(
+                    &operation,
+                    0,
+                    0,
+                    RegionDataFlowBoundary { regions: &boundaries[..2], ..boundary },
+                ),
+                Err(ProgramError::MalformedProgram(
+                    "operation `with_regions` has 2 attached region boundaries but declares 3 regions".to_owned(),
+                )),
+            );
+        }
+        let mut invalid = operation.clone();
+        invalid.inputs[0][0] = InputRegionProvenance::Input { index: 3 };
+        assert_eq!(
+            RegionDataFlow::Provenance.input_sources(&invalid, 0, 0, boundary),
+            Err(ProgramError::MalformedProgram(
+                "operation `with_regions` declares instruction input 3 but has 3 inputs".to_owned(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_region_data_flow_output_sources() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        assert_eq!(
+            RegionDataFlow::Provenance.output_sources(&operation, 0, boundary),
+            Ok(RegionDataFlowSources::Known(vec![
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 1, output_index: 0 }),
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 0, output_index: 1 }),
+            ])),
+        );
+        assert_eq!(
+            RegionDataFlow::Provenance.output_sources(&operation, 1, boundary),
+            Ok(RegionDataFlowSources::Unknown),
+        );
+        assert_eq!(RegionDataFlow::Opaque.output_sources(&operation, 0, boundary), Ok(RegionDataFlowSources::Unknown));
+        let empty =
+            DataFlowRuleFixture { sources: Some(RegionDataFlowSources::Known(Vec::new())), ..Default::default() };
+        assert_eq!(
+            RegionDataFlow::Custom(&empty).output_sources(&operation, 1, boundary),
+            Ok(RegionDataFlowSources::Known(Vec::new())),
+        );
+        let unknown = DataFlowRuleFixture::default();
+        assert_eq!(
+            RegionDataFlow::Custom(&unknown).output_sources(&operation, 1, boundary),
+            Ok(RegionDataFlowSources::Unknown),
+        );
+    }
+
+    #[test]
+    fn test_region_data_flow_output_sources_invalid_positions() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        let rule = DataFlowRuleFixture::default();
+        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+            assert_eq!(
+                data_flow.output_sources(&operation, 2, boundary),
+                Err(ProgramError::MalformedProgram(
+                    "operation `with_regions` declares output 2 with 2 outputs".to_owned(),
+                )),
+            );
+            assert_eq!(
+                data_flow.output_sources(
+                    &operation,
+                    0,
+                    RegionDataFlowBoundary { regions: &boundaries[..2], ..boundary },
+                ),
+                Err(ProgramError::MalformedProgram(
+                    "operation `with_regions` has 2 attached region boundaries but declares 3 regions".to_owned(),
+                )),
+            );
+        }
+        for (origin, message) in [
+            (
+                OutputRegionProvenance { region_index: 3, output_index: 0 },
+                "operation `with_regions` declares region 3 but has 3 attached regions",
+            ),
+            (
+                OutputRegionProvenance { region_index: 2, output_index: 0 },
+                "operation `with_regions` declares data flow through non-computation region 2",
+            ),
+            (
+                OutputRegionProvenance { region_index: 0, output_index: 2 },
+                "operation `with_regions` declares output 2 of region 0 with 2 outputs",
+            ),
+        ] {
+            let mut invalid = operation.clone();
+            invalid.outputs[0] = vec![origin];
+            assert_eq!(
+                RegionDataFlow::Provenance.output_sources(&invalid, 0, boundary),
+                Err(ProgramError::MalformedProgram(message.to_owned())),
+            );
+        }
+    }
+
+    #[test]
+    fn test_region_data_flow_custom_sources_invalid_positions() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        for (source, message) in [
+            (
+                RegionDataFlowSource::InstructionInput(3),
+                "operation `with_regions` declares instruction input 3 but has 3 inputs",
+            ),
+            (
+                RegionDataFlowSource::RegionInput { region_index: 0, input_index: 3 },
+                "operation `with_regions` declares input 3 of region 0 with 3 inputs",
+            ),
+            (
+                RegionDataFlowSource::RegionInput { region_index: 2, input_index: 0 },
+                "operation `with_regions` declares data flow through non-computation region 2",
+            ),
+            (
+                RegionDataFlowSource::RegionInput { region_index: 3, input_index: 0 },
+                "operation `with_regions` declares region 3 but has 3 attached regions",
+            ),
+            (
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 1, output_index: 1 }),
+                "operation `with_regions` declares output 1 of region 1 with 1 outputs",
+            ),
+            (
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 2, output_index: 0 }),
+                "operation `with_regions` declares data flow through non-computation region 2",
+            ),
+            (
+                RegionDataFlowSource::RegionOutput(OutputRegionProvenance { region_index: 3, output_index: 0 }),
+                "operation `with_regions` declares region 3 but has 3 attached regions",
+            ),
+        ] {
+            let rule =
+                DataFlowRuleFixture { sources: Some(RegionDataFlowSources::Known(vec![source])), ..Default::default() };
+            let error = Err(ProgramError::MalformedProgram(message.to_owned()));
+            assert_eq!(RegionDataFlow::Custom(&rule).input_sources(&operation, 0, 0, boundary), error);
+            assert_eq!(RegionDataFlow::Custom(&rule).output_sources(&operation, 0, boundary), error);
+        }
+    }
+
+    #[test]
+    fn test_region_data_flow_execution_demands() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        let mut liveness = DataFlowLivenessFixture::default();
+        assert_eq!(
+            RegionDataFlow::Provenance.execution_demands(&operation, &[true, false], boundary, &mut liveness),
+            Ok(vec![Some(vec![false, true]), Some(vec![true]), None]),
+        );
+        // A used output without declared provenance demands every computation-region output, while derivative rules
+        // stay dormant.
+        assert_eq!(
+            RegionDataFlow::Provenance.execution_demands(&operation, &[false, true], boundary, &mut liveness),
+            Ok(vec![Some(vec![true, true]), Some(vec![true]), None]),
+        );
+        // No used outputs still execute effect-retained work and never activate a dormant rule.
+        assert_eq!(
+            RegionDataFlow::Provenance.execution_demands(&operation, &[false, false], boundary, &mut liveness),
+            Ok(vec![Some(vec![false, false]), Some(vec![false]), None]),
+        );
+        // Opaque declarations demand every computation-region output, even without used outputs.
+        for used_outputs in [[true, false], [false, false]] {
+            assert_eq!(
+                RegionDataFlow::Opaque.execution_demands(&operation, &used_outputs, boundary, &mut liveness),
+                Ok(vec![Some(vec![true, true]), Some(vec![true]), None]),
+            );
+        }
+        assert_eq!(liveness.queries, Vec::<(usize, Vec<bool>)>::new());
+
+        let demands = vec![None, Some(vec![true]), None];
+        let rule = DataFlowRuleFixture { demands: demands.clone(), query: Some((1, vec![true])), ..Default::default() };
+        liveness.inputs = vec![true];
+        assert_eq!(
+            RegionDataFlow::Custom(&rule).execution_demands(&operation, &[true, false], boundary, &mut liveness),
+            Ok(demands),
+        );
+        assert_eq!(liveness.queries, vec![(1, vec![true])]);
+    }
+
+    #[test]
+    fn test_region_data_flow_execution_demands_empty_region_boundary() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 0 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 0 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        assert_eq!(
+            RegionDataFlow::Provenance.execution_demands(
+                &operation,
+                &[false, false],
+                boundary,
+                &mut DataFlowLivenessFixture::default(),
+            ),
+            Ok(vec![Some(Vec::new()), Some(Vec::new()), None]),
+        );
+    }
+
+    #[test]
+    fn test_region_data_flow_execution_demands_invalid_demanded_outputs() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        let empty = DataFlowRuleFixture::default();
+        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&empty)] {
+            assert_eq!(
+                data_flow.execution_demands(&operation, &[true], boundary, &mut DataFlowLivenessFixture::default()),
+                Err(ProgramError::MalformedProgram(
+                    "operation `with_regions` receives used outputs for 1 positions but has 2 outputs".to_owned(),
+                )),
+            );
+            assert_eq!(
+                data_flow.execution_demands(
+                    &operation,
+                    &[true, false],
+                    RegionDataFlowBoundary { regions: &boundaries[..2], ..boundary },
+                    &mut DataFlowLivenessFixture::default(),
+                ),
+                Err(ProgramError::MalformedProgram(
+                    "operation `with_regions` has 2 attached region boundaries but declares 3 regions".to_owned(),
+                )),
+            );
+        }
+        for (demands, message) in [
+            (Vec::new(), "operation `with_regions` declares demanded outputs for 0 regions but has 3 regions"),
+            (
+                vec![Some(vec![true]), None, None],
+                "operation `with_regions` declares demanded outputs for 1 positions of region 0 with 2 outputs",
+            ),
+            (
+                vec![None, None, Some(Vec::new())],
+                "operation `with_regions` declares data flow through non-computation region 2",
+            ),
+        ] {
+            let rule = DataFlowRuleFixture { demands, ..Default::default() };
+            assert_eq!(
+                RegionDataFlow::Custom(&rule).execution_demands(
+                    &operation,
+                    &[true, false],
+                    boundary,
+                    &mut DataFlowLivenessFixture::default(),
+                ),
+                Err(ProgramError::MalformedProgram(message.to_owned())),
+            );
+        }
+    }
+
+    #[test]
+    fn test_region_data_flow_execution_demands_invalid_liveness_queries() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        for (region_index, mask, message) in [
+            (3, Vec::new(), "operation `with_regions` declares region 3 but has 3 attached regions"),
+            (2, Vec::new(), "operation `with_regions` declares data flow through non-computation region 2"),
+            (
+                0,
+                vec![true],
+                "operation `with_regions` queries liveness with used outputs for 1 positions of region 0 \
+                 with 2 outputs",
+            ),
+        ] {
+            let rule = DataFlowRuleFixture { query: Some((region_index, mask)), ..Default::default() };
+            let mut liveness = DataFlowLivenessFixture::default();
+            assert_eq!(
+                RegionDataFlow::Custom(&rule).execution_demands(&operation, &[true, false], boundary, &mut liveness),
+                Err(ProgramError::MalformedProgram(message.to_owned())),
+            );
+            assert!(liveness.queries.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_region_data_flow_execution_demands_invalid_liveness_response() {
+        let operation = DataFlowOperation::new();
+        let boundaries = [
+            RegionDataFlowRegionBoundary { input_count: 3, output_count: 2 },
+            RegionDataFlowRegionBoundary { input_count: 1, output_count: 1 },
+            RegionDataFlowRegionBoundary { input_count: 0, output_count: 0 },
+        ];
+        let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
+        let rule = DataFlowRuleFixture { query: Some((0, vec![true, false])), ..Default::default() };
+        let mut liveness = DataFlowLivenessFixture { inputs: vec![true], ..Default::default() };
+        assert_eq!(
+            RegionDataFlow::Custom(&rule).execution_demands(&operation, &[true, false], boundary, &mut liveness),
+            Err(ProgramError::MalformedProgram(
+                "operation `with_regions` receives liveness for 1 inputs of region 0 with 3 inputs".to_owned(),
+            )),
+        );
+        assert_eq!(liveness.queries, vec![(0, vec![true, false])]);
+        let error = ProgramError::MalformedProgram("region liveness failed".to_owned());
+        liveness.error = Some(error.clone());
+        assert_eq!(
+            RegionDataFlow::Custom(&rule).execution_demands(&operation, &[true, false], boundary, &mut liveness),
+            Err(error),
+        );
+    }
+
+    #[test]
+    fn test_region_data_flow_debug() {
+        assert_eq!(format!("{:?}", RegionDataFlow::Opaque), "Opaque");
+        assert_eq!(format!("{:?}", RegionDataFlow::Provenance), "Provenance");
+        assert_eq!(format!("{:?}", RegionDataFlow::Custom(&DataFlowRuleFixture::default())), "Custom(..)");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Mutable references, their identities and views, and analysis and discharge of references in programs.
 //!
 //! A reference names mutable storage. Reading it produces an immutable value. Writing it changes the value seen by
-//! subsequent reads through any alias of that storage. References therefore need more than ordinary value dataflow:
+//! subsequent reads through any alias of that storage. References therefore need more than ordinary value data flow:
 //! programs must preserve access order, track aliases, and prevent access after consumption. This module supplies
 //! those contracts without assuming that the stored value is an array. Array reference values and indexing and slicing
 //! operations are defined in [`arrays`](crate::arrays).

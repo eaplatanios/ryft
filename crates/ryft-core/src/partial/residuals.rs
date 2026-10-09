@@ -52,7 +52,7 @@ use crate::partial::partitions::PartitionedProgram;
 use crate::partial::values::ResidualInputSource;
 use crate::programs::{
     Atom, AtomId, ErasedOperation, Instruction, Operation, OperationPayloadProjection, Program, ProgramBuilder,
-    ProgramError, RegionDataflowBoundary, RegionDataflowSource, RegionDataflowSources, RegionId, RegionPruningAnalysis,
+    ProgramError, RegionDataFlowBoundary, RegionDataFlowSource, RegionDataFlowSources, RegionId, RegionPruningAnalysis,
     RegionRole, Type, Typed, Value, ValueId,
 };
 
@@ -620,9 +620,10 @@ where
     }
 }
 
-/// Executable native policy for one type universe supported by both child policies, instantiated from a deferred
-/// [`NativeResidualPolicyComposition`]. The first saving decision takes precedence, and the second policy is consulted
-/// only when the first requests recomputation.
+/// Native instantiation of a [`SaveFromBothPolicies`](crate::SaveFromBothPolicies) composition in one type universe
+/// supported by both child policies, instantiated from a deferred [`NativeResidualPolicyComposition`]. Like the typed
+/// composition, it takes the first saving decision and consults the second policy only when the first requests
+/// recomputation.
 struct CombinedNativeResidualPolicy<T: Type> {
     /// Name of the composed policy, matching its non-erased definition.
     name: &'static str,
@@ -660,10 +661,6 @@ impl<T: Type> ErasedResidualPolicy<T> for CombinedNativeResidualPolicy<T> {
     }
 }
 
-// TODO(eaplatanios): Is the way this is structured and its `composition` correct and reasonable? I wonder if
-//  it's not really very compositional and hardcodes a very specific relationship. Also, why do we need this
-//  and `NativeResidualPolicyComposition`separate from the machinery we have for combining policies like
-//  `CombinedNativeResidualPolicy`?
 /// Instantiations of one [`ResidualPolicy`] in other type universes, which [`ResidualPolicy::native_instantiations`]
 /// returns and [`ResidualPolicyReference::lift`] prefers over projecting candidate types. For example, a policy that
 /// is generic over its type universe returns `NativeResidualPolicies::default().with::<ArrayType, _>(
@@ -676,6 +673,11 @@ impl<T: Type> ErasedResidualPolicy<T> for CombinedNativeResidualPolicy<T> {
 /// [`ArrayIrType`](crate::ArrayIrType), candidates that produce dimensions or references have no `ArrayType`
 /// representation, and so a policy that saves everything could not classify them unless it has a native
 /// `ArrayIrType` instantiation, which simply saves them).
+///
+/// [`SaveFromBothPolicies`](crate::SaveFromBothPolicies) derives its instantiations from those of its two policies.
+/// and so it has a native instantiation in every type universe in which both of them have one. Other composite policies
+/// register their instantiations explicitly through [`with`](Self::with), which requires the composite policy to
+/// implement [`ResidualPolicy`] in each registered universe.
 #[derive(Clone, Default)]
 pub struct NativeResidualPolicies {
     /// Instantiations keyed by the [`TypeId`] of their universe `U`, each holding an
@@ -696,10 +698,15 @@ impl NativeResidualPolicies {
         self
     }
 
-    /// Combines the native policies available in both registries, with the first policy's saves taking precedence.
-    /// Availability is intersected lazily because the erased entries cannot be instantiated in an unknown universe.
-    /// Explicit registrations added with [`with`](Self::with) override the derived policy for their universe.
-    pub(crate) fn intersection(self, other: Self, name: &'static str) -> Self {
+    /// Returns the native instantiations of the [`SaveFromBothPolicies`](crate::SaveFromBothPolicies) composition of a
+    /// policy whose instantiations are `self` with a policy whose instantiations are `other`. A combined instantiation
+    /// exists in each type universe for which both registries provide an instantiation. It classifies a candidate with
+    /// the first policy's instantiation and consults the second one only when the first recomputes the candidate,
+    /// reporting rejections under `name`. Combined instantiations are created when a lookup names their universe,
+    /// because the erased entries of both registries cannot be instantiated in a universe that is not yet known.
+    /// Explicit registrations added with [`with`](Self::with) override the combined instantiation of their universe.
+    #[inline]
+    pub(crate) fn save_from_both(self, other: Self, name: &'static str) -> Self {
         Self {
             entries: Vec::new(),
             composition: Some(Arc::new(NativeResidualPolicyComposition { name, first: self, second: other })),
@@ -723,11 +730,13 @@ impl NativeResidualPolicies {
     }
 }
 
-/// Deferred recipe for composing native policies in the type universes supported by both child registries. The
-/// registries erase their type universes, so composition is deferred until a lookup supplies the destination universe.
-/// The lookup then instantiates a [`CombinedNativeResidualPolicy`] from both children's native policies. Only universe
-/// availability is intersected; classification preserves the first saving decision and consults the second policy only
-/// when the first requests recomputation.
+/// Deferred recipe for the native instantiations of a [`SaveFromBothPolicies`](crate::SaveFromBothPolicies)
+/// composition, in the type universes supported by both child registries, as created by
+/// [`NativeResidualPolicies::save_from_both`]. The registries erase their type universes, so the
+/// composition is deferred until a lookup supplies the destination universe. The lookup then instantiates a
+/// [`CombinedNativeResidualPolicy`] from the native policies of both children. This is the only supported way to
+/// combine registries; another composite policy that needs instantiations derived from erased child registries
+/// requires its own recipe.
 struct NativeResidualPolicyComposition {
     /// Name of the composed policy, used in rejection diagnostics.
     name: &'static str,
@@ -1684,7 +1693,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
 /// policy only when the policy recomputes every value that this work produces, which
 /// [`allows_replay`](Self::allows_replay) checks by classifying each of those values.
 ///
-/// The executed work comes from the [`RegionDataflow`](crate::RegionDataflow) of each region-carrying operation. For
+/// The executed work comes from the [`RegionDataFlow`](crate::RegionDataFlow) of each region-carrying operation. For
 /// each region that an instruction executes, it determines the _demanded outputs_ of that region: the outputs that the
 /// instruction needs from the region, together with every output that the operation's own semantics need for them
 /// (e.g., the carries that later iterations of a loop read). The answer for a region therefore depends only on the
@@ -1722,25 +1731,25 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     ///
     /// # Errors
     ///
-    /// Returns the errors of classifying values with the policy and of the region dataflow and liveness queries.
+    /// Returns the errors of classifying values with the policy and of the region data flow and liveness queries.
     fn allows_replay(&mut self, instruction_index: usize, output_index: usize) -> Result<bool, ResidualPolicyError> {
         let program = self.program;
         let policy = self.policy;
         let instruction = &program.instructions()[instruction_index];
-        let Some(dataflow) = instruction.operation().region_dataflow() else {
+        let Some(data_flow) = instruction.operation().region_data_flow() else {
             return Ok(false);
         };
 
-        let regions = program.region_dataflow_boundaries(instruction)?;
-        let boundary = RegionDataflowBoundary {
+        let regions = program.region_data_flow_boundaries(instruction)?;
+        let boundary = RegionDataFlowBoundary {
             input_count: instruction.inputs().len(),
             output_count: instruction.outputs().len(),
             regions: &regions,
         };
 
         if matches!(
-            dataflow.output_sources(instruction.operation(), output_index, boundary)?,
-            RegionDataflowSources::Unknown
+            data_flow.output_sources(instruction.operation(), output_index, boundary)?,
+            RegionDataFlowSources::Unknown
         ) {
             // Whole-operation public replay is handled by the caller. A nested split cannot infer precise replay
             // permission for a root whose producing computations have not been declared.
@@ -1810,8 +1819,8 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
                                 recomputes &= matches!(policy.classify(&candidate)?, ResidualDecision::Recompute);
                             }
                         } else {
-                            let regions = program.region_dataflow_boundaries(instruction)?;
-                            let boundary = RegionDataflowBoundary {
+                            let regions = program.region_data_flow_boundaries(instruction)?;
+                            let boundary = RegionDataFlowBoundary {
                                 input_count: instruction.inputs().len(),
                                 output_count: instruction.outputs().len(),
                                 regions: &regions,
@@ -1841,8 +1850,8 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     }
 
     /// Returns the demanded outputs of each region that `instruction` executes when only the outputs that
-    /// `used_outputs` marks are used, according to the [`RegionDataflow`](crate::RegionDataflow) of its operation,
-    /// marked in the order of the outputs of each region. An operation that declares no region dataflow conservatively
+    /// `used_outputs` marks are used, according to the [`RegionDataFlow`](crate::RegionDataFlow) of its operation,
+    /// marked in the order of the outputs of each region. An operation that declares no region data flow conservatively
     /// demands every output of each of its computation regions.
     ///
     /// # Parameters
@@ -1850,21 +1859,21 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     ///   - `instruction`: Region-carrying instruction of the program.
     ///   - `used_outputs`: Outputs of `instruction` that are used, marked in the order of its outputs.
     ///   - `boundary`: Boundary of `instruction` and its attached regions, as constructed from
-    ///     [`Program::region_dataflow_boundaries`].
+    ///     [`Program::region_data_flow_boundaries`].
     ///
     /// # Errors
     ///
-    /// Returns the errors of the region dataflow and region liveness queries.
+    /// Returns the errors of the region data flow and region liveness queries.
     fn demands(
         &mut self,
         instruction: &Instruction<O>,
         used_outputs: &[bool],
-        boundary: RegionDataflowBoundary<'_>,
+        boundary: RegionDataFlowBoundary<'_>,
     ) -> Result<Vec<(RegionId, Vec<bool>)>, ProgramError> {
         let operation = instruction.operation();
-        let demands = if let Some(dataflow) = operation.region_dataflow() {
+        let demands = if let Some(data_flow) = operation.region_data_flow() {
             let mut regions = self.analysis.attached_region_liveness(instruction.regions());
-            dataflow.execution_demands(operation, used_outputs, boundary, &mut regions)?
+            data_flow.execution_demands(operation, used_outputs, boundary, &mut regions)?
         } else {
             boundary
                 .regions
@@ -1916,9 +1925,9 @@ enum ResidualReplayFrame {
 }
 
 /// Analysis that resolves the operation outputs that may have produced the values of a [`Program`].
-/// It follows the [`RegionDataflowSource`]s that region-carrying operations declare through their
-/// [`RegionDataflow`](crate::RegionDataflow), across attached regions, initial bindings, and recurrent feedback
-/// (e.g., loop carries). A region-carrying operation that declares no dataflow, or whose declared sources are unknown,
+/// It follows the [`RegionDataFlowSource`]s that region-carrying operations declare through their
+/// [`RegionDataFlow`](crate::RegionDataFlow), across attached regions, initial bindings, and recurrent feedback
+/// (e.g., loop carries). A region-carrying operation that declares no data flow, or whose declared sources are unknown,
 /// is itself kept as a possible producer.
 ///
 /// Every visited value is summarized symbolically, in terms of its containing region's inputs, and each summary is
@@ -1963,7 +1972,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] for malformed region dataflow declarations, and
+    /// Returns [`ProgramError::MalformedProgram`] for malformed region data flow declarations, and
     /// [`ProgramError::UnboundAtomId`] when `value` or one of its sources does not exist in the program.
     fn candidate(
         &mut self,
@@ -2041,18 +2050,18 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
         // Region-local summaries stay symbolic. Initial bindings and recurrent edges belong to the attachment,
         // so a shared body can be used by ordinary and recurrent carriers without contaminating its cached summary.
         let operation = instruction.operation();
-        let Some(dataflow) = operation.region_dataflow() else {
+        let Some(data_flow) = operation.region_data_flow() else {
             return Ok(vec![ResidualProvenanceLeaf::Producer(value)]);
         };
 
-        let regions = program.region_dataflow_boundaries(instruction)?;
-        let boundary = RegionDataflowBoundary {
+        let regions = program.region_data_flow_boundaries(instruction)?;
+        let boundary = RegionDataFlowBoundary {
             input_count: instruction.inputs().len(),
             output_count: instruction.outputs().len(),
             regions: &regions,
         };
 
-        let RegionDataflowSources::Known(sources) = dataflow.output_sources(operation, output_index, boundary)? else {
+        let RegionDataFlowSources::Known(sources) = data_flow.output_sources(operation, output_index, boundary)? else {
             return Ok(vec![ResidualProvenanceLeaf::Producer(value)]);
         };
 
@@ -2064,16 +2073,16 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
         while let Some(source) = pending.pop() {
             let replacements = match source {
                 ResidualProvenanceSource::Producer(producer) => vec![ResidualProvenanceLeaf::Producer(producer)],
-                ResidualProvenanceSource::Boundary(RegionDataflowSource::InstructionInput(index)) => {
+                ResidualProvenanceSource::Boundary(RegionDataFlowSource::InstructionInput(index)) => {
                     self.resolve(ValueId::new(value.region(), instruction.inputs()[index]))?
                 }
-                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionInput { region_index, input_index }) => {
+                ResidualProvenanceSource::Boundary(RegionDataFlowSource::RegionInput { region_index, input_index }) => {
                     if !expanded_inputs.insert((region_index, input_index)) {
                         continue;
                     }
-                    match dataflow.input_sources(operation, region_index, input_index, boundary)? {
-                        RegionDataflowSources::Unknown => vec![ResidualProvenanceLeaf::Producer(value)],
-                        RegionDataflowSources::Known(sources) => {
+                    match data_flow.input_sources(operation, region_index, input_index, boundary)? {
+                        RegionDataFlowSources::Unknown => vec![ResidualProvenanceLeaf::Producer(value)],
+                        RegionDataFlowSources::Known(sources) => {
                             // Complete each declared alternative before the next. Region input/output positions
                             // terminate cycles without changing the region-local symbolic summaries.
                             pending.extend(sources.into_iter().rev().map(ResidualProvenanceSource::Boundary));
@@ -2081,7 +2090,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
                         }
                     }
                 }
-                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionOutput(origin)) => {
+                ResidualProvenanceSource::Boundary(RegionDataFlowSource::RegionOutput(origin)) => {
                     if !expanded_outputs.insert((origin.region_index, origin.output_index)) {
                         continue;
                     }
@@ -2091,7 +2100,7 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
                         pending.push(match leaf {
                             ResidualProvenanceLeaf::Producer(producer) => ResidualProvenanceSource::Producer(producer),
                             ResidualProvenanceLeaf::Input(input_index) => {
-                                ResidualProvenanceSource::Boundary(RegionDataflowSource::RegionInput {
+                                ResidualProvenanceSource::Boundary(RegionDataFlowSource::RegionInput {
                                     region_index: origin.region_index,
                                     input_index,
                                 })
@@ -2116,9 +2125,9 @@ impl<'o, V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloa
 /// Work item of the expansion of the sources of one instruction output in
 /// [`ResidualProvenanceAnalysis::resolve_uncached`].
 enum ResidualProvenanceSource {
-    /// Source that the [`RegionDataflow`](crate::RegionDataflow) of the instruction declares, relative to the
+    /// Source that the [`RegionDataFlow`](crate::RegionDataFlow) of the instruction declares, relative to the
     /// instruction and its attached regions.
-    Boundary(RegionDataflowSource),
+    Boundary(RegionDataFlowSource),
 
     /// Instruction output that is itself a producer of the resolved value.
     Producer(ValueId),
@@ -2232,7 +2241,7 @@ mod tests {
     };
     use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::{
-        InputRegionProvenance, OutputRegionProvenance, ReferenceType, RegionDataflow, RegionInterface, RegionSlot,
+        InputRegionProvenance, OutputRegionProvenance, ReferenceType, RegionDataFlow, RegionInterface, RegionSlot,
         TypeError,
     };
     use crate::tests::TestRegionOperation;
@@ -2884,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_residual_policies_intersection() {
+    fn test_native_residual_policies_save_from_both() {
         /// Returns one native policy over the composite test universe with a fixed decision.
         fn native(decision: ResidualDecision<NoStorage>) -> NativeResidualPolicies {
             NativeResidualPolicies::default().with(TestPolicy {
@@ -2896,24 +2905,24 @@ mod tests {
         let save = || native(ResidualDecision::Save);
         let operation = dimension_size();
         let candidate = candidate(&operation, vec![vector_type()], dimension_type());
-        let combined = recompute().intersection(save(), "combined");
+        let combined = recompute().save_from_both(save(), "combined");
         assert!(combined.get::<ArrayType>().is_none());
         assert!(matches!(combined.get::<ArrayIrType>().unwrap().classify(&candidate), Ok(ResidualDecision::Save)));
         assert!(
             recompute()
-                .intersection(NativeResidualPolicies::default(), "missing_second")
+                .save_from_both(NativeResidualPolicies::default(), "missing_second")
                 .get::<ArrayIrType>()
                 .is_none()
         );
         assert!(
             NativeResidualPolicies::default()
-                .intersection(save(), "missing_first")
+                .save_from_both(save(), "missing_first")
                 .get::<ArrayIrType>()
                 .is_none()
         );
 
         // Derived registries can compose again, and a subsequent explicit native entry overrides the derived one.
-        let nested = recompute().intersection(combined, "nested");
+        let nested = recompute().save_from_both(combined, "nested");
         assert_eq!(nested.get::<ArrayIrType>().unwrap().name(), "nested");
         assert!(matches!(nested.get::<ArrayIrType>().unwrap().classify(&candidate), Ok(ResidualDecision::Save)));
         let overridden = nested.with(TestPolicy {
@@ -2928,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_residual_policies_intersection_preserves_storage_and_rejections() {
+    fn test_native_residual_policies_save_from_both_preserves_storage_and_rejections() {
         let operation = dimension_size();
         let candidate = candidate(&operation, vec![vector_type()], dimension_type());
         let store = || {
@@ -2952,7 +2961,8 @@ mod tests {
             })
         };
         // The second policy is not called when the first saves, and second-policy storage survives when it is used.
-        for combined in [store().intersection(reject(), "combined"), recompute().intersection(store(), "combined")] {
+        for combined in [store().save_from_both(reject(), "combined"), recompute().save_from_both(store(), "combined")]
+        {
             let ResidualDecision::SaveWith(storage) =
                 combined.get::<ArrayIrType>().unwrap().classify(&candidate).unwrap()
             else {
@@ -2960,7 +2970,8 @@ mod tests {
             };
             assert_eq!(storage.name(), "negation");
         }
-        for combined in [reject().intersection(store(), "combined"), recompute().intersection(reject(), "combined")] {
+        for combined in [reject().save_from_both(store(), "combined"), recompute().save_from_both(reject(), "combined")]
+        {
             assert_eq!(
                 combined.get::<ArrayIrType>().unwrap().classify(&candidate).map(|_| ()),
                 Err(ResidualPolicyError::Rejected {
@@ -4631,8 +4642,8 @@ mod tests {
                 }
             }
 
-            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
-                self.provenance.then_some(RegionDataflow::Ordinary)
+            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
+                self.provenance.then_some(RegionDataFlow::Ordinary)
             }
         }
 
@@ -5269,11 +5280,11 @@ mod tests {
                     .collect()
             }
 
-            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
+            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
                 let queries = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
                 // Bound work deterministically: a cache regression must fail before unfolding the diamond's paths.
                 assert!(queries <= 82, "shared provenance must not repeat operation queries");
-                (!self.region_slots().is_empty()).then_some(RegionDataflow::Ordinary)
+                (!self.region_slots().is_empty()).then_some(RegionDataFlow::Ordinary)
             }
         }
 
@@ -5520,8 +5531,8 @@ mod tests {
                 self.input
             }
 
-            fn region_dataflow(&self) -> Option<RegionDataflow<'_>> {
-                Some(RegionDataflow::Ordinary)
+            fn region_data_flow(&self) -> Option<RegionDataFlow<'_>> {
+                Some(RegionDataFlow::Ordinary)
             }
 
             fn output_region_provenance(&self, _output_index: usize) -> Vec<OutputRegionProvenance> {
