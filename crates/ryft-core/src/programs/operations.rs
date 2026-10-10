@@ -506,9 +506,14 @@ pub trait Operation: Clone {
         self.region_slots().get(index).map(|slot| slot.role)
     }
 
-    /// Validates that `region_count` matches the number of regions declared by [`region_slots`](Self::region_slots).
-    /// Operation application and program-construction boundaries call this function before inspecting attached regions
-    /// so downstream operation rules receive structurally valid applications.
+    /// Validates that `region_count` matches the number of regions declared by [`Self::region_slots`]. This is the
+    /// arity part of [`Self::validate_region_interfaces`], for code that pairs attached regions with region slots
+    /// before their interfaces exist (e.g., while summarizing the effects of an instruction), and for implementations
+    /// of [`Self::validate_region_interfaces`], which must validate the region count before their relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if `region_count` does not match the region slots of this operation.
     #[inline]
     fn validate_region_count(&self, region_count: usize) -> Result<(), ProgramError> {
         let declared_region_count = self.region_slots().len();
@@ -528,6 +533,42 @@ pub trait Operation: Clone {
             declared_region_count,
             region_count,
         )))
+    }
+
+    /// Validates the part of the region contract of an application of this [`Operation`] that does not depend on its
+    /// input types. The number of attached [`Region`](crate::Region)s must match [`Self::region_slots`], and the
+    /// declared interfaces of those regions must satisfy any operation-specific relationships (e.g., the two branches
+    /// of a `condition` operation must declare the same input types, and the body of a loop must map its state types
+    /// to themselves). Operation application boundaries (e.g., [`Context::bind`](crate::Context::bind) implementations
+    /// and transform entry points) call this function before inspecting the attached regions, so that operation rules
+    /// receive structurally valid applications, and [`ProgramBuilder`](crate::ProgramBuilder)s call it before
+    /// [`Self::infer_output_types`] when they record an instruction.
+    ///
+    /// Staging calls this function on the original declared interfaces, before it instantiates their type identities or
+    /// specializes their bodies to the application's input types. This complements [`Self::infer_region_input_types`],
+    /// which staging also calls on partially specialized interfaces (i.e., while reconciling regions whose signatures
+    /// depend on earlier ones), and which therefore cannot tell an original interface apart from a specialized one. For
+    /// example, specializing one of two condition branches that declare `f64[extent]` and `f64[3]` to an `f64[3]` input
+    /// would otherwise make their signatures equal and conceal the mismatch that [`Self::infer_output_types`] rejects.
+    ///
+    /// The default implementation only checks the number of attached regions. Implementations that add relationships
+    /// must check that number first. This function does not validate the input types of the application and does not
+    /// replace the mandatory [`Self::infer_output_types`] validation of the final application.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region_interfaces`: Declared interfaces of the attached regions, in slot order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if the number of attached regions does not match the region slots
+    /// of this operation, and a [`ProgramError::Type`] error if an operation-specific relationship is invalid.
+    #[inline]
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<(), ProgramError> {
+        self.validate_region_count(region_interfaces.len())
     }
 
     /// Derives the input [`Type`]s with which each attached [`Region`](crate::Region) will be invoked when this
@@ -995,6 +1036,14 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<(), ProgramError> {
+        self.as_ref().validate_region_interfaces(region_interfaces)
+    }
+
+    #[inline]
     fn infer_region_input_types(
         &self,
         input_types: &[Self::Type],
@@ -1295,6 +1344,18 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
 /// provenance, structural zero classification, effects, and rendering remain properties of the native payload and are
 /// delegated directly by the enclosing operation family.
 pub trait MemberOperation<U: Type>: Operation {
+    /// Validates the attached-[`Region`](crate::Region) interfaces of this payload's instruction in parent universe
+    /// `U`, using [`Operation::validate_region_interfaces`] semantics. The default implementation only checks the
+    /// number of attached regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Operation::validate_region_interfaces`].
+    #[inline]
+    fn validate_parent_region_interfaces(&self, region_interfaces: &[RegionInterface<U>]) -> Result<(), ProgramError> {
+        self.validate_region_count(region_interfaces.len())
+    }
+
     /// Infers attached-[`Region`](crate::Region) input [`Type`]s for this payload's instruction in parent universe `U`.
     fn infer_parent_region_input_types(
         &self,
@@ -1468,6 +1529,32 @@ impl<O: Operation> OperationBoundaryPruning<O> {
             .collect();
         Ok((kept_inputs, kept_outputs))
     }
+}
+
+/// Validates the region interfaces of a member [`Operation`] through a composite type boundary, using
+/// [`Operation::validate_region_interfaces`] semantics. Every attached-region [`RegionInterface`] is first
+/// projected to `T`. Projection fails with the composite type's canonical wrong-member [`TypeError`].
+///
+/// This function supports code generated by `#[derive(Operation)]` for `#[ryft(projected(T))]` variants in either
+/// transform role. Operation implementations normally call their payload's [`Operation::validate_region_interfaces`]
+/// method directly.
+///
+/// # Parameters
+///
+///   - `operation`: Member operation whose native type is `T`.
+///   - `region_interfaces`: Composite interfaces of regions attached to the enclosing operation.
+pub fn validate_projected_operation_region_interfaces<T: Type, I: Type + From<T>, O: Operation<Type = T>>(
+    operation: &O,
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<(), ProgramError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    // Check the region count before projecting, so that an unexpected region reports the native count diagnostic
+    // rather than a wrong-member error for one of its types.
+    operation.validate_region_count(region_interfaces.len())?;
+    let (_, region_interfaces) = project_operation_boundary(&[], region_interfaces)?;
+    operation.validate_region_interfaces(&region_interfaces)
 }
 
 /// Infers the region input types of a member [`Operation`] through a composite type boundary. Every composite input
@@ -1847,9 +1934,9 @@ mod tests {
         assert_eq!(operation.fold(&[DataType::F64], &[]), Ok(None));
         assert_eq!(operation.region_slots(), &[]);
         assert_eq!(operation.region_role(0), None);
-        assert_eq!(operation.validate_region_count(0), Ok(()));
+        assert_eq!(operation.validate_region_interfaces(&[]), Ok(()));
         assert_eq!(
-            operation.validate_region_count(1),
+            operation.validate_region_interfaces(&region_interfaces[..1]),
             Err(ProgramError::MalformedProgram(
                 "operation `stop_gradient` declares no region slots but 1 regions were attached".to_string(),
             )),
@@ -1875,9 +1962,9 @@ mod tests {
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
         assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
         assert_eq!(operation.region_role(1), None);
-        assert_eq!(operation.validate_region_count(1), Ok(()));
+        assert_eq!(operation.validate_region_interfaces(&region_interfaces), Ok(()));
         assert_eq!(
-            operation.validate_region_count(0),
+            operation.validate_region_interfaces(&[]),
             Err(ProgramError::MalformedProgram(
                 "operation `forwarding` declares 1 region slots but 0 regions were attached".to_string(),
             )),
@@ -2122,6 +2209,33 @@ mod tests {
         // Inputs of a different member kind fail projection before the rule runs.
         let inputs = [inputs[0].clone(), ArrayIrType::Array(ArrayType::scalar(DataType::F32))];
         assert!(fold_projected_operation(&operation, &inputs, &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_projected_operation_region_interfaces() {
+        let operation = ForwardingOperation::<ArrayType> { renamed: false, marker: PhantomData };
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let array_interface = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type], EffectClasses::NONE);
+        let dimension_interface =
+            RegionInterface::new(vec![dimension_type.clone()], vec![dimension_type], EffectClasses::NONE);
+        assert_eq!(validate_projected_operation_region_interfaces(&operation, &[array_interface]), Ok(()));
+
+        // An unexpected region reports the native region-count diagnostic, even when its types belong to another
+        // member kind, while a region of the expected count still fails projection.
+        assert_eq!(
+            validate_projected_operation_region_interfaces(
+                &operation,
+                &[dimension_interface.clone(), dimension_interface.clone()],
+            ),
+            Err(ProgramError::MalformedProgram(
+                "operation `forwarding` declares 1 region slots but 2 regions were attached".to_string(),
+            )),
+        );
+        assert!(matches!(
+            validate_projected_operation_region_interfaces(&operation, &[dimension_interface]),
+            Err(ProgramError::Type(_)),
+        ));
     }
 
     #[test]
