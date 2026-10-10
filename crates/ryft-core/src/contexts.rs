@@ -91,7 +91,7 @@ use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
     AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
-    Provenance, ProvenanceScope, ReferenceIdentity, Type, TypeError, Typed, Value, ValueProjection,
+    Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -771,6 +771,9 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             // shared regions. Pure identity renaming uses the driver's ordinary import cache without a separate arena.
             // Determine which regions require specialization before importing them, because importing instantiates
             // their type identities, which hides input types that only narrow bounds from the comparison below.
+            // Valid mixed refinements that cannot be specialized (`None`) lack a structural substitution, so they
+            // are imported with their declared boundaries intact. The specialization loop below retains them
+            // without replaying, and final inference validates them.
             let requires_specialization = region_interfaces
                 .iter()
                 .zip(&region_input_types)
@@ -778,28 +781,18 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     Some(requested) => {
                         FlatProgram::<Self>::region_requires_specialization(interface.input_types(), requested)
                     }
-                    None => Ok(false),
+                    None => Ok(Some(false)),
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| self.error(error.into()))?;
             let preparation_builder =
-                requires_specialization.contains(&true).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
+                requires_specialization.contains(&Some(true)).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
             let region_builder = preparation_builder.as_ref().unwrap_or(self.builder());
-
-            // Valid mixed refinements can lack a structural substitution. Keep their declared boundaries intact;
-            // the specialization loop below retains them without replaying, and final inference validates them.
-            let import_input_types = region_interfaces
+            let import_input_types = region_input_types
                 .iter()
-                .zip(&region_input_types)
-                .map(|(interface, requested)| match requested {
-                    Some(requested) => {
-                        Ok(FlatProgram::<Self>::region_input_identity_renaming(interface.input_types(), requested)?
-                            .map(|_| requested.clone()))
-                    }
-                    None => Ok(None),
-                })
-                .collect::<Result<Vec<_>, TypeError>>()
-                .map_err(|error| self.error(error.into()))?;
+                .zip(&requires_specialization)
+                .map(|(requested, requires_specialization)| requires_specialization.and(requested.clone()))
+                .collect::<Vec<_>>();
 
             let mut region_ids =
                 driver.import_into(region_builder, &import_input_types).map_err(|error| self.error(error))?;
@@ -838,7 +831,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 let mut specialization_failed = false;
                 for index in 0..region_ids.len() {
                     let Some(requested) = &requests[index] else { continue };
-                    if interfaces[index].input_types() == requested && !requires_specialization[index] {
+                    if interfaces[index].input_types() == requested && requires_specialization[index] != Some(true) {
                         continue;
                     }
 

@@ -782,22 +782,12 @@ impl<C: Context> PartialEvaluationContext<C> {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
-            match FlatProgram::<C>::specialize_attached_regions(
+            FlatProgram::<C>::specialize_attached_regions(
                 &operation,
                 &input_types,
                 regions.iter().map(Program::entry_region_ref),
-            ) {
-                Ok(Some(specialized)) => specialized,
-                Ok(None) => regions,
-                Err(_) => {
-                    // A valid refinement need not admit one identity renaming: a symbolic dimension input can keep its
-                    // identity while an array input binds that dimension to a static extent. Preparation is optional,
-                    // so retain accepted declared interfaces and preserve ordinary primitive diagnostics.
-                    let interfaces = regions.iter().map(Program::interface).collect::<Vec<_>>();
-                    operation.infer_output_types(&input_types, &interfaces)?;
-                    regions
-                }
-            }
+            )?
+            .unwrap_or(regions)
         };
 
         // Residualized regions splice into the residual builder's arena directly (i.e., owned move), in region order.
@@ -2342,6 +2332,62 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_residualize_propagates_region_preparation_errors() {
+        use crate::programs::RegionSlot;
+
+        /// Valid identity application whose specialization request reports a distinct preparation failure.
+        #[derive(Clone)]
+        struct PreparationFailureOperation;
+
+        impl Operation for PreparationFailureOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "preparation_failure"
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
+            }
+
+            fn infer_region_input_types(
+                &self,
+                _input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
+                Err(TypeError::invalid("region preparation failed"))
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(input_types.to_vec())
+            }
+        }
+
+        // Ordinary output validation accepts this application, but must not conceal a failed preparation request.
+        let state_type = ArrayType::scalar(DataType::F32);
+        let mut body = ProgramBuilder::<Array, PreparationFailureOperation>::new();
+        let input = body.add_input(state_type.clone());
+        let body = body.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let context = PartialEvaluationContext::new(TracingContext::<Array, PreparationFailureOperation>::new());
+        let input = context.unknown_input(state_type.clone(), 0);
+        assert_eq!(
+            PreparationFailureOperation.infer_output_types(&[state_type], &[body.interface()]),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+        assert!(matches!(
+            context.residualize(PreparationFailureOperation, vec![body], &[input]),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == "region preparation failed",
+        ));
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert_eq!(context.builder.borrow().regions.len(), 0);
+    }
+
+    #[test]
     fn test_partial_evaluation_context_residualize_falls_back_to_declared_regions() {
         // A specialized body that replaces a sharded carry with an unsharded constant no longer maps its carry
         // to itself. The declared body is valid and must remain available when specialized interfaces are rejected.
@@ -2387,14 +2433,13 @@ mod tests {
             .trim_end(),
         );
 
-        // Fallback must preserve validation: neither specialization nor the original regions can accept `f64`.
+        // Invalid inputs fail preparation; fallback is reserved for valid signatures that cannot be specialized.
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
-        assert!(matches!(
-            context.residualize(WhileOperation::new(), vec![condition, body], &[input]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`while` input 0 has type `f64[]`, which does not refine its state type `f32[]`",
-        ));
+        assert_eq!(
+            context.residualize(WhileOperation::new(), vec![condition, body], &[input]).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid("type f64[] cannot instantiate declared type f32[]"))),
+        );
     }
 
     #[test]

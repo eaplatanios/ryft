@@ -1444,6 +1444,25 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_derive_identity_renaming_rejects_retained_and_statically_bound_variable() {
+        let variable = DimensionVariable::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(F32, Shape::new(vec![variable.into()]));
+        let static_type = ArrayType::new_static(F32, [3]);
+        let declared = [dynamic_type.clone(), dynamic_type.clone()];
+        let error = TypeError::invalid(
+            "dimension variable n is renamed to n by one signature member and bound to static extent 3 by another",
+        );
+
+        // Full refinement can retain the relationship, but a pure identity substitution cannot express it.
+        // Structural consumers must reject the narrower signature rather than silently erase that obligation.
+        for actual in [[dynamic_type.clone(), static_type.clone()], [static_type.clone(), dynamic_type.clone()]] {
+            assert_eq!(ArrayType::derive_identity_renaming(&declared, &actual), Err(error.clone()));
+            let refinements = ArrayTypeRefinements::establish(&declared, &actual).unwrap();
+            assert_eq!(refinements.refine(&dynamic_type, &[]).unwrap(), static_type);
+        }
+    }
+
+    #[test]
     fn test_array_type_derive_identity_renaming_rejects_renamed_and_statically_bound_variable() {
         let declared_variable = DimensionVariable::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual_variable = DimensionVariable::new("m", DimensionBounds::non_negative(Some(8)).unwrap());

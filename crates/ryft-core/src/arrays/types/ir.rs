@@ -672,6 +672,35 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_type_derive_identity_renaming_rejects_retained_and_statically_bound_definition() {
+        let variable = DimensionVariable::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension = ArrayIrType::Dimension(DimensionType::from(variable.clone()));
+        let dynamic_type = ArrayType::new(F32, Shape::new(vec![variable.clone().into()]));
+        let static_type = ArrayType::new_static(F32, [3]);
+
+        let error = TypeError::invalid(
+            "dimension variable n is renamed to n by one signature member and bound to static extent 3 by another",
+        );
+        // Refinement accepts a concrete array or reference alongside a wide nominal dimension definition.
+        // Pure substitution remains strict because it cannot retain that cross-input runtime precondition.
+        for (declared_member, actual_member) in [
+            (ArrayIrType::Array(dynamic_type.clone()), ArrayIrType::Array(static_type.clone())),
+            (
+                ArrayIrType::Reference(ReferenceType::new(dynamic_type)),
+                ArrayIrType::Reference(ReferenceType::new(static_type)),
+            ),
+        ] {
+            for (declared, actual) in [
+                ([dimension.clone(), declared_member.clone()], [dimension.clone(), actual_member.clone()]),
+                ([declared_member, dimension.clone()], [actual_member, dimension.clone()]),
+            ] {
+                assert_eq!(ArrayIrType::derive_identity_renaming(&declared, &actual), Err(error.clone()));
+                ArrayIrTypeRefinements::establish(&declared, &actual).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn test_array_ir_type_validate_zero() {
         let array = ArrayType::scalar(F32);
         assert_eq!(ArrayIrType::Array(array.clone()).validate_zero(), Ok(()));

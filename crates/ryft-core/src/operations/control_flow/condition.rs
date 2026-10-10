@@ -5040,6 +5040,117 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_condition_tracing_preserves_mixed_dimension_constraints() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(extent_type.clone().into());
+        let input = builder.add_input(vector_type.into());
+        let output = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![input, input],
+                None,
+            )
+            .unwrap()[0];
+        let branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let expected_rendering = indoc! {"
+            lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f32[3] .
+            let %3:f32[3] = condition %0 %1 %2 [
+                true={
+                    lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                    let %2:f32[extent] = mul %1 %1
+                    in (%2)
+                },
+                false={
+                    lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                    let %2:f32[extent] = mul %1 %1
+                    in (%2)
+                },
+            ]
+            in (%3)"};
+
+        // The primitive accepts a broad dimension together with a concrete array, but one structural identity
+        // renaming cannot preserve their shared extent. Retain the declared branches, including after a caller's
+        // dimension definition changes identity, while ordinary output inference still produces a concrete shape.
+        let renamed_extent_type = DimensionType::new("renamed", extent_type.bounds());
+        for actual_extent_type in [&extent_type, &renamed_extent_type] {
+            let context = TracingContext::<TestValue, TestOperation>::new();
+            let inputs = [
+                context.input(ArrayType::scalar(DataType::Boolean).into()),
+                context.input(actual_extent_type.clone().into()),
+                context.input(ArrayType::new_static(DataType::F32, [3]).into()),
+            ];
+            let outputs =
+                context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
+            let output_ids = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(output_ids, vec![Placeholder; 3], vec![Placeholder])
+                .unwrap();
+            let expected_rendering = if actual_extent_type == &extent_type {
+                expected_rendering.to_string()
+            } else {
+                expected_rendering.replacen("%1:dimension<extent", "%1:dimension<renamed", 1)
+            };
+            assert_eq!(program.to_string(), expected_rendering);
+
+            let eager = EagerContext::<TestValue, TestOperation>::new();
+            let input = array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+            let expected = vec![array(Array::vector(vec![1.0f32, 4.0, 9.0]).unwrap())];
+            for predicate in [true, false] {
+                for actual_extent in [3, 4] {
+                    // Runtime payloads do not narrow a broad dimension descriptor. The fallback must preserve the
+                    // original eager application contract rather than introducing a new runtime equality assertion.
+                    let inputs = vec![
+                        array(Array::scalar(predicate).unwrap()),
+                        dimension(actual_extent_type, actual_extent),
+                        input.clone(),
+                    ];
+                    assert_eq!(
+                        eager.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                        Ok(expected.clone()),
+                    );
+                    assert_eq!(program.interpret(inputs), Ok(expected.clone()));
+                }
+            }
+
+            // An exact descriptor does establish a conflicting extent. Replay renames a shared caller/branch
+            // identity to literal `4`, while a separate branch definition retains the eager boundary's diagnostic.
+            let inputs = vec![
+                array(Array::scalar(true).unwrap()),
+                TestValue::Dimension(DimensionValue::constant(4).unwrap()),
+                input,
+            ];
+            assert!(matches!(
+                eager.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                Err(ProgramError::Type(error))
+                    if error.downcast_custom::<DimensionError>() == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "extent".to_string(),
+                        expected: 4,
+                        actual: 3,
+                    }),
+            ));
+            let expected_error = if actual_extent_type == &extent_type {
+                DimensionError::BindingOutOfBounds {
+                    variable: "4".to_string(),
+                    value: 3,
+                    bounds: DimensionBounds::new(4, Some(5)).unwrap(),
+                }
+            } else {
+                DimensionError::InputDimensionMismatch { dimension: "extent".to_string(), expected: 4, actual: 3 }
+            };
+            assert_eq!(program.interpret(inputs), Err(TypeError::custom(expected_error).into()));
+        }
+    }
+
+    #[test]
     fn test_condition_partial_evaluation() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |operation: ArrayOperation<Array>| {
@@ -5194,6 +5305,65 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_staging_retains_declared_branches_for_mixed_dimension_refinements() {
+        // A symbolic first-class dimension and a static array sharing its extent are a valid refinement that admits
+        // no structural identity substitution. Staging keeps both branches declared instead of replaying them, which
+        // would erase the relationship between the two inputs, and the refined output still comes from inference.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(extent_type.clone().into());
+        let vector = builder.add_input(vector_type.into());
+        let branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![vector], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let inputs = [
+            context.input(ArrayType::scalar(DataType::Boolean).into()),
+            context.input(extent_type.clone().into()),
+            context.input(ArrayType::new_static(DataType::F32, [3]).into()),
+        ];
+        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs).unwrap();
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::new_static(DataType::F32, [3]).into());
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![outputs[0].atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f32[3] .
+                let %3:f32[3] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f32[extent] .
+                        in (%1)
+                    },
+                ]
+                in (%3)"},
+        );
+        assert_eq!(
+            program.interpret(vec![
+                array(Array::scalar(true).unwrap()),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap()),
+            ]),
+            Ok(vec![array(Array::vector(vec![1f32, 2.0, 3.0]).unwrap())]),
+        );
+    }
+
+    #[test]
     fn test_condition_partial_evaluation_validates_direct_branch_contracts() {
         let operation = ConditionOperation::<ArrayType>::new();
         let scalar_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
@@ -5338,6 +5508,84 @@ mod tests {
                 if error.to_string() == "`condition` input 1 has type `ref<f32[3]>`, which does not equal its branch \
                                         input type `ref<f32[extent]>`",
         ));
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_preserves_mixed_dimension_reference_contracts() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+        )));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(extent_type.clone().into());
+        let reference = builder.add_input(reference_type);
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        for placement in [ReferencePlacement::Stage, ReferencePlacement::Execute] {
+            let reference = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+            let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+                .with_reference_placement(placement);
+            let inputs = [
+                PartialTracer::new(
+                    context.clone(),
+                    context.unknown_input(ArrayType::scalar(DataType::Boolean).into(), 0),
+                ),
+                PartialTracer::new(context.clone(), PartialEvaluationValue::known_input(dimension(&extent_type, 3))),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(reference.clone())),
+                ),
+            ];
+
+            // The shared first-class dimension prevents safe specialization to this concrete handle. Retaining the
+            // declared branch therefore preserves the primitive's exact reference boundary and its ordinary error.
+            assert_eq!(
+                context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                Err(TypeError::invalid(
+                    "`condition` input 2 has type `ref<f32[3]>`, which does not equal its branch input type \
+                     `ref<f32[extent]>`",
+                )
+                .into()),
+            );
+            assert_eq!(reference.read(), Ok(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()));
+
+            // Exact dimension metadata conflicts with the referent extent even before residual emission. An unknown
+            // predicate never permits either branch's additive write to execute during this failed preparation.
+            let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+                .with_reference_placement(placement);
+            let inputs = [
+                PartialTracer::new(
+                    context.clone(),
+                    context.unknown_input(ArrayType::scalar(DataType::Boolean).into(), 0),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Dimension(DimensionValue::constant(4).unwrap())),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(reference.clone())),
+                ),
+            ];
+            assert!(matches!(
+                context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+                Err(ProgramError::Type(error))
+                    if error.downcast_custom::<DimensionError>() == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "extent".to_string(),
+                        expected: 4,
+                        actual: 3,
+                    }),
+            ));
+            assert_eq!(reference.read(), Ok(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()));
+        }
     }
 
     #[test]
@@ -6494,17 +6742,18 @@ mod tests {
 
         let left = array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let right = array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap());
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Unknown(ArrayType::scalar(DataType::Boolean).into()),
-                PartialValue::Known(dimension(&extent_type, 3)),
-                PartialValue::Known(left.clone()),
-                PartialValue::Unknown(vector_type.into()),
-            ])
-            .unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
+        for actual_extent in [3, 4] {
+            let evaluation = program
+                .partially_evaluate(&[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean).into()),
+                    PartialValue::Known(dimension(&extent_type, actual_extent)),
+                    PartialValue::Known(left.clone()),
+                    PartialValue::Unknown(vector_type.clone().into()),
+                ])
+                .unwrap();
+            assert_eq!(
+                evaluation.program.to_string(),
+                indoc! {"
                 lambda %0:bool[], %1:f64[extent], %2:dimension<extent ∈ [1, 8)>, %3:f64[3] .
                 let %4:f64[3] = condition %0 %2 %3 %1 [
                     true={
@@ -6519,23 +6768,56 @@ mod tests {
                     },
                 ]
                 in (%4)"},
-        );
-        for (predicate, expected) in [(true, vec![1.0, 4.0, 9.0]), (false, vec![20.0, 40.0, 60.0])] {
-            let arguments =
-                [array(Array::scalar(predicate).unwrap()), dimension(&extent_type, 3), left.clone(), right.clone()];
-            let residual_arguments = evaluation
-                .inputs
-                .iter()
-                .map(|input| match input {
-                    PartialEvaluationInput::Known(value) => value.clone(),
-                    PartialEvaluationInput::Unknown(index) => arguments[*index].clone(),
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                evaluation.program.interpret(residual_arguments),
-                Ok(vec![array(Array::vector(expected).unwrap())]),
             );
+            for (predicate, expected) in [(true, vec![1.0, 4.0, 9.0]), (false, vec![20.0, 40.0, 60.0])] {
+                let arguments = [
+                    array(Array::scalar(predicate).unwrap()),
+                    dimension(&extent_type, actual_extent),
+                    left.clone(),
+                    right.clone(),
+                ];
+                assert_eq!(
+                    program.interpret(arguments.to_vec()),
+                    Ok(vec![array(Array::vector(expected.clone()).unwrap())]),
+                );
+                let residual_arguments = evaluation
+                    .inputs
+                    .iter()
+                    .map(|input| match input {
+                        PartialEvaluationInput::Known(value) => value.clone(),
+                        PartialEvaluationInput::Unknown(index) => arguments[*index].clone(),
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    evaluation.program.interpret(residual_arguments),
+                    Ok(vec![array(Array::vector(expected).unwrap())]),
+                );
+            }
         }
+
+        // Broad dimension payloads above deliberately preserve the existing eager contract. A singleton descriptor,
+        // however, conflicts with the known concrete array before any conditional branch is emitted or interpreted.
+        let exact_extent = TestValue::Dimension(DimensionValue::constant(4).unwrap());
+        let expected_error = ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "extent".to_string(),
+            expected: 4,
+            actual: 3,
+        }));
+        assert_eq!(
+            program.interpret(vec![array(Array::scalar(true).unwrap()), exact_extent.clone(), left.clone(), right]),
+            Err(expected_error.clone()),
+        );
+        assert_eq!(
+            program
+                .partially_evaluate(&[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean).into()),
+                    PartialValue::Known(exact_extent),
+                    PartialValue::Known(left),
+                    PartialValue::Unknown(vector_type.into()),
+                ])
+                .map(|_| ()),
+            Err(expected_error),
+        );
     }
 
     #[test]
@@ -10586,16 +10868,16 @@ mod tests {
             run_transposed_with_destinations(
                 &transposed,
                 vec![],
-                vec![Array::vector(vec![1f32, 2., 3.]).unwrap()],
+                vec![Array::vector(vec![1f32, 2.0, 3.0]).unwrap()],
                 vec![Array::scalar(true).unwrap(), Array::scalar(0i32).unwrap()],
             ),
-            vec![Array::scalar(2f32).unwrap(), Array::vector(vec![1f32, 2., 3.]).unwrap()],
+            vec![Array::scalar(2f32).unwrap(), Array::vector(vec![1f32, 2.0, 3.0]).unwrap()],
         );
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
                 vec![],
-                vec![Array::vector(vec![1f32, 2., 3.]).unwrap()],
+                vec![Array::vector(vec![1f32, 2.0, 3.0]).unwrap()],
                 vec![Array::scalar(false).unwrap(), Array::scalar(1i32).unwrap()],
             ),
             vec![Array::scalar(3f32).unwrap(), Array::vector(vec![1f32, 2., 0.]).unwrap()],
