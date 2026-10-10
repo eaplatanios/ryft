@@ -91,7 +91,7 @@ use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
     AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
-    Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
+    Provenance, ProvenanceScope, ReferenceIdentity, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -733,7 +733,19 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 .zip(&region_input_types)
                 .map(|(region, input_types)| match input_types {
                     Some(input_types) => {
-                        Ok(region.to_program().with_instantiated_type_identities(input_types)?.interface())
+                        // Instantiate the region's type identities at the requested input types when one structural
+                        // substitution expresses them. A valid mixed refinement (e.g., a symbolic `dimension<n>`
+                        // alongside an `f32[3]` that binds `n = 3`) admits none, so keep its declared interface,
+                        // as the healthy path below imports it, and let output inference accept the refined inputs.
+                        // Invalid signatures still return their derivation error.
+                        let renaming = FlatProgram::<Self>::region_input_identity_renaming(
+                            region.interface().input_types(),
+                            input_types,
+                        )?;
+                        match renaming {
+                            Some(renaming) => Ok(region.to_program().rename_type_identities(&renaming)?.interface()),
+                            None => Ok(region.interface()),
+                        }
                     }
                     None => Ok(region.interface()),
                 })
@@ -773,8 +785,24 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             let preparation_builder =
                 requires_specialization.contains(&true).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
             let region_builder = preparation_builder.as_ref().unwrap_or(self.builder());
+
+            // Valid mixed refinements can lack a structural substitution. Keep their declared boundaries intact;
+            // the specialization loop below retains them without replaying, and final inference validates them.
+            let import_input_types = region_interfaces
+                .iter()
+                .zip(&region_input_types)
+                .map(|(interface, requested)| match requested {
+                    Some(requested) => {
+                        Ok(FlatProgram::<Self>::region_input_identity_renaming(interface.input_types(), requested)?
+                            .map(|_| requested.clone()))
+                    }
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>, TypeError>>()
+                .map_err(|error| self.error(error.into()))?;
+
             let mut region_ids =
-                driver.import_into(region_builder, &region_input_types).map_err(|error| self.error(error))?;
+                driver.import_into(region_builder, &import_input_types).map_err(|error| self.error(error))?;
             let instantiated_region_ids = region_ids.clone();
 
             // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
@@ -813,6 +841,17 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     if interfaces[index].input_types() == requested && !requires_specialization[index] {
                         continue;
                     }
+
+                    // Replaying a mixed refinement that admits no structural substitution would erase a shared input
+                    // relationship, so retain every instantiated region instead, as `specialize_attached_regions` does.
+                    if FlatProgram::<Self>::region_input_identity_renaming(interfaces[index].input_types(), requested)
+                        .map_err(|error| self.error(error.into()))?
+                        .is_none()
+                    {
+                        specialization_failed = true;
+                        break;
+                    }
+
                     if let Some((_, _, specialized_id)) = specialized_regions
                         .iter()
                         .find(|(source_id, input_types, _)| *source_id == region_ids[index] && input_types == requested)

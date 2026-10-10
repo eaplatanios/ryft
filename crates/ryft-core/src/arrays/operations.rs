@@ -2157,7 +2157,9 @@ mod tests {
         let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::MalformedProgram("`condition` interpretation requires a predicate input".to_string())),
+            Err(ProgramError::MalformedProgram(
+                "operation `condition` declares 2 region slots but 0 regions were attached".to_string(),
+            )),
         );
     }
 

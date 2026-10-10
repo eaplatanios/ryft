@@ -648,8 +648,10 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     ///   - `operation`: [`Operation`] to emit into the residual [`Program`].
     ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in the
-    ///     order defined by [`Operation::region_slots`]. These programs are imported into the residual [`Program`]
-    ///     before the operation is emitted.
+    ///     order defined by [`Operation::region_slots`]. Regions are specialized when materialized input types refine
+    ///     their declared inputs and the operation requests specialization. If preparation or replay fails, or the
+    ///     operation rejects the specialized signatures, the declared programs are used when ordinary validation
+    ///     accepts them.
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Known inputs
     ///     are materialized as residual program inputs or constants, while unknown inputs reuse their existing residual
     ///     atoms.
@@ -759,6 +761,44 @@ impl<C: Context> PartialEvaluationContext<C> {
                 Ok(atom)
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
+
+        // Propagate the materialized inputs' refinements through attached regions, just as replay into a trace does.
+        // Release the builder borrow before specialization replays any body into its own fresh trace. Keep the original
+        // effect-based deferral restriction: replay can fold away effects, so that restriction is conservative.
+        let regions = if regions.is_empty() {
+            regions
+        } else {
+            operation.validate_region_count(regions.len())?;
+            let input_types = {
+                let builder = self.builder.borrow();
+                input_atoms
+                    .iter()
+                    .map(|atom| {
+                        builder
+                            .atoms()
+                            .get(atom.index())
+                            .map(|atom| atom.r#type().into_owned())
+                            .ok_or(ProgramError::UnboundAtomId { id: *atom })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            match FlatProgram::<C>::specialize_attached_regions(
+                &operation,
+                &input_types,
+                regions.iter().map(Program::entry_region_ref),
+            ) {
+                Ok(Some(specialized)) => specialized,
+                Ok(None) => regions,
+                Err(_) => {
+                    // A valid refinement need not admit one identity renaming: a symbolic dimension input can keep its
+                    // identity while an array input binds that dimension to a static extent. Preparation is optional,
+                    // so retain accepted declared interfaces and preserve ordinary primitive diagnostics.
+                    let interfaces = regions.iter().map(Program::interface).collect::<Vec<_>>();
+                    operation.infer_output_types(&input_types, &interfaces)?;
+                    regions
+                }
+            }
+        };
 
         // Residualized regions splice into the residual builder's arena directly (i.e., owned move), in region order.
         let region_ids = {
@@ -1450,16 +1490,17 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArrayType, DataType,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::{
-        AddOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, SubOperation,
-        Zero,
+        AddOperation, DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
+        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, RematerializeOperation, SubOperation, WhileOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
@@ -2232,6 +2273,185 @@ mod tests {
         );
         assert!(first[0].is_unknown() && second[0].is_unknown());
         assert_eq!(context.inputs.borrow().len(), 3);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_specializes_dependent_regions() {
+        // The transpose boundary depends on the forward output. Specializing only the forward region would leave
+        // an invalid `linear_call`, so residual emission must re-infer the transpose inputs after replaying forward.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut forward = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = forward.add_input(dynamic_type.clone());
+        let output = forward.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let forward =
+            forward.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut transpose = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = transpose.add_input(dynamic_type);
+        let output = transpose.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let transpose = transpose
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let input = context.unknown_input(static_type.clone(), 0);
+
+        // Specialization preparation validates malformed inputs and attached-region arity before replaying bodies.
+        let unbound = AtomId::new(usize::MAX);
+        let invalid = PartialEvaluationValue::variable(static_type, unbound);
+        assert!(matches!(
+            context.residualize(
+                LinearCallOperation::new(0),
+                vec![forward.clone(), transpose.clone()],
+                &[invalid],
+            ),
+            Err(ProgramError::UnboundAtomId { id }) if id == unbound,
+        ));
+        assert!(matches!(
+            context.residualize(LinearCallOperation::new(0), vec![forward.clone()], std::slice::from_ref(&input)),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `linear_call` declares 2 region slots but 1 regions were attached",
+        ));
+
+        let outputs = context.residualize(LinearCallOperation::new(0), vec![forward, transpose], &[input]).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = linear_call [residual_count=0] %0 [
+                    forward={
+                        lambda %0:f64[3] .
+                        let %1:f64[3] = neg %0
+                        in (%1)
+                    },
+                    transpose={
+                        lambda %0:f64[3] .
+                        let %1:f64[3] = neg %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![-1.0f64, -2.0, -3.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_falls_back_to_declared_regions() {
+        // A specialized body that replaces a sharded carry with an unsharded constant no longer maps its carry
+        // to itself. The declared body is valid and must remain available when specialized interfaces are rejected.
+        let state_type = ArrayType::scalar(DataType::F32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut condition = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        condition.add_input(state_type.clone());
+        let predicate = condition.add_constant(Array::scalar(false).unwrap());
+        let condition = condition
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        body.add_input(state_type.clone());
+        let replacement = body.add_constant(Array::scalar(1f32).unwrap());
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![replacement], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let input = context.unknown_input(sharded_type, 0);
+        let outputs =
+            context.residualize(WhileOperation::new(), vec![condition.clone(), body.clone()], &[input]).unwrap();
+        assert_eq!(outputs[0].r#type().into_owned(), state_type);
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=2:auto]>, []}] .
+                let %1:f32[] = while %0 [
+                    condition={
+                        lambda %0:f32[] .
+                        let %1:bool[] = const false
+                        in (%1)
+                    },
+                    body={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 1.0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Fallback must preserve validation: neither specialization nor the original regions can accept `f64`.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let input = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
+        assert!(matches!(
+            context.residualize(WhileOperation::new(), vec![condition, body], &[input]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`while` input 0 has type `f64[]`, which does not refine its state type `f32[]`",
+        ));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_retains_effect_order_after_region_fold() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(5)).unwrap());
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let left = body.add_input(left_type.clone().into());
+        let right = body.add_input(right_type.clone().into());
+        let subtraction = DimensionSubOperation::new(&left_type, &right_type).unwrap();
+        let difference = body.add_instruction(subtraction, Vec::new(), vec![left, right], None).unwrap()[0];
+        let body = body
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(body.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+
+        let live = ArrayReference::new(Array::scalar(1f32).unwrap());
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Execute);
+        let left = context.unknown_input(left_type.clone().into(), 0);
+        let zero = PartialEvaluationValue::known(TestValue::Dimension(DimensionValue::constant(0).unwrap()));
+        let outputs =
+            context.residualize(RematerializeOperation::new(save_nothing()), vec![body], &[left, zero]).unwrap();
+
+        // Narrowing the right input to zero folds checked subtraction away. Its original assertion classification
+        // conservatively keeps subsequent ordered work residual even though the specialized region is pure.
+        assert!(context.defer_ordered_effects.get());
+        let target = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
+        let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7f32).unwrap()));
+        assert!(
+            context
+                .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[target, replacement])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(live.read(), Ok(Array::scalar(1f32).unwrap()));
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        // Simplification may schedule the write before the now-pure body; the original assertion still prevented
+        // preparation from executing the write. The declared rematerialization boundary retains its unused zero input.
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<0>, %2:ref<f32[]>, %3:f32[] .
+                let () = reference_write %2 %3
+                    %4:dimension<left ∈ [0, 9)> = rematerialize [policy=\"save_nothing\"] %0 %1 [
+                        body={
+                            lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<0> .
+                            in (%0)
+                        },
+                    ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let left = TestValue::Dimension(DimensionValue::new(left_type, 3).unwrap());
+        assert_eq!(evaluation.interpret(&EagerContext::new(), std::slice::from_ref(&left)), Ok(vec![left]),);
+        assert_eq!(live.read(), Ok(Array::scalar(7f32).unwrap()));
     }
 
     #[test]

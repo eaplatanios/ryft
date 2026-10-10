@@ -6463,6 +6463,105 @@ mod tests {
     }
 
     #[test]
+    fn test_while_partial_evaluation_specializes_known_reference_carry() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = condition_builder.add_input(scalar_type.clone());
+        condition_builder.add_input(reference_type.clone());
+        let zero = condition_builder.add_constant(array(Array::scalar(0f32).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
+                Vec::new(),
+                vec![counter, zero],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = body_builder.add_input(scalar_type.clone());
+        let reference = body_builder.add_input(reference_type.clone());
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let step = body_builder.add_constant(array(Array::scalar(-1f32).unwrap()));
+        let next_counter = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next_counter, reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let counter = builder.add_input(scalar_type.clone());
+        let reference = builder.add_input(reference_type);
+        let outputs = builder
+            .add_instruction(WhileOperation::new(), vec![condition, body], vec![counter, reference], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // The known handle refines the symbolic carry, but preparation must not run any iteration's state update.
+        let live = ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap());
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(scalar_type),
+                PartialValue::Known(TestIrValue::Reference(live.clone())),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[3]> .
+                let %2:f32[], %3:ref<f32[3]> = while %0 %1 [
+                    condition={
+                        lambda %0:f32[], %1:ref<f32[3]> .
+                        let %2:f32[] = const 0.0
+                            %3:bool[] = compare [direction=GreaterThan] %0 %2
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:f32[], %1:ref<f32[3]> .
+                        let %2:f32[3] = reference_read %1
+                            %3:f32[] = const -1.0
+                            () = reference_add_update %1 %2
+                            %4:f32[] = add %0 %3
+                        in (%4, %1)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<TestIrValue, TestIrOperation>::new(),
+                &[array(Array::scalar(2f32).unwrap())],
+            ),
+            Ok(vec![array(Array::scalar(0f32).unwrap()), TestIrValue::Reference(live.clone())]),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![4f32, 8., 12.]).unwrap()));
+    }
+
+    #[test]
     fn test_while_partial_evaluation_folds_loop_invariant_known_state() {
         let scalar = || ArrayType::scalar(DataType::F64);
 

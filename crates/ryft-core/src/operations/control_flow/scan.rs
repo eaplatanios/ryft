@@ -10142,10 +10142,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_composite_refines_outputs_of_unspecialized_bodies() {
-        // Partially evaluating a scan whose refined outputs come from an unspecialized body keeps them refined, whether
-        // the carry or the stacked input is known, and the residual program reproduces the original one. With known
-        // slices, the known scan stacks the squares and the residual scan consumes its refined stacked edge.
+    fn test_scan_partial_evaluation_composite_specializes_residual_bodies() {
+        // Partial evaluation specializes the originally symbolic body to the concrete carry and slice types, whether
+        // the carry or the stacked input is known, and replay reproduces the original program. With known slices, the
+        // known scan stacks the squares and the residual scan consumes its refined stacked edge.
         let program = refined_vector_scan_program();
         let carry_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         let stacked_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3]));
@@ -10185,8 +10185,8 @@ mod tests {
                     lambda %0:f64[3], %1:f64[2, 3] .
                     let %2:f64[3] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
                         body={
-                            lambda %0:i64[], %1:f64[rows], %2:f64[rows] .
-                            let %3:f64[rows] = add %1 %2
+                            lambda %0:i64[], %1:f64[3], %2:f64[3] .
+                            let %3:f64[3] = add %1 %2
                             in (%3)
                         },
                     ]
@@ -10198,9 +10198,9 @@ mod tests {
                     lambda %0:f64[2, 3], %1:f64[3] .
                     let %2:f64[3], %3:f64[2, 3] = scan [carry_count=1, length=2, reverse=false] %1 %0 [
                         body={
-                            lambda %0:i64[], %1:f64[rows], %2:f64[rows] .
-                            let %3:f64[rows] = add %1 %2
-                                %4:f64[rows] = mul %2 %2
+                            lambda %0:i64[], %1:f64[3], %2:f64[3] .
+                            let %3:f64[3] = add %1 %2
+                                %4:f64[3] = mul %2 %2
                             in (%3, %4)
                         },
                     ]
@@ -10253,8 +10253,8 @@ mod tests {
                 lambda %0:f64[3], %1:f64[2, 3] .
                 let %2:f64[3] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
                     body={
-                        lambda %0:i64[], %1:f64[rows], %2:f64[rows] .
-                        let %3:f64[rows] = add %1 %2
+                        lambda %0:i64[], %1:f64[3], %2:f64[3] .
+                        let %3:f64[3] = add %1 %2
                         in (%3)
                     },
                 ]
@@ -11018,6 +11018,75 @@ mod tests {
             Ok(vec![TestIrValue::Array(Array::scalar(4.0f32).unwrap())]),
         );
         assert_eq!(live.read(), Ok(Array::scalar(4.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_scan_partial_evaluation_specializes_known_reference_carry() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let reference = body_builder.add_input(reference_type.clone());
+        body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_program(body);
+        let reference = builder.add_input(reference_type);
+        let values_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let values = builder.add_input(values_type.clone());
+        let outputs = builder
+            .add_instruction(ScanOperation::<ArrayIrType>::new(1, 2), vec![body], vec![reference, values], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // An unknown stack keeps the effectful scan residual, and its known carry gives the body precise geometry.
+        let live = ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap());
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(TestIrValue::Reference(live.clone())),
+                PartialValue::Unknown(values_type),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:ref<f32[3]> .
+                let %2:ref<f32[3]> = scan [carry_count=1, length=2, reverse=false] %1 [
+                    body={
+                        lambda %0:i64[], %1:ref<f32[3]> .
+                        let %2:f32[3] = reference_read %1
+                            () = reference_add_update %1 %2
+                        in (%1)
+                    },
+                ]
+                in ()"},
+        );
+        // The body ignores the scanned value, so its stack is pruned and the unchanged handle is a known output.
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Known(TestIrValue::Reference(live.clone()))]);
+        assert_eq!(live.read(), Ok(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<TestIrValue, TestIrOperation>::new(),
+                &[array(Array::vector(vec![0f32, 0.]).unwrap())],
+            ),
+            Ok(vec![TestIrValue::Reference(live.clone())]),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![4f32, 8., 12.]).unwrap()));
     }
 
     #[test]

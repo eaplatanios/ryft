@@ -80,8 +80,8 @@ use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, Typed, Value, ValueDomainDispatch,
-    ValueProjection,
+    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -1138,8 +1138,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 continue;
             };
 
-            if !Self::region_requires_specialization(interfaces[index].input_types(), requested)? {
-                continue;
+            match Self::region_requires_specialization(interfaces[index].input_types(), requested)? {
+                // A mixed refinement can be primitive-valid without admitting a structural substitution.
+                // Replaying it would erase a shared input relationship, so retain every declared region instead.
+                None => return Ok(None),
+                Some(false) => continue,
+                Some(true) => {}
             }
 
             let programs = programs.get_or_insert_with(|| regions.iter().map(|region| region.to_program()).collect());
@@ -1168,25 +1172,46 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     }
 
     /// Returns whether an attached region whose declared input types are `declared` must be specialized before an
-    /// operation application that infers the region input types `requested` for it can use it. Input types that differ
-    /// from the declared ones only in their type identities require no specialization, because instantiating the
-    /// identities of the region at them makes its signature agree with them. Input types that strictly refine the
-    /// declared ones (e.g., a static extent where the region declares a dynamic one) do, and so do input types that
-    /// only narrow bounds: instantiating the formal dimension `d` of a region that computes `d + 2` at an input that
-    /// is exactly 3 makes its signature agree, but leaves `d + 2` with the bounds that it was traced with instead of
-    /// inferring that it is exactly 5.
+    /// operation application that infers the region input types `requested` for it can use it, or [`None`] when it
+    /// cannot be specialized. Input types that differ from the declared ones only in their type identities require no
+    /// specialization, because instantiating the identities of the region at them makes its signature agree with them.
+    /// Input types that strictly refine the declared ones (e.g., a static extent where the region declares a dynamic
+    /// one) do, and so do input types that only narrow bounds: instantiating the formal dimension `d` of a region that
+    /// computes `d + 2` at an input that is exactly 3 makes its signature agree, but leaves `d + 2` with the bounds
+    /// that it was traced with instead of inferring that it is exactly 5. Valid mixed refinements that admit no
+    /// structural substitution (refer to [`region_input_identity_renaming`](Self::region_input_identity_renaming))
+    /// cannot be specialized, because replaying the region at them would erase a shared input relationship,
+    /// so they return [`None`].
     pub(crate) fn region_requires_specialization(
         declared: &[V::Type],
         requested: &[V::Type],
-    ) -> Result<bool, TypeError> {
-        let renaming = V::Type::derive_identity_renaming(declared, requested)?;
+    ) -> Result<Option<bool>, TypeError> {
+        let Some(renaming) = Self::region_input_identity_renaming(declared, requested)? else {
+            return Ok(None);
+        };
         let renamed =
             declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
         let narrows_bounds = declared
             .iter()
             .zip(requested)
             .any(|(declared, actual)| declared.is_refined_by(actual) && !actual.is_refined_by(declared));
-        Ok(renamed != requested || narrows_bounds)
+        Ok(Some(renamed != requested || narrows_bounds))
+    }
+
+    /// Derives the structural input substitution, returning [`None`] for a valid refinement that cannot be represented
+    /// by one substitution. Such a mixed signature must keep its declared region: replay at those types would remove a
+    /// shared relationship that its requested signature no longer expresses.
+    pub(crate) fn region_input_identity_renaming(
+        declared: &[V::Type],
+        requested: &[V::Type],
+    ) -> Result<Option<TypeIdentityRenaming<<V::Type as Type>::Identity>>, TypeError> {
+        match V::Type::derive_identity_renaming(declared, requested) {
+            Ok(renaming) => Ok(Some(renaming)),
+            Err(error) => match <V::Type as Type>::Refinements::establish(declared.iter(), requested.iter()) {
+                Ok(_) => Ok(None),
+                Err(_) => Err(error),
+            },
+        }
     }
 
     /// Returns this attached region specialized to the region input types `input_types` that an operation
@@ -1231,9 +1256,9 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, AxisIndex, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike, OneOperation,
-        ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite, ZeroLike,
-        ZeroOperation,
+        AddOperation, AxisIndex, ConditionOperation, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike,
+        OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite,
+        ZeroLike, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -2275,14 +2300,14 @@ mod tests {
                 std::slice::from_ref(&extent),
                 std::slice::from_ref(&extent),
             ),
-            Ok(false),
+            Ok(Some(false)),
         );
         assert_eq!(
             FlatDimensionProgram::region_requires_specialization(
                 std::slice::from_ref(&extent),
                 std::slice::from_ref(&other_extent),
             ),
-            Ok(false),
+            Ok(Some(false)),
         );
 
         // Input types that only narrow bounds require specialization, and so do input types that strictly refine the
@@ -2292,7 +2317,7 @@ mod tests {
                 std::slice::from_ref(&extent),
                 std::slice::from_ref(&exact_extent),
             ),
-            Ok(true),
+            Ok(Some(true)),
         );
         let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
@@ -2302,7 +2327,7 @@ mod tests {
                 std::slice::from_ref(&dynamic_type),
                 std::slice::from_ref(&static_type),
             ),
-            Ok(true),
+            Ok(Some(true)),
         );
 
         // Input types that the declared ones cannot be renamed to are rejected.
@@ -2310,6 +2335,106 @@ mod tests {
             FlatArrayProgram::region_requires_specialization(std::slice::from_ref(&dynamic_type), &[]),
             Err(TypeError::invalid("declared type count 1 does not match actual type count 0")),
         );
+    }
+
+    #[test]
+    fn test_program_region_input_identity_renaming_classifies_mixed_refinements() {
+        type FlatIrProgram =
+            Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
+
+        let variable = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension = ArrayIrType::Dimension(DimensionType::from(variable.clone()));
+        let exact_dimension = ArrayIrType::Dimension(DimensionValue::constant(4).unwrap().r#type().into_owned());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![variable.clone().into()]));
+        let static_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = ArrayIrOperation::<Array>::from(ConditionOperation::<ArrayIrType>::new());
+
+        // Ordinary structural substitutions remain supported; specialization is needed only for actual refinements.
+        assert!(
+            FlatIrProgram::region_input_identity_renaming(
+                std::slice::from_ref(&dimension),
+                std::slice::from_ref(&dimension),
+            )
+            .unwrap()
+            .unwrap()
+            .is_identity(),
+        );
+        let renamed_dimension = ArrayIrType::Dimension(DimensionType::new("renamed", variable.bounds()));
+        let renaming = FlatIrProgram::region_input_identity_renaming(
+            std::slice::from_ref(&dimension),
+            std::slice::from_ref(&renamed_dimension),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dimension.rename_identities(&renaming), Ok(renamed_dimension));
+
+        for (dynamic_member, static_member) in [
+            (ArrayIrType::Array(dynamic_type.clone()), ArrayIrType::Array(static_type.clone())),
+            (
+                ArrayIrType::Reference(ReferenceType::new(dynamic_type.clone())),
+                ArrayIrType::Reference(ReferenceType::new(static_type.clone())),
+            ),
+        ] {
+            for reversed in [false, true] {
+                let mut declared = vec![dimension.clone(), dynamic_member.clone()];
+                let mut requested = vec![dimension.clone(), static_member.clone()];
+                let mut invalid = vec![exact_dimension.clone(), static_member.clone()];
+                if reversed {
+                    declared.reverse();
+                    requested.reverse();
+                    invalid.reverse();
+                }
+
+                // Full refinement accepts the mixed boundary, but a rename-only substitution cannot retain its
+                // symbolic definition and concretize another occurrence. Such regions cannot be specialized, so
+                // optional specialization keeps both branches.
+                assert_eq!(FlatIrProgram::region_input_identity_renaming(&declared, &requested), Ok(None));
+                assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &requested), Ok(None));
+                let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                for r#type in &declared {
+                    builder.add_input(r#type.clone());
+                }
+                let body = builder
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        Vec::new(),
+                        vec![Placeholder; 2],
+                        Vec::new(),
+                    )
+                    .unwrap();
+                let mut input_types = vec![ArrayType::scalar(DataType::Boolean).into()];
+                input_types.extend(requested);
+                assert!(
+                    FlatIrProgram::specialize_attached_regions(
+                        &operation,
+                        &input_types,
+                        [body.entry_region_ref(), body.entry_region_ref()].into_iter(),
+                    )
+                    .unwrap()
+                    .is_none(),
+                );
+                assert_eq!(body.input_types(), declared);
+                assert!(body.instructions().is_empty());
+
+                // An exact dimension of four conflicts with the array/reference extent of three. Preserve the
+                // original structured derivation error rather than treating invalid inputs as unsupported replay.
+                let error = TypeError::invalid(
+                    "dimension variable n is renamed to 4 by one signature member \
+                     and bound to static extent 3 by another",
+                );
+                assert_eq!(FlatIrProgram::region_input_identity_renaming(&declared, &invalid), Err(error.clone()));
+                assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &invalid), Err(error.clone()));
+                input_types.truncate(1);
+                input_types.extend(invalid);
+                assert!(matches!(
+                    FlatIrProgram::specialize_attached_regions(
+                        &operation,
+                        &input_types,
+                        [body.entry_region_ref(), body.entry_region_ref()].into_iter(),
+                    ),
+                    Err(ProgramError::Type(actual)) if actual == error,
+                ));
+            }
+        }
     }
 
     #[test]

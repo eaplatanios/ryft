@@ -56,8 +56,9 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
     OperationBoundaryPruning, OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder,
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionDataFlow, RegionInterface,
-    RegionLiveness, RegionSlot, Type, TypeError, Typed, Value, ValueProjection, discharge_positional_region_operation,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot, RegionDataFlow, RegionDriver,
+    RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type, TypeError, TypeRefinements, Typed, Value,
+    ValueProjection, discharge_positional_region_operation,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -111,6 +112,55 @@ impl<T: Type> ConditionOperation<T> {
     #[inline]
     pub fn new() -> Self {
         Self { marker: PhantomData }
+    }
+}
+
+impl<T: ConditionType> ConditionOperation<T> {
+    /// Returns the `true` and `false` branches attached to an application of this operation through `driver`, after
+    /// validating that the application has exactly two regions and `input_count` inputs (i.e., the predicate followed
+    /// by one input per branch input).
+    fn branches<'r, V: Value<Type = T>, O: Operation<Type = T>, D: RegionDriver<V, O>>(
+        &self,
+        driver: &'r D,
+        input_count: usize,
+    ) -> Result<[RegionRef<'r, V, O>; 2], ProgramError> {
+        self.validate_region_count(driver.region_count())?;
+        let branches = [driver.region(0)?, driver.region(1)?];
+        let expected = branches[0].input_ids().len() + 1;
+        if input_count != expected {
+            return Err(ProgramError::InvalidInputCount { expected, actual: input_count });
+        }
+        Ok(branches)
+    }
+
+    /// Validates the part of a `condition` boundary that does not depend on the types of its branch inputs: both
+    /// branches must have the same input and output types, the predicate must be a scalar Boolean, and every branch
+    /// output must be valid under the variation of that predicate (refer to
+    /// [`ConditionType::validate_condition_output`]).
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate_type`: Type of the predicate input.
+    ///   - `branch_signatures`: Input and output types of the `true` branch followed by those of the `false` branch.
+    fn validate_branches(predicate_type: &T, branch_signatures: [(&[T], &[T]); 2]) -> Result<(), TypeError> {
+        let [(true_input_types, true_output_types), (false_input_types, false_output_types)] = branch_signatures;
+        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
+            true_input_types,
+            false_input_types,
+        ]);
+        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
+            true_output_types,
+            false_output_types,
+        ]);
+        if !predicate_type.is_condition_predicate() {
+            return Err(TypeError::invalid(format!(
+                "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{predicate_type}`",
+            )));
+        }
+        for output_type in true_output_types {
+            output_type.validate_condition_output(predicate_type)?;
+        }
+        Ok(())
     }
 }
 
@@ -189,24 +239,14 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         check_count!("region", region_interfaces, 2, TypeError);
         let true_interface = &region_interfaces[0];
         let false_interface = &region_interfaces[1];
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
-            true_interface.input_types(),
-            false_interface.input_types(),
-        ]);
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
-            true_interface.output_types(),
-            false_interface.output_types(),
-        ]);
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
-        if !input_types[0].is_condition_predicate() {
-            return Err(TypeError::invalid(format!(
-                "`{}` predicate type must be a scalar boolean, but got `{}`",
-                CONDITION_OPERATION_NAME, input_types[0],
-            )));
-        }
-        for output_type in true_interface.output_types() {
-            output_type.validate_condition_output(&input_types[0])?;
-        }
+        Self::validate_branches(
+            &input_types[0],
+            [
+                (true_interface.input_types(), true_interface.output_types()),
+                (false_interface.input_types(), false_interface.output_types()),
+            ],
+        )?;
         // Branch value inputs are validated with the directional declared-vs-actual `Type::is_refined_by` relation
         // rather than strict type equality, as for `while` and `scan`, so actual inputs that carry metadata the branch
         // input types leave unspecified (e.g., the normalized shardings of concrete backend array types) or static
@@ -367,11 +407,21 @@ where
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        if inputs.is_empty() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{CONDITION_OPERATION_NAME}` interpretation requires a predicate input"
-            )));
-        }
+        // Direct eager binding does not pass through program construction, so validate the part of the boundary that
+        // executing the selected branch does not check before selecting it: otherwise the unselected peer could
+        // conceal a signature that program construction rejects. Entering the selected branch validates the runtime
+        // inputs as one complete signature against its declared input types before any of its work executes. That
+        // check accepts the concrete referents of live reference handles as refinements of symbolic allocation types,
+        // and requires shared dimension identities to agree across arrays and reference referents. Interpreting an
+        // already validated program therefore repeats only these signature comparisons for each condition.
+        let [true_branch, false_branch] = self.branches(driver, inputs.len())?;
+        Self::validate_branches(
+            &inputs[0].r#type(),
+            [
+                (&true_branch.input_types(), &true_branch.output_types()),
+                (&false_branch.input_types(), &false_branch.output_types()),
+            ],
+        )?;
         let (predicate, branch_inputs) = (inputs[0].concretize()?, &inputs[1..]);
         driver.interpret_region(context, if predicate { 0 } else { 1 }, branch_inputs.to_vec())
     }
@@ -406,6 +456,31 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Specializing a concrete predicate or splitting symbolic branches rewrites the original condition. Validate
+        // its complete boundary first, including direct context binding and conditions that return no values.
+        let region_interfaces = self.branches(driver, inputs.len())?.map(|branch| branch.interface());
+        let branch_input_types = region_interfaces[0].input_types();
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let mut validation_types = input_types.clone();
+        if context.parent().is_eager() {
+            // Known eager references are live handles whose concrete referents refine their symbolic region types.
+            // Retain the declared reference types for the primitive's allocation contract; unknown references and
+            // symbolic known references still require its exact compile-time reference boundary. Runtime refinements
+            // are validated separately below. Residualization attempts to specialize branches to the materialized
+            // handle types; unsupported specialization retains the original regions and existing diagnostics.
+            for ((validation_type, declared_type), input) in
+                validation_types[1..].iter_mut().zip(branch_input_types).zip(&inputs[1..])
+            {
+                if input.is_known() && validation_type.is_reference() && declared_type.is_reference() {
+                    *validation_type = declared_type.clone();
+                }
+            }
+        }
+        self.infer_output_types(&validation_types, &region_interfaces)?;
+        // Inlining a selected branch does not revalidate its inputs. Establish refinement over the complete actual
+        // signature so concrete reference geometry cannot conflict with extents carried by other references, arrays,
+        // or first-class dimensions before branch work executes.
+        <C::Type as Type>::Refinements::establish(branch_input_types, &input_types[1..])?;
         // The rule requests all nested-computation work through its region access (region 0 is the `true` branch and
         // region 1 the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
         // Input 0 is the predicate; inputs 1.. feed both branches.
@@ -2269,8 +2344,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape,
-        Sharding, ShardingDimension,
+        DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
+        RaggedAxis, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
@@ -2281,7 +2356,7 @@ mod tests {
     use crate::kernels::KernelOperation;
     use crate::macros::check_gradient;
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SqrtOperation};
-    use crate::operations::assertions::AssertionError;
+    use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -2296,7 +2371,7 @@ mod tests {
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
-    use crate::partial::{PartialEvaluation, PartialEvaluationInput};
+    use crate::partial::{PartialEvaluation, PartialEvaluationInput, PartialTracer, ReferencePlacement};
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
         ReferenceAnalysisError, ReferenceDischargeResult, ReferenceSource, ReferenceType, ReferenceView, RegionDriver,
@@ -2315,6 +2390,21 @@ mod tests {
     type DischargeArrayCapture = CaptureReference<ArrayType>;
     /// Operation family used by captured array discharge programs.
     type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
+
+    /// Builds a unit-returning branch that fails if execution reaches it, for primitive validation-order tests.
+    fn failing_unit_branch() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_constant(Array::scalar(false).unwrap());
+        builder
+            .add_instruction(
+                AssertOperation::new("branch executed before validation"),
+                Vec::new(),
+                vec![predicate],
+                None,
+            )
+            .unwrap();
+        builder.build(Vec::new(), Vec::new(), Vec::new()).unwrap()
+    }
 
     /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary,
     /// shared by tests comparing direct reference transforms with explicit discharge. The program takes a Boolean
@@ -2675,6 +2765,40 @@ mod tests {
         builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap()
+    }
+
+    /// Returns the `f32[2]` type replicated on a two-device manual mesh over `x`, varying along `x` when `varying` is
+    /// set, together with the `bool[]` predicate type on that mesh that varies along `x`.
+    fn manual_mutation_types(varying: bool) -> (ArrayType, ArrayType) {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(varying.then_some("x"));
+        let referent_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.unwrap()).unwrap();
+        let predicate_sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(predicate_sharding).unwrap();
+        (referent_type, predicate_type)
+    }
+
+    /// Returns a branch with no outputs that doubles the referent of `reference` in place when `mutate` is set and
+    /// only reads it otherwise.
+    fn manual_mutation_branch<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
+        builder: &mut ProgramBuilder<V, O>,
+        reference: AtomId,
+        mutate: bool,
+    ) where
+        O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+            + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+            + From<AddOperation<ArrayIrType>>,
+    {
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        if mutate {
+            let doubled = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -4264,40 +4388,6 @@ mod tests {
         );
     }
 
-    /// Returns the `f32[2]` type replicated on a two-device manual mesh over `x`, varying along `x` when `varying` is
-    /// set, together with the `bool[]` predicate type on that mesh that varies along `x`.
-    fn manual_mutation_types(varying: bool) -> (ArrayType, ArrayType) {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(varying.then_some("x"));
-        let referent_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.unwrap()).unwrap();
-        let predicate_sharding = Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap();
-        let predicate_type = ArrayType::scalar(DataType::Boolean).with_sharding(predicate_sharding).unwrap();
-        (referent_type, predicate_type)
-    }
-
-    /// Returns a branch with no outputs that doubles the referent of `reference` in place when `mutate` is set and
-    /// only reads it otherwise.
-    fn manual_mutation_branch<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-        builder: &mut ProgramBuilder<V, O>,
-        reference: AtomId,
-        mutate: bool,
-    ) where
-        O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-            + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
-            + From<AddOperation<ArrayIrType>>,
-    {
-        let value =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        if mutate {
-            let doubled = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, value], None)
-                .unwrap()[0];
-            builder
-                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
-                .unwrap();
-        }
-    }
-
     #[test]
     fn test_condition_reference_discharge_rejects_mutated_reference_inputs_under_varying_predicates() {
         // A predicate that varies along `x` lets the devices take different branches, so a branch that mutates a
@@ -4607,8 +4697,8 @@ mod tests {
             .unwrap();
         assert_eq!(outputs, vec![Array::scalar(0.0f64).unwrap()]);
         assert_eq!(
-            operation.interpret(&context, &EmptyRegionDriver, &[] as &[Array]),
-            Err(ProgramError::MalformedProgram("`condition` interpretation requires a predicate input".to_string(),)),
+            context.bind(operation, vec![true_branch.clone(), false_branch.clone()], &[]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
         // Staging imports the branch programs as attached regions of the staged instruction instead of trying to
@@ -4654,6 +4744,117 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_condition_interpretation_validates_direct_branch_contracts() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let operation = ConditionOperation::<ArrayType>::new();
+        let scalar_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
+        let boolean_branch = boolean_branch();
+        for predicate in [true, false] {
+            assert_eq!(
+                context.bind(
+                    operation,
+                    vec![scalar_branch.clone(), boolean_branch.clone()],
+                    &[Array::scalar(predicate).unwrap(), Array::scalar(4.0f64).unwrap()],
+                ),
+                Err(TypeError::invalid(
+                    "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]",
+                )
+                .into()),
+            );
+        }
+        assert_eq!(
+            context.bind(
+                operation,
+                vec![scalar_branch, vector_scale_branch(2, 2.0)],
+                &[Array::scalar(true).unwrap(), Array::scalar(4.0f64).unwrap()],
+            ),
+            Err(TypeError::invalid(
+                "`condition` branch input type signature mismatch: expected [f64[]] but got [f64[2]]",
+            )
+            .into()),
+        );
+
+        // The selected branch would fail its assertion if run; its empty output boundary must still reject a peer
+        // that returns a value before executing either branch.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let output = builder.add_constant(Array::scalar(1.0f64).unwrap());
+        let value_branch = builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        assert_eq!(
+            context.bind(operation, vec![failing_unit_branch(), value_branch], &[Array::scalar(true).unwrap()]),
+            Err(TypeError::invalid("`condition` branch output type signature mismatch: expected [] but got [f64[]]")
+                .into()),
+        );
+
+        let unit_branch = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            context.bind(operation, vec![unit_branch.clone(), unit_branch.clone()], &[Array::scalar(true).unwrap()]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            context.bind(operation, vec![unit_branch.clone(), unit_branch], &[Array::vector(vec![true]).unwrap()]),
+            Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `bool[1]`").into()),
+        );
+    }
+
+    #[test]
+    fn test_condition_interpretation_validates_runtime_reference_geometry() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(ReferenceType::new(array_type.clone()).into());
+        let value = builder.add_input(array_type.into());
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            branch.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[extent]>, %1:f32[extent] .
+                let () = reference_write %0 %1
+                in (%0)"},
+        );
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let reference = ArrayReference::new(Array::vector(vec![1f32, 2.0, 3.0]).unwrap());
+        assert_eq!(
+            context.bind(
+                ConditionOperation::new(),
+                vec![branch.clone(), branch.clone()],
+                &[
+                    array(Array::scalar(true).unwrap()),
+                    TestValue::Reference(reference.clone()),
+                    array(Array::vector(vec![4f32, 5.0, 6.0]).unwrap()),
+                ],
+            ),
+            Ok(vec![TestValue::Reference(reference.clone())]),
+        );
+        assert_eq!(reference.read(), Ok(Array::vector(vec![4f32, 5.0, 6.0]).unwrap()));
+
+        // A reference and an ordinary value sharing one formal extent must agree before the selected write executes.
+        let result = context.bind(
+            ConditionOperation::new(),
+            vec![branch.clone(), branch],
+            &[
+                array(Array::scalar(false).unwrap()),
+                TestValue::Reference(reference.clone()),
+                array(Array::vector(vec![7f32, 8.0]).unwrap()),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>() == Some(&DimensionError::InputDimensionMismatch {
+                    dimension: "extent".to_string(), expected: 3, actual: 2,
+                }),
+        ));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![4f32, 5.0, 6.0]).unwrap()));
     }
 
     #[test]
@@ -4990,6 +5191,289 @@ mod tests {
             evaluation.program.interpret(vec![Array::scalar(4.0).unwrap(), Array::scalar(false).unwrap()]),
             Ok(vec![Array::scalar(0.0).unwrap()]),
         );
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_validates_direct_branch_contracts() {
+        let operation = ConditionOperation::<ArrayType>::new();
+        let scalar_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
+        let boolean_branch = boolean_branch();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let predicate = context.lift(Array::scalar(true).unwrap()).unwrap();
+        let input = context.lift(Array::scalar(4.0f64).unwrap()).unwrap();
+        assert_eq!(
+            context.bind(operation, vec![scalar_branch.clone(), boolean_branch.clone()], &[predicate, input]),
+            Err(TypeError::invalid(
+                "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]",
+            )
+            .into()),
+        );
+
+        // Symbolic known predicates and unknown branch inputs must reject the original boundary before partitioning.
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let predicate = PartialTracer::new(
+            context.clone(),
+            PartialEvaluationValue::known_input(outer.input(ArrayType::scalar(DataType::Boolean))),
+        );
+        let input = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
+        assert!(matches!(
+            context.bind(operation, vec![scalar_branch, boolean_branch], &[predicate, input]),
+            Err(ProgramError::Type(error))
+                if error == TypeError::invalid(
+                    "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]",
+                ),
+        ));
+        assert!(outer.builder().borrow().instructions().is_empty());
+
+        // Empty and unit-result boundaries still validate predicate presence and shape before specialization.
+        let unit_branch = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
+            .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(
+            context.bind(operation, vec![unit_branch.clone(), unit_branch.clone()], &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let predicate = context.lift(Array::vector(vec![true]).unwrap()).unwrap();
+        assert_eq!(
+            context.bind(operation, vec![unit_branch.clone(), unit_branch.clone()], &[predicate]),
+            Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `bool[1]`").into()),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let predicate = context.lift(Array::scalar(1.0f32).unwrap()).unwrap();
+        assert_eq!(
+            context.bind(operation, vec![unit_branch.clone(), unit_branch], &[predicate]),
+            Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `f32[]`").into()),
+        );
+
+        // An invalid peer must be diagnosed before a selected zero-output branch executes its failing assertion.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let output = builder.add_constant(Array::scalar(1.0f64).unwrap());
+        let value_branch = builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let predicate = context.lift(Array::scalar(true).unwrap()).unwrap();
+        assert_eq!(
+            context.bind(operation, vec![failing_unit_branch(), value_branch], &[predicate]),
+            Err(TypeError::invalid("`condition` branch output type signature mismatch: expected [] but got [f64[]]")
+                .into()),
+        );
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_refines_known_eager_reference_geometry() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(vector_type));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let destination = builder.add_input(reference_type.clone());
+        let source = builder.add_input(reference_type.clone());
+        let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![destination, value], None)
+            .unwrap();
+        let branch = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![destination], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            branch.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[extent]>, %1:ref<f32[extent]> .
+                let %2:f32[extent] = reference_read %1
+                    () = reference_write %0 %2
+                in (%0)"},
+        );
+
+        // Known eager handles have concrete referent types that refine the shared symbolic extent. The selected
+        // branch executes once, writes the caller's destination, and returns that same handle by identity.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Execute);
+        let destination = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let source = ArrayReference::new(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
+        let inputs = [
+            context.lift(array(Array::scalar(true).unwrap())).unwrap(),
+            context.lift(TestValue::Reference(destination.clone())).unwrap(),
+            context.lift(TestValue::Reference(source)).unwrap(),
+        ];
+        let outputs = context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs).unwrap();
+        assert_eq!(outputs[0].value().unwrap().as_known(), Some(&TestValue::Reference(destination.clone())));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap()));
+
+        // Each handle independently satisfies its declared bounds, but their common identity requires equal extents.
+        // Reject that conflict before executing the selected write.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_reference_placement(ReferencePlacement::Execute);
+        let destination = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let source = ArrayReference::new(Array::vector(vec![4.0f32, 5.0]).unwrap());
+        let inputs = [
+            context.lift(array(Array::scalar(true).unwrap())).unwrap(),
+            context.lift(TestValue::Reference(destination.clone())).unwrap(),
+            context.lift(TestValue::Reference(source)).unwrap(),
+        ];
+        assert!(matches!(
+            context.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>() == Some(&DimensionError::InputDimensionMismatch {
+                    dimension: "extent".to_string(),
+                    expected: 3,
+                    actual: 2,
+                }),
+        ));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()));
+
+        // An unknown reference describes a staged allocation, so its type must still match the primitive boundary
+        // exactly even when its static referent extent would refine the region's symbolic extent at runtime.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let static_reference_type =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let inputs = [
+            context.lift(array(Array::scalar(true).unwrap())).unwrap(),
+            PartialTracer::new(context.clone(), context.unknown_input(static_reference_type, 0)),
+            PartialTracer::new(context.clone(), context.unknown_input(reference_type, 1)),
+        ];
+        assert!(matches!(
+            context.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs),
+            Err(ProgramError::Type(error))
+                if error.to_string() == "`condition` input 1 has type `ref<f32[3]>`, which does not equal its branch \
+                                        input type `ref<f32[extent]>`",
+        ));
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_specializes_residual_known_eager_reference_geometry() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )));
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let destination = true_builder.add_input(reference_type.clone());
+        let source = true_builder.add_input(reference_type.clone());
+        let value =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];
+        true_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![destination, value], None)
+            .unwrap();
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![destination], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let destination = false_builder.add_input(reference_type.clone());
+        let source = false_builder.add_input(reference_type);
+        let value = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![destination], None)
+            .unwrap()[0];
+        false_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![source, value], None)
+            .unwrap();
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![destination], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        for placement in [ReferencePlacement::Stage, ReferencePlacement::Execute] {
+            let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+                .with_reference_placement(placement);
+            let destination = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+            let source = ArrayReference::new(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap());
+            let inputs = [
+                PartialTracer::new(
+                    context.clone(),
+                    context.unknown_input(ArrayType::scalar(DataType::Boolean).into(), 0),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(destination.clone())),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(source.clone())),
+                ),
+            ];
+            let outputs = context
+                .bind(ConditionOperation::new(), vec![true_branch.clone(), false_branch.clone()], &inputs)
+                .unwrap();
+            let output_values = outputs.iter().map(|output| output.value().unwrap().clone()).collect();
+            drop(outputs);
+            drop(inputs);
+            let evaluation = context.into_evaluation(output_values).unwrap();
+            assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(
+                evaluation.program().to_string(),
+                indoc! {"
+                    lambda %0:bool[], %1:ref<f32[3]>, %2:ref<f32[3]> .
+                    let %3:ref<f32[3]> = condition %0 %1 %2 [
+                        true={
+                            lambda %0:ref<f32[3]>, %1:ref<f32[3]> .
+                            let %2:f32[3] = reference_read %1
+                                () = reference_add_update %0 %2
+                            in (%0)
+                        },
+                        false={
+                            lambda %0:ref<f32[3]>, %1:ref<f32[3]> .
+                            let %2:f32[3] = reference_read %0
+                                () = reference_add_update %1 %2
+                            in (%0)
+                        },
+                    ]
+                    in (%3)"},
+            );
+
+            // Discharge requires value-only public outputs. Retain the conditional effects while omitting its
+            // forwarded handle; specialization and discharge must leave both live allocations untouched.
+            let discharged = evaluation.program().with_outputs(&[]).unwrap().discharge_references(0).unwrap();
+            assert_eq!(discharged.external_reference_bindings().len(), 2);
+            assert_eq!(destination.read(), Ok(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()));
+            assert_eq!(source.read(), Ok(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap()));
+
+            // Additive writes expose both duplicate execution and speculative execution of the peer branch. The
+            // second replay observes the first replay's destination through the original known handle.
+            let eager = EagerContext::<TestValue, TestOperation>::new();
+            assert_eq!(
+                evaluation.interpret(&eager, &[array(Array::scalar(true).unwrap())]),
+                Ok(vec![TestValue::Reference(destination.clone())]),
+            );
+            assert_eq!(destination.read(), Ok(Array::vector(vec![5.0f32, 7.0, 9.0]).unwrap()));
+            assert_eq!(source.read(), Ok(Array::vector(vec![4.0f32, 5.0, 6.0]).unwrap()));
+            assert_eq!(
+                evaluation.interpret(&eager, &[array(Array::scalar(false).unwrap())]),
+                Ok(vec![TestValue::Reference(destination.clone())]),
+            );
+            assert_eq!(destination.read(), Ok(Array::vector(vec![5.0f32, 7.0, 9.0]).unwrap()));
+            assert_eq!(source.read(), Ok(Array::vector(vec![9.0f32, 12.0, 15.0]).unwrap()));
+
+            // Specialization must not weaken the shared extent constraint, even with an unknown predicate and
+            // handles whose individual concrete shapes satisfy the declared bounds.
+            let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+                .with_reference_placement(placement);
+            let destination = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+            let source = ArrayReference::new(Array::vector(vec![4.0f32, 5.0]).unwrap());
+            let inputs = [
+                PartialTracer::new(
+                    context.clone(),
+                    context.unknown_input(ArrayType::scalar(DataType::Boolean).into(), 0),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(destination.clone())),
+                ),
+                PartialTracer::new(
+                    context.clone(),
+                    PartialEvaluationValue::known_input(TestValue::Reference(source.clone())),
+                ),
+            ];
+            assert!(matches!(
+                context.bind(ConditionOperation::new(), vec![true_branch.clone(), false_branch.clone()], &inputs),
+                Err(ProgramError::Type(error))
+                    if error.downcast_custom::<DimensionError>() == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "extent".to_string(),
+                        expected: 3,
+                        actual: 2,
+                    }),
+            ));
+            assert_eq!(destination.read(), Ok(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()));
+            assert_eq!(source.read(), Ok(Array::vector(vec![4.0f32, 5.0]).unwrap()));
+        }
     }
 
     #[test]
@@ -5831,9 +6315,9 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_condition_partial_evaluation_refines_outputs_of_unspecialized_branches() {
-        // Partially evaluating a condition whose refined output comes from unspecialized branches keeps it refined, and
-        // the residual program reproduces the original one, whether the predicate is concrete or unknown.
+    fn test_composite_condition_partial_evaluation_specializes_residual_branches() {
+        // Concrete predicates inline the selected branch; unknown predicates retain the condition and specialize both
+        // residual branches to the concrete input geometry. Both paths preserve the refined output and its values.
         let program = refined_vector_condition_program();
         let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         assert_eq!(program.output_types(), vec![vector_type.clone()]);
@@ -5865,14 +6349,14 @@ mod tests {
                     lambda %0:bool[], %1:f64[3], %2:f64[3] .
                     let %3:f64[3] = condition %0 %2 %1 [
                         true={
-                            lambda %0:f64[rows], %1:f64[rows] .
-                            let %2:f64[rows] = mul %0 %0
-                                %3:f64[rows] = add %2 %1
+                            lambda %0:f64[3], %1:f64[3] .
+                            let %2:f64[3] = mul %0 %0
+                                %3:f64[3] = add %2 %1
                             in (%3)
                         },
                         false={
-                            lambda %0:f64[rows], %1:f64[rows] .
-                            let %2:f64[rows] = add %0 %1
+                            lambda %0:f64[3], %1:f64[3] .
+                            let %2:f64[3] = add %0 %1
                             in (%2)
                         },
                     ]
@@ -5893,9 +6377,9 @@ mod tests {
             assert_eq!(evaluation.program.interpret(residual_arguments), Ok(expected.clone()));
         }
 
-        // A symbolic known predicate cannot select a branch. The branch partitions are computed over the unspecialized
-        // branches, so the residual edge `x * x` has the identity-bearing type `f64[rows]`, for which no peer-branch
-        // placeholder is invented: the condition remains whole, and its output stays refined.
+        // A symbolic known predicate cannot select a branch. Partitioning the original symbolic branches produces an
+        // identity-bearing residual edge `x * x`, for which no peer-branch placeholder is invented. The condition
+        // remains whole; emission specializes its residual branches without hoisting arithmetic into the known side.
         let outer = TracingContext::<TestValue, TestOperation>::new();
         let evaluation = program
             .partially_evaluate_in_context(
@@ -5914,14 +6398,14 @@ mod tests {
                 lambda %0:f64[3], %1:bool[], %2:f64[3] .
                 let %3:f64[3] = condition %1 %2 %0 [
                     true={
-                        lambda %0:f64[rows], %1:f64[rows] .
-                        let %2:f64[rows] = mul %0 %0
-                            %3:f64[rows] = add %2 %1
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = mul %0 %0
+                            %3:f64[3] = add %2 %1
                         in (%3)
                     },
                     false={
-                        lambda %0:f64[rows], %1:f64[rows] .
-                        let %2:f64[rows] = add %0 %1
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = add %0 %1
                         in (%2)
                     },
                 ]
@@ -10564,11 +11048,19 @@ mod tests {
         let input = Array::scalar(3.0f32).unwrap();
         assert_eq!(
             Array::scalar(1.0f32).unwrap().condition(input, Ok, Ok),
-            Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a value of type `f32[]`; expected `bool[]`"
-                    .to_string(),
-            }),
+            Err(TypeError::invalid("`condition` predicate type must be a scalar boolean, but got `f32[]`").into()),
         );
+        for predicate in [true, false] {
+            assert_eq!(
+                Array::scalar(predicate).unwrap().condition(Array::scalar(3.0f32).unwrap(), Ok, |input| {
+                    Ok(StagingContext::constant(input.context(), Array::scalar(true).unwrap()))
+                }),
+                Err(TypeError::invalid(
+                    "`condition` branch output type signature mismatch: expected [f32[]] but got [bool[]]",
+                )
+                .into()),
+            );
+        }
         let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, input): (Tracer<_>, Tracer<_>)| predicate.condition(input, Ok, Ok),
             (ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)),

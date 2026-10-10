@@ -5214,6 +5214,66 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_partial_evaluation_specializes_known_reference_input() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(extent)]),
+        )));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut primal_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = primal_builder.add_input(reference_type.clone());
+        let input = primal_builder.add_input(scalar_type.clone());
+        let value = primal_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        primal_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let primal = primal_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![input],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let operation = ArrayIrCustomFunction::from_rule_regions(CustomFunctionJvpRule::Absent, false)
+            .with_non_differentiated_count(1)
+            .unwrap();
+        let program = custom_function_call_program(operation, vec![primal], vec![reference_type, scalar_type.clone()]);
+
+        // A concrete leading reference refines the primal region without executing its effect during preparation.
+        let live = ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap());
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(ArrayIrValue::Reference(live.clone())),
+                PartialValue::Unknown(scalar_type),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[3]> .
+                let %2:f32[] = custom_function [non_differentiated_count=1] %1 %0 [
+                    primal={
+                        lambda %0:ref<f32[3]>, %1:f32[] .
+                        let %2:f32[3] = reference_read %0
+                            () = reference_add_update %0 %2
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            evaluation.interpret(&EagerArrayIrContext::new(), &[ArrayIrValue::Array(Array::scalar(7f32).unwrap())],),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(7f32).unwrap())]),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![2f32, 4., 6.]).unwrap()));
+    }
+
+    #[test]
     fn test_custom_function_partial_evaluation_vjp_rule() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation = ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
