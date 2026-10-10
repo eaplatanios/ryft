@@ -1168,7 +1168,7 @@ impl<'c> Context for XlaDomain<'c> {
         ensure_effect_dispatch_allowed()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let operation = operation.into();
-        operation.validate_region_count(driver.region_count())?;
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
         let name = operation.name();
         if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
             let array_type = eager_identity_output_type(&operation)?;

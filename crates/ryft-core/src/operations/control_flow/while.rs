@@ -205,6 +205,15 @@ impl<T: WhileType> Operation for WhileOperation<T> {
         const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] }
     }
 
+    fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<T>]) -> Result<(), ProgramError> {
+        // The condition and the body both receive the loop state, and the body must map it to itself. Validating these
+        // declared signatures here means that specialization cannot make a mismatched body agree with its state types,
+        // and that eager execution rejects such a body even when the loop would not iterate.
+        self.validate_region_count(region_interfaces.len())?;
+        validated_while_interfaces(region_interfaces)?;
+        Ok(())
+    }
+
     fn infer_region_input_types(
         &self,
         input_types: &[T],
@@ -389,7 +398,6 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         let name = self.name();
-        self.validate_region_count(driver.region_count())?;
         let carries = inputs.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
 
         // Both regions observe the same entering state, so one summary of the two sizes one boundary.
@@ -3262,6 +3270,7 @@ mod tests {
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
+    use crate::kernels::{KernelOperation, NoKernelExtension};
     use crate::operations::arithmetic::{
         AddOperation, DivOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, SubOperation,
     };
@@ -3283,7 +3292,7 @@ mod tests {
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Parameter;
-    use crate::partial::ResidualInputSource;
+    use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
         BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
         ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary,
@@ -3295,6 +3304,23 @@ mod tests {
 
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
+
+    /// Builds a `while` condition and body over an `f64[extent]` state whose condition is always false and whose body
+    /// returns a constant `f64[3]`. The body maps its state to itself only when `extent` is 3, so its declared
+    /// signature is invalid even though an `f64[3]` input refines it to a valid one.
+    fn refinement_only_while_regions() -> [Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>; 2] {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(state_type.clone());
+        let predicate = builder.add_constant(Array::scalar(false).unwrap());
+        let condition = builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(state_type);
+        let output = builder.add_constant(Array::vector(vec![2.0f64; 3]).unwrap());
+        let body = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        [condition, body]
+    }
 
     /// Builds a condition program that maps a scalar `f64` state to the scalar Boolean predicate `state > 0`.
     fn greater_than_zero_condition() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
@@ -3835,6 +3861,80 @@ mod tests {
                 "`while` body output type signature mismatch: expected [f32[carry]] but got [f32[next]]".to_string(),
             )),
         );
+    }
+
+    #[test]
+    fn test_while_validate_region_interfaces() {
+        let regions = refinement_only_while_regions();
+        let interfaces = regions.each_ref().map(Program::interface);
+        let expected = Err(ProgramError::Type(TypeError::invalid(
+            "`while` body output type signature mismatch: expected [f64[extent]] but got [f64[3]]",
+        )));
+        assert_eq!(WhileOperation::<ArrayType>::new().validate_region_interfaces(&interfaces), expected);
+        assert_eq!(Box::new(WhileOperation::<ArrayType>::new()).validate_region_interfaces(&interfaces), expected);
+        assert_eq!(
+            ArrayOperation::<Array>::While(WhileOperation::new()).validate_region_interfaces(&interfaces),
+            expected,
+        );
+        assert_eq!(
+            WhileOperation::<ArrayType>::new().validate_region_interfaces(&interfaces[..1]),
+            Err(ProgramError::MalformedProgram(
+                "operation `while` declares 2 region slots but 1 regions were attached".to_string(),
+            )),
+        );
+
+        // Composite operation families validate the same contract through their derived and kernel dispatch.
+        let regions = regions.map(|region| region.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
+        let interfaces = regions.each_ref().map(Program::interface);
+        assert_eq!(TestIrOperation::While(WhileOperation::new()).validate_region_interfaces(&interfaces), expected);
+        assert_eq!(
+            KernelOperation::<NoKernelExtension>::Portable(TestIrOperation::While(WhileOperation::new()))
+                .validate_region_interfaces(&interfaces),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_while_rejects_bodies_that_only_fit_after_refinement() {
+        // An `f64[3]` input refines the body's declared `f64[extent] -> f64[3]` signature to a valid one, but the
+        // declared body does not map its state to itself. Builder construction, eager binding (even though the loop
+        // never iterates), staging (which could otherwise specialize the body), partial evaluation, and forward-mode
+        // differentiation all reject it.
+        let regions = refinement_only_while_regions();
+        let expected = ProgramError::Type(TypeError::invalid(
+            "`while` body output type signature mismatch: expected [f64[extent]] but got [f64[3]]",
+        ));
+        let input_type = ArrayType::new_static(DataType::F64, [3]);
+        let input = Array::vector(vec![1.0f64; 3]).unwrap();
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let region_ids = regions.each_ref().map(|region| builder.import_region(region.entry_region_ref()));
+        let state = builder.add_input(input_type.clone());
+        assert_eq!(
+            builder.add_instruction(WhileOperation::new(), region_ids.to_vec(), vec![state], None).map(|_| ()),
+            Err(expected.clone()),
+        );
+
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert_eq!(
+            context.bind(WhileOperation::new(), regions.to_vec(), std::slice::from_ref(&input)),
+            Err(expected.clone()),
+        );
+
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let state = context.input(input_type.clone());
+        assert_eq!(context.bind(WhileOperation::new(), regions.to_vec(), &[state]).map(|_| ()), Err(expected.clone()));
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let state = PartialTracer::new(context.clone(), context.unknown_input(input_type, 0));
+        assert_eq!(context.bind(WhileOperation::new(), regions.to_vec(), &[state]).map(|_| ()), Err(expected.clone()));
+
+        let result = differentiate_at(input.clone()).jvp(input, |state| {
+            let context = state.context().clone();
+            Ok(context.bind(WhileOperation::new(), regions.to_vec(), &[state])?.remove(0))
+        });
+        assert!(matches!(result, Err(DifferentiationError::Program(error)) if error == expected));
     }
 
     #[test]

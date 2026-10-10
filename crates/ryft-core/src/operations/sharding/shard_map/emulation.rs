@@ -106,7 +106,7 @@ where
         >,
     D: InterpretationDriver<C>,
 {
-    operation.validate_region_count(driver.region_count())?;
+    operation.validate_region_interfaces(&driver.region_interfaces())?;
     let emulator = ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default() };
     let outputs = emulator.run_shard_map(
         operation,
@@ -399,7 +399,7 @@ where
 
         // The attached regions communicate across the emulated devices, so they must run in lockstep.
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
-        operation.validate_region_count(regions.len())?;
+        operation.validate_region_interfaces(&regions.iter().map(|region| region.interface()).collect::<Vec<_>>())?;
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
             return self.run_while(operation, regions[0], regions[1], inputs);
         }

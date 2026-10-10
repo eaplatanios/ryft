@@ -4292,7 +4292,7 @@ pub fn discharge_local_reference_operation<
     inputs: &[ReferenceDischargeValue<C, P>],
 ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
     let name = operation.name();
-    operation.validate_region_count(driver.region_count())?;
+    operation.validate_region_interfaces(&driver.region_interfaces())?;
     if let Some(position) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(

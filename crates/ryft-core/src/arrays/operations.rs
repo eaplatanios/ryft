@@ -2157,9 +2157,7 @@ mod tests {
         let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::MalformedProgram(
-                "operation `condition` declares 2 region slots but 0 regions were attached".to_string(),
-            )),
+            Err(ProgramError::MalformedProgram("region index 0 is out of range".to_string())),
         );
     }
 

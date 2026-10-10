@@ -1115,6 +1115,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// operations infer their outputs from their inputs and so never observe this, but a differentiation rule that
     /// linearizes such a region would construct tangents whose types disagree with those of the primal outputs.
     ///
+    /// Callers must validate the original region interfaces of the application first (refer to
+    /// [`Operation::validate_region_interfaces`]), because specialization could otherwise make mismatched region
+    /// signatures agree.
+    ///
     /// # Errors
     ///
     /// Returns the errors of inferring the region input types and of checking whether the regions require

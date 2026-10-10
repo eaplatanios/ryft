@@ -1774,7 +1774,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
     {
-        operation.validate_region_count(driver.region_count())?;
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
         // tangent is a structural zero, skip its rule only when each output tangent can later be materialized without

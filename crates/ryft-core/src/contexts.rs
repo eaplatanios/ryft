@@ -405,7 +405,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let operation = operation.into();
-        operation.validate_region_count(driver.region_count())?;
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
         operation.interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
     }
 
@@ -697,16 +697,17 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             .map_err(|error| self.error(error))?;
 
         // Region input identities are instantiated from the instruction input types before the regions enter this
-        // builder. First validate the operation's complete attachment declaration so later zips cannot silently omit
-        // either a region or its instantiation request. Region-free operations avoid collecting input types here as
-        // the checked builder path will infer them directly from its atoms.
+        // builder. First validate the operation's region contract on the original region interfaces, so that later
+        // zips cannot silently omit either a region or its instantiation request, and so that specialization below
+        // cannot make otherwise mismatched region signatures agree (refer to `Operation::validate_region_interfaces`).
+        // Region-free operations avoid collecting input types here as the checked builder path will infer them directly
+        // from its atoms.
         let declared_region_count = operation.region_slots().len();
+        let region_interfaces = driver.region_interfaces();
+        operation.validate_region_interfaces(&region_interfaces).map_err(|error| self.error(error))?;
         let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
-            operation.validate_region_count(driver.region_count()).map_err(|error| self.error(error))?;
             (None, Vec::new(), Vec::new())
         } else {
-            let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
-            operation.validate_region_count(region_interfaces.len()).map_err(|error| self.error(error))?;
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let region_input_types = operation
                 .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())

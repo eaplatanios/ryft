@@ -149,6 +149,16 @@ impl Operation for XlaKernelExtension {
         }
     }
 
+    fn validate_region_interfaces(
+        &self,
+        _region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<(), ProgramError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.validate_region_interfaces(_region_interfaces),
+        }
+    }
+
     fn infer_region_input_types(
         &self,
         _input_types: &[ArrayIrType],
@@ -308,6 +318,13 @@ impl Operation for XlaKernelOperation {
 
     fn region_slots(&self) -> &'static [RegionSlot] {
         self.0.region_slots()
+    }
+
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<(), ProgramError> {
+        self.0.validate_region_interfaces(region_interfaces)
     }
 
     fn infer_region_input_types(

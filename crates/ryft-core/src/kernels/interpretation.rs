@@ -747,7 +747,7 @@ where
         self.check_step(operation.name())?;
         self.check_nans(operation.name(), "input", inputs)?;
         let outputs = (|| {
-            operation.validate_region_count(driver.region_count())?;
+            operation.validate_region_interfaces(&driver.region_interfaces())?;
             if let KernelOperation::Scratch(scratch) = &operation {
                 scratch.infer_output_types(
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),

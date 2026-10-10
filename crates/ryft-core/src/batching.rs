@@ -1822,7 +1822,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
-        operation.validate_region_count(driver.region_count())?;
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
         let driver = RecursiveBatchingDriver::new(&driver);
 

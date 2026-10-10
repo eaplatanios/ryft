@@ -127,6 +127,7 @@ pub use operations::{
     ErasedOperation, MemberOperation, Operation, OperationBoundaryPruning, OperationFoldOutput,
     OperationFoldReplacement, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
     fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    validate_projected_operation_region_interfaces,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};
 pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};

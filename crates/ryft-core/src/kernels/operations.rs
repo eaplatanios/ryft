@@ -262,6 +262,24 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
         }
     }
 
+    fn validate_region_interfaces(
+        &self,
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<(), ProgramError> {
+        match self {
+            Self::Portable(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::Call(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::Scratch(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::TileLoad(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::AsyncCopy(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::Wait(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::MaskedLoad(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::MaskedStore(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::MaskedSwap(operation) => operation.validate_region_interfaces(region_interfaces),
+            Self::Extension(operation) => operation.validate_region_interfaces(region_interfaces),
+        }
+    }
+
     fn infer_region_input_types(
         &self,
         input_types: &[ArrayIrType],

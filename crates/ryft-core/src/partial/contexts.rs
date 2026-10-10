@@ -543,7 +543,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             if !input_types.iter().any(Type::is_reference) {
                 let replacements = (|| -> Result<_, ProgramError> {
-                    operation.validate_region_count(0)?;
+                    operation.validate_region_interfaces(&[])?;
                     let output_types = operation.infer_output_types(&input_types, &[])?;
                     operation.effects().validate_application(operation.name(), &input_types, &output_types)?;
                     can_defer_unsupported = !output_types.iter().any(Type::is_reference);
@@ -768,7 +768,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let regions = if regions.is_empty() {
             regions
         } else {
-            operation.validate_region_count(regions.len())?;
+            operation.validate_region_interfaces(&regions.iter().map(Program::interface).collect::<Vec<_>>())?;
             let input_types = {
                 let builder = self.builder.borrow();
                 input_atoms
@@ -1147,7 +1147,7 @@ where
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         let operation = operation.into();
-        operation.validate_region_count(driver.region_count())?;
+        operation.validate_region_interfaces(&driver.region_interfaces())?;
         let input_values = match self.error.borrow().clone() {
             Some(error) => Err(error),
             None => inputs

@@ -9038,6 +9038,17 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
             ),
         });
     }
+    // Branch inputs only need to refine the branch input types, so each one is converted to the lowered type of its
+    // branch input first.
+    let branch_inputs = input_values[1..]
+        .iter()
+        .zip(&input_types[1..])
+        .zip(branch_input_types.iter())
+        .map(|((value, input_type), branch_input_type)| {
+            lower_refined_region_input(*value, input_type, branch_input_type, block, context, location)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let branch_inputs = branch_inputs.as_slice();
     // Each ordered class used by either branch is captured and returned independently. Both branches carry the union
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
     let threaded_effects = true_branch.effects().classes().union(false_branch.effects().classes());
@@ -9046,40 +9057,32 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
         let token = current_or_new_token(effect, effect_tokens, block, location)?;
         entry_effect_tokens.set(effect, token);
     }
-    let mut lowered_branches = Vec::with_capacity(2);
-    let mut converted_inputs = None;
-    for branch in [true_branch, false_branch] {
-        // Each branch keeps its own declared input geometry. Refinement can make dynamic and static formals agree
-        // at this invocation without making their lowered storage types interchangeable. Equal formals share the
-        // conversion so ordinary conditions still pad their inputs only once.
-        let declared_input_types = branch.input_types();
-        if converted_inputs.as_ref().is_none_or(|(types, _)| types != &declared_input_types) {
-            let values = input_values[1..]
-                .iter()
-                .zip(&input_types[1..])
-                .zip(&declared_input_types)
-                .map(|((value, input_type), branch_input_type)| {
-                    lower_refined_region_input(*value, input_type, branch_input_type, block, context, location)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            converted_inputs = Some((declared_input_types, values));
-        }
-        let branch_inputs = &converted_inputs.as_ref().unwrap().1;
-        lowered_branches.push(lower_control_flow_region(
-            branch,
-            branch_inputs,
-            output_types,
-            context,
-            location,
-            captured_values,
-            nested_functions,
-            collective_state,
-            entry_effect_tokens,
-            threaded_effects,
-        )?);
-    }
-    let false_branch_region = lowered_branches.pop().unwrap();
-    let true_branch_region = lowered_branches.pop().unwrap();
+    // The declared branch outputs may differ (e.g., `f64[extent]` and `f64[3]`) while agreeing after input refinement,
+    // so each branch normalizes its results to the condition's output types.
+    let true_branch_region = lower_control_flow_region(
+        true_branch,
+        branch_inputs,
+        output_types,
+        context,
+        location,
+        captured_values,
+        nested_functions,
+        collective_state,
+        entry_effect_tokens,
+        threaded_effects,
+    )?;
+    let false_branch_region = lower_control_flow_region(
+        false_branch,
+        branch_inputs,
+        output_types,
+        context,
+        location,
+        captured_values,
+        nested_functions,
+        collective_state,
+        entry_effect_tokens,
+        threaded_effects,
+    )?;
     let operation = block.append_operation(stable_hlo::r#if(
         input_values[0],
         true_branch_region.into(),
@@ -28466,62 +28469,50 @@ pub(crate) mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let client = execution_client();
-        for static_false_input in [false, true] {
+        let mut builder = CompositeXlaProgramBuilder::new();
+        builder.add_input(extent_type.clone().into());
+        let input = builder.add_input(dynamic_type.clone().into());
+        let true_branch = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        builder.add_input(extent_type.clone().into());
+        builder.add_input(dynamic_type.into());
+        let output = builder
+            .add_instruction(ZeroOperation::new(static_type.clone().into()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let false_branch = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        for predicate_value in [false, true] {
+            // The broad first-class dimension and static array share an extent relationship that structural
+            // specialization cannot replace. Direct construction retains both declared branch programs, whose declared
+            // outputs (`f64[extent]` and `f64[3]`) agree only after input refinement.
             let mut builder = CompositeXlaProgramBuilder::new();
-            builder.add_input(extent_type.clone().into());
-            let input = builder.add_input(dynamic_type.clone().into());
-            let true_branch = builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            let mut builder = CompositeXlaProgramBuilder::new();
-            builder.add_input(extent_type.clone().into());
-            let input_type = if static_false_input { &static_type } else { &dynamic_type };
-            let input = builder.add_input(input_type.clone().into());
-            let output = if static_false_input {
-                builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0]
-            } else {
-                builder
-                    .add_instruction(ZeroOperation::new(static_type.clone().into()), Vec::new(), Vec::new(), None)
-                    .unwrap()[0]
-            };
-            let false_branch = builder
+            let regions = vec![
+                builder.import_region(true_branch.entry_region_ref()),
+                builder.import_region(false_branch.entry_region_ref()),
+            ];
+            let predicate = builder.add_constant(XlaConstant::Boolean(predicate_value));
+            let extent = builder.add_input(extent_type.clone().into());
+            let input = builder.add_input(static_type.clone().into());
+            let output = builder
+                .add_instruction(ConditionOperation::new(), regions, vec![predicate, extent, input], None)
+                .unwrap()[0];
+            let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            for predicate_value in [false, true] {
-                // The broad first-class dimension and static array share an extent relationship that structural
-                // specialization cannot replace. Direct construction retains both declared branch programs.
-                let mut builder = CompositeXlaProgramBuilder::new();
-                let regions = vec![
-                    builder.import_region(true_branch.entry_region_ref()),
-                    builder.import_region(false_branch.entry_region_ref()),
-                ];
-                let predicate = builder.add_constant(XlaConstant::Boolean(predicate_value));
-                let extent = builder.add_input(extent_type.clone().into());
-                let input = builder.add_input(static_type.clone().into());
-                let output = builder
-                    .add_instruction(ConditionOperation::new(), regions, vec![predicate, extent, input], None)
-                    .unwrap()[0];
-                let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                    .unwrap();
-                assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone())]);
-                let expected = if predicate_value {
-                    vec![1.0, 2.0, 3.0]
-                } else if static_false_input {
-                    vec![-1.0, -2.0, -3.0]
-                } else {
-                    vec![0.0; 3]
-                };
-                assert_eq!(
-                    execute_mixed_program(
-                        &client,
-                        &program,
-                        &[MixedValue::Dimension(3), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
-                        &[],
-                    ),
-                    Ok(vec![MixedValue::Array(expected, vec![3])]),
-                );
-            }
+            assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone())]);
+            let expected = if predicate_value { vec![1.0, 2.0, 3.0] } else { vec![0.0; 3] };
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Dimension(3), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
+                    &[],
+                ),
+                Ok(vec![MixedValue::Array(expected, vec![3])]),
+            );
         }
     }
 

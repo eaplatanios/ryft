@@ -114,7 +114,6 @@ impl<T: ConditionType> ConditionOperation<T> {
         driver: &'r D,
         input_count: usize,
     ) -> Result<[RegionRef<'r, V, O>; 2], ProgramError> {
-        self.validate_region_count(driver.region_count())?;
         let branches = [driver.region(0)?, driver.region(1)?];
         let expected = branches[0].input_ids().len() + 1;
         if input_count != expected {
@@ -123,8 +122,26 @@ impl<T: ConditionType> ConditionOperation<T> {
         Ok(branches)
     }
 
-    /// Validates the complete operation boundary using actual input facts, while permitting live reference handles
-    /// to refine their declared referents. Symbolic reference inputs retain the primitive's exact type requirement.
+    /// Validates that the two branches with interfaces `region_interfaces` declare the same input types. Both branches
+    /// receive the same inputs, and staging can specialize a branch to the actual input types, which could otherwise
+    /// make two different declarations equal (refer to [`Operation::validate_region_interfaces`]).
+    fn validate_branch_input_types(region_interfaces: &[RegionInterface<T>]) -> Result<(), TypeError> {
+        check_count!("region", region_interfaces, 2, TypeError);
+        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
+            region_interfaces[0].input_types(),
+            region_interfaces[1].input_types(),
+        ]);
+        Ok(())
+    }
+
+    /// Validates an application of this operation to inputs of types `input_types` with the branch interfaces
+    /// `region_interfaces`, and returns its output types. Both branches must declare the same input types, the
+    /// predicate must be a scalar Boolean, and every value input must refine its declared branch input type. Reference
+    /// inputs must equal their declared types, except that a live reference handle may refine its declared referent:
+    /// its concrete geometry then participates in refinement, while the declared type remains its allocation contract.
+    /// The declared branch outputs must agree after applying the facts that the inputs establish (e.g., `f64[extent]`
+    /// and `f64[3]` agree for an `f64[3]` input), and every output must satisfy the predicate's manual variation
+    /// requirements (refer to [`ConditionType::validate_condition_output`]).
     ///
     /// # Parameters
     ///
@@ -137,88 +154,37 @@ impl<T: ConditionType> ConditionOperation<T> {
         region_interfaces: &[RegionInterface<T>],
         mut is_live_input: impl FnMut(usize) -> bool,
     ) -> Result<Vec<T>, TypeError> {
-        check_count!("region", region_interfaces, 2, TypeError);
-        check_count!("input", input_types, region_interfaces[0].input_types().len() + 1, TypeError);
-        let mut identity_input_types = input_types.to_vec();
-        for interface in region_interfaces {
-            for (index, (declared, actual)) in interface.input_types().iter().zip(&input_types[1..]).enumerate() {
-                if declared.is_reference() {
-                    if actual.is_reference() && is_live_input(index) {
-                        // Reference outputs retain their declared types. Keep their input identities in scope even
-                        // when a live handle's concrete referent supplies static geometry to output refinement.
-                        identity_input_types[index + 1] = region_interfaces[0].input_types()[index].clone();
-                    } else if let Some(relation) = region_input_mismatch(declared, actual) {
-                        return Err(TypeError::invalid(format!(
-                            "`{CONDITION_OPERATION_NAME}` input {} has type `{actual}`, which {relation} its branch input \
-                             type `{declared}`",
-                            index + 1,
-                        )));
-                    }
-                }
-            }
-        }
-        let output_types = Self::refined_branch_output_types(
-            input_types,
-            [
-                (region_interfaces[0].input_types(), region_interfaces[0].output_types()),
-                (region_interfaces[1].input_types(), region_interfaces[1].output_types()),
-            ],
-        )?;
-        validate_output_identities(CONDITION_OPERATION_NAME, &identity_input_types, &output_types)?;
-        Ok(output_types)
-    }
-
-    /// Returns the common branch outputs after applying the facts established by the actual branch inputs. Both
-    /// branches must have the same refined input signature, the predicate must be a scalar Boolean, and their
-    /// refined outputs must agree and satisfy the predicate's manual variation requirements.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Actual operation input types, including the predicate.
-    ///   - `branch_signatures`: Input and output types of the `true` branch followed by those of the `false` branch.
-    fn refined_branch_output_types(
-        input_types: &[T],
-        branch_signatures: [(&[T], &[T]); 2],
-    ) -> Result<Vec<T>, TypeError> {
-        let [(true_input_types, true_output_types), (false_input_types, false_output_types)] = branch_signatures;
+        Self::validate_branch_input_types(region_interfaces)?;
+        let (true_interface, false_interface) = (&region_interfaces[0], &region_interfaces[1]);
+        let branch_input_types = true_interface.input_types();
+        check_count!("input", input_types, branch_input_types.len() + 1, TypeError);
         if !input_types[0].is_condition_predicate() {
             return Err(TypeError::invalid(format!(
                 "`{CONDITION_OPERATION_NAME}` predicate type must be a scalar boolean, but got `{}`",
                 input_types[0],
             )));
         }
-        for declared_input_types in [true_input_types, false_input_types] {
-            check_count!("input", input_types, declared_input_types.len() + 1, TypeError);
-            for (index, (declared, actual)) in declared_input_types.iter().zip(&input_types[1..]).enumerate() {
-                // Reference handles expose concrete referents during eager execution. Complete-signature refinement
-                // below validates their geometry; primitive inference additionally requires exact reference types.
-                if !declared.is_reference()
-                    && let Some(relation) = region_input_mismatch(declared, actual)
-                {
-                    return Err(TypeError::invalid(format!(
-                        "`{CONDITION_OPERATION_NAME}` input {} has type `{actual}`, which {relation} its branch input \
-                         type `{declared}`",
-                        index + 1,
-                    )));
-                }
+        let mut identity_input_types = input_types.to_vec();
+        for (index, (declared, actual)) in branch_input_types.iter().zip(&input_types[1..]).enumerate() {
+            if declared.is_reference() && actual.is_reference() && is_live_input(index) {
+                // Reference outputs retain their declared types. Keep their input identities in scope even when a live
+                // handle's concrete referent supplies static geometry to output refinement.
+                identity_input_types[index + 1] = declared.clone();
+            } else if let Some(relation) = region_input_mismatch(declared, actual) {
+                return Err(TypeError::invalid(format!(
+                    "`{CONDITION_OPERATION_NAME}` input {} has type `{actual}`, which {relation} its branch input type \
+                     `{declared}`",
+                    index + 1,
+                )));
             }
         }
-        let refined_inputs = [true_input_types, false_input_types].map(|declared| {
-            let refinements = T::Refinements::establish(declared, &input_types[1..])?;
-            declared.iter().map(|r#type| refinements.refine(r#type, &[])).collect::<Result<Vec<_>, TypeError>>()
-        });
-        let [true_refined_inputs, false_refined_inputs] = refined_inputs;
-        let (true_refined_inputs, false_refined_inputs) = (true_refined_inputs?, false_refined_inputs?);
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch input"), [
-            true_refined_inputs.as_slice(),
-            false_refined_inputs.as_slice(),
-        ]);
         // A branch may forward any reference input, and which one is only visible in its body, so reference outputs
-        // retain their declared types. Output-defined identities also stay symbolic, rather than inheriting facts
-        // about the entering values. Compare the two complete refined signatures before checking their variation.
-        let true_output_types = refine_output_types(true_input_types, &input_types[1..], true_output_types, |_| None)?;
-        let false_output_types =
-            refine_output_types(false_input_types, &input_types[1..], false_output_types, |_| None)?;
+        // retain their declared types. Output-defined identities also stay symbolic, rather than inheriting facts about
+        // the entering values. Compare the two refined output signatures before checking their variation.
+        let [true_output_types, false_output_types] = [true_interface, false_interface].map(|interface| {
+            refine_output_types(branch_input_types, &input_types[1..], interface.output_types(), |_| None)
+        });
+        let (true_output_types, false_output_types) = (true_output_types?, false_output_types?);
         check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
             true_output_types.as_slice(),
             false_output_types.as_slice(),
@@ -226,7 +192,50 @@ impl<T: ConditionType> ConditionOperation<T> {
         for output_type in &true_output_types {
             output_type.validate_condition_output(&input_types[0])?;
         }
+        validate_output_identities(CONDITION_OPERATION_NAME, &identity_input_types, &true_output_types)?;
         Ok(true_output_types)
+    }
+
+    /// Returns whether replaying both branches at the actual branch input types `input_types[1..]` preserves the
+    /// validity of this application, i.e., whether the two refined branch signatures agree and satisfy the predicate's
+    /// manual variation requirements. Replay can refine geometry, but cannot repair mismatched metadata or supply a
+    /// missing variation contract, so specialization is requested only when it cannot change which applications are
+    /// accepted. Branch input types are compared after refinement because `region_interfaces` may be partially
+    /// reconciled (i.e., one branch already specialized and its peer not yet), and reference outputs are refined too,
+    /// so that specializing the first branch does not prevent specializing its peer. The original branches are
+    /// required to declare the same input types separately (refer to [`Operation::validate_region_interfaces`]).
+    fn admits_specialization(input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> bool {
+        let refined_signatures = region_interfaces
+            .iter()
+            .map(|interface| {
+                // A pure identity substitution renames the branch identities to those of the caller. A valid mixed
+                // refinement admits none and keeps the declared identities, while an invalid signature fails the
+                // refinement below, so the derivation error itself carries no additional information here.
+                let renaming = T::derive_identity_renaming(interface.input_types(), &input_types[1..]).ok();
+                let rename = |types: &[T]| match &renaming {
+                    Some(renaming) => types.iter().map(|r#type| r#type.rename_identities(renaming)).collect(),
+                    None => Ok(types.to_vec()),
+                };
+                let (declared_inputs, declared_outputs) =
+                    (rename(interface.input_types())?, rename(interface.output_types())?);
+                let refinements = T::Refinements::establish(&declared_inputs, &input_types[1..])?;
+                let symbolic = declared_outputs
+                    .iter()
+                    .flat_map(Type::identities)
+                    .filter_map(|(position, identity)| {
+                        (position == TypeIdentityPosition::Definition).then(|| identity.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let refine = |types: &[T], symbolic: &[T::Identity]| {
+                    types.iter().map(|r#type| refinements.refine(r#type, symbolic)).collect::<Result<Vec<_>, _>>()
+                };
+                Ok::<_, TypeError>((refine(&declared_inputs, &[])?, refine(&declared_outputs, &symbolic)?))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        refined_signatures.is_ok_and(|signatures| {
+            signatures[0] == signatures[1]
+                && signatures[0].1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
+        })
     }
 }
 
@@ -279,6 +288,11 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         const { &[RegionSlot::computation("true"), RegionSlot::computation("false")] }
     }
 
+    fn validate_region_interfaces(&self, region_interfaces: &[RegionInterface<T>]) -> Result<(), ProgramError> {
+        self.validate_region_count(region_interfaces.len())?;
+        Ok(Self::validate_branch_input_types(region_interfaces)?)
+    }
+
     fn infer_region_input_types(
         &self,
         input_types: &[T],
@@ -290,59 +304,7 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
                 "`{CONDITION_OPERATION_NAME}` expects at least one input but got 0"
             )));
         }
-        // Replay may refine geometry, but cannot repair mismatched metadata or provide a missing output variation
-        // contract. Compare instantiated signatures first; this also accepts partially reconciled static/symbolic
-        // interfaces. Reference outputs are refined here only to decide eligibility, so specializing the first branch
-        // does not prevent specializing its peer. Published reference outputs still retain their declared types.
-        let refined_signatures = region_interfaces
-            .iter()
-            .map(|interface| {
-                // Pure identity substitutions are supported even when the caller's dynamic identity differs.
-                // A mixed signature may have no structural renaming; establish its facts from the declared types.
-                let (declared_inputs, declared_outputs) =
-                    match T::derive_identity_renaming(interface.input_types(), &input_types[1..]) {
-                        Ok(renaming) => (
-                            interface
-                                .input_types()
-                                .iter()
-                                .map(|r#type| r#type.rename_identities(&renaming))
-                                .collect::<Result<Vec<_>, TypeError>>()?,
-                            interface
-                                .output_types()
-                                .iter()
-                                .map(|r#type| r#type.rename_identities(&renaming))
-                                .collect::<Result<Vec<_>, TypeError>>()?,
-                        ),
-                        Err(_) => (interface.input_types().to_vec(), interface.output_types().to_vec()),
-                    };
-                let refinements = T::Refinements::establish(&declared_inputs, &input_types[1..])?;
-                let symbolic = declared_outputs
-                    .iter()
-                    .flat_map(Type::identities)
-                    .filter_map(|(position, identity)| {
-                        (position == TypeIdentityPosition::Definition).then(|| identity.clone())
-                    })
-                    .collect::<Vec<_>>();
-                let inputs = declared_inputs.iter().map(|r#type| refinements.refine(r#type, &[])).collect::<Result<
-                    Vec<_>,
-                    TypeError,
-                >>(
-                )?;
-                let outputs = declared_outputs
-                    .iter()
-                    .map(|r#type| refinements.refine(r#type, &symbolic))
-                    .collect::<Result<Vec<_>, TypeError>>()?;
-                Ok((inputs, outputs))
-            })
-            .collect::<Result<Vec<_>, TypeError>>();
-        let Ok(refined_signatures) = refined_signatures else {
-            return Ok(vec![None, None]);
-        };
-        if refined_signatures[0] != refined_signatures[1]
-            || refined_signatures.iter().any(|(_, outputs)| {
-                outputs.iter().any(|output_type| output_type.validate_condition_output(&input_types[0]).is_err())
-            })
-        {
+        if !Self::admits_specialization(input_types, region_interfaces) {
             return Ok(vec![None, None]);
         }
         if region_interfaces.iter().all(|interface| interface.input_types() == &input_types[1..]) {
@@ -357,7 +319,6 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        check_count!("region", region_interfaces, 2, TypeError);
         self.validated_output_types(input_types, region_interfaces, |_| false)
     }
 
@@ -1165,17 +1126,10 @@ where
                 .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
         } else {
             let mut partitions = Vec::with_capacity(2);
-            // Different formal signatures can agree after static input refinement. Their shared residual boundary
-            // uses the actual primals and tangents, so both existing structural splices receive that common signature.
-            let different_input_formals = true_branch.input_types() != false_branch.input_types();
-            let mut branch_input_types = if different_input_formals {
-                condition_inputs[1..].iter().map(|input| input.r#type().into_owned()).collect()
-            } else {
-                true_branch.input_types()
-            };
+            let mut branch_input_types = true_branch.input_types();
             for branch in [true_branch, false_branch] {
                 let (primal, tangent, residual_count) = driver.linearize_program(branch, &input_indices)?.into_parts();
-                if partitions.is_empty() && !different_input_formals {
+                if partitions.is_empty() {
                     branch_input_types.extend(tangent.input_types().into_iter().take(live_input_count));
                 }
                 partitions.push(PartitionedProgram::from_parts(
@@ -1701,15 +1655,6 @@ where
     let branch_inputs = &inputs[1..];
     let branch_input_types = true_branch.input_types();
     check_count!("input", branch_inputs, branch_input_types.len(), ProgramError);
-    // Splitting builds one structural boundary shared by both partitions. Independently refined input formals may
-    // require different splices, so retain the original conditional before partitioning or staging known work.
-    if branch_input_types != false_branch.input_types() {
-        return context.fold_or_residualize(
-            O::from(condition),
-            vec![true_branch.to_program(), false_branch.to_program()],
-            inputs,
-        );
-    }
     let input_known = branch_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
     // Partition each branch through its own fresh known-side context, requested through the driver so that this rule
     // carries no fresh-trace semantic bounds of its own. Unlike the branches' derived forward-mode and transposed
@@ -2582,6 +2527,18 @@ mod tests {
         [true_branch, false_branch]
     }
 
+    /// Builds identity branches that declare `f64[extent]` and `f64[3]` inputs, respectively, which an `f64[3]` input
+    /// refines to the same type even though the branches declare different input types.
+    fn mismatched_input_branches() -> [Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>; 2] {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        [dynamic_type, ArrayType::new_static(DataType::F64, [3])].map(|input_type| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(input_type);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        })
+    }
+
     /// Builds a scalar branch that returns whether its input is greater than zero.
     fn boolean_branch() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -3103,47 +3060,93 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_compares_refined_branch_input_signatures() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let static_type = ArrayType::new_static(DataType::F64, [3]);
-        let branches = [dynamic_type, static_type.clone()].map(|input_type| {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(input_type);
-            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
-        });
+    fn test_condition_validate_region_interfaces() {
+        let branches = mismatched_input_branches();
+        let interfaces = branches.each_ref().map(Program::interface);
+        let expected = Err(ProgramError::Type(TypeError::invalid(
+            "`condition` branch input type signature mismatch: expected [f64[extent]] but got [f64[3]]",
+        )));
+        assert_eq!(ConditionOperation::<ArrayType>::new().validate_region_interfaces(&interfaces), expected);
+        assert_eq!(Box::new(ConditionOperation::<ArrayType>::new()).validate_region_interfaces(&interfaces), expected);
+        assert_eq!(
+            ArrayOperation::<Array>::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
+            expected,
+        );
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new().validate_region_interfaces(&[interfaces[0].clone()]),
+            Err(ProgramError::MalformedProgram(
+                "operation `condition` declares 2 region slots but 1 regions were attached".to_string(),
+            )),
+        );
+        let same_interfaces = [interfaces[0].clone(), interfaces[0].clone()];
+        assert_eq!(ConditionOperation::<ArrayType>::new().validate_region_interfaces(&same_interfaces), Ok(()));
+
+        // Composite operation families validate the same contract through their derived and kernel dispatch.
+        let composite_branches = branches.map(|branch| branch.into_unprojected::<TestValue, TestOperation>().unwrap());
+        let interfaces = composite_branches.each_ref().map(Program::interface);
+        assert_eq!(
+            TestOperation::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
+            expected,
+        );
+        assert_eq!(
+            KernelOperation::<NoKernelExtension>::Portable(TestOperation::Condition(ConditionOperation::new()))
+                .validate_region_interfaces(&interfaces),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_condition_rejects_different_branch_input_signatures() {
+        // Branches must declare the same input types, even when refinement by the actual inputs would make them agree
+        // (an `f64[3]` input refines `f64[extent]` to `f64[3]`). Builder construction, type inference, and eager binding
+        // all reject such branches, and so does staging, which validates the original branch interfaces before it can
+        // specialize the dynamic branch to the actual input types and make both declared signatures equal.
+        let branches = mismatched_input_branches();
         let interfaces = branches.each_ref().map(Program::interface);
         let operation = ConditionOperation::new();
         let expected = TypeError::invalid(
-            "`condition` input 1 has type `f64[4]`, which does not refine its branch input type `f64[3]`",
+            "`condition` branch input type signature mismatch: expected [f64[extent]] but got [f64[3]]",
         );
         for extent in [3, 4] {
             let input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [extent])];
-            let inferred = operation.infer_output_types(&input_types, &interfaces);
+            assert_eq!(operation.infer_output_types(&input_types, &interfaces), Err(expected.clone()));
+
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let regions = branches.each_ref().map(|branch| builder.import_region(branch.entry_region_ref()));
+            let predicate = builder.add_input(input_types[0].clone());
+            let input = builder.add_input(input_types[1].clone());
+            assert_eq!(
+                builder.add_instruction(operation, regions.to_vec(), vec![predicate, input], None).map(|_| ()),
+                Err(ProgramError::Type(expected.clone())),
+            );
+
+            let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let input = Array::vector(vec![1.0f64; extent]).unwrap();
+            assert_eq!(
+                context.bind(operation, branches.clone(), &[Array::scalar(true).unwrap(), input]),
+                Err(ProgramError::Type(expected.clone())),
+            );
+
             let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let predicate = context.input(input_types[0].clone());
             let input = context.input(input_types[1].clone());
-            let staged = context.bind(operation, branches.clone(), &[predicate, input]);
-            if extent == 3 {
-                assert_eq!(inferred, Ok(vec![static_type.clone()]));
-                assert_eq!(
-                    operation.infer_region_input_types(&input_types, &interfaces),
-                    Ok(vec![Some(vec![static_type.clone()]), Some(vec![static_type.clone()])])
-                );
-                assert_eq!(staged.unwrap()[0].r#type().as_ref(), &static_type);
-            } else {
-                assert_eq!(inferred, Err(expected.clone()));
-                assert_eq!(staged.map(|_| ()), Err(ProgramError::Type(expected.clone())));
-                assert!(context.builder().borrow().instructions().is_empty());
-            }
-            let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+            assert_eq!(
+                context.bind(operation, branches.clone(), &[predicate, input]).map(|_| ()),
+                Err(ProgramError::Type(expected.clone())),
+            );
+            assert!(context.builder().borrow().instructions().is_empty());
+
+            // Forward-mode differentiation specializes attached regions before applying its rule.
             let input = Array::vector(vec![1.0f64; extent]).unwrap();
-            let eager = context.bind(operation, branches.clone(), &[Array::scalar(true).unwrap(), input.clone()]);
-            if extent == 3 {
-                assert_eq!(eager, Ok(vec![input]));
-            } else {
-                assert_eq!(eager, Err(ProgramError::Type(expected.clone())));
-            }
+            let result = differentiate_at(input.clone()).jvp(input, |input| {
+                let context = input.context().clone();
+                let predicate = context.lift(Array::scalar(true).unwrap())?;
+                Ok(context.bind(operation, branches.clone(), &[predicate, input])?.remove(0))
+            });
+            assert!(matches!(
+                result,
+                Err(DifferentiationError::Program(ProgramError::Type(error))) if error == expected,
+            ));
         }
     }
 
@@ -3279,7 +3282,7 @@ mod tests {
                 &[true_branch.interface(), mismatched_interface],
             ),
             Err(TypeError::invalid(
-                "`condition` input 1 has type `f64[]`, which does not refine its branch input type `f64[2]`",
+                "`condition` branch input type signature mismatch: expected [f64[]] but got [f64[2]]",
             )),
         );
 
@@ -5152,7 +5155,7 @@ mod tests {
                 &[Array::scalar(true).unwrap(), Array::scalar(4.0f64).unwrap()],
             ),
             Err(TypeError::invalid(
-                "`condition` input 1 has type `f64[]`, which does not refine its branch input type `f64[2]`",
+                "`condition` branch input type signature mismatch: expected [f64[]] but got [f64[2]]",
             )
             .into()),
         );
@@ -5870,70 +5873,6 @@ mod tests {
             Err(TypeError::invalid("`condition` branch output type signature mismatch: expected [] but got [f64[]]")
                 .into()),
         );
-    }
-
-    #[test]
-    fn test_condition_partial_evaluation_retains_different_refined_input_formals() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let static_type = ArrayType::new_static(DataType::F64, [3]);
-        let branches = [dynamic_type, static_type.clone()]
-            .into_iter()
-            .enumerate()
-            .map(|(index, input_type)| {
-                let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-                let input = builder.add_input(input_type);
-                let output = if index == 0 {
-                    builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
-                } else {
-                    builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0]
-                };
-                let constant = builder.add_constant(Array::scalar((index + 1) as f64).unwrap());
-                builder
-                    .build::<Vec<Array>, Vec<Array>>(vec![output, constant], vec![Placeholder], vec![Placeholder; 2])
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let predicate = outer.input(ArrayType::scalar(DataType::Boolean));
-        let context = PartialEvaluationContext::new(outer.clone());
-        let predicate = PartialTracer::new(context.clone(), PartialEvaluationValue::known_input(predicate));
-        let input = PartialTracer::new(context.clone(), context.unknown_input(static_type.clone(), 0));
-        let outputs = context.bind(ConditionOperation::new(), branches, &[predicate, input]).unwrap();
-        let output_values = outputs.into_iter().map(PartialTracer::into_value).collect::<Result<Vec<_>, _>>().unwrap();
-        let evaluation = context.into_evaluation(output_values).unwrap();
-        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
-        assert!(outer.builder().borrow().instructions().is_empty());
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-            lambda %0:f64[3], %1:bool[] .
-            let %2:f64[3], %3:f64[] = condition %1 %0 [
-                true={
-                    lambda %0:f64[3] .
-                    let %1:f64[3] = add %0 %0
-                        %2:f64[] = const 1.0
-                    in (%1, %2)
-                },
-                false={
-                    lambda %0:f64[3] .
-                    let %1:f64[3] = neg %0
-                        %2:f64[] = const 2.0
-                    in (%1, %2)
-                },
-            ]
-            in (%2, %3)"}
-        );
-        for predicate in [false, true] {
-            let input = Array::vector(vec![1.0f64; 3]).unwrap();
-            assert_eq!(
-                evaluation.program.interpret(vec![input, Array::scalar(predicate).unwrap()]),
-                Ok(vec![
-                    Array::vector(vec![if predicate { 2.0f64 } else { -1.0f64 }; 3]).unwrap(),
-                    Array::scalar(if predicate { 1.0f64 } else { 2.0f64 }).unwrap(),
-                ])
-            );
-        }
     }
 
     #[test]

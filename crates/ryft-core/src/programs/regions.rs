@@ -1357,6 +1357,13 @@ pub trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
         self.regions().count()
     }
 
+    /// Returns the [`RegionInterface`]s of every [`Region`] attached to the current operation application, in
+    /// operation-defined order (e.g., for [`Operation::validate_region_interfaces`]).
+    #[inline]
+    fn region_interfaces(&self) -> Vec<RegionInterface<V::Type>> {
+        self.regions().map(RegionRef::interface).collect()
+    }
+
     /// Returns a borrowed view of the [`Region`] at `index`, or an error when the current operation application has no
     /// region at that index.
     #[inline]

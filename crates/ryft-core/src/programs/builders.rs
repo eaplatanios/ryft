@@ -675,7 +675,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         inputs: &[AtomId],
     ) -> Result<(Vec<V::Type>, Vec<RegionInterface<V::Type>>, Vec<V::Type>), ProgramError> {
         self.references.validate(operation, inputs)?;
-        operation.validate_region_count(regions.len())?;
         for region in regions.iter().copied() {
             if region.index() >= self.regions.len() {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -708,6 +707,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 .collect()
         };
 
+        operation.validate_region_interfaces(region_interfaces.as_slice())?;
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
         let effects = operation.effects();
         effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;

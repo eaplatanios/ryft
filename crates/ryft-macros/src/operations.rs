@@ -976,6 +976,35 @@ impl OperationEnum {
                 },
             }
         });
+
+        let region_interface_validation_arms = self.variants.iter().map(|variant| {
+            // Original region interfaces are validated in the universe whose contract the payload defines, like the
+            // region input type inference below.
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            match &variant.class {
+                OperationVariantClass::MixedMember { .. } => quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::MemberOperation<#primary_type>>::validate_parent_region_interfaces(
+                            #receiver,
+                            region_interfaces,
+                        )
+                    },
+                },
+                OperationVariantClass::ProjectedMember { .. } => quote! {
+                    Self::#variant_ident(operation) => {
+                        #ryft::validate_projected_operation_region_interfaces(#receiver, region_interfaces)
+                    },
+                },
+                OperationVariantClass::CompositeNative => quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::Operation>::validate_region_interfaces(#receiver, region_interfaces)
+                    },
+                },
+            }
+        });
+
         let region_instantiation_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -1062,6 +1091,13 @@ impl OperationEnum {
 
                 fn region_slots(&self) -> &'static [#ryft::RegionSlot] {
                     match self { #(#region_slot_arms)* }
+                }
+
+                fn validate_region_interfaces(
+                    &self,
+                    region_interfaces: &[#ryft::RegionInterface<#primary_type>],
+                ) -> ::std::result::Result<(), #ryft::ProgramError> {
+                    match self { #(#region_interface_validation_arms)* }
                 }
 
                 fn infer_region_input_types(

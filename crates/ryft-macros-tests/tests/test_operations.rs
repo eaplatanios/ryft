@@ -79,6 +79,12 @@ impl TypeError {
 #[derive(Debug, PartialEq, Eq)]
 struct ProgramError;
 
+impl From<TypeError> for ProgramError {
+    fn from(_error: TypeError) -> Self {
+        Self
+    }
+}
+
 /// Stand-in for `ryft_core::RegionInterface`.
 struct RegionInterface<T: Type> {
     marker: PhantomData<T>,
@@ -317,6 +323,13 @@ trait Operation: Clone {
         self.region_slots().get(index).map(|slot| slot.role)
     }
 
+    fn validate_region_interfaces(
+        &self,
+        _region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<(), ProgramError> {
+        Ok(())
+    }
+
     fn infer_region_input_types(
         &self,
         _input_types: &[Self::Type],
@@ -451,6 +464,19 @@ trait OperationProvider<T: Type, Request = ()> {
 
 impl<T: Type, O: Operation<Type = T>, Request> OperationProvider<T, Request> for O {
     type Operation = Self;
+}
+
+/// Validates projected original region interfaces using the same contract as `ryft_core`'s derive support helper.
+fn validate_projected_operation_region_interfaces<T: Type, U: Type, O: Operation<Type = T>>(
+    operation: &O,
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<(), ProgramError>
+where
+    U: From<T>,
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    let (_, region_interfaces) = project_operation_boundary(&[], region_interfaces)?;
+    operation.validate_region_interfaces(&region_interfaces)
 }
 
 /// Infers projected region input types using the same contract as `ryft_core`'s derive support helper.
