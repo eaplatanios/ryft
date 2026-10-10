@@ -1839,6 +1839,45 @@ mod tests {
     }
 
     #[test]
+    fn test_program_builder_splice_program_rejects_unrepresented_input_relationships() {
+        let variable = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let mut source = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        source.add_input(dimension_type.clone().into());
+        let array = source.add_input(ArrayType::new(DataType::F32, Shape::new(vec![variable.into()])).into());
+        let source = source
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![array],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        for (dimension, error) in [
+            (
+                DimensionValue::new(dimension_type, 4).unwrap(),
+                "dimension variable n is renamed to n by one signature member and bound to static extent 3 by another",
+            ),
+            (
+                DimensionValue::constant(4).unwrap(),
+                "dimension variable n is renamed to 4 by one signature member and bound to static extent 3 by another",
+            ),
+        ] {
+            let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let dimension = destination.add_constant(ArrayIrValue::Dimension(dimension));
+            let array = destination.add_constant(ArrayIrValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+            assert_eq!(
+                destination.splice_program(&source, &[dimension, array]),
+                Err(ProgramError::Type(TypeError::invalid(error)))
+            );
+            assert_eq!(destination.atoms().len(), 2);
+            assert!(destination.input_ids().is_empty());
+            assert!(destination.instructions().is_empty());
+            assert_eq!(destination.regions.len(), 0);
+        }
+    }
+
+    #[test]
     fn test_program_builder_splice_program_preserves_assertions() {
         let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
