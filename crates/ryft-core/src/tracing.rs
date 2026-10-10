@@ -1248,8 +1248,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::axes::{AxisError, NamedAxes};
     use crate::captures::{CaptureReference, CapturingContext};
@@ -2415,8 +2415,9 @@ mod tests {
                 assert_eq!(body.input_types(), declared);
                 assert!(body.instructions().is_empty());
 
-                // An exact dimension of four conflicts with the array/reference extent of three. Preserve the
-                // original structured derivation error rather than treating invalid inputs as unsupported replay.
+                // An exact dimension of four conflicts with the array/reference extent of three. Structural
+                // derivation retains its precise error; optional preparation declines replay and mandatory primitive
+                // inference rejects the original application before either branch can run.
                 let error = TypeError::invalid(
                     "dimension variable n is renamed to 4 by one signature member \
                      and bound to static extent 3 by another",
@@ -2425,14 +2426,32 @@ mod tests {
                 assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &invalid), Err(error.clone()));
                 input_types.truncate(1);
                 input_types.extend(invalid);
-                assert!(matches!(
+                assert!(
                     FlatIrProgram::specialize_attached_regions(
                         &operation,
                         &input_types,
                         [body.entry_region_ref(), body.entry_region_ref()].into_iter(),
-                    ),
-                    Err(ProgramError::Type(actual)) if actual == error,
-                ));
+                    )
+                    .unwrap()
+                    .is_none(),
+                );
+                let expected_error = if static_member.is_reference() {
+                    let input_index = if reversed { 1 } else { 2 };
+                    TypeError::invalid(format!(
+                        "`condition` input {input_index} has type `ref<f32[3]>`, \
+                         which does not equal its branch input type `ref<f32[n]>`",
+                    ))
+                } else {
+                    TypeError::custom(DimensionError::InputDimensionMismatch {
+                        dimension: "n".to_string(),
+                        expected: if reversed { 3 } else { 4 },
+                        actual: if reversed { 4 } else { 3 },
+                    })
+                };
+                assert_eq!(
+                    operation.infer_output_types(&input_types, &[body.interface(), body.interface()]),
+                    Err(expected_error),
+                );
             }
         }
     }

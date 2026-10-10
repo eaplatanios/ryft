@@ -170,11 +170,7 @@ pub enum LoweringError {
         "{value_kind} type #{value_index} of a standalone `shard_map` varies along mesh axis `{axis_name}`, which is \
          not one of its manual axes; lower it as part of the program whose manual region makes that axis manual"
     )]
-    StandaloneShardMapVariesAlongEnclosingManualAxis {
-        value_kind: &'static str,
-        value_index: usize,
-        axis_name: String,
-    },
+    StandaloneShardMapVariesAlongEnclosingManualAxis { value_kind: &'static str, value_index: usize, axis_name: String },
 
     /// Error returned when [`to_mlir_module`] lowers a traced shard map whose body applies a collective (e.g.,
     /// `parallel_reduce` or `axis_index`) along a manual mesh axis that neither the shard map nor a shard map nested in
@@ -7626,10 +7622,11 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let results = lower_condition_to_if(
+        lower_condition_to_if(
             branch_regions,
             input_values,
             self.input_types.as_slice(),
+            output_types,
             &mut self.block,
             self.context,
             self.location,
@@ -7637,15 +7634,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.nested_functions.as_ref(),
             &self.collective_state,
             &mut self.effect_tokens,
-        )?;
-        let region_output_types = branch_regions.first().map(|branch| branch.output_types()).unwrap_or_default();
-        lower_refined_region_outputs(
-            results,
-            region_output_types.as_slice(),
-            output_types,
-            &mut self.block,
-            self.context,
-            self.location,
         )
     }
 
@@ -7852,7 +7840,10 @@ pub fn to_mlir_module<Input: Parameterized<ArrayType>, Output: Parameterized<Arr
         shard_map.mesh(),
         shard_map.manual_axes(),
     ) {
-        return Err(LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis { operation_name, axis_name });
+        return Err(LoweringError::StandaloneShardMapCommunicatesAlongEnclosingManualAxis {
+            operation_name,
+            axis_name,
+        });
     }
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
@@ -8961,11 +8952,13 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
 ///
 /// `entry_effect_tokens` are the enclosing scope's active per-class tokens, referenced inside the region through
 /// StableHLO's implicit region capture (the same mechanism that feeds `input_values` into `stablehlo.if` branches).
-/// The region returns one trailing token for each class in `threaded_effects`, in canonical effect order. A branch
-/// that is pure for one of those classes returns that class's entry token unchanged.
+/// Ordinary results are converted to `output_types` before the region returns one trailing token for each class
+/// in `threaded_effects`, in canonical effect order. A branch that is pure for one of those classes returns that
+/// class's entry token unchanged.
 fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
     program: &FlatXlaProgram,
     input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayIrType],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
@@ -8991,6 +8984,16 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
             collective_state,
             &mut region_effect_tokens,
         )?;
+        // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
+        // common refined geometry even when their declared dynamic and static result types differ.
+        outputs = lower_refined_region_outputs(
+            outputs,
+            &program.output_types(),
+            output_types,
+            &mut block_ref,
+            context,
+            location,
+        )?;
         for effect in token_threaded_effects(threaded_effects) {
             outputs.push(
                 region_effect_tokens
@@ -9008,6 +9011,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
     branch_regions: &[FlatXlaProgram],
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayIrType],
+    output_types: &[ArrayIrType],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -9034,17 +9038,6 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
             ),
         });
     }
-    // Branch inputs only need to refine the branch input types, so each one is converted to the lowered type of its
-    // branch input first.
-    let branch_inputs = input_values[1..]
-        .iter()
-        .zip(&input_types[1..])
-        .zip(branch_input_types.iter())
-        .map(|((value, input_type), branch_input_type)| {
-            lower_refined_region_input(*value, input_type, branch_input_type, block, context, location)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let branch_inputs = branch_inputs.as_slice();
     // Each ordered class used by either branch is captured and returned independently. Both branches carry the union
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
     let threaded_effects = true_branch.effects().classes().union(false_branch.effects().classes());
@@ -9053,28 +9046,40 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
         let token = current_or_new_token(effect, effect_tokens, block, location)?;
         entry_effect_tokens.set(effect, token);
     }
-    let true_branch_region = lower_control_flow_region(
-        true_branch,
-        branch_inputs,
-        context,
-        location,
-        captured_values,
-        nested_functions,
-        collective_state,
-        entry_effect_tokens,
-        threaded_effects,
-    )?;
-    let false_branch_region = lower_control_flow_region(
-        false_branch,
-        branch_inputs,
-        context,
-        location,
-        captured_values,
-        nested_functions,
-        collective_state,
-        entry_effect_tokens,
-        threaded_effects,
-    )?;
+    let mut lowered_branches = Vec::with_capacity(2);
+    let mut converted_inputs = None;
+    for branch in [true_branch, false_branch] {
+        // Each branch keeps its own declared input geometry. Refinement can make dynamic and static formals agree
+        // at this invocation without making their lowered storage types interchangeable. Equal formals share the
+        // conversion so ordinary conditions still pad their inputs only once.
+        let declared_input_types = branch.input_types();
+        if converted_inputs.as_ref().is_none_or(|(types, _)| types != &declared_input_types) {
+            let values = input_values[1..]
+                .iter()
+                .zip(&input_types[1..])
+                .zip(&declared_input_types)
+                .map(|((value, input_type), branch_input_type)| {
+                    lower_refined_region_input(*value, input_type, branch_input_type, block, context, location)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            converted_inputs = Some((declared_input_types, values));
+        }
+        let branch_inputs = &converted_inputs.as_ref().unwrap().1;
+        lowered_branches.push(lower_control_flow_region(
+            branch,
+            branch_inputs,
+            output_types,
+            context,
+            location,
+            captured_values,
+            nested_functions,
+            collective_state,
+            entry_effect_tokens,
+            threaded_effects,
+        )?);
+    }
+    let false_branch_region = lowered_branches.pop().unwrap();
+    let true_branch_region = lowered_branches.pop().unwrap();
     let operation = block.append_operation(stable_hlo::r#if(
         input_values[0],
         true_branch_region.into(),
@@ -9476,6 +9481,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 let condition_region = lower_control_flow_region(
                     condition,
                     next_state_values.as_slice(),
+                    &condition_output_types,
                     context,
                     location,
                     captured_values,
@@ -28291,6 +28297,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_condition_without_outputs_executes_selected_effects_in_order_on_cpu() {
+        use ryft_core::PrintOperation;
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        // An empty data-flow boundary must retain the selected branch's effects and sequence later effects after it.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let branch = |label| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            builder
+                .add_instruction(PrintOperation::<ArrayType>::new(label), Vec::new(), vec![input], None)
+                .unwrap();
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_branch = builder.import_region(branch("true").entry_region_ref());
+        let false_branch = builder.import_region(branch("false").entry_region_ref());
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let predicate = builder.add_input(predicate_type.clone().into());
+        let input = builder.add_input(scalar_type.clone().into());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_branch, false_branch],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 0);
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![input], None)
+            .unwrap();
+        let program =
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![predicate_type, scalar_type],
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<f64>) {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = "stablehlo.if"(%arg0) ({
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "true"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %3 : !stablehlo.token
+                    }, {
+                      %3 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "false"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      stablehlo.return %3 : !stablehlo.token
+                    }) : (tensor<i1>) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg1, %1) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                    return
+                  }
+                }
+            "#},
+        );
+        let client = execution_client();
+        ensure_print_handler_registered(&client).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        for (predicate, expected) in [(true, "true: 7.0"), (false, "false: 7.0")] {
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(&[u8::from(predicate)], BufferType::Predicate, &[], None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(&7f64.to_ne_bytes(), BufferType::F64, &[], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let (outputs, lines) = with_captured_prints(|| {
+                executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        Vec::new(),
+                        0,
+                        None,
+                        Some(file!()),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+            });
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].outputs.len(), 0);
+            assert_eq!(lines, vec![expected, "after: 7.0"]);
+        }
+    }
+
+    #[test]
     fn test_condition_converts_a_refined_static_branch_input_to_its_bounded_branch_input_type() {
         // A branch input only needs to refine its branch input type, so a static `f64[3]` input feeds a branch input
         // with the bounded dynamic type `f64[rows]`. The output takes the static extent that the inputs establish for
@@ -28342,6 +28457,72 @@ pub(crate) mod tests {
             ),
             Ok(vec![MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3])]),
         );
+    }
+
+    #[test]
+    fn test_condition_normalizes_retained_branch_signatures_before_lowering_on_cpu() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let client = execution_client();
+        for static_false_input in [false, true] {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(extent_type.clone().into());
+            let input = builder.add_input(dynamic_type.clone().into());
+            let true_branch = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(extent_type.clone().into());
+            let input_type = if static_false_input { &static_type } else { &dynamic_type };
+            let input = builder.add_input(input_type.clone().into());
+            let output = if static_false_input {
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0]
+            } else {
+                builder
+                    .add_instruction(ZeroOperation::new(static_type.clone().into()), Vec::new(), Vec::new(), None)
+                    .unwrap()[0]
+            };
+            let false_branch = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            for predicate_value in [false, true] {
+                // The broad first-class dimension and static array share an extent relationship that structural
+                // specialization cannot replace. Direct construction retains both declared branch programs.
+                let mut builder = CompositeXlaProgramBuilder::new();
+                let regions = vec![
+                    builder.import_region(true_branch.entry_region_ref()),
+                    builder.import_region(false_branch.entry_region_ref()),
+                ];
+                let predicate = builder.add_constant(XlaConstant::Boolean(predicate_value));
+                let extent = builder.add_input(extent_type.clone().into());
+                let input = builder.add_input(static_type.clone().into());
+                let output = builder
+                    .add_instruction(ConditionOperation::new(), regions, vec![predicate, extent, input], None)
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap();
+                assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone())]);
+                let expected = if predicate_value {
+                    vec![1.0, 2.0, 3.0]
+                } else if static_false_input {
+                    vec![-1.0, -2.0, -3.0]
+                } else {
+                    vec![0.0; 3]
+                };
+                assert_eq!(
+                    execute_mixed_program(
+                        &client,
+                        &program,
+                        &[MixedValue::Dimension(3), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
+                        &[],
+                    ),
+                    Ok(vec![MixedValue::Array(expected, vec![3])]),
+                );
+            }
+        }
     }
 
     #[test]

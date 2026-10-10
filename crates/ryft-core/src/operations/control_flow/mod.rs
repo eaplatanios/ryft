@@ -1,3 +1,68 @@
+//! Operations that select values and control the execution of attached branch or loop programs. Each operation is
+//! represented by an [`Operation`] type; value capabilities such as [`Condition`] and [`Select`]
+//! apply the corresponding operation to eager arrays and traced values through the same API.
+//!
+//! The operations provide four forms of control flow:
+//!
+//!   - **Conditional Execution:** [`ConditionOperation`] evaluates the `true` or `false` branch according to a scalar
+//!     Boolean predicate. [`Condition::condition`] traces two functions over structured inputs and returns the selected
+//!     branch's outputs. Both functions are traced when the condition is built, while only the selected branch executes
+//!     at runtime. [`ConditionType`] defines predicate and manual-variation constraints for each type universe.
+//!   - **Elementwise Selection:** [`Select`] chooses between two already-computed values according to a Boolean mask.
+//!     Input shapes broadcast and branch element types promote, so a scalar mask can select a whole array or a shaped
+//!     mask can select individual elements. This does not defer either input's computation.
+//!   - **Predicate-Controlled Loops:** [`WhileOperation`] repeatedly tests its condition region and applies its body to
+//!     loop-carried state while the predicate is true. [`WhilePredicate`] also supports batched predicates through
+//!     per-item masking. An explicit [`iteration_bound`](WhileOperation::with_iteration_bound) additionally permits
+//!     reverse-mode differentiation through a masked tangent scan.
+//!   - **Shape-Determined Loops:** [`ScanOperation`] threads loop-carried state through a body while consuming slices of
+//!     stacked array inputs and producing stacked outputs. Its body also receives the slice index; reference inputs
+//!     supply complete roots. [`reverse`](ScanOperation::with_reverse) changes visit order without changing the pairing
+//!     of input and output slices, while [`unroll`](ScanOperation::with_unroll) controls backend lowering.
+//!
+//! Branch and loop computations are [`Region`](crate::Region)s attached to an instruction, rather than fields of its
+//! operation payload. [`WhileType`] and [`ScanType`] define their type-family contracts. The operation rules provide
+//! interpretation, reference discharge, partial evaluation, batching and differentiation; the shared
+//! [`transpose_primal_condition`] rule is also available to operation families that transpose conditions themselves.
+//! Mapped-predicate batching evaluates both pure branches and selects their outputs per item, so branch computation
+//! that is only valid when selected needs care under batching. A concrete predicate known during partial evaluation
+//! instead specializes the condition to its selected branch.
+//!
+//! XLA lowers conditional execution to [StableHLO `if`](https://openxla.org/stablehlo/spec#if), and both loop forms to
+//! [StableHLO `while`](https://openxla.org/stablehlo/spec#while). Individual operation types document their boundary,
+//! effect and transformation constraints.
+//!
+//! # Examples
+//!
+//! Conditional execution traces branch functions over the input structure and selects their result at runtime:
+//!
+//! ```rust
+//! # use ryft_core::{Array, Condition, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
+//! let predicate = Array::scalar(true)?;
+//! let output = predicate.condition(
+//!     (Array::scalar(2f32)?, Array::scalar(3f32)?),
+//!     |(first, second)| Ok(first + second),
+//!     |(first, second)| Ok(first * second),
+//! )?;
+//! assert_eq!(output, Array::scalar(5f32)?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Elementwise selection chooses between values that have already been computed:
+//!
+//! ```rust
+//! # use ryft_core::{Array, ProgramError, Select};
+//! # fn main() -> Result<(), ProgramError> {
+//! let mask = Array::vector(vec![true, false, true])?;
+//! let values = Array::vector(vec![1f32, 2.0, 3.0])?;
+//! let output = mask.select(&values, &Array::scalar(0f32)?)?;
+//! assert_eq!(output, Array::vector(vec![1f32, 0.0, 3.0])?);
+//! # Ok(())
+//! # }
+//! ```
+
 use crate::arrays::{ArrayIrType, ArrayType};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};

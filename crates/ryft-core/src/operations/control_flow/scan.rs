@@ -1,11 +1,3 @@
-//! Contains the `scan` control-flow operation: [`ScanOperation`], a shape-determined loop that threads `carry_count`
-//! loop-carried values through an attached body [`Region`] while consuming one slice of every stacked array input and
-//! producing one slice of every stacked output per iteration, together with its reference discharge, interpretation,
-//! partial-evaluation, batching, forward-mode differentiation, and transposition rules. This is the analogue of [JAX's
-//! `lax.scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html) (including `reverse` and the
-//! lowering-only `unroll` factor) and lowers to a [StableHLO `while`](https://openxla.org/stablehlo/spec#while) loop
-//! with counter-indexed slice reads and writes.
-
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;

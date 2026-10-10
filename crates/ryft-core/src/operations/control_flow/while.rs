@@ -1,13 +1,3 @@
-//! Contains the `while` control-flow operation: [`WhileOperation`], which repeatedly applies a body
-//! [`Region`](crate::Region) to a loop-carried state while a condition [`Region`](crate::Region) over that same state
-//! produces a true predicate, together with its interpretation, partial-evaluation, batching, forward-mode
-//! differentiation, and transposition rules. This is the analogue of
-//! [JAX's `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) and lowers to
-//! [StableHLO's `while`](https://openxla.org/stablehlo/spec#while). Predicates may be batched: a prefix-shaped Boolean
-//! supplies per-item termination decisions through [`WhilePredicate`]'s masking semantics. Loops constructed with a
-//! semantic [`iteration_bound`](WhileOperation::with_iteration_bound) additionally support reverse-mode differentiation
-//! through a staged masked tangent scan.
-
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
