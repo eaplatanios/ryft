@@ -1,22 +1,84 @@
 use std::borrow::Cow;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use ryft_pjrt::extensions::ffi::FfiStream;
+use ryft_core::macros::check_count;
+use ryft_core::{ArrayType, EffectClass, PrintOperation};
+use ryft_mlir::dialects::stable_hlo;
+use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
+use ryft_mlir::{
+    Attribute, Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue,
+    ValueRef,
+};
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::{Client, Error};
 
+use crate::experimental::lowering::{EffectTokens, current_or_new_token};
+use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use super::assertions::copy_cuda_bytes;
+use crate::operations::assertions::copy_cuda_bytes;
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_pjrt::extensions::ffi::FfiStream;
+
+/// Lowers one `print` operation to the [`PRINT_CUSTOM_CALL_TARGET`] host-callback custom call and advances the
+/// scope's effect token chain past it when ordered. Unordered printing retains the same handler ABI but uses an
+/// independent local token.
+///
+/// The emitted operation follows the calling convention decoded by the FFI handler registered by
+/// [`ensure_print_handler_registered`]:
+///
+/// ```mlir
+/// %token_out = stablehlo.custom_call @"ryft.print"(%value, %token_in)
+///   {api_version = 4 : i32, backend_config = {label = "<label>"}, has_side_effect = true}
+///   : (tensor<...>, !stablehlo.token) -> !stablehlo.token
+/// ```
+///
+/// The custom call's only result is the continuation token; the `print` operation's data flow output is the
+/// forwarded input value, which the caller returns directly.
+pub(crate) fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
+    label: &str,
+    ordered: bool,
+    value: ValueRef<'b, 'c, 't>,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    // Unordered calls retain the registered handler ABI, using a fresh local token with no boundary dependency.
+    let mut local_tokens = EffectTokens::default();
+    let effect_tokens = if ordered { effect_tokens } else { &mut local_tokens };
+    let input_token = current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?;
+    let token_type = context.stable_hlo_token_type()?;
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))
+    ]);
+    let operation = block.append_operation(stable_hlo::custom_call(
+        &[value, input_token],
+        PRINT_CUSTOM_CALL_TARGET,
+        true,
+        Some(backend_config.as_ref()),
+        CustomCallApiVersion::TypedFfi,
+        &[],
+        None,
+        &[],
+        None,
+        &[token_type],
+        location,
+    )?)?;
+    effect_tokens.set(
+        EffectClass::OrderedIo,
+        operation.result(0).expect("the print custom call should return one token result").as_ref(),
+    );
+    Ok(())
+}
 
 /// Name of the XLA custom call target that implements the host-callback side of `print` lowering.
 ///
-/// A lowered [`PrintOperation`](ryft_core::operations::debugging::PrintOperation) becomes a
-/// `stablehlo.custom_call` with the following calling convention, which the FFI handler registered by
-/// [`ensure_print_handler_registered`] decodes:
+/// A lowered [`PrintOperation`] becomes a `stablehlo.custom_call` with the following calling convention, which the FFI
+/// handler registered by [`ensure_print_handler_registered`] decodes:
 ///
 ///   - `call_target_name` is [`PRINT_CUSTOM_CALL_TARGET`] (i.e., `"ryft.print"`).
 ///   - `api_version` is `4` (the typed FFI API version), so that the `backend_config` dictionary entries arrive
@@ -171,7 +233,7 @@ unsafe fn print_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<PrintBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = super::domains::EffectCallbackGuard::enter();
+    let _callback_guard = crate::experimental::domains::EffectCallbackGuard::enter();
     // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
     // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and `handle_print_call_frame`.
     unsafe {
@@ -231,7 +293,7 @@ fn decode_label<'o>(call_frame: &FfiCallFrame<'o>) -> Result<&'o str, FfiError> 
 }
 
 /// Returns the number of elements stored in the provided [`FfiBuffer`] (i.e., the product of its dimensions).
-fn element_count(buffer: &FfiBuffer<'_>) -> usize {
+pub(crate) fn element_count(buffer: &FfiBuffer<'_>) -> usize {
     buffer.dimensions().iter().map(|&dimension| dimension.max(0) as usize).product()
 }
 
@@ -383,6 +445,31 @@ fn copy_value_to_outputs(
     Ok(())
 }
 
+impl LowerableOperation for PrintOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _input_types: &[ArrayType],
+        _output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        // `print` is the identity on its data flow output; its observable effect lowers to a host-callback custom call
+        // that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain instead of
+        // the value data flow.
+        check_count!("input", input_values, 1, ProgramError);
+        lower_print_to_custom_call(
+            self.label(),
+            self.effect_class().is_ordered(),
+            input_values[0],
+            &mut lowerer.effect_tokens,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        Ok(vec![input_values[0]])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -390,15 +477,185 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-
+    use ryft_core::{
+        AddOperation, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, Shape, Sharding,
+    };
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin,
     };
 
+    use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::experimental::lowering::tests::{XlaProgramBuilder, unproject_plain_program};
+    use crate::experimental::ops::XlaArrayConstant;
+    use crate::operations::dot::RaggedDotLoweringStrategy;
     use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::to_mlir_module_for_program;
 
-    use super::{PRINT_CUSTOM_CALL_TARGET, emit_print_line, ensure_print_handler_registered, with_captured_prints};
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Print lowering / effect-token threading tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_two_prints_through_one_token_chain() {
+        use ryft_core::PrintOperation;
+
+        // Two prints in one flat program: the token chain is created lazily by one zero-operand
+        // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
+        // each print's data flow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
+        // call results).
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let first = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("first"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("second"), Vec::new(), vec![doubled], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf64>) -> tensor<2xf64> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<2xf64>
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%0, %2) {api_version = 4 : i32, backend_config = {label = "second"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %4 = stablehlo.add %arg0, %0 : tensor<2xf64>
+                    return %4 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_executable_print_effect_boundary() {
+        use ryft_core::PrintOperation;
+
+        for effect_class in [EffectClass::UnorderedIo, EffectClass::OrderedIo, EffectClass::DeviceOrderedIo] {
+            let ordered = effect_class.is_ordered();
+            let array_type = ArrayType::scalar(DataType::F32);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(array_type.clone());
+            builder
+                .add_instruction(
+                    PrintOperation::<ArrayType>::new("value").with_effect_class(effect_class),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap();
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+                .unwrap();
+            let lowered = lower_mlir_module_for_program_with_reference_state(
+                &unproject_plain_program(program),
+                &[],
+                &vec![array_type],
+                &Vec::<ArrayType>::new(),
+                "main",
+                None,
+                None,
+                Some("cpu"),
+                &[],
+                RaggedDotLoweringStrategy::default(),
+            )
+            .unwrap();
+            assert_eq!(lowered.signature.has_ordered_io(), ordered);
+            assert_eq!(lowered.signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
+            assert_eq!(lowered.signature.has_unordered_io(), !ordered);
+            assert!(lowered.signature.has_effects());
+            assert!(!lowered.signature.requires_assertion_handler());
+            assert_eq!(lowered.signature.ordered_io_input_index(), ordered.then_some(1));
+            assert_eq!(lowered.signature.ordered_io_output_index(), ordered.then_some(0));
+            assert_eq!(lowered.signature.physical_input_count(), 1 + usize::from(ordered));
+            assert_eq!(lowered.stable_hlo.matches("stablehlo.after_all").count(), usize::from(!ordered));
+            assert!(lowered.stable_hlo.contains("has_side_effect = true"));
+            if ordered {
+                assert!(lowered.stable_hlo.contains("%arg1: !stablehlo.token) -> !stablehlo.token"));
+                assert!(lowered.stable_hlo.contains("@ryft.print(%arg0, %arg1)"));
+                assert!(lowered.stable_hlo.contains("return %0 : !stablehlo.token"));
+            } else {
+                assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<f32>) {"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_jit_two_prints_execute_in_order_on_cpu() {
+        use ryft_core::{Device, DeviceMesh, Print};
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+        use crate::XlaSession;
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::tests::{values_from_bytes, values_to_bytes};
+        use crate::{CompiledXlaFunction, FromPjrt, XlaArray, compile};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![device],
+        )
+        .unwrap();
+        let engine = XlaSession::new(&client).domain();
+
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |x| {
+                let x = x.print("x").unwrap();
+                (x.clone() + x).print("doubled").unwrap()
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let values = [1.5f64, 2.5];
+        let source =
+            XlaArray::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
+                .unwrap();
+        let (output, lines) =
+            with_captured_prints(|| engine.interpret(&compiled.executable_function(), source).unwrap());
+
+        // Both prints fire in program order, and the printed values are the forwarded operands.
+        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);
+
+        // The compiled function still computes its data flow output (each print is the identity on its operand).
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let output_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![3.0, 5.0]);
+    }
 
     #[test]
     fn test_with_captured_prints() {

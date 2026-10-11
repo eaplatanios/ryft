@@ -317,9 +317,7 @@ impl KernelAotBundle {
 
     /// Computes the canonical source identity independently of its transport encoding and diagnostic provenance.
     fn semantic_digest(definition: &KernelDefinition) -> Result<String, KernelAotError> {
-        Ok(hex::encode(Sha256::digest(
-            definition.semantic_key().map_err(|error| Self::invalid(error.to_string()))?,
-        )))
+        Ok(hex::encode(Sha256::digest(definition.semantic_key().map_err(|error| Self::invalid(error.to_string()))?)))
     }
 
     /// Constructs an exact bundle-owned diagnostic.
@@ -448,8 +446,10 @@ pub(crate) mod tests {
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
         bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
-        bundle.manifest.execution =
-            XlaKernelExecutionFacts::from_target(domain.target().unwrap(), mesh).unwrap().configuration_key().unwrap();
+        bundle.manifest.execution = XlaKernelExecutionFacts::from_target(domain.target().unwrap(), mesh)
+            .unwrap()
+            .configuration_key()
+            .unwrap();
         bundle
     }
 

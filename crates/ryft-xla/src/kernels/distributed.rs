@@ -301,7 +301,8 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         if identity.len() > 64 * 1024 || execution.len() > 64 * 1024 {
             return Err(DistributedKernelError::invalid("kernel identity exceeds the coordination metadata budget"));
         }
-        let actual = crate::kernels::XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
+        let actual =
+            crate::kernels::XlaKernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
         if actual != execution {
             return Err(DistributedKernelError::invalid("loaded kernel live execution identity changed"));
         }
@@ -533,8 +534,8 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             if Sha256::digest(&bytes).as_slice() != manifest.checksum {
                 return Err(DistributedKernelError::invalid("received input checksum mismatch"));
             }
-            let value =
-                XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes).map_err(XlaDomainError::from)?;
+            let value = XlaArray::from_host_buffer(domain, r#type.clone(), mesh.clone(), bytes)
+                .map_err(XlaDomainError::from)?;
             value.block_until_ready().map_err(XlaDomainError::from)?;
             arguments.push(value);
         }
@@ -728,11 +729,7 @@ mod tests {
     use super::*;
 
     /// Produces a real CPU-loaded scalar identity through the existing AOT persistence fixture.
-    fn loaded<'c>(
-        domain: &crate::XlaDomain<'c>,
-        mesh: &DeviceMesh,
-        compiler_options: u32,
-    ) -> LoadedKernel<'c> {
+    fn loaded<'c>(domain: &crate::XlaDomain<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
         crate::kernels::aot::tests::executable_bundle(domain, mesh, ryft_core::DataType::I32, false, &compiler)
             .load(domain, &compiler, mesh)

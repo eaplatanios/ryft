@@ -1871,12 +1871,13 @@ mod tests {
 
     use crate::experimental::XlaDomainError;
     use crate::experimental::domains::StatefulFailureInjection;
-    use crate::experimental::ops::{JitCallOperation, XlaConstant, XlaOperation};
+    use crate::experimental::ops::{XlaConstant, XlaOperation};
     use crate::jit::{
         CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer,
         XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
         compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
+    use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         AdaptiveProfileGuidedOptions, ArrayError, Error, FromPjrt, XlaArray, XlaDomain, XlaOptions, XlaReference,
@@ -5879,7 +5880,8 @@ mod tests {
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
         use ryft_core::StagingContext;
 
-        use crate::experimental::ops::{FlatXlaProgram, JitCallOperation};
+        use crate::experimental::ops::FlatXlaProgram;
+        use crate::operations::jit_call::JitCallOperation;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

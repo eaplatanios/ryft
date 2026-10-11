@@ -7,6 +7,8 @@ pub mod experimental;
 pub mod jit;
 pub mod kernels;
 pub mod mlir;
+/// Backend-owned per-operation code (e.g., StableHLO lowering), organized to mirror [`ryft_core::operations`].
+pub mod operations;
 pub mod pjrt;
 pub mod profile_guided;
 pub mod sharding;
@@ -18,10 +20,13 @@ pub use arrays::{ShardDescriptor, ShardIndex, ShardLayout, XlaArray, XlaArraySha
 pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
-pub use experimental::RaggedDotLoweringStrategy;
 pub use experimental::domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
     XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession, XlaTarget, XlaTargetDevice,
+};
+pub use experimental::lowering::{
+    LowerableOperation, LowerableOperationFamily, LoweringError, MemberLowerableOperation, XlaLowerer,
+    to_mlir_module_for_program,
 };
 pub use jit::{
     CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,
@@ -31,6 +36,7 @@ pub use jit::{
     stage_with_captures, try_jitted_statefully_with_options, try_jitted_with_options,
 };
 pub use mlir::ToMlir;
+pub use operations::dot::RaggedDotLoweringStrategy;
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use profile_guided::{
     AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState, AdaptiveProfileGuidedStatistics,

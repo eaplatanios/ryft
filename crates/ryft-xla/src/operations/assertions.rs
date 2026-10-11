@@ -1,13 +1,265 @@
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
-use ryft_core::DYNAMIC_SLICE_OPERATION_NAME;
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use ryft_pjrt::extensions::ffi::FfiStream;
+use ryft_core::macros::check_count;
+use ryft_core::{
+    ArrayIrType, ArrayType, AssertOperation, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
+    DimensionType, EffectClass, Operation,
+};
+use ryft_mlir::dialects::stable_hlo;
+use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
+use ryft_mlir::{
+    Attribute, Block, BlockRef, Context as MlirContext, DictionaryAttributeRef, LocationRef,
+    Operation as MlirOperation, TensorTypeRef, Type, Value as MlirValue, ValueRef,
+};
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::{Client, Error};
+
+use crate::experimental::lowering::types::{
+    lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type,
+};
+use crate::experimental::lowering::{EffectTokens, current_or_new_token};
+use crate::operations::comparisons::lower_compare_to_mlir;
+use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
+
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_pjrt::extensions::ffi::FfiStream;
+
+/// Emits one typed assertion callback and advances only the ordered-assertion chain.
+pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
+    predicate: ValueRef<'b, 'c, 't>,
+    observed_values: &[ValueRef<'b, 'c, 't>],
+    backend_config: DictionaryAttributeRef<'c, 't>,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let input_token = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
+    let mut inputs = Vec::with_capacity(2 + observed_values.len());
+    inputs.push(predicate);
+    inputs.extend_from_slice(observed_values);
+    inputs.push(input_token);
+    let layouts = inputs
+        .iter()
+        .map(|input| {
+            Ok(input
+                .r#type()?
+                .cast::<TensorTypeRef>()
+                .map(|tensor| (0..tensor.dimensions().count()).rev().collect::<Vec<_>>())
+                .unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    let layouts = layouts
+        .iter()
+        .any(|layout| !layout.is_empty())
+        .then_some(CustomCallMemoryLayouts { operands: layouts, results: vec![Vec::new()] });
+    let operation = block.append_operation(stable_hlo::custom_call(
+        inputs.as_slice(),
+        ASSERT_CUSTOM_CALL_TARGET,
+        true,
+        Some(backend_config.as_ref()),
+        CustomCallApiVersion::TypedFfi,
+        &[],
+        layouts,
+        &[],
+        None,
+        &[context.stable_hlo_token_type()?],
+        location,
+    )?)?;
+    effect_tokens.set(
+        EffectClass::OrderedAssertion,
+        operation.result(0).expect("the assertion custom call should return one token result").as_ref(),
+    );
+    Ok(())
+}
+
+/// Emits an assertion with a literal message and named observations. Bounded element reports carry logical
+/// extents. Diagnostic buffers retain their element types so unsigned values and floating-point values reach the
+/// callback without lossy conversions.
+pub(crate) fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
+    actor: &str,
+    message: &str,
+    labels: &[String],
+    failure_limit: Option<NonZeroUsize>,
+    input_types: &[ArrayType],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    check_count!("input", input_values, labels.len() + 1, ProgramError);
+    check_count!("input", input_types, input_values.len(), ProgramError);
+    let mut attributes = vec![
+        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(actor)),
+        context.named_attribute(
+            context.identifier(ASSERT_KIND_ATTRIBUTE),
+            context.string_attribute(if failure_limit.is_some() { ASSERT_ELEMENTS_KIND } else { ASSERT_GENERIC_KIND }),
+        ),
+        context.named_attribute(context.identifier(ASSERT_MESSAGE_ATTRIBUTE), context.string_attribute(message)),
+        context.named_attribute(
+            context.identifier(ASSERT_LABEL_COUNT_ATTRIBUTE),
+            context.string_attribute(labels.len().to_string().as_str()),
+        ),
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        attributes.push(context.named_attribute(
+            context.identifier(format!("label_{index}").as_str()),
+            context.string_attribute(label.as_str()),
+        ));
+    }
+    let mut arguments = input_values.to_vec();
+    if let Some(limit) = failure_limit {
+        // Use byte-wide diagnostic carriers rather than relying on backend sub-byte buffer packing.
+        for (value, input_type) in arguments[1..].iter_mut().zip(&input_types[1..]) {
+            let data_type = input_type.data_type();
+            let carrier = match data_type {
+                DataType::I1 | DataType::I2 | DataType::I4 => DataType::I8,
+                DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
+                _ => continue,
+            };
+            let tensor_type = lower_tensor_type(&input_type.clone().with_data_type(carrier), context, location)?;
+            let converted = block.append_operation(stable_hlo::convert(*value, tensor_type, location)?)?;
+            *value = converted.result(0).unwrap().as_ref();
+            if data_type == DataType::I1 {
+                let signed = block.append_operation(stable_hlo::negate(*value, location)?)?;
+                *value = signed.result(0).unwrap().as_ref();
+            }
+        }
+        let rank = input_values[0].r#type()?.cast::<TensorTypeRef>().unwrap().dimensions().count();
+        attributes.push(context.named_attribute(
+            context.identifier(ASSERT_FAILURE_LIMIT_ATTRIBUTE),
+            context.string_attribute(limit.get().to_string().as_str()),
+        ));
+        attributes.push(context.named_attribute(
+            context.identifier(ASSERT_PREDICATE_RANK_ATTRIBUTE),
+            context.string_attribute(rank.to_string().as_str()),
+        ));
+        for axis in 0..rank {
+            arguments.push(lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?);
+        }
+        // XLA custom calls require static physical carriers; the separately captured logical extents exclude padding.
+        for (value, input_type) in arguments.iter_mut().zip(input_types) {
+            let data_type = match input_type.data_type() {
+                DataType::I1 | DataType::I2 | DataType::I4 => DataType::I8,
+                DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
+                data_type => data_type,
+            };
+            *value = lower_physical_bound_value(
+                *value,
+                &input_type.clone().with_data_type(data_type),
+                0.0,
+                block,
+                context,
+                location,
+            )?;
+        }
+    }
+    lower_assertion_custom_call(
+        arguments[0],
+        &arguments[1..],
+        context.dictionary_attribute(&attributes),
+        effect_tokens,
+        block,
+        context,
+        location,
+    )
+}
+
+/// Builds the deliberately false `value < 0` predicate attached to diagnostic assertion custom calls whose safety
+/// condition is evaluated host-side with checked operations: a nonnegative dimension value can never satisfy it, so
+/// the callback always inspects the concrete observed operands, and the side-effecting call cannot be folded away by
+/// a constant-true predicate.
+pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let zero = lower_static_index_constants(&[0], block, context, location)?[0];
+    lower_compare_to_mlir(ComparisonDirection::LessThan, value, zero, block, location)
+}
+
+/// Validates the extent operands of a complete output signature against the static extents to which type inference
+/// refined their declared dynamic axes. An exact operand of a shared dimension identity refines every occurrence of
+/// that identity, so a symbolic operand of another occurrence must equal the refined extent at runtime. This emits one
+/// assertion per distinct pair of operand value and expected extent, and none for operands whose exact extent already
+/// proves it. Axes that remain dynamic need no check: distinct values that share a symbolic identity are equal by
+/// construction, because each internal identity has a single defining value (i.e., `Region::type_identity_signature`
+/// rejects a second definition) and entry refinements validate identities shared by boundary inputs. Returns the
+/// conjunction of the emitted predicates, when there are any, so that foreign-call consumers can gate their
+/// invocation on it.
+///
+/// # Parameters
+///
+///   - `name`: Name of the operation that owns the assertions, reported in their diagnostics.
+///   - `declared_types`: Declared output types, which consume one extent operand per dynamic axis, in axis order.
+///   - `input_values`: Compact extent operands of the declared dynamic axes.
+///   - `input_types`: Dimension types of `input_values`.
+///   - `output_types`: Refined output types, which must have the ranks of `declared_types`.
+pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
+    name: &str,
+    declared_types: &[ArrayType],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayType],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Option<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("output", output_types, declared_types.len(), ProgramError);
+    let dynamic_count = declared_types
+        .iter()
+        .flat_map(|r#type| r#type.shape().dimensions())
+        .filter_map(Dimension::variable)
+        .count();
+    check_count!("input", input_values, dynamic_count, ProgramError);
+    check_count!("input", input_types, input_values.len(), ProgramError);
+    let mut inputs = input_values.iter().zip(input_types);
+    let mut checked = Vec::new();
+    let mut validation = None;
+    let dimensions = declared_types
+        .iter()
+        .zip(output_types)
+        .flat_map(|(declared, output)| declared.shape().dimensions().iter().zip(output.shape().dimensions()));
+    for (declared, output) in dimensions {
+        let Dimension::Dynamic(variable) = declared else { continue };
+        let (&value, input_type) = inputs.next().unwrap();
+        let input_type =
+            <&DimensionType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        let Dimension::Static(extent) = *output else { continue };
+        if input_type.extent() == Some(extent) || checked.contains(&(value, extent)) {
+            continue;
+        }
+        checked.push((value, extent));
+        let expected = lower_static_index_constants(&[extent], block, context, location)?.remove(0);
+        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, value, expected, block, location)?;
+        lower_assert_to_custom_call(
+            name,
+            &format!("input dimension `{variable}` expected {extent}"),
+            &[variable.to_string()],
+            None,
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64)],
+            &[predicate, value],
+            effect_tokens,
+            block,
+            context,
+            location,
+        )?;
+        validation = Some(match validation {
+            None => predicate,
+            Some(previous) => {
+                block.append_operation(stable_hlo::and(previous, predicate, location)?)?.result(0).unwrap().as_ref()
+            }
+        });
+    }
+    Ok(validation)
+}
 
 /// Name of the typed XLA FFI custom call that reports failed runtime assertions.
 pub(crate) const ASSERT_CUSTOM_CALL_TARGET: &str = "ryft.assert";
@@ -168,7 +420,7 @@ unsafe fn assertion_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<AssertionBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
-    let _callback_guard = super::domains::EffectCallbackGuard::enter();
+    let _callback_guard = crate::experimental::domains::EffectCallbackGuard::enter();
     // SAFETY: XLA owns the call frame for this invocation. All access is localized in `FfiCallFrame` and the checked
     // scalar-buffer readers below.
     unsafe {
@@ -191,7 +443,7 @@ unsafe fn assertion_handler_for_memory(
 
 /// Copies `byte_count` bytes from one CUDA device allocation into host memory and waits for completion. The copy is
 /// enqueued on the invoking FFI call's `stream`, so it observes every device write ordered before the custom call.
-/// This is shared by the CUDA assertion handler and the CUDA print handler in [`super::debugging`].
+/// This is shared by the CUDA assertion handler and the CUDA print handler in [`crate::operations::debugging`].
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 pub(crate) fn copy_cuda_bytes(
     source: *mut std::ffi::c_void,
@@ -883,15 +1135,233 @@ fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i
     Ok(i64::from_ne_bytes(scalar_bytes(buffer, memory)?))
 }
 
+impl LowerableOperation for AssertOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        _output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_assert_to_custom_call(
+            self.name(),
+            self.message(),
+            self.labels(),
+            self.failure_limit(),
+            input_types,
+            input_values,
+            &mut lowerer.effect_tokens,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        Ok(Vec::new())
+    }
+}
+
+impl LowerableOperation for AssertOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        _output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let context = lowerer.context;
+        let location = lowerer.location;
+        let effect_tokens = &mut lowerer.effect_tokens;
+        let block = &mut lowerer.block;
+        lower_assert_to_custom_call(
+            self.name(),
+            self.message(),
+            self.labels(),
+            self.failure_limit(),
+            &input_types
+                .iter()
+                .map(|input| match input {
+                    ArrayIrType::Array(array) => array.clone(),
+                    ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
+                    ArrayIrType::Reference(_) => {
+                        unreachable!("assertion validation rejects reference observations")
+                    }
+                })
+                .collect::<Vec<_>>(),
+            input_values,
+            effect_tokens,
+            block,
+            context,
+            location,
+        )?;
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue, Div, ProgramError, Rem, Sub,
+        ArrayIrType, CompareOperation, DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue,
+        DimensionVariable, Div, Placeholder, ProgramError, Rem, Sub,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
+    use crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::operations::dot::RaggedDotLoweringStrategy;
+    use crate::to_mlir_module_for_program;
+
     use super::*;
+
+    #[test]
+    fn test_executable_assertions_remain_local() {
+        use ryft_core::{AssertOperation, DimensionFromScalarOperation};
+
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let left = builder.add_input(scalar_type.clone().into());
+        let right = builder.add_input(scalar_type.clone().into());
+        let left_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+            .unwrap()[0];
+        let right_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+            .unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                Vec::new(),
+                vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("dimensions must agree"),
+                Vec::new(),
+                vec![predicate],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder, Placeholder], vec![])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program_with_reference_state(
+            &program,
+            &[],
+            &vec![scalar_type.clone(), scalar_type],
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+            Some("cpu"),
+            &[],
+            RaggedDotLoweringStrategy::default(),
+        )
+        .unwrap();
+        assert!(lowered.requires_assertion_handler);
+        assert!(lowered.signature.requires_assertion_handler());
+        assert!(lowered.signature.has_effects());
+        assert!(!lowered.signature.has_ordered_io());
+        assert!(!lowered.signature.has_unordered_io());
+        assert_eq!(lowered.signature.ordered_io_input_index(), None);
+        assert_eq!(lowered.signature.ordered_io_output_index(), None);
+        assert_eq!(lowered.signature.physical_input_count(), 2);
+        assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) {"));
+        assert!(lowered.stable_hlo.contains("stablehlo.after_all"));
+        assert!(lowered.stable_hlo.contains("stablehlo.custom_call @ryft.assert"));
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_separates_assertion_and_io_token_chains() {
+        use ryft_core::{AssertOperation, DimensionFromScalarOperation, PrintOperation};
+
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let left = builder.add_input(scalar_type.clone().into());
+        let right = builder.add_input(scalar_type.clone().into());
+        let left_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+            .unwrap()[0];
+        let right_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+            .unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                Vec::new(),
+                vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left_dimension` <= `right_dimension`")
+                    .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
+                Vec::new(),
+                vec![predicate, left_dimension, right_dimension],
+                None,
+            )
+            .unwrap();
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![left], None)
+            .unwrap();
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                Vec::new(),
+                vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left_dimension` == `right_dimension`")
+                    .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
+                Vec::new(),
+                vec![predicate, left_dimension, right_dimension],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![left], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![scalar_type.clone(), scalar_type.clone()],
+            &vec![scalar_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The two gateway bounds checks and two explicit requirements share the assertion chain. The print receives
+        // a separately created token, so it has no artificial dependency on either neighboring assertion.
+        assert_eq!(module.matches("stablehlo.after_all").count(), 2, "{module}");
+        assert_eq!(module.matches("@ryft.assert").count(), 4, "{module}");
+        assert_eq!(module.matches("@ryft.print").count(), 1, "{module}");
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let first_assertion = module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
+        let print_token =
+            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
+        let assertion_token = first_assertion
+            .split_once("@ryft.assert(")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0
+            .rsplit_once(", ")
+            .unwrap()
+            .1;
+        assert_ne!(print_token, assertion_token, "{module}",);
+    }
 
     /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.
     fn eager_dimension(name: &str, extent: usize) -> DimensionValue {
@@ -1005,8 +1475,11 @@ mod tests {
     #[test]
     fn test_validate_arithmetic_matches_eager_checked_diagnostics() {
         // The host callback recomputes each checked predicate, so its wording must match the eager path exactly for
-        // the same named inputs; these pairs fail on both paths and must render identically.
-        let compiled = |kind, left, right| validate_arithmetic(kind, "left", left, "right", right).unwrap_err();
+        // the same inputs; these pairs fail on both paths and must render identically. Eager dimension values have
+        // static types, which both paths name by their extents (e.g., when a program is traced from eager values).
+        let compiled = |kind, left: i64, right: i64| {
+            validate_arithmetic(kind, &left.to_string(), left, &right.to_string(), right).unwrap_err()
+        };
         assert_eq!(
             compiled(ASSERT_SUB_KIND, 2, 5),
             eager_message(eager_dimension("left", 2).sub(&eager_dimension("right", 5)).unwrap_err()),
@@ -1030,12 +1503,13 @@ mod tests {
         // template instead of a reproduced eager error.
         assert_eq!(
             compiled(ASSERT_ADD_KIND, i64::MAX - 1, 2),
-            "dimension arithmetic overflow while adding dimensions with inputs left=9223372036854775806, right=2",
+            "dimension arithmetic overflow while adding dimensions with inputs 9223372036854775806=9223372036854775806, \
+             2=2",
         );
         assert_eq!(
             compiled(ASSERT_MUL_KIND, i64::MAX / 2, 3),
-            "dimension arithmetic overflow while multiplying dimensions with inputs left=4611686018427387903, \
-             right=3",
+            "dimension arithmetic overflow while multiplying dimensions with inputs \
+             4611686018427387903=4611686018427387903, 3=3",
         );
     }
 

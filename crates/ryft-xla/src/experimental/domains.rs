@@ -18,10 +18,10 @@ use ryft_core::{
     CompileRequest, Concretizable, Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
     DifferentiationError, Dimension, DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize,
     DimensionType, DimensionValue, DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass,
-    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, InterpretationDriver, Layout, LogicalMesh,
-    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized,
-    Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
+    EmptyRegionDriver, ExternalReferenceBinding, InterpretableOperation, Layout, LogicalMesh, LoweringRequest, Memory,
+    MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError,
+    Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceId,
     ReferenceReplacementPreparation, ReferenceSource, RegionKey, RegionRef, ScatterMode, ScatterReductionKind, Shape,
     Sharding, ShardingDimension, SortDirection, SpecializationCache, SpecializationCacheEntry,
     SpecializationCacheStatistics, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
@@ -38,10 +38,9 @@ use ryft_pjrt::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::lowering::{
-    RaggedDotLoweringStrategy, XlaExecutableSignature, contains_unresolved_references, contains_unresolved_state,
-};
-use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
+use super::lowering::signature::XlaExecutableSignature;
+use super::lowering::{contains_unresolved_references, contains_unresolved_state};
+use super::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::tracing::TraceError;
 use crate::arrays::{ArrayOutputLayout, ArrayTypeExtension};
 use crate::arrays_v0::host::{DenseArrayHostCopy, begin_materialize_dense_array_bytes, materialize_dense_array_bytes};
@@ -52,7 +51,10 @@ use crate::arrays_v0::{
 #[cfg(feature = "rocm")]
 use crate::kernels::RocmKernelRuntime;
 use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
-use crate::{ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt, XlaArray, XlaDimension, XlaValue};
+use crate::{
+    ArrayError, Error, FromPjrt, RaggedDotLoweringStrategy, ShardDescriptor, ShardLayout, ToPjrt, XlaArray,
+    XlaDimension, XlaValue,
+};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -1240,25 +1242,6 @@ impl<'c> Constant<XlaValue<'c>, XlaConstant> for XlaDomain<'c> {
     }
 }
 
-// Eager interpretation of a staged jitted call over concrete [`XlaArray`]s. Top-level flat programs containing
-// `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
-// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
-// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
-// PJRT client — mirroring JAX dispatching a jitted function called from eager code straight to the compiled
-// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
-// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
-// through this same domain.
-impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType> {
-    fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
-        &self,
-        context: &XlaDomain<'c>,
-        driver: &D,
-        inputs: &[XlaValue<'c>],
-    ) -> Result<Vec<XlaValue<'c>>, ProgramError> {
-        driver.interpret_region(context, 0, inputs.to_vec())
-    }
-}
-
 /// Returns the single [`ArrayType`] produced by a nullary additive/multiplicative identity operation
 /// ([`ZERO_OPERATION_NAME`] / [`ONE_OPERATION_NAME`]). The identity fast path in [`Context::bind`] materializes these
 /// constants directly through the runtime client instead of compiling a program.
@@ -1429,7 +1412,7 @@ impl<'c> XlaDomain<'c> {
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
             let array = <XlaValue<'c> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             // Arrays derived from this dimension are placed on the mesh of the array that it was decoded from.
-            let value = array.to_dimension(operation.output_type().variable().clone())?;
+            let value = array.to_dimension(operation.output_type().to_variable())?;
             return Ok(vec![XlaValue::Dimension(XlaDimension::new(value, self.with_mesh(array.mesh().clone())))]);
         }
 
@@ -1535,8 +1518,8 @@ impl<'c> XlaDomain<'c> {
         let region_ids = driver.import_into(&builder, &region_input_types)?;
         let output_atoms = {
             let mut builder = builder.borrow_mut();
-            // A dimension constant defines its value's dimension identity, which may be defined only once per region,
-            // so repeated dimension inputs (equal by value, and hence by identity) share one constant instruction.
+            // Eager dimension values have static types, which define no identities, so equal dimension inputs share one
+            // constant instruction.
             let mut dimension_atoms = HashMap::new();
             let input_atoms = inputs
                 .iter()
@@ -1947,7 +1930,7 @@ const EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// The key must capture everything that the eager lowering reads besides the session itself (whose client, and thus
 /// [`XlaTarget`], is fixed): the operation including all of its attributes, the contents of every attached region
 /// (for operations such as `condition`, `while`, `scan`, `jit_call`, or `shard_map`), the physical type of every array
-/// input (shardings included), the value of every dimension input (because eager binding bakes dimension inputs into
+/// input (shardings included), the extent of every dimension input (because eager binding bakes dimension inputs into
 /// the traced program as constants), the device mesh that the lowering compiles against, and the domain's compilation
 /// options. Attached regions are keyed by their contents (refer to [`RegionKey`]), so applications whose closures are
 /// traced afresh on every call still hit the cache when they trace to the same regions. Instruction provenance is not
@@ -1985,7 +1968,7 @@ enum XlaEagerDispatchInput {
     /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
     Array(ArrayType),
 
-    /// Dimension input, keyed by its [`DimensionValue`] (including its extent).
+    /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(DimensionValue),
 }
 
@@ -1995,7 +1978,7 @@ enum XlaEagerDispatchInputRef<'a> {
     /// Array input, keyed by its physical [`ArrayType`] (including its sharding).
     Array(Cow<'a, ArrayType>),
 
-    /// Dimension input, keyed by its [`DimensionValue`] (including its extent).
+    /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
     Dimension(&'a DimensionValue),
 }
 
@@ -3599,7 +3582,7 @@ impl<'c> XlaDomain<'c> {
         let has_print_handler = platform_name.eq_ignore_ascii_case("cpu")
             || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
         if (signature.has_ordered_io() || signature.has_unordered_io()) && has_print_handler {
-            super::debugging::ensure_print_handler_registered(self.client())?;
+            crate::operations::debugging::ensure_print_handler_registered(self.client())?;
         }
         if !signature.requires_assertion_handler() {
             return Ok(());
@@ -3609,7 +3592,7 @@ impl<'c> XlaDomain<'c> {
         if !supported {
             return Err(XlaDomainError::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
         }
-        super::assertions::ensure_assertion_handler_registered(self.client())?;
+        crate::operations::assertions::ensure_assertion_handler_registered(self.client())?;
         Ok(())
     }
 
@@ -5755,7 +5738,10 @@ fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), X
     for region in program.regions() {
         for instruction in region.instructions() {
             if let XlaOperation::DimensionFromScalar(operation) = instruction.operation() {
-                let variable = operation.output_type().variable();
+                // A static output defines no identity and is checked against its extent.
+                let Some(variable) = operation.output_type().variable() else {
+                    continue;
+                };
                 if variable.bounds().upper().is_none() {
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
@@ -5787,7 +5773,7 @@ fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), X
                 }
                 for output in instruction.outputs() {
                     if let ArrayIrType::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref() {
-                        variables.insert(r#type.variable().clone());
+                        variables.insert(r#type.variable().unwrap().clone());
                     }
                 }
             }
@@ -6816,28 +6802,29 @@ mod tests {
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::{
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert,
-        AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation, BatchingContext,
-        CalleeRegionDriver, CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection,
-        CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher, ConcatenateOperation,
-        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind,
-        CumulativeOperation, CustomCallOperation, CustomFunctionJvpRule, CustomFunctionOperation, Dimension,
-        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-        DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicArrayExtentBatchingPolicy,
-        DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice,
-        DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation,
-        EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing,
-        IotaOperation, Linearization, MulOperation, NegOperation, OneOperation, ParallelAllGatherOperation,
-        ParallelAllGatherOutputVariance, ParallelAllToAllOperation, ParallelPermuteOperation, ParallelReduceOperation,
-        ParallelVaryOperation, PrintOperation, Program, ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation,
-        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape,
-        ReshapeOperation, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding,
-        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext, StaticShape, SubOperation,
-        TracingContext, Value, WhileOperation, ZeroOperation, batch, shard_map, try_jit_with_options,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis,
+        Assert, AssertOperation, Atan2Operation, AtomId, AxisIndexOperation, BatchAxis, BatchableOperation,
+        BatchingContext, CalleeRegionDriver, CaptureReference, CollectiveOptions, CompareOperation,
+        ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
+        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation, CustomFunctionJvpRule,
+        CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        DimensionToScalarOperation, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation,
+        DynamicArrayExtentBatchingPolicy, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
+        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        OneOperation, ParallelAllGatherOperation, ParallelAllGatherOutputVariance, ParallelAllToAllOperation,
+        ParallelPermuteOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation, Program,
+        ProgramBuilder, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+        ReferenceWrite, ReferenceWriteOperation, Reshape, ReshapeOperation, RngBitGeneratorOperation,
+        ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+        ScatterOptions, SelectOperation, ShardMap, ShardMapOperation, Sharding, ShardingDimension, SliceOperation,
+        SortDirection, SortOperation, StagingContext, StaticShape, SubOperation, TracingContext, Value, WhileOperation,
+        ZeroOperation, batch, shard_map, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6848,6 +6835,7 @@ mod tests {
     use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
 
     use super::*;
+    use crate::operations::jit_call::JitCallOperation;
 
     /// Checks compiled basic and broadcast advanced reads and repeated indexed updates on the provided backend.
     fn assert_compiled_indexing(client: &Client<'_>) {
@@ -8288,7 +8276,7 @@ mod tests {
 
         let from_scalar = domain
             .bind(
-                ryft_core::DimensionFromScalarOperation::new(output.r#type().variable().clone()),
+                ryft_core::DimensionFromScalarOperation::for_type(output.r#type().into_owned()),
                 Vec::new(),
                 &[XlaValue::Array(scalar)],
             )
@@ -8369,7 +8357,7 @@ mod tests {
         let third_input = builder.add_input(input_type.clone().into());
         let first = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(first_type.variable().clone()),
+                DimensionFromScalarOperation::new(first_type.variable().unwrap().clone()),
                 Vec::new(),
                 vec![first_input],
                 None,
@@ -8377,7 +8365,7 @@ mod tests {
             .unwrap()[0];
         let second = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(second_type.variable().clone()),
+                DimensionFromScalarOperation::new(second_type.variable().unwrap().clone()),
                 Vec::new(),
                 vec![second_input],
                 None,
@@ -8385,7 +8373,7 @@ mod tests {
             .unwrap()[0];
         let third = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(third_type.variable().clone()),
+                DimensionFromScalarOperation::new(third_type.variable().unwrap().clone()),
                 Vec::new(),
                 vec![third_input],
                 None,
@@ -8464,7 +8452,7 @@ mod tests {
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.variable().clone()),
+                    DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
                     Vec::new(),
                     vec![left_input],
                     None,
@@ -8472,7 +8460,7 @@ mod tests {
                 .unwrap()[0];
             let right = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.variable().clone()),
+                    DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
                     Vec::new(),
                     vec![right_input],
                     None,
@@ -9066,7 +9054,7 @@ mod tests {
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.variable().clone()),
+                    DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
                     Vec::new(),
                     vec![left_input],
                     None,
@@ -9074,7 +9062,7 @@ mod tests {
                 .unwrap()[0];
             let right = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.variable().clone()),
+                    DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
                     Vec::new(),
                     vec![right_input],
                     None,
@@ -9133,7 +9121,7 @@ mod tests {
 
     #[test]
     fn test_compiled_dimension_assertion_does_not_merge_ordered_io_chains_on_cpu() {
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -9155,7 +9143,7 @@ mod tests {
             .unwrap();
         let left = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(left_type.variable().clone()),
+                DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
                 Vec::new(),
                 vec![left_input],
                 None,
@@ -9163,7 +9151,7 @@ mod tests {
             .unwrap()[0];
         let right = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(right_type.variable().clone()),
+                DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
                 Vec::new(),
                 vec![right_input],
                 None,
@@ -12336,6 +12324,83 @@ mod tests {
         let four = execute(&[true, true, true, true]);
         assert_eq!(four[0].shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, &four[0]), vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_data_derived_prefix_slice_executes_with_duplicate_and_equal_outputs() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaSession::new(&client).domain().with_mesh(mesh.clone());
+        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(input_sharding.clone())
+            .unwrap();
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(input_sharding)
+            .unwrap();
+        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
+
+        // XLA merges bounded dynamic results that it proves equal and, on CPU, fills the duplicate result with a plain
+        // copy that leaves its runtime-size trailer at zero (CUDA preserves the trailer). The program returns the same
+        // prefix slice twice and then an equal slice staged separately, which covers duplicate entry results and
+        // results merged by XLA's CSE.
+        let mut builder = XlaProgramBuilder::new();
+        let mask = builder.add_input(mask_type.into());
+        let values = builder.add_input(values_type.into());
+        let mask = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
+                Vec::new(),
+                vec![mask],
+                None,
+            )
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)
+            .unwrap()[0];
+        let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
+        let mut prefix = || {
+            builder
+                .add_instruction(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                    Vec::new(),
+                    vec![values, start, count],
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let output = prefix();
+        let equal_output = prefix();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output, output, equal_output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let execute = |mask: &[bool]| {
+            domain.execute_xla_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
+        };
+
+        let two = execute(&[true, false, true, false]);
+        assert_eq!(two.len(), 3);
+        for output in &two {
+            assert_eq!(output.shape(), StaticShape::new(vec![2]));
+            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0]);
+        }
+        let four = execute(&[true, true, true, true]);
+        assert_eq!(four.len(), 3);
+        for output in &four {
+            assert_eq!(output.shape(), StaticShape::new(vec![4]));
+            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0, 30.0, 40.0]);
+        }
     }
 
     #[test]
@@ -15569,9 +15634,9 @@ mod tests {
         negate(&sibling, vector.clone().associate(&sibling).unwrap());
         assert_eq!(misses(&domain), 5);
 
-        // Dimension inputs are keyed by their values (their extents and dimension identities), because eager binding
-        // bakes them into the traced program and the output types refer to their identities. Dynamic reshapes execute
-        // on a single device, so this part uses a single-device session.
+        // Dimension inputs are keyed by their extents, because eager binding bakes them into the traced program as
+        // constants of exact types. Dynamic reshapes execute on a single device, so this part uses a single-device
+        // session.
         let single_device_client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
@@ -15595,10 +15660,10 @@ mod tests {
         let four = DimensionValue::constant(4).unwrap();
         assert_eq!(program_array(&reshape(&one, &four)).shape().as_slice(), &[1, 4]);
         assert_eq!(misses(&single_device_domain), 2);
-        // A fresh dimension identity with the same extent is a different key.
+        // A separately created dimension value with the same extent, and hence a distinct identity, is the same key.
         let other_rows = DimensionValue::constant(2).unwrap();
         assert_eq!(program_array(&reshape(&other_rows, &columns)).shape().as_slice(), &[2, 2]);
-        assert_eq!(misses(&single_device_domain), 3);
+        assert_eq!(misses(&single_device_domain), 2);
     }
 
     #[test]
@@ -15620,6 +15685,38 @@ mod tests {
         let output = program_array(&output);
         assert_eq!(output.shape().as_slice(), &[2, 2]);
         assert_eq!(read_f32s(&client, output), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_defines_separate_constants_for_distinct_dimension_identities() {
+        // Dimension values compare by extent, but each distinct identity still needs its own constant, because a
+        // constant defines its identity and the operation's type refers to both identities.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let domain = XlaSession::new(&client).domain();
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let rows = DimensionVariable::new("rows", bounds);
+        let columns = DimensionVariable::new("columns", bounds);
+        let operation = OneOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
+        ));
+        let inputs = [
+            XlaValue::Dimension(XlaDimension::new(
+                DimensionValue::new(DimensionType::from(rows), 2).unwrap(),
+                domain.clone(),
+            )),
+            XlaValue::Dimension(XlaDimension::new(
+                DimensionValue::new(DimensionType::from(columns), 2).unwrap(),
+                domain.clone(),
+            )),
+        ];
+        let output = domain.bind(operation, Vec::new(), &inputs).unwrap().remove(0);
+        let output = program_array(&output);
+        assert_eq!(output.shape().as_slice(), &[2, 2]);
+        assert_eq!(read_f32s(&client, output), vec![1.0; 4]);
     }
 
     #[test]
@@ -15702,13 +15799,13 @@ mod tests {
         assert_eq!(hash_of(borrowed_key), query_hash);
         assert_eq!(hash_of(&key), query_hash);
 
-        // Compilation options are compared by identity, and every other component by value.
+        // Compilation options are compared by identity, and every other component by value (dimensions by extent).
         let other_options = Arc::new(domain.compilation_options.as_ref().clone());
         let other_options_query = XlaEagerDispatchQuery { compilation_options: &other_options, ..query };
         assert!(borrowed_key != &other_options_query as &dyn XlaEagerDispatchKeyView);
         let other_inputs = [
             inputs[0].clone(),
-            XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(2).unwrap(), domain.clone())),
+            XlaValue::Dimension(XlaDimension::new(DimensionValue::constant(3).unwrap(), domain.clone())),
         ];
         let other_inputs_query = XlaEagerDispatchQuery { inputs: &other_inputs, ..query };
         assert!(borrowed_key != &other_inputs_query as &dyn XlaEagerDispatchKeyView);
@@ -16280,8 +16377,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaSession::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let length =
-            DimensionValue::new(DimensionType::new("length", DimensionBounds::new(0, Some(9)).unwrap()), 3).unwrap();
+        let length_type = DimensionType::new("length", DimensionBounds::new(0, Some(9)).unwrap());
+        let length = DimensionValue::new(length_type.clone(), 3).unwrap();
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
@@ -16301,7 +16398,7 @@ mod tests {
         // An unroll factor that does not divide the runtime length runs the remaining iterations in a second loop, and
         // factors beyond the length's upper bound are clamped to it.
         for unroll in [1, 2, 4, usize::MAX] {
-            let scan = ScanOperation::new(1, length.r#type().to_dimension()).with_unroll(unroll).unwrap();
+            let scan = ScanOperation::new(1, length_type.to_dimension()).with_unroll(unroll).unwrap();
             let outputs = domain
                 .bind(
                     XlaOperation::Scan(scan),
@@ -16614,7 +16711,7 @@ mod tests {
     /// CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so there the
     /// chain is proven through submission order and barrier completion alone.
     fn assert_xla_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
-        use crate::experimental::debugging::with_captured_prints;
+        use crate::operations::debugging::with_captured_prints;
         use ryft_core::Print;
 
         let mesh = domain_mesh(client, "x", 1);
@@ -16701,7 +16798,7 @@ mod tests {
     /// an outstanding predecessor token that is released only afterwards; refer to
     /// [`assert_xla_session_array_ordered_effects`] for why that fixture is CPU-only.
     fn assert_xla_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let mesh = domain_mesh(client, "x", 1);
         let session = XlaSession::new(client);
@@ -16784,7 +16881,7 @@ mod tests {
 
     #[test]
     fn test_xla_domain_device_ordered_effects_preserve_per_device_dependencies() {
-        use crate::experimental::debugging::{
+        use crate::operations::debugging::{
             PRINT_CUSTOM_CALL_TARGET, ensure_print_handler_registered, with_captured_prints,
         };
 
@@ -16924,7 +17021,7 @@ mod tests {
     fn assert_eager_bind_executes_print_effect(client: &Client<'_>) {
         use ryft_core::PrintOperation;
 
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let mesh = domain_mesh(client, "x", 1);
         let domain = array_domain(client);
@@ -16964,7 +17061,7 @@ mod tests {
     fn test_batched_print_executes_on_cpu() {
         use ryft_core::Print;
 
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

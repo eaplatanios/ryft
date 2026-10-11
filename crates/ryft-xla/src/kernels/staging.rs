@@ -23,10 +23,11 @@ use ryft_core::{
     RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
     TypeError, TypeIdentityRenaming, Typed, Value,
 };
+use ryft_mlir::ValueRef;
 
-use crate::XlaTarget;
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
+use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer, XlaTarget};
 
 /// Adapter operation families enabled in this XLA integration.
 ///
@@ -520,6 +521,20 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
             self.name(),
         ))
         .into())
+    }
+}
+
+impl LowerableOperation for XlaKernelOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        _lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        _input_values: &[ValueRef<'b, 'c, 't>],
+        _input_types: &[ArrayIrType],
+        _output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        Err(LoweringError::UnsupportedOp {
+            op: format!("unselected kernel operation `{}` requires an explicit XLA compiler binding", self.name()),
+        })
     }
 }
 
@@ -2284,7 +2299,7 @@ pub(crate) mod tests {
     fn test_select_kernels_preserves_call_and_rematerialization_regions() {
         use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
 
-        use crate::experimental::ops::JitCallOperation;
+        use crate::operations::jit_call::JitCallOperation;
 
         let definition = differentiable_definition();
         let body = kernel_primal(&definition).unwrap();

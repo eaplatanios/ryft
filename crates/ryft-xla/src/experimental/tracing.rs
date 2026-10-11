@@ -8,7 +8,7 @@
 //! [`shard_map`](mod@ryft_core::operations::sharding::shard_map) module of `ryft-core`, and its manual computations
 //! lower to Shardy `sdy.manual_computation` operations in the [`lowering`] module, which also lowers
 //! [`TracedShardMap`](ryft_core::TracedShardMap)s traced for [`XlaDomain`] directly through
-//! [`to_mlir_module`](crate::experimental::lowering::to_mlir_module).
+//! [`to_mlir_module`](crate::operations::sharding::shard_map::to_mlir_module).
 
 use std::cell::RefCell;
 
@@ -561,7 +561,7 @@ mod tests {
     fn test_traced_xla_program_effectful_dead_shard_map_executes_on_cpu() {
         use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput};
 
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
@@ -1308,7 +1308,7 @@ mod tests {
             )
             .unwrap();
         // Recovering the dimension residual in the tangent body checks its bounds with a runtime assertion.
-        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
         let executable = client
             .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
             .unwrap();
