@@ -1,4 +1,5 @@
 use std::borrow::{Borrow, Cow};
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -129,14 +130,21 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     ///
     /// # Parameters
     ///
-    ///   - `declared`: Complete formal type signature declared by the program or region boundary.
-    ///   - `actual`: Corresponding type signature supplied at the instantiation site.
+    ///   - `declared`: Borrowed types of the complete signature declared by the program or region boundary.
+    ///   - `actual`: Corresponding borrowed types supplied at the instantiation site.
     #[inline]
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        Self::Refinements::establish(declared.iter(), actual.iter())?;
+    fn derive_identity_renaming<
+        't,
+        D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+    >(
+        declared: D,
+        actual: A,
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+    where
+        Self: 't,
+    {
+        Self::Refinements::establish(declared, actual)?;
         Ok(TypeIdentityRenaming::new())
     }
 
@@ -280,7 +288,7 @@ impl<'o, I: TypeIdentity> TypeIdentityClass<'o, I> {
 ///
 /// The facts hold for one invocation only, conditional on its entry check. They never mutate a caller identity and
 /// never justify dropping an entry check; relationships that the actual types leave unproven still need the boundary or
-/// an [`EntryGuardOperation`](crate::EntryGuardOperation).
+/// an [`GuardOperation`](crate::GuardOperation).
 pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// Establishes the refinement facts of one invocation from the complete `actual` input signature relative to the
     /// corresponding `declared` signature. Each pair must first be admissible on its own (i.e., `actual` must refine
@@ -300,7 +308,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
 
     /// Establishes the refinement facts of `actual` relative to `declared` types whose identities are _local_ to the
     /// consumer that declares them, such as the declared types of an
-    /// [`EntryGuardOperation`](crate::EntryGuardOperation), which name relationships rather than identities of the
+    /// [`GuardOperation`](crate::GuardOperation), which name relationships rather than identities of the
     /// surrounding program. Unlike [`Self::establish`], any actual identity may then enter a declared identity, which
     /// links the two as first-class dimension members are linked, provided that the declared bounds contain the
     /// actual bounds, so that a consistent renaming of the surrounding program (e.g., from `n` to `m`) never changes
@@ -534,14 +542,14 @@ impl<V: Typed + ?Sized> Typed for &V {
 
 /// Returns the declared type identities whose relationships are not proven by the supplied input types. For example,
 /// `[f32[n], f32[n]]` declares that two arrays have the same length. Actual types `[f32[3], f32[3]]` prove that
-/// relationship, while `[f32[n], f32[3]]` leave the first array's length unknown. A transform that removes the boundary
-/// must preserve its runtime check, either by retaining the boundary or by emitting an
-/// [`EntryGuardOperation`](crate::EntryGuardOperation).
+/// relationship, while `[f32[n], f32[3]]` leave the first array's length unknown. A transform that removes the
+/// boundary must preserve its runtime check, either by retaining the boundary or by emitting a
+/// [`GuardOperation`](crate::GuardOperation).
 ///
 /// A relationship is proven when one consistent structural substitution, as determined by
 /// [`Type::derive_identity_renaming`], instantiates every occurrence of its identity. `actual` must align with
-/// `declared` and use [`Some`] for available types, including symbolic types, and [`None`] for unavailable types.
-/// An unavailable type leaves every identity carried by its corresponding declared type unproven.
+/// `declared` and use [`Some`] with a borrowed type for available types, including symbolic types, and [`None`] for
+/// unavailable types. An unavailable type leaves every identity carried by its corresponding declared type unproven.
 ///
 /// The result contains each unproven identity once, in the order it first appears in `declared`. The analysis is
 /// _conservative_ meaning that a member carrying several identities can cause one to be reported because another is
@@ -564,14 +572,14 @@ impl<V: Typed + ?Sized> Typed for &V {
 /// let declared = [symbolic.clone(), symbolic.clone()];
 ///
 /// // The first input may have a different length, so removing the boundary would lose a runtime check.
-/// let mixed = [Some(symbolic), Some(exact.clone())];
+/// let mixed = [Some(&symbolic), Some(&exact)];
 /// assert_eq!(unproven_type_identities(&declared, &mixed).unwrap(), vec![length]);
 ///
 /// // Both types now prove length three, so this relationship needs no runtime boundary check.
-/// let proven = [Some(exact.clone()), Some(exact)];
+/// let proven = [Some(&exact), Some(&exact)];
 /// assert!(unproven_type_identities(&declared, &proven).unwrap().is_empty());
 /// ```
-pub fn unproven_type_identities<T: Type>(declared: &[T], actual: &[Option<T>]) -> Result<Vec<T::Identity>, TypeError> {
+pub fn unproven_type_identities<T: Type>(declared: &[T], actual: &[Option<&T>]) -> Result<Vec<T::Identity>, TypeError> {
     if declared.len() != actual.len() {
         return Err(TypeError::invalid(format!(
             "declared type count {} does not match actual type count {}",
@@ -579,29 +587,56 @@ pub fn unproven_type_identities<T: Type>(declared: &[T], actual: &[Option<T>]) -
             actual.len(),
         )));
     }
-    let mut identities = Vec::<T::Identity>::new();
-    for r#type in declared {
+
+    if declared.iter().all(|r#type| r#type.identities().next().is_none()) {
+        return Ok(Vec::new());
+    }
+
+    // A successful complete match proves every identity without constructing per-identity member groups.
+    let is_complete_match = actual
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .map(|actual| T::derive_identity_renaming(declared, actual).is_ok());
+    if is_complete_match == Some(true) {
+        return Ok(Vec::new());
+    }
+
+    // Record each identity's member positions once, preserving declaration order and repeated axes within a member.
+    let mut identities = Vec::<(&T::Identity, Vec<usize>)>::new();
+    for (index, r#type) in declared.iter().enumerate() {
         for (_, identity) in r#type.identities() {
-            if !identities.contains(identity) {
-                identities.push(identity.clone());
+            match identities.iter_mut().find(|(carried, _)| *carried == identity) {
+                Some((_, members)) => {
+                    if members.last() != Some(&index) {
+                        members.push(index);
+                    }
+                }
+                None => identities.push((identity, vec![index])),
             }
         }
     }
-    identities.retain(|identity| {
-        let mut members_declared = Vec::new();
-        let mut members_actual = Vec::new();
-        for (declared, actual) in declared.iter().zip(actual) {
-            if declared.identities().any(|(_, carried)| carried == identity) {
-                let Some(actual) = actual else {
-                    return true;
-                };
-                members_declared.push(declared.clone());
-                members_actual.push(actual.clone());
-            }
-        }
-        T::derive_identity_renaming(&members_declared, &members_actual).is_err()
-    });
-    Ok(identities)
+
+    // Identities carried by the same members have the same conservative result. Compare those members only once.
+    let mut proven_members = HashMap::new();
+    Ok(identities
+        .into_iter()
+        .filter_map(|(identity, members)| {
+            let proven = *proven_members.entry(members).or_insert_with_key(|members| {
+                // This group is the complete signature, so its failed comparison has already been performed.
+                if is_complete_match == Some(false) && members.len() == declared.len() {
+                    return false;
+                }
+                members.iter().all(|&index| actual[index].is_some())
+                    && T::derive_identity_renaming(
+                        members.iter().map(|&index| &declared[index]),
+                        members.iter().map(|&index| actual[index].unwrap()),
+                    )
+                    .is_ok()
+            });
+            (!proven).then(|| identity.clone())
+        })
+        .collect())
 }
 
 /// Zips one complete declared/actual [`Type`] signature and applies `visitor` to each corresponding pair, rejecting
@@ -732,19 +767,22 @@ mod tests {
         let symbolic = |variable: &DimensionVariable| vector(Dimension::Dynamic(variable.clone()));
         let exact = vector(Dimension::Static(3));
         let declared = [symbolic(&n), symbolic(&n), symbolic(&p)];
+        let actual_n = symbolic(&n);
+        let actual_m = symbolic(&m);
+        let actual_p = symbolic(&p);
 
         // One structural substitution proves `n`, whether it renames `n` or fixes it to a static extent.
-        let renamed = [Some(symbolic(&m)), Some(symbolic(&m)), Some(symbolic(&p))];
+        let renamed = [Some(&actual_m), Some(&actual_m), Some(&actual_p)];
         assert_eq!(unproven_type_identities(&declared, &renamed), Ok(Vec::<DimensionVariable>::new()));
-        let fixed = [Some(exact.clone()), Some(exact.clone()), Some(symbolic(&p))];
+        let fixed = [Some(&exact), Some(&exact), Some(&actual_p)];
         assert_eq!(unproven_type_identities(&declared, &fixed), Ok(Vec::<DimensionVariable>::new()));
 
         // Mixed or conflicting occurrences, and unknown entries, leave `n` to the boundary, while `p` stays proven.
-        let mixed = [Some(symbolic(&n)), Some(exact.clone()), Some(symbolic(&p))];
+        let mixed = [Some(&actual_n), Some(&exact), Some(&actual_p)];
         assert_eq!(unproven_type_identities(&declared, &mixed), Ok(vec![n.clone()]));
-        let conflicting = [Some(symbolic(&m)), Some(symbolic(&n)), Some(symbolic(&p))];
+        let conflicting = [Some(&actual_m), Some(&actual_n), Some(&actual_p)];
         assert_eq!(unproven_type_identities(&declared, &conflicting), Ok(vec![n.clone()]));
-        let unknown = [Some(symbolic(&n)), None, Some(symbolic(&p))];
+        let unknown = [Some(&actual_n), None, Some(&actual_p)];
         assert_eq!(unproven_type_identities(&declared, &unknown), Ok(vec![n.clone()]));
 
         // Unavailable types preserve the distinct identities' declaration order; empty signatures have none.
@@ -752,7 +790,7 @@ mod tests {
         assert_eq!(unproven_type_identities::<ArrayType>(&[], &[]), Ok(Vec::new()));
 
         // This query does not validate scalar admissibility, even when it finds no identity relationship to preserve.
-        assert_eq!(unproven_type_identities(&[DataType::F32], &[Some(DataType::I32)]), Ok(Vec::new()));
+        assert_eq!(unproven_type_identities(&[DataType::F32], &[Some(&DataType::I32)]), Ok(Vec::new()));
 
         // Reject both missing and extra actual entries instead of silently truncating the signature walk.
         assert_eq!(
