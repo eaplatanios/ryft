@@ -2,6 +2,19 @@ use std::fmt::{Debug, Display};
 
 use crate::programs::types::TypeError;
 
+/// Role of a [`TypeIdentity`] in one invocation's type-refinement facts. Declared and actual occurrences of the same
+/// identity are distinct nodes, related only by correspondences admitted when matching the invocation's types. Note
+/// that [`TypeIdentityKind`]s belong to identity occurrences in comparisons and not permanently to the identities
+/// themselves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeIdentityKind {
+    /// Identity interpreted in the invoked program's declared scope, including its intermediate and output types.
+    Declared,
+
+    /// Identity interpreted in the scope of the actual supplied input types.
+    Actual,
+}
+
 /// Nominal identity embedded in [`Program`](crate::Program) [`Type`](crate::Type) metadata. A nominal identity records
 /// that repeated metadata occurrences denote the same unknown runtime quantity. It is distinct from a Single Static
 /// Assignment (SSA) atom identity in that types retain it before any value-producing instruction exists, while
@@ -176,6 +189,93 @@ impl<I: TypeIdentity> TypeIdentitySignature<I> {
     }
 }
 
+/// A borrowed view of a connected group of scoped [`TypeIdentity`]s that must denote the same runtime quantity for
+/// an invocation's type contract to hold. A scoped identity is an identity together with its [`TypeIdentityKind`].
+/// The same identity object can have both roles without relating those two occurrences.
+/// [`TypeRefinements::identity_classes`](crate::TypeRefinements::identity_classes) exposes these groups
+/// so that consumers can preserve relationships between identities even when their values are unknown.
+///
+/// Each corresponding pair of input types can connect declared and actual identities. Classes contain all identities
+/// connected transitively, rather than one class per input pair. For example:
+///
+/// ```text
+/// declared types: [dimension<n>, dimension<p>]
+/// actual types:   [dimension<m>, dimension<m>]
+///
+/// first input:           declared n <-> actual m
+/// second input:          declared p <-> actual m
+///
+/// single identity class: declared n <-> actual m <-> declared p
+/// ```
+///
+/// Both connections reach the same actual `m`, so the class has declared members `[n, p]` and actual members `[m]`.
+/// These member lists are not parallel signatures or positional pairs. In contrast, swapping two identities gives
+/// two independent classes, because declared `m` and actual `m` are different scoped identities:
+///
+/// ```text
+/// declared types:        [dimension<n>, dimension<m>]
+/// actual types:          [dimension<m>, dimension<n>]
+///
+/// first input:           declared n <-> actual m
+/// second input:          declared m <-> actual n
+///
+/// first identity class:  declared n <-> actual m
+/// second identity class: declared m <-> actual n
+/// ```
+///
+/// A class can relate identities without determining their value. Adding a third declared input `f32[n]` and actual
+/// input `f32[2]` to the first example determines extent `2` for its entire class, making [`Self::is_exact`] `true`.
+/// This means that the refinement facts determine one exact value. It does not mean the runtime check has executed,
+/// that every containing type is fully static, or that consumers must erase symbolic identities.
+///
+/// Members are in first-observation order within each scope. Connections must be admitted by the type family;
+/// unrelated identities do not join merely because they have equal exact values. All relationships and refinement
+/// facts are conditional on the invocation satisfying its contract. This view neither performs nor proves that check.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TypeIdentityClass<'o, I: TypeIdentity> {
+    /// Identities of the declared signature in this class.
+    declared: &'o [I],
+
+    /// Identities of the supplied signature in this class.
+    actual: &'o [I],
+
+    /// Whether the invocation fixes this class to an exact refinement.
+    exact: bool,
+}
+
+impl<'o, I: TypeIdentity> TypeIdentityClass<'o, I> {
+    /// Creates a new [`TypeIdentityClass`] with the provided scoped members and exactness.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Declared identities, in first-observation order.
+    ///   - `actual`: Supplied identities, in first-observation order.
+    ///   - `exact`: Whether the invocation fixes this class to an exact refinement.
+    #[inline]
+    pub fn new(declared: &'o [I], actual: &'o [I], exact: bool) -> Self {
+        Self { declared, actual, exact }
+    }
+
+    /// Returns the declared identities in first-observation order.
+    #[inline]
+    pub fn declared(&self) -> &'o [I] {
+        self.declared
+    }
+
+    /// Returns the supplied identities in first-observation order.
+    #[inline]
+    pub fn actual(&self) -> &'o [I] {
+        self.actual
+    }
+
+    /// Returns whether the invocation's refinement facts determine one exact value for this class's shared quantity.
+    /// This fact is conditional on satisfying the invocation's contract, not evidence that its runtime check ran.
+    #[inline]
+    pub fn is_exact(&self) -> bool {
+        self.exact
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Display;
@@ -277,5 +377,16 @@ mod tests {
                 "fresh replacement for type identity `identity` collides with an existing type identity",
             )),
         );
+    }
+
+    #[test]
+    fn test_type_identity_class() {
+        let declared = [TestIdentity::new("declared")];
+        let actual = [TestIdentity::new("actual")];
+        let class = TypeIdentityClass::new(&declared, &actual, true);
+        assert_eq!(class.declared(), &declared);
+        assert_eq!(class.actual(), &actual);
+        assert!(class.is_exact());
+        assert!(!TypeIdentityClass::new(&declared, &[], false).is_exact());
     }
 }

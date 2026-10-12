@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::errors::CustomError;
 use crate::parameters::Parameter;
-use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::identities::{TypeIdentity, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming};
 
 /// Represents errors produced while inferring or validating [`Type`]s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -212,61 +212,6 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     #[inline]
     fn is_reference(&self) -> bool {
         false
-    }
-}
-
-/// A borrowed view of a group of [`TypeIdentity`]s that must describe the same value for an invocation's entry
-/// contract to hold. The group contains identities from the declared input types and from the actual supplied types.
-/// [`TypeRefinements::identity_classes`] exposes these groups so that consumers can preserve relationships between
-/// identities even when their exact values are unknown.
-///
-/// For example, entering declared types `[dimension<n>, dimension<p>]` with actual types `[dimension<m>,
-/// dimension<m>]` relates both `n` and `p` to `m`. The resulting class contains declared identities `[n, p]` and actual
-/// identities `[m]`. None of their extents needs to be known. If another input establishes that `n` has extent `2`, the
-/// entire class has that extent and [`Self::is_exact`] returns `true`.
-///
-/// Declared and actual identities belong to separate scopes, even when the same identity object occurs in both.
-/// Members are in first-observation order within each scope. Groups connect through correspondences admitted by the
-/// type family; unrelated identities do not join merely because they have equal exact values. The relationships
-/// describe what the entry contract requires (i.e., this view does not perform or prove the runtime entry check).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct TypeIdentityClass<'o, I: TypeIdentity> {
-    /// Identities of the declared signature in this class.
-    declared: &'o [I],
-
-    /// Identities of the supplied signature in this class.
-    actual: &'o [I],
-
-    /// Whether the invocation fixes this class to an exact refinement.
-    exact: bool,
-}
-
-// TODO(eaplatanios): Review this.
-impl<'o, I: TypeIdentity> TypeIdentityClass<'o, I> {
-    /// Creates a semantic view of one class with the provided scoped members and exactness.
-    ///
-    /// # Parameters
-    ///
-    ///   - `declared`: Declared identities, in first-observation order.
-    ///   - `actual`: Supplied identities, in first-observation order.
-    ///   - `exact`: Whether the invocation fixes this class to an exact refinement.
-    pub fn new(declared: &'o [I], actual: &'o [I], exact: bool) -> Self {
-        Self { declared, actual, exact }
-    }
-
-    /// Returns the declared identities in first-observation order.
-    pub fn declared(&self) -> &'o [I] {
-        self.declared
-    }
-
-    /// Returns the supplied identities in first-observation order.
-    pub fn actual(&self) -> &'o [I] {
-        self.actual
-    }
-
-    /// Returns whether the invocation determines an exact refinement for this class.
-    pub fn is_exact(&self) -> bool {
-        self.exact
     }
 }
 
@@ -704,24 +649,13 @@ mod tests {
     }
 
     #[test]
-    fn test_type_identity_class() {
-        let declared = [DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap())];
-        let actual = [DimensionVariable::new("actual", DimensionBounds::non_negative(Some(8)).unwrap())];
-        let class = TypeIdentityClass::new(&declared, &actual, true);
-        assert_eq!(class.declared(), &declared);
-        assert_eq!(class.actual(), &actual);
-        assert!(class.is_exact());
-        assert!(!TypeIdentityClass::new(&declared, &[], false).is_exact());
-        assert_eq!(<() as TypeRefinements<DataType>>::identity_classes(&()).count(), 0);
-    }
-
-    #[test]
     fn test_type_refinements() {
         let refinements = <() as TypeRefinements<DataType>>::establish(
             [DataType::F32, DataType::I32].iter(),
             [DataType::F32, DataType::I32].iter(),
         )
         .unwrap();
+        assert_eq!(<() as TypeRefinements<DataType>>::identity_classes(&refinements).count(), 0);
         assert_eq!(
             <() as TypeRefinements<DataType>>::validate(
                 &refinements,
