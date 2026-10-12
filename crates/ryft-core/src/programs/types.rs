@@ -226,13 +226,13 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// in two scopes that are never merged, even when the same identity object occurs on both sides: _formal_ facts about
 /// the declared [`TypeIdentity`]s, which [`Self::refine_declared`] applies to declared, intermediate, and output types
 /// and against which [`Self::validate`] checks outputs, and _actual_ facts about the identities of the supplied types,
-/// which [`Self::refine_actual`] applies to those supplied input types. [`TypeIdentity`]s produced inside the
-/// [`Program`](crate::Program) or [`Region`](crate::Region) may establish additional output facts, while unrelated,
-/// unbound output identities are rejected.
+/// which [`Self::refine_actual`] applies to those supplied input types. [`TypeIdentity`]s produced inside
+/// [`Program`](crate::Program)s or [`Region`](crate::Region)s may establish additional output facts, while
+/// unrelated, unbound output identities are rejected.
 ///
 /// The facts hold for one invocation only, conditional on its entry check. They never mutate a caller identity and
-/// never justify dropping an entry check; relationships that the actual types leave unproven still need the boundary or
-/// an [`GuardOperation`](crate::GuardOperation).
+/// never justify dropping an entry check; relationships that the actual types leave unproven still need the boundary
+/// or an [`GuardOperation`](crate::GuardOperation).
 pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// Establishes the refinement facts of one invocation from the complete `actual` input signature relative to the
     /// corresponding `declared` signature. Each pair must first be admissible on its own (i.e., `actual` must refine
