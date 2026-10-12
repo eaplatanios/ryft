@@ -237,12 +237,12 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// Establishes the refinement facts of one invocation from the complete `actual` input signature relative to the
     /// corresponding `declared` signature. Each pair must first be admissible on its own (i.e., `actual` must refine
     /// `declared` up to the identity correspondences that the family admits). The facts that the pairs observe directly
-    /// are shared within each connected class of formal/actual identity correspondences, so that, for
-    /// example, entering `[dimension<n>, dimension<p>, f32[n]]` with `[dimension<m>, dimension<m>, f32[2]]` fixes the
-    /// actual `m` and the formal `p` to 2 as well. A class fact that a receiving identity's bounds exclude, or
-    /// that conflicts with another fact about the same identity, is rejected. Correspondences without an exact fact
-    /// (e.g., a repeated formal identity entered by two distinct symbolic actual identities) add no fact; their runtime
-    /// relationship stays the responsibility of the entry check.
+    /// are shared within each connected class of formal/actual identity correspondences, so that, for example, entering
+    /// `[dimension<n>, dimension<p>, f32[n]]` with `[dimension<m>, dimension<m>, f32[2]]` fixes the actual `m` and the
+    /// formal `p` to 2 as well. A class fact that a receiving identity's bounds exclude, or that conflicts with another
+    /// fact about the same identity, is rejected. Correspondences without an exact fact (e.g., a repeated formal
+    /// identity entered by two distinct symbolic actual identities) add no fact; their runtime relationship stays
+    /// the responsibility of the entry check.
     fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
