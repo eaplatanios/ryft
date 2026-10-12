@@ -215,21 +215,20 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// A borrowed view of a group of type identities that must describe the same value for an invocation's entry
+/// A borrowed view of a group of [`TypeIdentity`]s that must describe the same value for an invocation's entry
 /// contract to hold. The group contains identities from the declared input types and from the actual supplied types.
-/// [`TypeRefinements::identity_classes`] exposes these groups so consumers can preserve relationships between
+/// [`TypeRefinements::identity_classes`] exposes these groups so that consumers can preserve relationships between
 /// identities even when their exact values are unknown.
 ///
-/// For example, entering declared types `[dimension<n>, dimension<p>]` with actual types
-/// `[dimension<m>, dimension<m>]` relates both `n` and `p` to `m`. The resulting class contains declared identities
-/// `[n, p]` and actual identities `[m]`. None of their extents needs to be known. If another input establishes that
-/// `n` has extent `2`, the entire class has that extent and [`Self::is_exact`] returns `true`.
+/// For example, entering declared types `[dimension<n>, dimension<p>]` with actual types `[dimension<m>,
+/// dimension<m>]` relates both `n` and `p` to `m`. The resulting class contains declared identities `[n, p]` and actual
+/// identities `[m]`. None of their extents needs to be known. If another input establishes that `n` has extent `2`, the
+/// entire class has that extent and [`Self::is_exact`] returns `true`.
 ///
 /// Declared and actual identities belong to separate scopes, even when the same identity object occurs in both.
 /// Members are in first-observation order within each scope. Groups connect through correspondences admitted by the
 /// type family; unrelated identities do not join merely because they have equal exact values. The relationships
-/// describe what the entry contract requires: this view does not perform or prove the runtime entry check.
+/// describe what the entry contract requires (i.e., this view does not perform or prove the runtime entry check).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TypeIdentityClass<'o, I: TypeIdentity> {
     /// Identities of the declared signature in this class.
