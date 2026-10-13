@@ -1048,34 +1048,6 @@ impl DimensionRefinements {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Validates that `renaming` preserves every recorded declared extent. A renamed identity's target must have bounds
-    /// fixing it to the recorded extent. Call after comparing the complete signature so the result does not depend on
-    /// the order in which renamings and extents were recorded.
-    pub fn validate_identity_renaming(
-        &self,
-        renaming: &TypeIdentityRenaming<DimensionVariable>,
-    ) -> Result<(), TypeError> {
-        for (variable, extent) in self
-            .classes
-            .iter()
-            .filter_map(|class| class.extent.map(|extent| (class, extent)))
-            .flat_map(|(class, extent)| class.declared.iter().map(move |variable| (variable, extent)))
-        {
-            if let Some(target) = renaming.target(variable) {
-                if target.bounds().extent() == Some(extent) {
-                    continue;
-                }
-                return Err(TypeError::invalid(format!(
-                    "dimension variable {variable} is renamed to {target} by one signature member and bound to \
-                     static extent {extent} by another",
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Returns a declared dimension with its class's exact extent applied, unless its identity is listed in
     /// `preserved_identities` (e.g., identities defined by outputs).
     pub(crate) fn refine_declared_dimension(
@@ -1106,6 +1078,8 @@ impl DimensionRefinements {
             Dimension::Dynamic(_) | Dimension::Static(_) => dimension.clone(),
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the supplied dimension under a retained member of its declared class, or its exact refinement.
     pub(crate) fn retype_actual_dimension(
@@ -1179,7 +1153,26 @@ impl DimensionRefinements {
                 DimensionRefinementFact::Actual(..) => {}
             }
         }
-        refinements.validate_identity_renaming(&renaming)?;
+
+        // Compare renamings with extents after collecting the complete signature so input order does not matter.
+        // If one member renames n to m and another fixes n to 2, m must also have bounds fixing its extent to 2.
+        for (variable, extent) in refinements
+            .classes
+            .iter()
+            .filter_map(|class| class.extent.map(|extent| (class, extent)))
+            .flat_map(|(class, extent)| class.declared.iter().map(move |variable| (variable, extent)))
+        {
+            if let Some(target) = renaming.target(variable) {
+                if target.bounds().extent() == Some(extent) {
+                    continue;
+                }
+                return Err(TypeError::invalid(format!(
+                    "dimension variable {variable} is renamed to {target} by one signature member and bound to \
+                     static extent {extent} by another",
+                )));
+            }
+        }
+
         Ok(renaming)
     }
 
