@@ -11,7 +11,7 @@ use ryft_macros::Parameter;
 
 use crate::axes::Axis;
 use crate::parameters::Parameter;
-use crate::programs::types::visit_type_signature_pairs;
+use crate::programs::types::{type_signature_pairs, visit_type_signature_pairs};
 use crate::programs::{
     ProgramError, Type, TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition,
     TypeIdentityRenaming, TypeRefinements, type_identities_needing_runtime_checks,
@@ -727,22 +727,27 @@ pub struct DimensionTypeRefinements {
 }
 
 impl DimensionTypeRefinements {
-    /// Validates that the first-class dimension type `actual` refines `declared` (i.e., that its bounds lie within the
-    /// declared bounds) and visits the [`DimensionRefinementFact`]s of the pair. Unlike an array axis, a first-class
-    /// dimension admits a differently named actual identity, which links it to the declared one, and identical members
-    /// are always reported, so that an identity with singleton bounds contributes its exact extent. This is the shared
-    /// comparison for first-class dimensions in both [`DimensionTypeRefinements`] and
-    /// [`ArrayIrTypeRefinements`](crate::ArrayIrTypeRefinements). The visitor decides
-    /// whether to record each fact or validate it against existing refinements.
-    pub(crate) fn visit_dimension_type_refinements<'t>(
+    /// Returns the [`DimensionRefinementFact`]s relating the provided [`DimensionType`]s, validating their bounds
+    /// first. Differently named identities are linked, and identical singleton identities contribute their exact
+    /// extent.
+    pub(crate) fn dimension_refinement_facts<'t>(
         declared: &'t DimensionType,
         actual: &'t DimensionType,
-        visitor: &mut impl FnMut(DimensionRefinementFact<'t>) -> Result<(), TypeError>,
-    ) -> Result<(), TypeError> {
-        if !declared.is_refined_by(actual) {
-            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
-        }
-        DimensionRefinements::visit_dimension_refinements(declared.dimension(), actual.dimension(), true, true, visitor)
+    ) -> impl Iterator<Item = Result<DimensionRefinementFact<'t>, TypeError>> {
+        let (error, facts) = if declared.is_refined_by(actual) {
+            (
+                None,
+                Some(DimensionRefinements::dimension_refinement_facts(
+                    declared.dimension(),
+                    actual.dimension(),
+                    true,
+                    true,
+                )),
+            )
+        } else {
+            (Some(TypeError::invalid(format!("type {actual} does not refine declared type {declared}"))), None)
+        };
+        error.into_iter().map(Err).chain(facts.into_iter().flatten())
     }
 }
 
@@ -756,17 +761,10 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
     {
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
-        let dimensions = DimensionRefinements::from_refinement_facts(|visitor| {
-            visit_type_signature_pairs(
-                declared.iter().map(Borrow::borrow),
-                actual.iter().map(Borrow::borrow),
-                |declared, actual| {
-                    Self::visit_dimension_type_refinements(declared, actual, &mut |refinement_fact| {
-                        visitor(refinement_fact)
-                    })
-                },
-            )
-        })?;
+        let dimensions = DimensionRefinements::from_refinement_facts(
+            type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?
+                .flat_map(|(declared, actual)| Self::dimension_refinement_facts(declared, actual)),
+        )?;
         let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
         let unproven = type_identities_needing_runtime_checks::<DimensionType, _>(&declared, &actual)?;
         Ok(Self { dimensions: dimensions.with_identities_needing_runtime_checks(unproven) })
@@ -800,7 +798,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
         // Validation is "declared-only". It checks outputs against the declared facts and never records actual facts.
         let mut refinements = self.dimensions.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_dimension_type_refinements(declared, actual, &mut |refinement_fact| match refinement_fact {
+            Self::dimension_refinement_facts(declared, actual).try_for_each(|refinement_fact| match refinement_fact? {
                 DimensionRefinementFact::Declared(variable, extent) => {
                     refinements.validate_or_bind(variable, extent, closed_identities)
                 }
@@ -815,7 +813,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
         r#type: &DimensionType,
         preserved_identities: &[DimensionVariable],
     ) -> Result<DimensionType, TypeError> {
-        Ok(DimensionType::from(self.dimensions.refine_dimension(r#type.dimension(), preserved_identities)))
+        Ok(DimensionType::from(self.dimensions.refine_declared_dimension(r#type.dimension(), preserved_identities)))
     }
 
     #[inline]
@@ -843,12 +841,11 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
 }
 
 // TODO(eaplatanios): Review this.
-/// Shared dimension-identity facts used by array, first-class dimension, and composite array IR refinements.
-///
-/// The type-specific [`TypeRefinements`] implementations validate their input signatures and collect these facts.
+/// Shared dimension identity facts used by array, first-class dimension, and composite array IR [`TypeRefinements`].
+/// [`Type`]-specific [`TypeRefinements`] implementations validate their input signatures and collect these facts.
 /// Operations can also construct an empty set with [`Default`] and record exact extents with [`Self::bind`] or
 /// [`Self::bind_dimension_input`]. To apply such facts to array types, convert this set into
-/// [`ArrayTypeRefinements`](crate::arrays::types::arrays::ArrayTypeRefinements).
+/// [`ArrayTypeRefinements`](crate::ArrayTypeRefinements).
 ///
 /// Facts are kept in two separate scopes. Formal facts bind identities of the declared signature (e.g., the formal `n`
 /// of a region declared as `f32[n]` that receives an `f32[3]`) and apply to declared, intermediate, and output types
@@ -870,20 +867,122 @@ pub struct DimensionRefinements {
     unproven: Vec<DimensionVariable>,
 }
 
+// TODO(eaplatanios): Review this.
 impl DimensionRefinements {
-    /// Collects validated refinement facts and builds their scoped identity classes as one transaction.
-    pub(crate) fn from_refinement_facts(
-        visit_refinements: impl FnOnce(
-            &mut dyn for<'o> FnMut(DimensionRefinementFact<'o>) -> Result<(), TypeError>,
-        ) -> Result<(), TypeError>,
+    /// Consumes refinement facts in iterator order and builds their scoped identity classes.
+    ///
+    /// Each item contains a borrowed fact or a comparison error. Records each fact immediately and stops on the first
+    /// comparison or recording error. After the iterator is exhausted, connected identities are merged and their
+    /// shared extents are checked against bounds. Stored identities are owned; borrowed facts do not escape construction.
+    pub(crate) fn from_refinement_facts<'t>(
+        facts: impl IntoIterator<Item = Result<DimensionRefinementFact<'t>, TypeError>>,
     ) -> Result<Self, TypeError> {
         let mut refinements = Self::default();
         let mut indices = HashMap::new();
         let mut correspondences = Vec::new();
-        visit_refinements(&mut |refinement_fact| {
-            refinements.record_refinement(refinement_fact, &mut indices, &mut correspondences)
-        })?;
-        refinements.build_classes(&correspondences)?;
+        // Record scoped identities, exact extents, and correspondence edges before joining their classes.
+        for refinement_fact in facts {
+            let refinement_fact = refinement_fact?;
+            let mut index_of = |variable: &DimensionVariable, kind: TypeIdentityKind| {
+                *indices.entry((variable.clone(), kind)).or_insert_with(|| {
+                    let mut class = DimensionIdentityClass::default();
+                    match kind {
+                        TypeIdentityKind::Declared => class.formal.push(variable.clone()),
+                        TypeIdentityKind::Actual => class.actual.push(variable.clone()),
+                    }
+                    refinements.classes.push(class);
+                    refinements.classes.len() - 1
+                })
+            };
+            match refinement_fact {
+                DimensionRefinementFact::Declared(variable, extent) => {
+                    let index = index_of(variable, TypeIdentityKind::Declared);
+                    refinements.bind_class(index, variable, extent, TypeIdentityKind::Declared)?;
+                }
+                DimensionRefinementFact::Actual(variable, extent) => {
+                    let index = index_of(variable, TypeIdentityKind::Actual);
+                    refinements.bind_class(index, variable, extent, TypeIdentityKind::Actual)?;
+                }
+                DimensionRefinementFact::Correspondence(formal, actual) => {
+                    correspondences.push((
+                        index_of(formal, TypeIdentityKind::Declared),
+                        index_of(actual, TypeIdentityKind::Actual),
+                    ));
+                }
+            }
+        }
+
+        // Join linked identities, validate receiving bounds, and preserve recording order in the final classes.
+        let mut parents = (0..refinements.classes.len()).collect::<Vec<_>>();
+        let mut members = (0..refinements.classes.len()).map(|index| vec![index]).collect::<Vec<_>>();
+        let mut extents = refinements.classes.iter().map(|class| class.extent).collect::<Vec<_>>();
+        for &(formal, actual) in &correspondences {
+            let formal_root = Self::root(&mut parents, formal);
+            let actual_root = Self::root(&mut parents, actual);
+            if formal_root == actual_root {
+                continue;
+            }
+            let extent = match (extents[formal_root], extents[actual_root]) {
+                (Some(expected), Some(actual)) if expected != actual => {
+                    return Err(DimensionError::InputDimensionMismatch {
+                        dimension: refinements.classes[formal].formal[0].to_string(),
+                        expected,
+                        actual,
+                    }
+                    .into());
+                }
+                (Some(extent), _) | (_, Some(extent)) => Some(extent),
+                (None, None) => None,
+            };
+            if let Some(extent) = extent {
+                // Each receiving node is checked only when its component first obtains a fact. Diagnose the first
+                // recorded invalid member, independent of union roots and node-list concatenation order.
+                let invalid = [formal_root, actual_root]
+                    .into_iter()
+                    .filter(|&root| extents[root].is_none())
+                    .flat_map(|root| members[root].iter().copied())
+                    .filter(|&index| {
+                        refinements.classes[index]
+                            .formal
+                            .iter()
+                            .chain(&refinements.classes[index].actual)
+                            .any(|variable| !variable.bounds().contains(extent))
+                    })
+                    .min();
+                if let Some(index) = invalid {
+                    let variable = refinements.classes[index]
+                        .formal
+                        .iter()
+                        .chain(&refinements.classes[index].actual)
+                        .next()
+                        .unwrap();
+                    Self::validate_extent(variable, extent)?;
+                }
+            }
+            // Joining the smaller node list into the larger bounds construction work without changing recording
+            // order: final classes are emitted by the original node vector below, never by union roots or hash order.
+            let (root, merged) = if members[formal_root].len() >= members[actual_root].len() {
+                (formal_root, actual_root)
+            } else {
+                (actual_root, formal_root)
+            };
+            parents[merged] = root;
+            let merged_members = std::mem::take(&mut members[merged]);
+            members[root].extend(merged_members);
+            extents[root] = extent;
+        }
+        let mut classes = Vec::<DimensionIdentityClass>::new();
+        let mut positions = vec![None; refinements.classes.len()];
+        for (index, class) in std::mem::take(&mut refinements.classes).into_iter().enumerate() {
+            let root = Self::root(&mut parents, index);
+            let position = *positions[root].get_or_insert_with(|| {
+                classes.push(DimensionIdentityClass { extent: extents[root], ..DimensionIdentityClass::default() });
+                classes.len() - 1
+            });
+            classes[position].formal.extend(class.formal);
+            classes[position].actual.extend(class.actual);
+        }
+        refinements.classes = classes;
         Ok(refinements)
     }
 
@@ -1018,9 +1117,9 @@ impl DimensionRefinements {
         Ok(())
     }
 
-    /// Returns `dimension` with its variable replaced by the static extent that these refinements bind it to, unless
-    /// the variable is listed in `preserved_identities` (e.g., identities defined by outputs).
-    pub(crate) fn refine_dimension(
+    /// Returns a declared dimension with its class's exact extent applied, unless its identity is listed in
+    /// `preserved_identities` (e.g., identities defined by outputs).
+    pub(crate) fn refine_declared_dimension(
         &self,
         dimension: &Dimension,
         preserved_identities: &[DimensionVariable],
@@ -1097,25 +1196,21 @@ impl DimensionRefinements {
         self.refine_actual_dimension(actual, if preserves_actual { preferred_identities } else { &[] })
     }
 
-    /// Reports the [`DimensionRefinementFact`]s of one declared and one actual dimension after checking that the actual
-    /// dimension refines the declared one. A static extent, or an identity whose singleton bounds admit only one
-    /// extent, is exact. A declared identity met by an exact actual dimension is fixed to that extent (and so is the
-    /// actual identity, if any), and a declared identity met by an actual identity is linked to it. Differently named
-    /// identities without an exact extent are admitted only when `admits_renamed` is set, which first-class dimension
-    /// members and scoped declarations allow and ordinary array axes do not, and only when the declared bounds contain
-    /// the actual bounds.
-    pub(crate) fn visit_dimension_refinements<'o>(
-        declared: &'o Dimension,
-        actual: &'o Dimension,
+    /// Returns the refinement facts for one declared and one actual dimension, or their comparison error.
+    /// Differently named identities are admitted only when `admits_renamed` is set and the actual bounds fit within
+    /// the declared bounds. Identical dimensions contribute facts only when `include_identical` is set.
+    pub(crate) fn dimension_refinement_facts<'t>(
+        declared: &'t Dimension,
+        actual: &'t Dimension,
         admits_renamed: bool,
         include_identical: bool,
-        visitor: &mut impl FnMut(DimensionRefinementFact<'o>) -> Result<(), TypeError>,
-    ) -> Result<(), TypeError> {
+    ) -> impl Iterator<Item = Result<DimensionRefinementFact<'t>, TypeError>> {
+        // One pair can establish at most three facts: declared extent, actual extent, and their correspondence.
+        let mut facts = [None, None, None];
         if declared == actual && !include_identical {
-            return Ok(());
+            return facts.into_iter().flatten();
         }
-        // Dimension-valued constructor inputs retain their nominal identities even after specialization proves an
-        // exact extent. Use that concrete proof just as for a static axis while retaining both identities.
+        // Singleton identities supply the same exact extent as static dimensions while retaining their names.
         let (exact_actual, actual_variable) = match actual {
             Dimension::Static(extent) => (Some(*extent), None),
             Dimension::Dynamic(variable) => (variable.bounds().extent(), Some(variable)),
@@ -1125,145 +1220,42 @@ impl DimensionRefinements {
         match (declared, exact_actual, actual_variable) {
             (Dimension::Static(declared_extent), exact_actual, actual_variable) => {
                 if exact_actual != Some(*declared_extent) {
-                    return Err(mismatch());
+                    facts[0] = Some(Err(mismatch()));
+                } else if let Some(actual_variable) = actual_variable {
+                    facts[0] = Some(Ok(DimensionRefinementFact::Actual(actual_variable, *declared_extent)));
                 }
-                if let Some(actual_variable) = actual_variable {
-                    visitor(DimensionRefinementFact::Actual(actual_variable, *declared_extent))?;
-                }
-                Ok(())
             }
             (Dimension::Dynamic(declared_variable), Some(extent), actual_variable) => {
                 if !declared_variable.bounds().contains(extent) {
-                    return Err(DimensionError::BindingOutOfBounds {
+                    facts[0] = Some(Err(DimensionError::BindingOutOfBounds {
                         variable: declared_variable.to_string(),
                         value: extent,
                         bounds: declared_variable.bounds(),
                     }
-                    .into());
+                    .into()));
+                } else {
+                    facts[0] = Some(Ok(DimensionRefinementFact::Declared(declared_variable, extent)));
+                    if let Some(actual_variable) = actual_variable {
+                        facts[1] = Some(Ok(DimensionRefinementFact::Actual(actual_variable, extent)));
+                        facts[2] =
+                            Some(Ok(DimensionRefinementFact::Correspondence(declared_variable, actual_variable)));
+                    }
                 }
-                visitor(DimensionRefinementFact::Declared(declared_variable, extent))?;
-                if let Some(actual_variable) = actual_variable {
-                    visitor(DimensionRefinementFact::Actual(actual_variable, extent))?;
-                    visitor(DimensionRefinementFact::Correspondence(declared_variable, actual_variable))?;
-                }
-                Ok(())
             }
             (Dimension::Dynamic(declared_variable), None, Some(actual_variable)) => {
-                if actual_variable != declared_variable
-                    && (!admits_renamed || !declared_variable.bounds().contains_bounds(actual_variable.bounds()))
-                {
-                    return Err(mismatch());
-                }
-                visitor(DimensionRefinementFact::Correspondence(declared_variable, actual_variable))
+                facts[0] = Some(
+                    if actual_variable != declared_variable
+                        && (!admits_renamed || !declared_variable.bounds().contains_bounds(actual_variable.bounds()))
+                    {
+                        Err(mismatch())
+                    } else {
+                        Ok(DimensionRefinementFact::Correspondence(declared_variable, actual_variable))
+                    },
+                );
             }
-            (Dimension::Dynamic(_), None, None) => Err(mismatch()),
+            (Dimension::Dynamic(_), None, None) => facts[0] = Some(Err(mismatch())),
         }
-    }
-
-    /// Records an exact extent or a correspondence using construction's scoped identity index.
-    fn record_refinement(
-        &mut self,
-        refinement_fact: DimensionRefinementFact<'_>,
-        indices: &mut HashMap<(DimensionVariable, TypeIdentityKind), usize>,
-        correspondences: &mut Vec<(usize, usize)>,
-    ) -> Result<(), TypeError> {
-        let mut index_of = |variable: &DimensionVariable, kind: TypeIdentityKind| {
-            *indices.entry((variable.clone(), kind)).or_insert_with(|| {
-                let mut class = DimensionIdentityClass::default();
-                match kind {
-                    TypeIdentityKind::Declared => class.formal.push(variable.clone()),
-                    TypeIdentityKind::Actual => class.actual.push(variable.clone()),
-                }
-                self.classes.push(class);
-                self.classes.len() - 1
-            })
-        };
-        match refinement_fact {
-            DimensionRefinementFact::Declared(variable, extent) => {
-                let index = index_of(variable, TypeIdentityKind::Declared);
-                self.bind_class(index, variable, extent, TypeIdentityKind::Declared)
-            }
-            DimensionRefinementFact::Actual(variable, extent) => {
-                let index = index_of(variable, TypeIdentityKind::Actual);
-                self.bind_class(index, variable, extent, TypeIdentityKind::Actual)
-            }
-            DimensionRefinementFact::Correspondence(formal, actual) => {
-                correspondences
-                    .push((index_of(formal, TypeIdentityKind::Declared), index_of(actual, TypeIdentityKind::Actual)));
-                Ok(())
-            }
-        }
-    }
-
-    /// Joins the scoped identity nodes once, sharing each class's exact fact and checking receiving bounds.
-    /// Temporary union roots and node lists do not determine class/member order and are discarded after construction.
-    fn build_classes(&mut self, correspondences: &[(usize, usize)]) -> Result<(), TypeError> {
-        let mut parents = (0..self.classes.len()).collect::<Vec<_>>();
-        let mut members = (0..self.classes.len()).map(|index| vec![index]).collect::<Vec<_>>();
-        let mut extents = self.classes.iter().map(|class| class.extent).collect::<Vec<_>>();
-        for &(formal, actual) in correspondences {
-            let formal_root = Self::root(&mut parents, formal);
-            let actual_root = Self::root(&mut parents, actual);
-            if formal_root == actual_root {
-                continue;
-            }
-            let extent = match (extents[formal_root], extents[actual_root]) {
-                (Some(expected), Some(actual)) if expected != actual => {
-                    return Err(DimensionError::InputDimensionMismatch {
-                        dimension: self.classes[formal].formal[0].to_string(),
-                        expected,
-                        actual,
-                    }
-                    .into());
-                }
-                (Some(extent), _) | (_, Some(extent)) => Some(extent),
-                (None, None) => None,
-            };
-            if let Some(extent) = extent {
-                // Each receiving node is checked only when its component first obtains a fact. Diagnose the first
-                // recorded invalid member, independent of union roots and node-list concatenation order.
-                let invalid = [formal_root, actual_root]
-                    .into_iter()
-                    .filter(|&root| extents[root].is_none())
-                    .flat_map(|root| members[root].iter().copied())
-                    .filter(|&index| {
-                        self.classes[index]
-                            .formal
-                            .iter()
-                            .chain(&self.classes[index].actual)
-                            .any(|variable| !variable.bounds().contains(extent))
-                    })
-                    .min();
-                if let Some(index) = invalid {
-                    let variable = self.classes[index].formal.iter().chain(&self.classes[index].actual).next().unwrap();
-                    Self::validate_extent(variable, extent)?;
-                }
-            }
-            // Joining the smaller node list into the larger bounds construction work without changing recording
-            // order: final classes are emitted by the original node vector below, never by union roots or hash order.
-            let (root, merged) = if members[formal_root].len() >= members[actual_root].len() {
-                (formal_root, actual_root)
-            } else {
-                (actual_root, formal_root)
-            };
-            parents[merged] = root;
-            let merged_members = std::mem::take(&mut members[merged]);
-            members[root].extend(merged_members);
-            extents[root] = extent;
-        }
-        let mut classes = Vec::<DimensionIdentityClass>::new();
-        let mut positions = vec![None; self.classes.len()];
-        for (index, class) in std::mem::take(&mut self.classes).into_iter().enumerate() {
-            let root = Self::root(&mut parents, index);
-            let position = *positions[root].get_or_insert_with(|| {
-                classes.push(DimensionIdentityClass { extent: extents[root], ..DimensionIdentityClass::default() });
-                classes.len() - 1
-            });
-            classes[position].formal.extend(class.formal);
-            classes[position].actual.extend(class.actual);
-        }
-        self.classes = classes;
-        Ok(())
+        facts.into_iter().flatten()
     }
 
     /// Finds the class containing `variable` in the requested scope.
@@ -2120,6 +2112,28 @@ mod tests {
     }
 
     #[test]
+    fn test_dimension_refinements_from_refinement_facts() {
+        let empty = std::iter::empty::<Result<DimensionRefinementFact<'_>, TypeError>>();
+        assert_eq!(DimensionRefinements::from_refinement_facts(empty), Ok(DimensionRefinements::default()));
+
+        let error = TypeError::invalid("dimension comparison failed");
+        let facts = std::iter::once(Err(error.clone()))
+            .chain(std::iter::from_fn(|| panic!("facts after a comparison error must not be requested")));
+        assert_eq!(DimensionRefinements::from_refinement_facts(facts), Err(error));
+
+        let variable = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let facts =
+            [Ok(DimensionRefinementFact::Declared(&variable, 2)), Ok(DimensionRefinementFact::Declared(&variable, 3))]
+                .into_iter()
+                .chain(std::iter::from_fn(|| panic!("facts after a recording error must not be requested")));
+        let error = DimensionRefinements::from_refinement_facts(facts).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "length".to_string(), expected: 2, actual: 3 }),
+        );
+    }
+
+    #[test]
     fn test_dimension_refinements() {
         let first = DimensionVariable::new("first", DimensionBounds::non_negative(Some(8)).unwrap());
         let mut isolated = DimensionRefinements::default();
@@ -2134,14 +2148,13 @@ mod tests {
             isolated.identity_classes().collect::<Vec<_>>(),
             vec![TypeIdentityClass::new(std::slice::from_ref(&first), &[], true)],
         );
-        assert_eq!(isolated.refine_dimension(&first.clone().into(), &[]), Dimension::Static(3));
+        assert_eq!(isolated.refine_declared_dimension(&first.clone().into(), &[]), Dimension::Static(3));
 
         // Binding a declared identity does not reuse a fact for the same identity object in the actual scope.
         let mut scoped =
-            DimensionRefinements::from_refinement_facts(|visitor| visitor(DimensionRefinementFact::Actual(&first, 2)))
-                .unwrap();
+            DimensionRefinements::from_refinement_facts([Ok(DimensionRefinementFact::Actual(&first, 2))]).unwrap();
         scoped.bind(&first, 3).unwrap();
-        assert_eq!(scoped.refine_dimension(&first.clone().into(), &[]), Dimension::Static(3));
+        assert_eq!(scoped.refine_declared_dimension(&first.clone().into(), &[]), Dimension::Static(3));
         assert_eq!(scoped.refine_actual_dimension(&first.into(), &[]), Dimension::Static(2));
     }
 
@@ -2149,9 +2162,9 @@ mod tests {
     fn test_dimension_refinements_identity_classes_validate_later_facts() {
         let formal = DimensionVariable::new("formal", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(2)).unwrap());
-        let mut refinements = DimensionRefinements::from_refinement_facts(|visitor| {
-            visitor(DimensionRefinementFact::Correspondence(&formal, &actual))
-        })
+        let mut refinements = DimensionRefinements::from_refinement_facts([Ok(
+            DimensionRefinementFact::Correspondence(&formal, &actual),
+        )])
         .unwrap();
         let error = refinements.bind(&formal, 2).unwrap_err();
         assert_eq!(

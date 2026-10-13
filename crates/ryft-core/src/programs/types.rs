@@ -865,6 +865,27 @@ pub fn type_identities_needing_runtime_checks<T: Type, D: Borrow<T>>(
         .collect())
 }
 
+/// Returns corresponding declared/actual [`Type`] signature members, rejecting different lengths with the canonical
+/// type-count diagnostic. Both iterators are checked before any member is consumed.
+pub(crate) fn type_signature_pairs<
+    D: IntoIterator<IntoIter: ExactSizeIterator>,
+    A: IntoIterator<IntoIter: ExactSizeIterator>,
+>(
+    declared: D,
+    actual: A,
+) -> Result<std::iter::Zip<D::IntoIter, A::IntoIter>, TypeError> {
+    let declared = declared.into_iter();
+    let actual = actual.into_iter();
+    if declared.len() != actual.len() {
+        return Err(TypeError::invalid(format!(
+            "declared type count {} does not match actual type count {}",
+            declared.len(),
+            actual.len(),
+        )));
+    }
+    Ok(declared.zip(actual))
+}
+
 /// Zips one complete declared/actual [`Type`] signature and applies `visitor` to each corresponding pair, rejecting
 /// signatures of different lengths with the canonical count diagnostic. This is the shared driver behind complete
 /// signature walks such as [`TypeRefinements::from_local_declarations`], [`TypeRefinements::validate_refinement`],
@@ -878,16 +899,8 @@ pub(crate) fn visit_type_signature_pairs<
     actual: A,
     mut visitor: impl FnMut(&T, &T) -> Result<(), TypeError>,
 ) -> Result<(), TypeError> {
-    let declared = declared.into_iter();
-    let actual = actual.into_iter();
-    if declared.len() != actual.len() {
-        return Err(TypeError::invalid(format!(
-            "declared type count {} does not match actual type count {}",
-            declared.len(),
-            actual.len(),
-        )));
-    }
-    declared.zip(actual).try_for_each(|(declared, actual)| visitor(declared.borrow(), actual.borrow()))
+    type_signature_pairs(declared, actual)?
+        .try_for_each(|(declared, actual)| visitor(declared.borrow(), actual.borrow()))
 }
 
 #[allow(clippy::let_unit_value)]
