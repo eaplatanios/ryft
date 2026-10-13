@@ -840,7 +840,6 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Shared dimension identity facts used by array, first-class dimension, and composite array IR [`TypeRefinements`].
 /// [`Type`]-specific [`TypeRefinements`] implementations validate their input signatures and collect these facts.
 /// Operations can also construct an empty set with [`Default`] and record exact extents with [`Self::bind`] or
@@ -852,12 +851,12 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
 /// through [`TypeRefinements::refine_declared`]. Actual facts bind identities of the supplied signature and apply to
 /// the supplied input types through [`TypeRefinements::refine_actual`]. The two scopes stay separate even when the same
 /// identity object occurs on both sides of an invocation: matching declared `[dimension<n>, dimension<m>, f32[m]]`
-/// against actual `[dimension<m>, dimension<n>, f32[2]]` fixes the formal `m` and the actual `n` to 2, while the formal
-/// `n` and the actual `m` stay unresolved. Establishment links each formal identity to the actual identity in the same
-/// position and collects their scoped classes, sharing one exact fact within each class. For example, matching declared
-/// `[dimension<n>, dimension<p>, f32[n]]` against actual `[dimension<m>, dimension<m>, f32[2]]` also fixes the actual
-/// `m` and the formal `p` to 2. These facts hold for one invocation only and never mutate a caller identity. Input
-/// relationships that the supplied types do not prove must still be checked at runtime.
+/// against actual `[dimension<m>, dimension<n>, f32[2]]` fixes the formal `m` and the actual `n` to `2`, while the
+/// formal `n` and the actual `m` stay unresolved. Establishment links each formal identity to the actual identity in
+/// the same position and collects their scoped classes, sharing one exact fact within each class. For example, matching
+/// declared `[dimension<n>, dimension<p>, f32[n]]` against actual `[dimension<m>, dimension<m>, f32[2]]` also fixes the
+/// actual `m` and the formal `p` to `2`. These facts hold for one invocation only and never mutate a caller identity.
+/// Input relationships that the supplied types do not prove must still be checked at runtime.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DimensionRefinements {
     /// Scoped identity classes, in recording order, with each class's exact extent when established.
