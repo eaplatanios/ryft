@@ -308,13 +308,14 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// actual `m`, the second relates the same declared `n` to actual `k`, and the third supplies extent `2`. In the
 /// runnable example below, [`Self::from_local_declarations`] compares the signatures and returns an object named
 /// `guard_refinements`. It records one class with declared `[n]`, actual `[m, k]`, and conditional extent `2`. This
-/// extent comes from the third input, not from the `symbolic` or `representatives` argument of a later method call.
-/// Runtime checks must establish that the arrays carrying `m` and `k` also have length `2`.
+/// extent comes from the third input, not from a later call's `preserved_identities` or `preferred_identities`
+/// argument. Runtime checks must establish that the arrays carrying `m` and `k` also have length `2`.
 ///
-/// The `symbolic` argument to [`Self::refine_declared`] and [`Self::refine_actual`] lists existing identities to keep
-/// symbolic when applying stored exact facts. Keeping `m` symbolic does not keep every related identity symbolic:
-/// `k` still becomes `2` unless it is also listed. In contrast, `representatives` tells [`Self::retype_actual`] which
-/// actual identities may represent related types; it can replace `k` with `m`.
+/// The `preserved_identities` argument to [`Self::refine_declared`] and [`Self::refine_actual`] lists existing names
+/// to keep in the returned type, even when their exact extents are known. Preserving `m` does not preserve every
+/// related identity: `k` still becomes `2` unless it is also listed. The `preferred_identities` argument to
+/// [`Self::retype_actual`] selects which related actual identities to use in the returned type; it can
+/// replace `k` with `m`.
 ///
 /// The example also calls [`Self::from_local_declarations`] without the third input pair and names the returned object
 /// `without_exact_extent`. This object relates `n`, `m`, and `k` but does not determine their exact extent. Refinement
@@ -322,29 +323,29 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// arrays have equal lengths. Ordinary input validation with [`Self::new`] rejects these signatures
 /// because their symbolic array axes have different nominal identities.
 ///
-/// The following calls use the facts stored in these objects. An empty `symbolic` list preserves no identities;
-/// a nonempty list preserves only the existing names it contains. `representatives` instead selects compatible actual
-/// identities from the corresponding declared class. An actual type already carrying a requested representative keeps
-/// its own name, even if another requested member comes first.
+/// The following calls use the facts stored in these objects. An empty `preserved_identities` list preserves no names;
+/// a non-empty list preserves only the existing names it contains. `preferred_identities` instead selects compatible
+/// actual identities from the corresponding declared class. An actual type already carrying a compatible preferred
+/// identity keeps its own name, even if another requested member comes first.
 ///
-/// | Call | Result |
-/// | --- | --- |
-/// | `guard_refinements.refine_declared(f32[n], symbolic = [])` | `f32[2]` |
-/// | `guard_refinements.refine_declared(f32[n], symbolic = [n])` | `f32[n]` |
-/// | `guard_refinements.refine_actual(f32[m], symbolic = [m])` | `f32[m]` |
-/// | `guard_refinements.refine_actual(f32[k], symbolic = [m])` | `f32[2]` |
-/// | `guard_refinements.refine_actual(f32[k], symbolic = [m, k])` | `f32[k]` |
-/// | `guard_refinements.refine_actual(f32[2], symbolic = [m])` | `f32[2]` |
-/// | `guard_refinements.retype_actual(f32[n], f32[k], representatives = [m])` | `f32[m]` |
-/// | `guard_refinements.retype_actual(f32[n], f32[2], representatives = [m])` | `f32[m]` |
-/// | `guard_refinements.retype_actual(f32[n], f32[k], representatives = [m, k])` | `f32[k]` |
-/// | `without_exact_extent.refine_declared(f32[n], symbolic = [])` | `f32[n]` |
-/// | `without_exact_extent.refine_actual(f32[k], symbolic = [m])` | `f32[k]` |
-/// | `without_exact_extent.retype_actual(f32[n], f32[k], representatives = [m])` | `f32[m]` |
+/// |                                       Call                                       |  Result  |
+/// | -------------------------------------------------------------------------------- | -------- |
+/// | `guard_refinements.refine_declared(f32[n], preserved_identities = [])`           | `f32[2]` |
+/// | `guard_refinements.refine_declared(f32[n], preserved_identities = [n])`          | `f32[n]` |
+/// | `guard_refinements.refine_actual(f32[m], preserved_identities = [m])`            | `f32[m]` |
+/// | `guard_refinements.refine_actual(f32[k], preserved_identities = [m])`            | `f32[2]` |
+/// | `guard_refinements.refine_actual(f32[k], preserved_identities = [m, k])`         | `f32[k]` |
+/// | `guard_refinements.refine_actual(f32[2], preserved_identities = [m])`            | `f32[2]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[k], preferred_identities = [m])`    | `f32[m]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[2], preferred_identities = [m])`    | `f32[m]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[k], preferred_identities = [m, k])` | `f32[k]` |
+/// | `without_exact_extent.refine_declared(f32[n], preserved_identities = [])`        | `f32[n]` |
+/// | `without_exact_extent.refine_actual(f32[k], preserved_identities = [m])`         | `f32[k]` |
+/// | `without_exact_extent.retype_actual(f32[n], f32[k], preferred_identities = [m])` | `f32[m]` |
 ///
-/// Refinement never renames `n` or `k` to `m`, or introduces `m` into a static type. Representation selection can do
-/// that when the identities belong to the same class. Equal numeric extents in unrelated classes do not justify
-/// sharing a representative. Selecting `m` is useful when a related value, such as a reference, must keep that name
+/// Refinement never renames `n` or `k` to `m`, or introduces `m` into a static type. Representation selection can
+/// do that when the identities belong to the same class. Equal numeric extents in unrelated classes do not justify
+/// choosing the same identity. Selecting `m` is useful when a related value, such as a reference, must keep that name
 /// in its type. The resulting representations are justified only when the corresponding runtime checks succeed.
 ///
 /// ## Identity Classes and Runtime Checks
@@ -354,11 +355,11 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// the input relationships hold. [`Self::type_identities_requiring_runtime_checks`] reports which relationships still
 /// require runtime checks, whether or not an exact extent is known:
 ///
-/// | Refinement object | Declared members | Actual members | Exact extent | Required check |
-/// | --- | --- | --- | --- | --- |
-/// | `refinements` | `[n]` | `[m]` | 2 | `m = 2` |
-/// | `guard_refinements` | `[n]` | `[m, k]` | 2 | `m = k = 2` |
-/// | `without_exact_extent` | `[n]` | `[m, k]` | Unknown | `m = k` |
+/// |   Refinement Object    | Declared Members | Actual Members | Exact Extent | Required Check |
+/// | ---------------------- | ---------------- | -------------- | ------------ | -------------- |
+/// | `refinements`          | `[n]`            | `[m]`          | 2            | `m = 2`        |
+/// | `guard_refinements`    | `[n]`            | `[m, k]`       | 2            | `m = k = 2`    |
+/// | `without_exact_extent` | `[n]`            | `[m, k]`       | Unknown      | `m = k`        |
 ///
 /// All three objects report `[n]` as requiring runtime checks. In the first comparison, supplying `dimension<2>`
 /// instead of `dimension<m>` makes the complete supplied signature prove the relationship, so no check is needed.
@@ -370,110 +371,112 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// #     ArrayIrType, ArrayIrTypeRefinements, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
 /// #     DimensionVariable, Shape, TypeRefinements,
 /// # };
+///
+/// // Shared identities and types: `n`, `m`, and `k` all have bounds `[1, 8)`.
 /// let bounds = DimensionBounds::positive(Some(8)).unwrap();
 /// let n = DimensionVariable::new("n", bounds);
 /// let m = DimensionVariable::new("m", bounds);
+/// let k = DimensionVariable::new("k", bounds);
+///
+/// let dimension_n: ArrayIrType = DimensionType::from(n.clone()).into();
+/// let dimension_m: ArrayIrType = DimensionType::from(m.clone()).into();
+/// let dimension_two: ArrayIrType = DimensionType::from(Dimension::Static(2)).into();
 /// let array = |dimension: Dimension| {
 ///     ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])))
 /// };
-/// let declared = [ArrayIrType::from(DimensionType::from(n.clone())), array(n.clone().into())];
-/// let actual = [ArrayIrType::from(DimensionType::from(m.clone())), array(2.into())];
+/// let array_n = array(n.clone().into());
+/// let array_m = array(m.clone().into());
+/// let array_k = array(k.clone().into());
+/// let array_two = array(2.into());
+/// let array_three = array(3.into());
+///
+/// // Ordinary inputs: `[dimension<n>, f32[n]]` against `[dimension<m>, f32[2]]`.
+/// let declared = [dimension_n, array_n.clone()];
+/// let actual = [dimension_m.clone(), array_two.clone()];
 /// let refinements = ArrayIrTypeRefinements::new(&declared, &actual).unwrap();
 ///
-/// // Applying exact facts uses the scope of the type being refined.
-/// assert_eq!(refinements.refine_declared(&declared[1], &[]).unwrap(), array(2.into()));
-/// assert_eq!(
-///     refinements.refine_actual(&actual[0], &[]).unwrap(),
-///     ArrayIrType::from(DimensionType::from(Dimension::Static(2))),
-/// );
-/// assert_eq!(refinements.refine_declared(&declared[1], &[n.clone()]).unwrap(), declared[1]);
-/// assert_eq!(refinements.refine_actual(&actual[0], &[m.clone()]).unwrap(), actual[0]);
+/// // Apply the stored facts `n = 2` and `m = 2`, or keep the listed identities symbolic.
+/// let keep_n = std::slice::from_ref(&n);
+/// let keep_m = std::slice::from_ref(&m);
+/// assert_eq!(refinements.refine_declared(&array_n, &[]).unwrap(), array_two);
+/// assert_eq!(refinements.refine_actual(&dimension_m, &[]).unwrap(), dimension_two);
+/// assert_eq!(refinements.refine_declared(&array_n, keep_n).unwrap(), array_n);
+/// assert_eq!(refinements.refine_actual(&dimension_m, keep_m).unwrap(), dimension_m);
 ///
-/// // Preserving m does not put it into the static array type; representation selection can do that.
-/// assert_eq!(refinements.refine_actual(&actual[1], &[m.clone()]).unwrap(), array(2.into()));
-/// assert_eq!(
-///     refinements.retype_actual(&declared[1], &actual[1], &[m.clone()]).unwrap(),
-///     array(m.clone().into()),
-/// );
-/// assert_eq!(refinements.retype_actual(&declared[1], &actual[1], &[]).unwrap(), array(2.into()));
+/// // Keeping m symbolic does not introduce it into `f32[2]`; choosing m as the preferred identity does.
+/// let preferred_identities = keep_m;
+/// assert_eq!(refinements.refine_actual(&array_two, keep_m).unwrap(), array_two);
+/// assert_eq!(refinements.retype_actual(&array_n, &array_two, preferred_identities).unwrap(), array_m);
+/// assert_eq!(refinements.retype_actual(&array_n, &array_two, &[]).unwrap(), array_two);
 ///
-/// // Checking a declared output uses the input facts, so n cannot acquire a different extent.
-/// assert!(refinements.validate_refinement([&declared[1]], [&array(2.into())], &[]).is_ok());
-/// assert!(refinements.validate_refinement([&declared[1]], [&array(3.into())], &[]).is_err());
-/// assert!(ArrayIrTypeRefinements::new([&declared[1]], [&array(3.into())]).is_ok());
-/// // Exact input types prove the relationship without a runtime check.
-/// let exact_actual = [ArrayIrType::from(DimensionType::from(Dimension::Static(2))), array(2.into())];
-/// let exact = ArrayIrTypeRefinements::new(&declared, &exact_actual).unwrap();
-/// assert!(exact.type_identities_requiring_runtime_checks().is_empty());
-/// // Repeated dimensions reject inconsistent extents, but can record a conditional exact fact.
-/// let repeated: ArrayIrType =
-///     ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), n.clone().into()])).into();
-/// let inconsistent: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 3]).into();
-/// assert!(ArrayIrTypeRefinements::new([&repeated], [&inconsistent]).is_err());
-/// let partial: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), 3.into()])).into();
-/// let repeated_refinements = ArrayIrTypeRefinements::new([&repeated], [&partial]).unwrap();
-/// assert_eq!(repeated_refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// // These exact facts are conditional: the dimension input still needs a runtime check.
 /// let classes = refinements.identity_classes().collect::<Vec<_>>();
 /// assert_eq!(classes.len(), 1);
-/// assert_eq!(classes[0].declared(), std::slice::from_ref(&n));
-/// assert_eq!(classes[0].actual(), std::slice::from_ref(&m));
+/// assert_eq!(classes[0].declared(), keep_n);
+/// assert_eq!(classes[0].actual(), keep_m);
 /// assert!(classes[0].is_exact());
-/// assert_eq!(refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// assert_eq!(refinements.type_identities_requiring_runtime_checks(), keep_n);
 ///
-/// // A guard's local comparison relates n to m and k; the third input supplies the exact extent 2.
-/// let k = DimensionVariable::new("k", bounds);
-/// let local_declared = [array(n.clone().into()), array(n.clone().into()), array(n.clone().into())];
-/// let local_actual = [array(m.clone().into()), array(k.clone().into()), array(2.into())];
+/// // Output validation uses the existing `n = 2` fact. A new comparison can instead establish `n = 3`.
+/// assert!(refinements.validate_refinement([&array_n], [&array_two], &[]).is_ok());
+/// assert!(refinements.validate_refinement([&array_n], [&array_three], &[]).is_err());
+/// assert!(ArrayIrTypeRefinements::new([&array_n], [&array_three]).is_ok());
+///
+/// // Fully exact inputs prove the relationship, so no runtime check is required.
+/// let exact_actual = [dimension_two, array_two.clone()];
+/// let exact = ArrayIrTypeRefinements::new(&declared, &exact_actual).unwrap();
+/// assert!(exact.type_identities_requiring_runtime_checks().is_empty());
+///
+/// // Repeating `n` within `f32[n, n]` also requires consistent extents.
+/// let repeated_n: ArrayIrType =
+///     ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), n.clone().into()])).into();
+/// let mismatched_extents: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 3]).into();
+/// let partially_symbolic: ArrayIrType =
+///     ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), 3.into()])).into();
+/// assert!(ArrayIrTypeRefinements::new([&repeated_n], [&mismatched_extents]).is_err());
+/// let repeated_refinements = ArrayIrTypeRefinements::new([&repeated_n], [&partially_symbolic]).unwrap();
+/// assert_eq!(repeated_refinements.type_identities_requiring_runtime_checks(), keep_n);
+///
+/// // A guard's local declarations: `[f32[n], f32[n], f32[n]]` against `[f32[m], f32[k], f32[2]]`.
+/// let local_declared = [array_n.clone(), array_n.clone(), array_n.clone()];
+/// let local_actual = [array_m.clone(), array_k.clone(), array_two.clone()];
 /// assert!(ArrayIrTypeRefinements::new(&local_declared, &local_actual).is_err());
-/// assert!(
-///     ArrayIrTypeRefinements::new(&local_declared[..2], &[array(2.into()), array(3.into())]).is_err(),
-/// );
+/// assert!(ArrayIrTypeRefinements::new(&local_declared[..2], &[array_two.clone(), array_three]).is_err());
 /// let guard_refinements = ArrayIrTypeRefinements::from_local_declarations(&local_declared, &local_actual).unwrap();
-/// let keep_declared_symbolic = [n.clone()];
-/// let keep_actual_symbolic = [m.clone()];
-/// assert_eq!(guard_refinements.refine_declared(&local_declared[0], &[]).unwrap(), array(2.into()));
-/// assert_eq!(
-///     guard_refinements.refine_declared(&local_declared[0], &keep_declared_symbolic).unwrap(),
-///     local_declared[0],
-/// );
-/// assert_eq!(guard_refinements.refine_actual(&local_actual[0], &keep_actual_symbolic).unwrap(), local_actual[0]);
-/// // Keeping m symbolic does not protect k. Its stored exact fact is still applied.
-/// assert_eq!(guard_refinements.refine_actual(&local_actual[1], &keep_actual_symbolic).unwrap(), array(2.into()));
-/// assert_eq!(guard_refinements.refine_actual(&local_actual[1], &[m.clone(), k.clone()]).unwrap(), local_actual[1]);
-/// assert_eq!(guard_refinements.refine_actual(&local_actual[2], &keep_actual_symbolic).unwrap(), array(2.into()));
-/// // Representation selection can use m for either the differently named or static array.
-/// let representatives = [m.clone()];
-/// assert_eq!(
-///     guard_refinements.retype_actual(&local_declared[1], &local_actual[1], &representatives).unwrap(),
-///     array(m.clone().into()),
-/// );
-/// assert_eq!(
-///     guard_refinements.retype_actual(&local_declared[2], &local_actual[2], &representatives).unwrap(),
-///     array(m.clone().into()),
-/// );
-/// // If the supplied type already carries a requested representative, it keeps its own name.
-/// assert_eq!(
-///     guard_refinements.retype_actual(&local_declared[1], &local_actual[1], &[m.clone(), k.clone()]).unwrap(),
-///     local_actual[1],
-/// );
+///
+/// // Keeping `m` symbolic leaves `m` unchanged but still lets `k` refine to `2`.
+/// let keep_m_and_k = [m.clone(), k.clone()];
+/// assert_eq!(guard_refinements.refine_declared(&array_n, &[]).unwrap(), array_two);
+/// assert_eq!(guard_refinements.refine_declared(&array_n, keep_n).unwrap(), array_n);
+/// assert_eq!(guard_refinements.refine_actual(&array_m, keep_m).unwrap(), array_m);
+/// assert_eq!(guard_refinements.refine_actual(&array_k, keep_m).unwrap(), array_two);
+/// assert_eq!(guard_refinements.refine_actual(&array_k, &keep_m_and_k).unwrap(), array_k);
+/// assert_eq!(guard_refinements.refine_actual(&array_two, keep_m).unwrap(), array_two);
+///
+/// // Choosing `m` as the preferred identity can rename `k` or introduce `m` into the static array type.
+/// assert_eq!(guard_refinements.retype_actual(&array_n, &array_k, preferred_identities).unwrap(), array_m);
+/// assert_eq!(guard_refinements.retype_actual(&array_n, &array_two, preferred_identities).unwrap(), array_m);
+///
+/// // If the actual type already carries a compatible preferred identity, it keeps its own name.
+/// assert_eq!(guard_refinements.retype_actual(&array_n, &array_k, &keep_m_and_k).unwrap(), array_k);
+///
 /// let classes = guard_refinements.identity_classes().collect::<Vec<_>>();
 /// assert_eq!(classes.len(), 1);
-/// assert_eq!(classes[0].declared(), std::slice::from_ref(&n));
-/// assert_eq!(classes[0].actual(), &[m.clone(), k.clone()]);
+/// assert_eq!(classes[0].declared(), keep_n);
+/// assert_eq!(classes[0].actual(), &keep_m_and_k);
 /// assert!(classes[0].is_exact());
-/// assert_eq!(guard_refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// assert_eq!(guard_refinements.type_identities_requiring_runtime_checks(), keep_n);
 ///
-/// // Without the third input, no exact extent is known. The relationship still permits selecting m.
+/// // Removing the third pair leaves `n`, `m`, and `k` related, without an exact extent.
 /// let without_exact_extent =
 ///     ArrayIrTypeRefinements::from_local_declarations(&local_declared[..2], &local_actual[..2]).unwrap();
-/// assert_eq!(without_exact_extent.refine_declared(&local_declared[1], &[]).unwrap(), local_declared[1]);
-/// assert_eq!(without_exact_extent.refine_actual(&local_actual[1], &keep_actual_symbolic).unwrap(), local_actual[1]);
-/// assert_eq!(
-///     without_exact_extent.retype_actual(&local_declared[1], &local_actual[1], &representatives).unwrap(),
-///     array(m.clone().into()),
-/// );
+/// assert_eq!(without_exact_extent.refine_declared(&array_n, &[]).unwrap(), array_n);
+/// assert_eq!(without_exact_extent.refine_actual(&array_k, keep_m).unwrap(), array_k);
+///
+/// // The relationship alone still permits choosing `m` as the preferred identity, provided `m = k` at runtime.
+/// assert_eq!(without_exact_extent.retype_actual(&array_n, &array_k, preferred_identities).unwrap(), array_m);
 /// assert!(!without_exact_extent.identity_classes().next().unwrap().is_exact());
-/// assert_eq!(without_exact_extent.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// assert_eq!(without_exact_extent.type_identities_requiring_runtime_checks(), keep_n);
 /// ```
 ///
 /// These functions inspect types only. Their conditional results do not replace the required runtime input checks.
@@ -602,12 +605,12 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     where
         T::Identity: 'o;
 
-    /// Returns `declared` with every identity that these refinement facts determine replaced by its refinement, except
-    /// the identities in `symbolic`, which stay symbolic. This applies the facts constructed by [`Self::new`] or
-    /// [`Self::from_local_declarations`] to a declared type, including intermediate and output types.
-    /// Because the facts are established from the complete signature first, an identity in
-    /// `symbolic` still takes part in conflict detection and is only kept symbolic when the facts are applied.
-    /// Exclusion applies per identity, so a type that mentions both an excluded identity and a refinable one is still
+    /// Returns `r#type` with the stored declared-scope facts applied, except for identities in `preserved_identities`.
+    /// The type can be a declared input, intermediate, or output type; it need not be one of the input types used to
+    /// construct these facts. The argument supplies the type to refine, while `self` supplies the facts to apply.
+    /// Because the facts are established from the complete signature first, a preserved identity still takes part in
+    /// conflict detection and is only kept symbolic when the facts are applied.
+    /// Preservation applies per identity, so a type mentioning both a preserved and a refinable identity is still
     /// refined at the latter. Refinements never add metadata that is not a fact about an identity (e.g., an array's
     /// sharding or layout).
     ///
@@ -615,15 +618,16 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///
     /// # Parameters
     ///
-    ///   - `declared`: Declared type to refine.
-    ///   - `symbolic`: Identities that must stay symbolic in the returned type.
-    fn refine_declared(&self, declared: &T, symbolic: &[T::Identity]) -> Result<T, TypeError>;
+    ///   - `r#type`: Type to refine using declared-scope facts.
+    ///   - `preserved_identities`: Declared identities to preserve instead of replacing them with their refinements.
+    fn refine_declared(&self, r#type: &T, preserved_identities: &[T::Identity]) -> Result<T, TypeError>;
 
-    /// Returns `actual`, one type of the supplied input signature from which these facts were established, with every
-    /// identity that the actual facts fix replaced by its refinement, except for the identities in `symbolic`,
-    /// preserving its layout, placement, and other non-identity metadata. A declared fact never applies to an actual
-    /// identity merely because the two share a name.
-    /// Identities in `symbolic` are kept even when their exact values are known. This lets a supplied value preserve
+    /// Returns the supplied input `r#type` with the stored actual-scope facts applied, except for preserved identities.
+    /// It preserves the identities in `preserved_identities` and the type's layout, placement, and other metadata.
+    /// The argument supplies the type to refine, while `self` supplies the facts from the complete input signature.
+    /// A declared fact never
+    /// applies to an actual identity merely because the two share a name.
+    /// Preserved identities are kept even when their exact values are known. This lets a supplied value preserve
     /// identities also carried by a reference whose type cannot change. Other identities in the same supplied type
     /// are still refined.
     ///
@@ -631,27 +635,27 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///
     /// # Parameters
     ///
-    ///   - `actual`: Supplied input type to refine.
-    ///   - `symbolic`: Actual identities that must stay symbolic in the returned type.
-    fn refine_actual(&self, actual: &T, symbolic: &[T::Identity]) -> Result<T, TypeError>;
+    ///   - `r#type`: Supplied input type to refine using actual-scope facts.
+    ///   - `preserved_identities`: Actual identities to preserve instead of replacing them with their refinements.
+    fn refine_actual(&self, r#type: &T, preserved_identities: &[T::Identity]) -> Result<T, TypeError>;
 
     /// Selects a type representation for the supplied `actual` input using compatible identities from its declared
     /// classes. Unlike [`Self::refine_actual`], this can introduce a requested identity where `actual` has an exact
     /// value or a different identity. `declared` identifies the relevant class; equal extents alone do not relate
     /// otherwise independent identities. The function chooses a type, without performing a runtime check or conversion.
     ///
-    /// The function applies actual-scope facts as [`Self::refine_actual`] does, with `representatives` kept symbolic,
-    /// except that each part of the declared type whose identity is linked to a representative takes the first
-    /// compatible representative instead. For arrays these parts are shape dimensions; for a first-class dimension
-    /// it is the dimension itself. Links may pass through other declared and actual identities in the same class.
-    /// For bounded identities, compatibility requires the declared identity's bounds to contain the representative's
-    /// bounds. An actual identity already in `representatives` and in that declared class
-    /// keeps its own compatible name, so immutable handles may preserve their different identities within one checked
-    /// class. When a class without an exact value has requested representatives but none fits a part of the declared
+    /// The function applies actual-scope facts as [`Self::refine_actual`] does, preserving compatible identities in
+    /// `preferred_identities`. It can also select a preferred identity from the corresponding declared class for each
+    /// part of the type. For arrays these parts are shape dimensions; for a first-class dimension it is the dimension
+    /// itself. Relationships may pass through other declared and actual identities in the same class. An actual type
+    /// already carrying a compatible preferred identity in that class keeps its own name; otherwise, the first
+    /// compatible preferred identity is selected. This lets immutable handles preserve their different names in one
+    /// checked class. Compatibility requires the declared identity's bounds to contain the chosen identity's bounds.
+    /// When a class without an exact value has preferred identities but none fits a part of the declared
     /// type, that part uses its declared identity if an actual member carries it, otherwise the first compatible
     /// actual member. This keeps the body's representation within the declared identity's bounds; exact classes
     /// instead apply their exact fact.
-    /// Classes without an exact extent can also select representatives. Consumers use this to give related values
+    /// Classes without an exact extent can also select preferred identities. Consumers use this to give related values
     /// compatible representations while respecting immutable reference geometry. A changed known representation
     /// may require a residual checked value. The result is a representation justified by checking the complete input
     /// signature, rather than a runtime check performed by this type-level function.
@@ -662,8 +666,9 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///
     ///   - `declared`: Declared type corresponding to this supplied input, identifying its identity classes.
     ///   - `actual`: Supplied input type to refine.
-    ///   - `representatives`: Actual identities that represent their classes, in order of preference.
-    fn retype_actual(&self, declared: &T, actual: &T, representatives: &[T::Identity]) -> Result<T, TypeError>;
+    ///   - `preferred_identities`: Actual identities to use in the returned type where compatible, in preference order.
+    ///     A compatible listed identity already present in the actual type takes precedence over earlier choices.
+    fn retype_actual(&self, declared: &T, actual: &T, preferred_identities: &[T::Identity]) -> Result<T, TypeError>;
 }
 
 impl<T: Type> TypeRefinements<T> for () {
@@ -712,17 +717,17 @@ impl<T: Type> TypeRefinements<T> for () {
     }
 
     #[inline]
-    fn refine_declared(&self, declared: &T, _symbolic: &[T::Identity]) -> Result<T, TypeError> {
-        Ok(declared.clone())
+    fn refine_declared(&self, r#type: &T, _preserved_identities: &[T::Identity]) -> Result<T, TypeError> {
+        Ok(r#type.clone())
     }
 
     #[inline]
-    fn refine_actual(&self, actual: &T, _symbolic: &[T::Identity]) -> Result<T, TypeError> {
-        Ok(actual.clone())
+    fn refine_actual(&self, r#type: &T, _preserved_identities: &[T::Identity]) -> Result<T, TypeError> {
+        Ok(r#type.clone())
     }
 
     #[inline]
-    fn retype_actual(&self, _declared: &T, actual: &T, _representatives: &[T::Identity]) -> Result<T, TypeError> {
+    fn retype_actual(&self, _declared: &T, actual: &T, _preferred_identities: &[T::Identity]) -> Result<T, TypeError> {
         Ok(actual.clone())
     }
 }
