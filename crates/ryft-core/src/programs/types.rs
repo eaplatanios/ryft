@@ -188,7 +188,7 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// Returns `true` if every value described by `other` is also described by this [`Type`]. The receiver is the more
     /// general type (e.g., a declared or staged type) and the argument is the more precise one (e.g., the actual type
     /// carried by a runtime value), and so the relation is directional: `declared.is_refined_by(&actual)`. Note that
-    /// this is a proof about the types alone. [`TypeRefinements::validate_inputs`] can also accept input types whose
+    /// this is a proof about the types alone. [`TypeRefinements::new`] can also accept input types whose
     /// shared identities require checking at runtime. Such input types need not satisfy this predicate.
     ///
     /// For fully static types this is type equality (e.g., [`DataType`](crate::DataType) requires equal data types).
@@ -237,52 +237,266 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// [`Region`](crate::Region) boundary, ensuring that repeated identity occurrences remain consistent across boundary
 /// leaves and outputs.
 ///
-/// [`Self::validate_inputs`] validates supplied input types against those declared by a program or region and
-/// constructs their conditional relationships. [`Self::establish`] constructs relationships for local declarations,
-/// such as a guard's own signature. Both reason about the complete invocation, keeping identities repeated within a
+/// A _guard_, represented by [`GuardOperation`](crate::GuardOperation), checks required relationships between its
+/// inputs' type identities at runtime. It preserves these checks when a transform removes the program or region
+/// invocation that would otherwise perform them.
+///
+/// Use [`Self::new`] to construct refinement facts for program and region inputs under ordinary input-admission rules.
+/// Use [`Self::from_local_declarations`] when declared identities are local names for the comparison, such as a guard's
+/// own signature. Both constructors return facts about the complete invocation, keeping identities repeated within a
 /// type or across several inputs consistent. Their facts live in two scopes that are never merged, even when the same
 /// identity object occurs on both sides: _declared_ facts about the declared [`TypeIdentity`]s, which
-/// [`Self::refine_declared`] applies to declared, intermediate, and output types and against which [`Self::validate`]
-/// checks outputs, and _actual_ facts about the identities of the supplied types, which [`Self::refine_actual`] applies
-/// to those supplied input types. [`TypeIdentity`]s produced inside [`Program`](crate::Program)s or
-/// [`Region`](crate::Region)s may establish additional output facts, while unrelated, unbound output identities are
-/// rejected.
+/// [`Self::refine_declared`] applies to declared, intermediate, and output types and against which
+/// [`Self::validate_refinement`] checks outputs, and _actual_ facts about the identities of the supplied types,
+/// which [`Self::refine_actual`] applies to those supplied input types. [`TypeIdentity`]s produced inside
+/// [`Program`](crate::Program)s or [`Region`](crate::Region)s may establish additional output facts, while
+/// unrelated, unbound output identities are rejected.
 ///
 /// The facts hold for one invocation only, provided its input relationships are satisfied. They never mutate a caller
 /// identity or replace runtime validation: relationships that the actual types leave unproven must still be checked by
 /// the program or region, or by a [`GuardOperation`](crate::GuardOperation).
+///
+/// # Examples
+///
+/// These examples use consistent type signatures and identity names. All symbolic identities have bounds `[1, 8)`.
+/// The abbreviated calls use type notation rather than Rust syntax. A complete runnable example follows.
+///
+/// ## Constructing Refinement Facts
+///
+/// Both constructors take corresponding declared and actual input types. They differ in how they interpret declared
+/// identities: [`Self::new`] enforces the type family's ordinary input rules. [`Self::from_local_declarations`] permits
+/// compatible actual identities to instantiate different declared names that are local to the comparison. Both reject
+/// incompatible structure, bounds, and conflicting facts. Neither performs runtime checks.
+///
+/// For arrays with the bounds used here, `new` rejects declared `f32[n]` supplied as `f32[m]`, because the symbolic
+/// axes have different nominal identities. `from_local_declarations` accepts that comparison and relates declared `n`
+/// to actual `m`. The examples below use `new` for ordinary inputs and `from_local_declarations` for a guard's types.
+///
+/// ## Validating Supplied Types
+///
+/// Consider the following type signatures:
+///
+/// ```text
+/// declared = [dimension<n>, f32[n]]
+/// actual   = [dimension<m>, f32[2]]
+/// ```
+///
+/// The dimension input relates the declared `n` to the supplied `m` and the array input supplies extent `2`. The
+/// resulting class contains declared `[n]` and actual `[m]`, with conditional facts `n = 2` and `m = 2`. The types
+/// alone do not prove that the supplied dimension has extent `2`, so the invocation must still check that relationship
+/// at runtime. In the runnable example below, [`Self::new`] returns an object containing these facts, assigned
+/// to a variable named `refinements`.
+///
+/// Calling [`Self::validate_refinement`] on that object checks output types against the stored input facts: a declared
+/// output `f32[n]` accepts `f32[2]` and rejects `f32[3]`. Calling [`Self::new`] again with declared `f32[n]` and actual
+/// `f32[3]` would instead create a new object with the fact `n = 3`. That separate comparison would not check
+/// consistency with the original input fact `n = 2`.
+///
+/// Repeated identities must also agree within and across inputs. Declared `[f32[n], f32[n]]` rejects supplied
+/// `[f32[2], f32[3]]`, and declared `f32[n, n]` rejects supplied `f32[2, 3]`. Supplied `f32[n, 3]` is accepted
+/// for the latter declared type, conditional on checking that its symbolic dimension has extent 3 at runtime.
+///
+/// ## Applying Facts and Selecting Identities
+///
+/// To see how several symbolic inputs interact, establish a guard's local comparison:
+///
+/// ```text
+/// local_declared = [f32[n], f32[n], f32[n]]
+/// local_actual   = [f32[m], f32[k], f32[2]]
+/// ```
+/// All three declared arrays use `n`, so their supplied lengths must agree. The first pair relates declared `n` to
+/// actual `m`, the second relates the same declared `n` to actual `k`, and the third supplies extent `2`. In the
+/// runnable example below, [`Self::from_local_declarations`] compares the signatures and returns an object named
+/// `guard_refinements`. It records one class with declared `[n]`, actual `[m, k]`, and conditional extent `2`. This
+/// extent comes from the third input, not from the `symbolic` or `representatives` argument of a later method call.
+/// Runtime checks must establish that the arrays carrying `m` and `k` also have length `2`.
+///
+/// The `symbolic` argument to [`Self::refine_declared`] and [`Self::refine_actual`] lists existing identities to keep
+/// symbolic when applying stored exact facts. Keeping `m` symbolic does not keep every related identity symbolic:
+/// `k` still becomes `2` unless it is also listed. In contrast, `representatives` tells [`Self::retype_actual`] which
+/// actual identities may represent related types; it can replace `k` with `m`.
+///
+/// The example also calls [`Self::from_local_declarations`] without the third input pair and names the returned object
+/// `without_exact_extent`. This object relates `n`, `m`, and `k` but does not determine their exact extent. Refinement
+/// then leaves `k` unchanged, while representation selection can still replace it with `m`, provided the two supplied
+/// arrays have equal lengths. Ordinary input validation with [`Self::new`] rejects these signatures
+/// because their symbolic array axes have different nominal identities.
+///
+/// The following calls use the facts stored in these objects. An empty `symbolic` list preserves no identities;
+/// a nonempty list preserves only the existing names it contains. `representatives` instead selects compatible actual
+/// identities from the corresponding declared class. An actual type already carrying a requested representative keeps
+/// its own name, even if another requested member comes first.
+///
+/// | Call | Result |
+/// | --- | --- |
+/// | `guard_refinements.refine_declared(f32[n], symbolic = [])` | `f32[2]` |
+/// | `guard_refinements.refine_declared(f32[n], symbolic = [n])` | `f32[n]` |
+/// | `guard_refinements.refine_actual(f32[m], symbolic = [m])` | `f32[m]` |
+/// | `guard_refinements.refine_actual(f32[k], symbolic = [m])` | `f32[2]` |
+/// | `guard_refinements.refine_actual(f32[k], symbolic = [m, k])` | `f32[k]` |
+/// | `guard_refinements.refine_actual(f32[2], symbolic = [m])` | `f32[2]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[k], representatives = [m])` | `f32[m]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[2], representatives = [m])` | `f32[m]` |
+/// | `guard_refinements.retype_actual(f32[n], f32[k], representatives = [m, k])` | `f32[k]` |
+/// | `without_exact_extent.refine_declared(f32[n], symbolic = [])` | `f32[n]` |
+/// | `without_exact_extent.refine_actual(f32[k], symbolic = [m])` | `f32[k]` |
+/// | `without_exact_extent.retype_actual(f32[n], f32[k], representatives = [m])` | `f32[m]` |
+///
+/// Refinement never renames `n` or `k` to `m`, or introduces `m` into a static type. Representation selection can do
+/// that when the identities belong to the same class. Equal numeric extents in unrelated classes do not justify
+/// sharing a representative. Selecting `m` is useful when a related value, such as a reference, must keep that name
+/// in its type. The resulting representations are justified only when the corresponding runtime checks succeed.
+///
+/// ## Identity Classes and Runtime Checks
+///
+/// [`Self::identity_classes`] returns the groups of related declared and actual identities.
+/// [`TypeIdentityClass::is_exact`] reports whether the stored facts determine an exact extent for a group, assuming
+/// the input relationships hold. [`Self::type_identities_requiring_runtime_checks`] reports which relationships still
+/// require runtime checks, whether or not an exact extent is known:
+///
+/// | Refinement object | Declared members | Actual members | Exact extent | Required check |
+/// | --- | --- | --- | --- | --- |
+/// | `refinements` | `[n]` | `[m]` | 2 | `m = 2` |
+/// | `guard_refinements` | `[n]` | `[m, k]` | 2 | `m = k = 2` |
+/// | `without_exact_extent` | `[n]` | `[m, k]` | Unknown | `m = k` |
+///
+/// All three objects report `[n]` as requiring runtime checks. In the first comparison, supplying `dimension<2>`
+/// instead of `dimension<m>` makes the complete supplied signature prove the relationship, so no check is needed.
+///
+/// ## Runnable Example
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     ArrayIrType, ArrayIrTypeRefinements, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+/// #     DimensionVariable, Shape, TypeRefinements,
+/// # };
+/// let bounds = DimensionBounds::positive(Some(8)).unwrap();
+/// let n = DimensionVariable::new("n", bounds);
+/// let m = DimensionVariable::new("m", bounds);
+/// let array = |dimension: Dimension| {
+///     ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])))
+/// };
+/// let declared = [ArrayIrType::from(DimensionType::from(n.clone())), array(n.clone().into())];
+/// let actual = [ArrayIrType::from(DimensionType::from(m.clone())), array(2.into())];
+/// let refinements = ArrayIrTypeRefinements::new(&declared, &actual).unwrap();
+///
+/// // Applying exact facts uses the scope of the type being refined.
+/// assert_eq!(refinements.refine_declared(&declared[1], &[]).unwrap(), array(2.into()));
+/// assert_eq!(
+///     refinements.refine_actual(&actual[0], &[]).unwrap(),
+///     ArrayIrType::from(DimensionType::from(Dimension::Static(2))),
+/// );
+/// assert_eq!(refinements.refine_declared(&declared[1], &[n.clone()]).unwrap(), declared[1]);
+/// assert_eq!(refinements.refine_actual(&actual[0], &[m.clone()]).unwrap(), actual[0]);
+///
+/// // Preserving m does not put it into the static array type; representation selection can do that.
+/// assert_eq!(refinements.refine_actual(&actual[1], &[m.clone()]).unwrap(), array(2.into()));
+/// assert_eq!(
+///     refinements.retype_actual(&declared[1], &actual[1], &[m.clone()]).unwrap(),
+///     array(m.clone().into()),
+/// );
+/// assert_eq!(refinements.retype_actual(&declared[1], &actual[1], &[]).unwrap(), array(2.into()));
+///
+/// // Checking a declared output uses the input facts, so n cannot acquire a different extent.
+/// assert!(refinements.validate_refinement([&declared[1]], [&array(2.into())], &[]).is_ok());
+/// assert!(refinements.validate_refinement([&declared[1]], [&array(3.into())], &[]).is_err());
+/// assert!(ArrayIrTypeRefinements::new([&declared[1]], [&array(3.into())]).is_ok());
+/// // Exact input types prove the relationship without a runtime check.
+/// let exact_actual = [ArrayIrType::from(DimensionType::from(Dimension::Static(2))), array(2.into())];
+/// let exact = ArrayIrTypeRefinements::new(&declared, &exact_actual).unwrap();
+/// assert!(exact.type_identities_requiring_runtime_checks().is_empty());
+/// // Repeated dimensions reject inconsistent extents, but can record a conditional exact fact.
+/// let repeated: ArrayIrType =
+///     ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), n.clone().into()])).into();
+/// let inconsistent: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 3]).into();
+/// assert!(ArrayIrTypeRefinements::new([&repeated], [&inconsistent]).is_err());
+/// let partial: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.clone().into(), 3.into()])).into();
+/// let repeated_refinements = ArrayIrTypeRefinements::new([&repeated], [&partial]).unwrap();
+/// assert_eq!(repeated_refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// let classes = refinements.identity_classes().collect::<Vec<_>>();
+/// assert_eq!(classes.len(), 1);
+/// assert_eq!(classes[0].declared(), std::slice::from_ref(&n));
+/// assert_eq!(classes[0].actual(), std::slice::from_ref(&m));
+/// assert!(classes[0].is_exact());
+/// assert_eq!(refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+///
+/// // A guard's local comparison relates n to m and k; the third input supplies the exact extent 2.
+/// let k = DimensionVariable::new("k", bounds);
+/// let local_declared = [array(n.clone().into()), array(n.clone().into()), array(n.clone().into())];
+/// let local_actual = [array(m.clone().into()), array(k.clone().into()), array(2.into())];
+/// assert!(ArrayIrTypeRefinements::new(&local_declared, &local_actual).is_err());
+/// assert!(
+///     ArrayIrTypeRefinements::new(&local_declared[..2], &[array(2.into()), array(3.into())]).is_err(),
+/// );
+/// let guard_refinements = ArrayIrTypeRefinements::from_local_declarations(&local_declared, &local_actual).unwrap();
+/// let keep_declared_symbolic = [n.clone()];
+/// let keep_actual_symbolic = [m.clone()];
+/// assert_eq!(guard_refinements.refine_declared(&local_declared[0], &[]).unwrap(), array(2.into()));
+/// assert_eq!(
+///     guard_refinements.refine_declared(&local_declared[0], &keep_declared_symbolic).unwrap(),
+///     local_declared[0],
+/// );
+/// assert_eq!(guard_refinements.refine_actual(&local_actual[0], &keep_actual_symbolic).unwrap(), local_actual[0]);
+/// // Keeping m symbolic does not protect k. Its stored exact fact is still applied.
+/// assert_eq!(guard_refinements.refine_actual(&local_actual[1], &keep_actual_symbolic).unwrap(), array(2.into()));
+/// assert_eq!(guard_refinements.refine_actual(&local_actual[1], &[m.clone(), k.clone()]).unwrap(), local_actual[1]);
+/// assert_eq!(guard_refinements.refine_actual(&local_actual[2], &keep_actual_symbolic).unwrap(), array(2.into()));
+/// // Representation selection can use m for either the differently named or static array.
+/// let representatives = [m.clone()];
+/// assert_eq!(
+///     guard_refinements.retype_actual(&local_declared[1], &local_actual[1], &representatives).unwrap(),
+///     array(m.clone().into()),
+/// );
+/// assert_eq!(
+///     guard_refinements.retype_actual(&local_declared[2], &local_actual[2], &representatives).unwrap(),
+///     array(m.clone().into()),
+/// );
+/// // If the supplied type already carries a requested representative, it keeps its own name.
+/// assert_eq!(
+///     guard_refinements.retype_actual(&local_declared[1], &local_actual[1], &[m.clone(), k.clone()]).unwrap(),
+///     local_actual[1],
+/// );
+/// let classes = guard_refinements.identity_classes().collect::<Vec<_>>();
+/// assert_eq!(classes.len(), 1);
+/// assert_eq!(classes[0].declared(), std::slice::from_ref(&n));
+/// assert_eq!(classes[0].actual(), &[m.clone(), k.clone()]);
+/// assert!(classes[0].is_exact());
+/// assert_eq!(guard_refinements.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+///
+/// // Without the third input, no exact extent is known. The relationship still permits selecting m.
+/// let without_exact_extent =
+///     ArrayIrTypeRefinements::from_local_declarations(&local_declared[..2], &local_actual[..2]).unwrap();
+/// assert_eq!(without_exact_extent.refine_declared(&local_declared[1], &[]).unwrap(), local_declared[1]);
+/// assert_eq!(without_exact_extent.refine_actual(&local_actual[1], &keep_actual_symbolic).unwrap(), local_actual[1]);
+/// assert_eq!(
+///     without_exact_extent.retype_actual(&local_declared[1], &local_actual[1], &representatives).unwrap(),
+///     array(m.clone().into()),
+/// );
+/// assert!(!without_exact_extent.identity_classes().next().unwrap().is_exact());
+/// assert_eq!(without_exact_extent.type_identities_requiring_runtime_checks(), std::slice::from_ref(&n));
+/// ```
+///
+/// These functions inspect types only. Their conditional results do not replace the required runtime input checks.
 pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
-    /// Establishes the conditional relationships of the complete `actual` signature relative to `declared`, whose
-    /// identities are local names for this comparison. Bounds-compatible actual identities may instantiate different
-    /// declared identities. Programs and regions validate their supplied input types with [`Self::validate_inputs`];
-    /// guards and already-prepared replay call this function directly. The facts that the pairs observe directly are
-    /// shared within each connected class of declared/actual identity correspondences. For example, matching declared
-    /// types `[dimension<n>, dimension<p>, f32[n]]` against `[dimension<m>, dimension<m>, f32[2]]` fixes the actual `m`
-    /// and the declared `p` to 2 as well. A class fact that a receiving identity's bounds exclude, or that conflicts
-    /// with another fact about the same identity, is rejected. Correspondences without an exact fact (e.g., one
-    /// declared identity matched against two distinct symbolic actual identities) do not determine an exact value.
-    /// Relationships that the supplied types do not prove are recorded by [`Self::unproven_identities`]; they require
-    /// the original program's or region's input checks, or a guard, before the facts may be used to execute a
-    /// specialized body. Establishment never performs a runtime check.
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
-    where
-        D::IntoIter: ExactSizeIterator,
-        A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<T>,
-        A::Item: Borrow<T>;
-
-    /// Validates the complete `actual` input signature against `declared` and returns its conditional refinement facts.
+    /// Creates refinement facts by validating the complete `actual` input signature against `declared` under the type
+    /// family's ordinary input-admission rules. Use this constructor for program and region inputs.
     /// This checks ordinary input admission and every repeated identity relationship, including repetitions within one
-    /// type. For example, declared `f32[n, n]` rejects actual `f32[2, 3]`, while actual `f32[n, 3]` is accepted
-    /// provided the program or region checks that `n` has extent 3 at runtime. Such obligations are recorded in
-    /// [`Self::unproven_identities`]; success does not mean that a guard can be removed.
+    /// type. Relationships not guaranteed by the supplied types must be checked at runtime. Such obligations are
+    /// recorded in [`Self::type_identities_requiring_runtime_checks`]; success does not mean a guard can be removed.
     ///
-    /// Unlike [`Self::establish`], which treats declared identities as local names, this enforces the family's ordinary
+    /// Unlike [`Self::from_local_declarations`], which treats declared identities as local names, it enforces ordinary
     /// nominal input rules. The default requires each actual type to satisfy [`Type::is_refined_by`] before
     /// establishing relationships. Families that accept inputs requiring runtime checks or equivalent exact
     /// representations override this function, keeping complete-signature consistency and guard obligations in the
     /// returned facts. Neither input validation nor establishment converts values or performs runtime checks.
-    fn validate_inputs<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Complete input type signature declared by the program or region.
+    ///   - `actual`: Corresponding supplied input types.
+    fn new<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
@@ -301,8 +515,34 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
                 Ok(())
             },
         )?;
-        Self::establish(declared, actual)
+        Self::from_local_declarations(declared, actual)
     }
+
+    /// Creates refinement facts by comparing the complete `actual` signature with `declared`, treating declared
+    /// identities as local names for this comparison. Bounds-compatible actual identities may instantiate different
+    /// declared identities. Programs and regions construct their input refinements with [`Self::new`];
+    /// guards and code replaying a body with prepared inputs call this function directly.
+    /// Identities connected through matched input pairs form a class, which may contain several identities in either
+    /// scope. An exact fact observed in any pair applies to every identity in its class. A fact outside an identity's
+    /// bounds, or inconsistent with another fact about the same identity, is rejected.
+    /// Correspondences without an exact fact do not determine an exact value.
+    /// Relationships that the supplied types do not prove are recorded by
+    /// [`Self::type_identities_requiring_runtime_checks`]; they require the original program's or region's input
+    /// checks, or a guard, before the facts may be used to execute a specialized body. This constructor never performs
+    /// a runtime check.
+    ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Complete declared type signature whose identities are local to this comparison.
+    ///   - `actual`: Corresponding supplied types to compare with those declarations.
+    fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<T>,
+        A::Item: Borrow<T>;
 
     /// Validates `actual` against `declared` using the refinement facts previously established from the corresponding
     /// input signature. Facts already stored in `self` must remain consistent at every occurrence of the corresponding
@@ -317,6 +557,8 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// `closed_identities` only identifies which identities may establish facts during validation. It does not contain
     /// concrete extents or inspect runtime value payloads.
     ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
     /// # Parameters
     ///
     ///   - `declared`: Complete declared type signature being validated, normally a program or region output signature.
@@ -325,7 +567,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///     (e.g., a [`TypeIdentitySignature`](crate::TypeIdentitySignature)'s
     ///     [`identities`](crate::TypeIdentitySignature::identities) slice), whose members are permitted to establish
     ///     refinement facts when first encountered in `actual`.
-    fn validate<D: IntoIterator, A: IntoIterator>(
+    fn validate_refinement<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
         actual: A,
@@ -337,66 +579,39 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
         D::Item: Borrow<T>,
         A::Item: Borrow<T>;
 
-    /// Returns the declared identities whose relationships still require runtime checking, in first-occurrence order.
-    /// These obligations are independent of exact facts: matching declared `[f32[n], f32[n]]` against actual `[f32[n],
-    /// f32[2]]` fixes the class's extent to 2 conditionally, but still leaves `n` unproven. Implementations may report
-    /// conservative obligations for identities sharing an input member (refer to [`unproven_type_identities`]).
-    fn unproven_identities(&self) -> &[T::Identity];
+    /// Returns the declared type identities whose equality relationships are not guaranteed by the supplied input
+    /// types, in first-occurrence order. Those relationships still require runtime checking.
+    /// These obligations are independent of exact conditional facts. Implementations may report conservative
+    /// obligations for identities sharing an input member (refer to the
+    /// [standalone query](crate::programs::types::type_identities_requiring_runtime_checks)).
+    ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
+    fn type_identities_requiring_runtime_checks(&self) -> &[T::Identity];
 
-    /// Returns whether the supplied types leave a relationship to the boundary's runtime check. Removing that
-    /// boundary requires a guard; keeping it preserves the check without adding an operation.
-    #[inline]
-    fn requires_guard(&self) -> bool {
-        !self.unproven_identities().is_empty()
-    }
-
-    /// Returns the invocation's semantic identity classes in first-observation order. Every observed identity belongs
-    /// to one class in its own scope, including isolated observations and exact facts. The same identity object in the
-    /// formal and actual scopes denotes two nodes, joined only when the invocation observes a correspondence. Equal
-    /// exact refinements do not connect otherwise unrelated classes. The classes describe relationships between the
-    /// supplied inputs, conditional on those relationships being satisfied. Using the classes never replaces the
-    /// runtime checks that the inputs require.
+    /// Returns the invocation's groups of related declared and actual identities, in first-observation order.
+    /// Every observed identity belongs to one class in its own scope, including isolated observations and exact facts.
+    /// The same identity object is tracked separately in the declared and actual scopes and related only through
+    /// matched input types. Equal exact refinements do not connect otherwise unrelated classes. The classes describe
+    /// relationships between the supplied inputs, conditional on those relationships being satisfied. Using the
+    /// classes never replaces the runtime checks that the inputs require.
+    ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
     fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, T::Identity>>
     where
         T::Identity: 'o;
 
     /// Returns `declared` with every identity that these refinement facts determine replaced by its refinement, except
-    /// the identities in `symbolic`, which stay symbolic. This applies the facts that [`Self::establish`] derived from
-    /// a complete input signature to a declared type (e.g., a declared output type of an operation whose inputs refine
-    /// its declared input types). Because the facts are established from the complete signature first, an identity in
+    /// the identities in `symbolic`, which stay symbolic. This applies the facts constructed by [`Self::new`] or
+    /// [`Self::from_local_declarations`] to a declared type, including intermediate and output types.
+    /// Because the facts are established from the complete signature first, an identity in
     /// `symbolic` still takes part in conflict detection and is only kept symbolic when the facts are applied.
     /// Exclusion applies per identity, so a type that mentions both an excluded identity and a refinable one is still
     /// refined at the latter. Refinements never add metadata that is not a fact about an identity (e.g., an array's
     /// sharding or layout).
     ///
-    /// # Example
-    ///
-    /// A region that declares its input as `f32[rows, columns]` and receives an `f32[3, 4]` input establishes the
-    /// facts `rows = 3` and `columns = 4`, which then refine the region's declared output types:
-    ///
-    /// ```rust
-    /// # use ryft_core::{
-    /// #     ArrayType, ArrayTypeRefinements, DataType, DimensionBounds, DimensionVariable, Shape, TypeRefinements,
-    /// # };
-    /// let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
-    /// let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
-    /// let declared_input_type =
-    ///     ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), columns.clone().into()]));
-    /// let input_type = ArrayType::new_static(DataType::F32, [3, 4]);
-    /// let refinements = ArrayTypeRefinements::establish([&declared_input_type], [&input_type]).unwrap();
-    ///
-    /// // Every identity that has a fact is replaced by it, wherever it appears in the declared type.
-    /// let declared_output_type =
-    ///     ArrayType::new(DataType::F32, Shape::new(vec![columns.clone().into(), rows.clone().into()]));
-    /// assert_eq!(refinements.refine_declared(&declared_output_type, &[]).unwrap().to_string(), "f32[4, 3]");
-    ///
-    /// // Identities in `symbolic` (e.g., ones that an output defines and that may therefore change, such as the extent
-    /// // of a loop's dimension carry) are kept, while the remaining identities of the same type are still refined.
-    /// assert_eq!(
-    ///     refinements.refine_declared(&declared_output_type, &[rows]).unwrap().to_string(),
-    ///     "f32[4, rows]",
-    /// );
-    /// ```
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
     ///
     /// # Parameters
     ///
@@ -406,11 +621,13 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
 
     /// Returns `actual`, one type of the supplied input signature from which these facts were established, with every
     /// identity that the actual facts fix replaced by its refinement, except for the identities in `symbolic`,
-    /// preserving its layout, placement, and other non-identity metadata. For example, matching declared
-    /// `[dimension<n>, f32[n]]` against actual `[dimension<m>, f32[2]]` refines the supplied `dimension<m>` to
-    /// `dimension<2>`, whereas a formal fact never applies to an actual identity merely because the two share a name.
-    /// Identities in `symbolic` are kept even when the facts fix them (e.g., ones that another value which cannot be
-    /// refined, such as a reference, also carries), while the remaining identities of the same type are still refined.
+    /// preserving its layout, placement, and other non-identity metadata. A declared fact never applies to an actual
+    /// identity merely because the two share a name.
+    /// Identities in `symbolic` are kept even when their exact values are known. This lets a supplied value preserve
+    /// identities also carried by a reference whose type cannot change. Other identities in the same supplied type
+    /// are still refined.
+    ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
     ///
     /// # Parameters
     ///
@@ -418,27 +635,32 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///   - `symbolic`: Actual identities that must stay symbolic in the returned type.
     fn refine_actual(&self, actual: &T, symbolic: &[T::Identity]) -> Result<T, TypeError>;
 
-    /// Returns a representation of `actual`, the supplied input type corresponding to `declared`, refined like
-    /// [`Self::refine_actual`] with the `representatives` kept symbolic, except that each component whose declared
-    /// identity is linked (directly, or through other formal and actual identities that denote the same runtime extent)
-    /// to one of the `representatives` takes the first compatible representative instead, even where `actual` is exact
-    /// or carries another identity. For bounded identities, compatibility requires the declared component's bounds to
-    /// contain the representative's bounds. An actual identity already in `representatives` and in that declared class
+    /// Selects a type representation for the supplied `actual` input using compatible identities from its declared
+    /// classes. Unlike [`Self::refine_actual`], this can introduce a requested identity where `actual` has an exact
+    /// value or a different identity. `declared` identifies the relevant class; equal extents alone do not relate
+    /// otherwise independent identities. The function chooses a type, without performing a runtime check or conversion.
+    ///
+    /// The function applies actual-scope facts as [`Self::refine_actual`] does, with `representatives` kept symbolic,
+    /// except that each part of the declared type whose identity is linked to a representative takes the first
+    /// compatible representative instead. For arrays these parts are shape dimensions; for a first-class dimension
+    /// it is the dimension itself. Links may pass through other declared and actual identities in the same class.
+    /// For bounded identities, compatibility requires the declared identity's bounds to contain the representative's
+    /// bounds. An actual identity already in `representatives` and in that declared class
     /// keeps its own compatible name, so immutable handles may preserve their different identities within one checked
-    /// class. When an unfixed class has requested representatives but none fits a component, that component uses its
-    /// declared identity if an actual member carries it, otherwise the first compatible actual member. This keeps the
-    /// body's representation within the declared component's bounds; exact classes instead apply their exact fact. For
-    /// example, establishment of `[f32[m], f32[m]]` with `[f32[a], f32[3]]` fixes `a = 3`, and representing the second
-    /// input with a compatible `a` returns `f32[a]` rather than `f32[3]`, while matching declared `[dimension<m>,
-    /// dimension<m>]` against actual `[dimension<a>, dimension<b>]` relates `a` and `b` without an extent, and
-    /// representing the second input with a compatible `a` returns `dimension<a>`. Consumers use this to give related
-    /// values compatible representations while respecting immutable reference geometry. A changed known representation
+    /// class. When a class without an exact value has requested representatives but none fits a part of the declared
+    /// type, that part uses its declared identity if an actual member carries it, otherwise the first compatible
+    /// actual member. This keeps the body's representation within the declared identity's bounds; exact classes
+    /// instead apply their exact fact.
+    /// Classes without an exact extent can also select representatives. Consumers use this to give related values
+    /// compatible representations while respecting immutable reference geometry. A changed known representation
     /// may require a residual checked value. The result is a representation justified by checking the complete input
     /// signature, rather than a runtime check performed by this type-level function.
     ///
+    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    ///
     /// # Parameters
     ///
-    ///   - `declared`: Declared type that `actual` enters.
+    ///   - `declared`: Declared type corresponding to this supplied input, identifying its identity classes.
     ///   - `actual`: Supplied input type to refine.
     ///   - `representatives`: Actual identities that represent their classes, in order of preference.
     fn retype_actual(&self, declared: &T, actual: &T, representatives: &[T::Identity]) -> Result<T, TypeError>;
@@ -446,17 +668,17 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
 
 impl<T: Type> TypeRefinements<T> for () {
     #[inline]
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
         D::Item: Borrow<T>,
         A::Item: Borrow<T>,
     {
-        Self::validate(&(), declared, actual, &[])
+        Self::validate_refinement(&(), declared, actual, &[])
     }
 
-    fn validate<D: IntoIterator, A: IntoIterator>(
+    fn validate_refinement<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
         actual: A,
@@ -477,7 +699,7 @@ impl<T: Type> TypeRefinements<T> for () {
     }
 
     #[inline]
-    fn unproven_identities(&self) -> &[T::Identity] {
+    fn type_identities_requiring_runtime_checks(&self) -> &[T::Identity] {
         &[]
     }
 
@@ -532,11 +754,54 @@ impl<V: Typed + ?Sized> Typed for &V {
 }
 
 // TODO(eaplatanios): Review this.
-/// Shared proof driver over borrowed signature members, including generic iterator items retained by establishment.
-pub(crate) fn unproven_type_identity_members<T: Type, D: Borrow<T>>(
-    declared: &[D],
+/// Returns the declared type identities whose equality relationships are not guaranteed by the supplied input types.
+/// For example, `[f32[n], f32[n]]` declares that two arrays have the same length. Actual types `[f32[3], f32[3]]`
+/// prove that relationship, while `[f32[n], f32[3]]` leave the first array's length unknown. A transform removing the
+/// boundary must preserve its runtime check, either by retaining the boundary or by emitting a
+/// [`GuardOperation`](crate::GuardOperation).
+///
+/// A relationship is proven when one consistent structural substitution, as determined by
+/// [`Type::derive_identity_renaming`], instantiates every occurrence of its identity. `actual` must align with
+/// `declared` and use [`Some`] with a borrowed type for available types, including symbolic types, and [`None`] for
+/// unavailable types. An unavailable type leaves every identity carried by its corresponding declared type unproven.
+/// Declared members may be owned types or values that borrow a type, such as references or [`Cow`]s; the analysis
+/// borrows their types without cloning them. An empty declared slice needs an explicit element type.
+///
+/// Each reported identity appears once, in the order it first occurs in `declared`. The analysis is conservative:
+/// when one input type contains several identities, failure to prove one relationship can also cause another identity
+/// to be reported. This function neither validates input admissibility nor performs runtime checks. In particular,
+/// an empty result does not establish that the actual types satisfy the boundary's complete type contract.
+///
+/// # Errors
+///
+/// Returns [`TypeError::Invalid`] when the signatures have different lengths. Other structural comparison failures
+/// leave the affected identities unproven instead of returning an error.
+///
+/// # Examples
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     ArrayType, DataType, DimensionBounds, DimensionVariable, Shape, type_identities_requiring_runtime_checks,
+/// # };
+///
+/// let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+/// let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()]));
+/// let exact = ArrayType::new_static(DataType::F32, [3]);
+/// let declared = [symbolic.clone(), symbolic.clone()];
+///
+/// // The first input may have a different length, so removing the boundary would lose a runtime check.
+/// let mixed = [Some(&symbolic), Some(&exact)];
+/// assert_eq!(type_identities_requiring_runtime_checks(&declared, &mixed).unwrap(), vec![length]);
+///
+/// // Both types now prove length three, so this relationship needs no runtime boundary check.
+/// let proven = [Some(&exact), Some(&exact)];
+/// assert!(type_identities_requiring_runtime_checks(&declared, &proven).unwrap().is_empty());
+/// ```
+pub fn type_identities_requiring_runtime_checks<T: Type>(
+    declared: &[impl Borrow<T>],
     actual: &[Option<&T>],
 ) -> Result<Vec<T::Identity>, TypeError> {
+    // TODO(eaplatanios): Review this.
     if declared.len() != actual.len() {
         return Err(TypeError::invalid(format!(
             "declared type count {} does not match actual type count {}",
@@ -596,54 +861,10 @@ pub(crate) fn unproven_type_identity_members<T: Type, D: Borrow<T>>(
         .collect())
 }
 
-// TODO(eaplatanios): Review this.
-/// Returns the declared type identities whose relationships are not proven by the supplied input types. For example,
-/// `[f32[n], f32[n]]` declares that two arrays have the same length. Actual types `[f32[3], f32[3]]` prove that
-/// relationship, while `[f32[n], f32[3]]` leave the first array's length unknown. A transform that removes the
-/// boundary must preserve its runtime check, either by retaining the boundary or by emitting a
-/// [`GuardOperation`](crate::GuardOperation).
-///
-/// A relationship is proven when one consistent structural substitution, as determined by
-/// [`Type::derive_identity_renaming`], instantiates every occurrence of its identity. `actual` must align with
-/// `declared` and use [`Some`] with a borrowed type for available types, including symbolic types, and [`None`] for
-/// unavailable types. An unavailable type leaves every identity carried by its corresponding declared type unproven.
-///
-/// The result contains each unproven identity once, in the order it first appears in `declared`. The analysis is
-/// _conservative_ meaning that a member carrying several identities can cause one to be reported because another is
-/// unproven. This function neither validates input admissibility nor performs runtime checks. In particular, an empty
-/// result does not establish that the actual types satisfy the boundary's complete type contract.
-///
-/// # Errors
-///
-/// Returns [`TypeError::Invalid`] when the signatures have different lengths. Other structural comparison failures
-/// leave the affected identities unproven instead of returning an error.
-///
-/// # Examples
-///
-/// ```rust
-/// # use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Shape, unproven_type_identities};
-///
-/// let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-/// let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![length.clone().into()]));
-/// let exact = ArrayType::new_static(DataType::F32, [3]);
-/// let declared = [symbolic.clone(), symbolic.clone()];
-///
-/// // The first input may have a different length, so removing the boundary would lose a runtime check.
-/// let mixed = [Some(&symbolic), Some(&exact)];
-/// assert_eq!(unproven_type_identities(&declared, &mixed).unwrap(), vec![length]);
-///
-/// // Both types now prove length three, so this relationship needs no runtime boundary check.
-/// let proven = [Some(&exact), Some(&exact)];
-/// assert!(unproven_type_identities(&declared, &proven).unwrap().is_empty());
-/// ```
-pub fn unproven_type_identities<T: Type>(declared: &[T], actual: &[Option<&T>]) -> Result<Vec<T::Identity>, TypeError> {
-    unproven_type_identity_members(declared, actual)
-}
-
 /// Zips one complete declared/actual [`Type`] signature and applies `visitor` to each corresponding pair, rejecting
 /// signatures of different lengths with the canonical count diagnostic. This is the shared driver behind complete
-/// signature walks such as [`TypeRefinements::establish`], [`TypeRefinements::validate`], and
-/// [`Type::derive_identity_renaming`], so that every such walk agrees on the length contract and its diagnostic.
+/// signature walks such as [`TypeRefinements::from_local_declarations`], [`TypeRefinements::validate_refinement`],
+/// and [`Type::derive_identity_renaming`], so that every such walk agrees on the length contract and its diagnostic.
 pub(crate) fn visit_type_signature_pairs<
     T: Type,
     D: IntoIterator<Item: Borrow<T>, IntoIter: ExactSizeIterator>,
@@ -708,16 +929,38 @@ mod tests {
     }
 
     #[test]
-    fn test_type_refinements() {
-        let refinements = <() as TypeRefinements<DataType>>::establish(
+    fn test_type_refinements_new() {
+        assert_eq!(<() as TypeRefinements<DataType>>::new([DataType::F32], [DataType::F32]), Ok(()));
+        assert_eq!(
+            <() as TypeRefinements<DataType>>::new([DataType::F32], [DataType::F32, DataType::F32]),
+            Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
+        );
+
+        // Implicit promotion does not make a differently typed value a valid input to an f32 program.
+        assert!(DataType::F16.is_compatible_with(&DataType::F32));
+        assert_eq!(
+            <() as TypeRefinements<DataType>>::new([DataType::F32], [DataType::F16]),
+            Err(TypeError::invalid("type f16 does not refine declared type f32")),
+        );
+
+        // Broadcasting is likewise a conversion, not ordinary entry admission.
+        let declared = ArrayType::new_static(DataType::F32, [2, 3]);
+        let actual = ArrayType::new_static(DataType::F32, [1, 3]);
+        assert!(actual.is_compatible_with(&declared));
+        assert!(ArrayTypeRefinements::new([declared], [actual]).is_err());
+    }
+
+    #[test]
+    fn test_type_refinements_from_local_declarations() {
+        let refinements = <() as TypeRefinements<DataType>>::from_local_declarations(
             [DataType::F32, DataType::I32].iter(),
             [DataType::F32, DataType::I32].iter(),
         )
         .unwrap();
         assert_eq!(<() as TypeRefinements<DataType>>::identity_classes(&refinements).count(), 0);
-        assert!(!<() as TypeRefinements<DataType>>::requires_guard(&refinements));
+        assert!(<() as TypeRefinements<DataType>>::type_identities_requiring_runtime_checks(&refinements).is_empty());
         assert_eq!(
-            <() as TypeRefinements<DataType>>::validate(
+            <() as TypeRefinements<DataType>>::validate_refinement(
                 &refinements,
                 [DataType::F32, DataType::I32].iter(),
                 [DataType::F32, DataType::I32].iter(),
@@ -726,11 +969,14 @@ mod tests {
             Ok(()),
         );
         assert_eq!(
-            <() as TypeRefinements<DataType>>::establish([DataType::F32].iter(), [DataType::F32, DataType::I32].iter(),),
+            <() as TypeRefinements<DataType>>::from_local_declarations(
+                [DataType::F32].iter(),
+                [DataType::F32, DataType::I32].iter(),
+            ),
             Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
         );
         assert_eq!(
-            <() as TypeRefinements<DataType>>::validate(
+            <() as TypeRefinements<DataType>>::validate_refinement(
                 &refinements,
                 [DataType::F32].iter(),
                 [DataType::F64].iter(),
@@ -745,28 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn test_type_refinements_validate_inputs() {
-        assert_eq!(<() as TypeRefinements<DataType>>::validate_inputs([DataType::F32], [DataType::F32]), Ok(()));
-        assert_eq!(
-            <() as TypeRefinements<DataType>>::validate_inputs([DataType::F32], [DataType::F32, DataType::F32]),
-            Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
-        );
-
-        // Implicit promotion does not make a differently typed value a valid input to an f32 program.
-        assert!(DataType::F16.is_compatible_with(&DataType::F32));
-        assert_eq!(
-            <() as TypeRefinements<DataType>>::validate_inputs([DataType::F32], [DataType::F16]),
-            Err(TypeError::invalid("type f16 does not refine declared type f32")),
-        );
-
-        // Broadcasting is likewise a conversion, not ordinary entry admission.
-        let declared = ArrayType::new_static(DataType::F32, [2, 3]);
-        let actual = ArrayType::new_static(DataType::F32, [1, 3]);
-        assert!(actual.is_compatible_with(&declared));
-        assert!(ArrayTypeRefinements::validate_inputs([declared], [actual]).is_err());
-    }
-
-    #[test]
     fn test_type_refinements_admission_and_guard_obligations() {
         let bounds = DimensionBounds::positive(Some(8)).unwrap();
         let n = DimensionVariable::new("n", bounds);
@@ -776,28 +1000,30 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let declared = [vector(&n), vector(&n)];
         let actual = [vector(&n), exact.clone()];
-        let refinements = ArrayTypeRefinements::validate_inputs(&declared, &actual).unwrap();
+        let refinements = ArrayTypeRefinements::new(&declared, &actual).unwrap();
 
         // Exact conditional facts do not prove the relationship: the symbolic input can still have another extent.
         assert!(refinements.identity_classes().next().unwrap().is_exact());
-        assert!(refinements.requires_guard());
-        assert_eq!(refinements.unproven_identities(), &[n.clone()]);
+        assert_eq!(refinements.type_identities_requiring_runtime_checks(), &[n.clone()]);
         assert_eq!(refinements.refine_declared(&declared[0], &[]).unwrap(), exact);
         assert!(ArrayType::derive_identity_renaming(&declared, &actual).is_err());
 
         // A local declaration can be structurally instantiated without ordinary nominal admission permitting it.
         let renamed = [vector(&m), vector(&m)];
-        assert!(ArrayTypeRefinements::validate_inputs(&declared, &renamed).is_err());
-        let refinements = ArrayTypeRefinements::establish(&declared, &renamed).unwrap();
-        assert!(!refinements.requires_guard());
-        assert!(refinements.unproven_identities().is_empty());
+        assert!(ArrayTypeRefinements::new(&declared, &renamed).is_err());
+        let refinements = ArrayTypeRefinements::from_local_declarations(&declared, &renamed).unwrap();
+        assert!(refinements.type_identities_requiring_runtime_checks().is_empty());
 
         // A mixed local instantiation records the guard obligation, while unrelated extents remain invalid.
         let mixed = [vector(&m), exact.clone()];
-        let refinements = ArrayTypeRefinements::establish(&declared, &mixed).unwrap();
-        assert_eq!(refinements.unproven_identities(), &[n]);
+        let refinements = ArrayTypeRefinements::from_local_declarations(&declared, &mixed).unwrap();
+        assert_eq!(refinements.type_identities_requiring_runtime_checks(), &[n]);
         assert!(
-            ArrayTypeRefinements::establish(&declared, &[exact, ArrayType::new_static(DataType::F32, [3])]).is_err()
+            ArrayTypeRefinements::from_local_declarations(
+                &declared,
+                &[exact, ArrayType::new_static(DataType::F32, [3])]
+            )
+            .is_err()
         );
     }
 
@@ -809,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unproven_type_identities() {
+    fn test_type_identities_requiring_runtime_checks() {
         let vector = |dimension: Dimension| ArrayType::new(DataType::F32, Shape::new(vec![dimension]));
         let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let m = DimensionVariable::new("m", DimensionBounds::positive(Some(8)).unwrap());
@@ -823,32 +1049,41 @@ mod tests {
 
         // One structural substitution proves `n`, whether it renames `n` or fixes it to a static extent.
         let renamed = [Some(&actual_m), Some(&actual_m), Some(&actual_p)];
-        assert_eq!(unproven_type_identities(&declared, &renamed), Ok(Vec::<DimensionVariable>::new()));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &renamed), Ok(Vec::<DimensionVariable>::new()));
+        let borrowed = declared.each_ref();
+        assert_eq!(type_identities_requiring_runtime_checks(&borrowed, &renamed), Ok(Vec::<DimensionVariable>::new()));
+        assert_eq!(
+            type_identities_requiring_runtime_checks::<ArrayType>(&borrowed, &[None, None, None]),
+            Ok(vec![n.clone(), p.clone()]),
+        );
         let fixed = [Some(&exact), Some(&exact), Some(&actual_p)];
-        assert_eq!(unproven_type_identities(&declared, &fixed), Ok(Vec::<DimensionVariable>::new()));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &fixed), Ok(Vec::<DimensionVariable>::new()));
 
         // Mixed or conflicting occurrences, and unknown entries, leave `n` to the boundary, while `p` stays proven.
         let mixed = [Some(&actual_n), Some(&exact), Some(&actual_p)];
-        assert_eq!(unproven_type_identities(&declared, &mixed), Ok(vec![n.clone()]));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &mixed), Ok(vec![n.clone()]));
+        let borrowed = declared.each_ref().map(Cow::Borrowed);
+        assert_eq!(type_identities_requiring_runtime_checks(&borrowed, &mixed), Ok(vec![n.clone()]));
         let conflicting = [Some(&actual_m), Some(&actual_n), Some(&actual_p)];
-        assert_eq!(unproven_type_identities(&declared, &conflicting), Ok(vec![n.clone()]));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &conflicting), Ok(vec![n.clone()]));
         let unknown = [Some(&actual_n), None, Some(&actual_p)];
-        assert_eq!(unproven_type_identities(&declared, &unknown), Ok(vec![n.clone()]));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &unknown), Ok(vec![n.clone()]));
 
         // Unavailable types preserve the distinct identities' declaration order; empty signatures have none.
-        assert_eq!(unproven_type_identities(&declared, &[None, None, None]), Ok(vec![n, p]));
-        assert_eq!(unproven_type_identities::<ArrayType>(&[], &[]), Ok(Vec::new()));
+        assert_eq!(type_identities_requiring_runtime_checks(&declared, &[None, None, None]), Ok(vec![n, p]));
+        assert_eq!(type_identities_requiring_runtime_checks::<ArrayType>(&[] as &[ArrayType], &[]), Ok(Vec::new()));
+        assert_eq!(type_identities_requiring_runtime_checks::<ArrayType>(&[] as &[&ArrayType], &[]), Ok(Vec::new()));
 
         // This query does not validate scalar admissibility, even when it finds no identity relationship to preserve.
-        assert_eq!(unproven_type_identities(&[DataType::F32], &[Some(&DataType::I32)]), Ok(Vec::new()));
+        assert_eq!(type_identities_requiring_runtime_checks(&[DataType::F32], &[Some(&DataType::I32)]), Ok(Vec::new()));
 
         // Reject both missing and extra actual entries instead of silently truncating the signature walk.
         assert_eq!(
-            unproven_type_identities(&declared, &renamed[..2]),
+            type_identities_requiring_runtime_checks(&declared, &renamed[..2]),
             Err(TypeError::invalid("declared type count 3 does not match actual type count 2")),
         );
         assert_eq!(
-            unproven_type_identities(&declared, &[None, None, None, None]),
+            type_identities_requiring_runtime_checks(&declared, &[None, None, None, None]),
             Err(TypeError::invalid("declared type count 3 does not match actual type count 4")),
         );
     }

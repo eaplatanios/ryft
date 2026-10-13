@@ -3,9 +3,8 @@ use std::fmt::{Debug, Display};
 use crate::programs::types::TypeError;
 
 /// Role of a [`TypeIdentity`] in one invocation's type-refinement facts. Declared and actual occurrences of the same
-/// identity are distinct nodes, related only by correspondences admitted when matching the invocation's types. Note
-/// that [`TypeIdentityKind`]s belong to identity occurrences in comparisons and not permanently to the identities
-/// themselves.
+/// identity are tracked separately and related only when matching the invocation's types establishes a relationship.
+/// The kind describes how an identity is used in a comparison; it is not a permanent property of the identity.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypeIdentityKind {
     /// Identity interpreted in the invoked program's declared scope, including its intermediate and output types.
@@ -191,12 +190,12 @@ impl<I: TypeIdentity> TypeIdentitySignature<I> {
 
 /// A borrowed view of a connected group of scoped [`TypeIdentity`]s that must denote the same runtime quantity for
 /// an invocation's type contract to hold. A scoped identity is an identity together with its [`TypeIdentityKind`].
-/// The same identity object can have both roles without relating those two occurrences.
+/// Using the same identity object in both scopes does not, by itself, relate its declared and actual occurrences.
 /// [`TypeRefinements::identity_classes`](crate::TypeRefinements::identity_classes) exposes these groups
 /// so that consumers can preserve relationships between identities even when their values are unknown.
 ///
-/// Each corresponding pair of input types can connect declared and actual identities. Classes contain all identities
-/// connected transitively, rather than one class per input pair. For example:
+/// Matching an input's declared and actual types can relate their identities. Identities connected through one or more
+/// such pairs belong to the same class. For example:
 ///
 /// ```text
 /// declared types: [dimension<n>, dimension<p>]
@@ -244,7 +243,8 @@ pub struct TypeIdentityClass<'o, I: TypeIdentity> {
 }
 
 impl<'o, I: TypeIdentity> TypeIdentityClass<'o, I> {
-    /// Creates a new [`TypeIdentityClass`] with the provided scoped members and exactness.
+    /// Creates a [`TypeIdentityClass`] from its declared and actual members. `exact` indicates whether the refinement
+    /// facts determine one exact value for those members.
     ///
     /// # Parameters
     ///
