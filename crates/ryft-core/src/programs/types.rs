@@ -102,20 +102,20 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     }
 
     /// Derives the simultaneous [`TypeIdentityRenaming`] implied by matching a complete declared type signature
-    /// against an actual type signature. Matching is directional: `declared` contains the formal types of a
+    /// against an actual type signature. Matching is directional: `declared` contains the types declared by a
     /// [`Program`](crate::Program) or [`Region`](crate::Region) boundary, while `actual` contains the corresponding
-    /// types supplied at an instantiation site. The method validates that the actual signature can instantiate the
+    /// types supplied at an instantiation site. This function validates that the actual signature can instantiate the
     /// declared signature and derives every declared-identity-to-actual-identity correspondence. For example:
     ///
     /// ```text
-    /// declared: [array<n>, array<m>]
-    /// actual:   [array<batch>, array<sequence>]
+    /// declared: [f32[n], f32[m]]
+    /// actual:   [f32[batch], f32[sequence]]
     /// renaming: n -> batch, m -> sequence
     /// ```
     ///
     /// The default implementation requires each actual type to refine its declared type and preserve all identity
     /// occurrences unchanged. It therefore returns an empty renaming. Families supporting identity substitutions
-    /// override this method and verify that those substitutions preserve the complete signature's relationships without
+    /// override this function and verify that substitutions preserve the complete signature's relationships without
     /// requiring additional runtime checks.
     ///
     /// The renaming is derived once from the complete boundary signature and then reused with
@@ -129,6 +129,22 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// When a declared identity is instantiated by a static component, there is no actual identity to place in the
     /// renaming. The implementation must still validate bounds and ensure that repeated occurrences of the declared
     /// identity observe consistent static refinements.
+    ///
+    /// For array identities `n` and `m` with bounds `[0, 8)`, comparing complete signatures has these results:
+    ///
+    ///   - `[f32[n], f32[n]]` against `[f32[m], f32[m]]` records the consistent substitution `n -> m`.
+    ///   - `[f32[n], f32[n]]` against `[f32[3], f32[3]]` accepts the repeated extent `n = 3` without a substitution.
+    ///   - `[f32[n], f32[n]]` against `[f32[3], f32[4]]` rejects inconsistent extents.
+    ///   - `[f32[n], f32[n]]` against `[f32[m], f32[3]]` rejects the signature as substitution alone cannot establish
+    ///     the additional condition `m = 3`. It is accepted if `m` has singleton bounds fixing its extent to `3`.
+    ///     Conditional [`TypeRefinements::from_local_declarations`] can represent the relationship for wider bounds,
+    ///     but its facts cannot justify a structural substitution without the required runtime check.
+    ///
+    /// Array axes and first-class dimensions have different structural admission rules. A declared static array axis
+    /// requires an equal static actual axis. A first-class dimension instead admits actual bounds within its declared
+    /// bounds, so a static declared dimension can accept an actual singleton identity without producing a substitution.
+    /// Repeated substitutions, extents, and their agreement are checked across the entire signature, independently of
+    /// which member first records a substitution or extent.
     ///
     /// Returns a [`TypeError`] when the signatures are structurally incompatible, an actual type cannot instantiate its
     /// declared type, bounds are violated, or repeated occurrences imply conflicting identity mappings or refinements.
