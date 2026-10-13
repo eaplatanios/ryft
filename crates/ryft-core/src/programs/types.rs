@@ -481,19 +481,20 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 ///
 /// These functions inspect types only. Their conditional results do not replace the required runtime input checks.
 pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
-    /// Creates refinement facts by validating the complete `actual` input signature against `declared` under the type
-    /// family's ordinary input-admission rules. Use this constructor for program and region inputs.
-    /// This checks ordinary input admission and every repeated identity relationship, including repetitions within one
-    /// type. Relationships not guaranteed by the supplied types must be checked at runtime. Such obligations are
-    /// recorded in [`Self::type_identities_requiring_runtime_checks`]; success does not mean a guard can be removed.
+    /// Creates a new [`TypeRefinements`] instance by validating the complete `actual` input signature against
+    /// `declared` under the type family's ordinary input-admission rules. Use this constructor for program and region
+    /// inputs. This checks ordinary input admission and every repeated identity relationship, including repetitions
+    /// within one type. Relationships not guaranteed by the supplied types must be checked at runtime. Such obligations
+    /// are recorded in [`Self::type_identities_requiring_runtime_checks`]; success does not mean that a guard can be
+    /// removed.
     ///
-    /// Unlike [`Self::from_local_declarations`], which treats declared identities as local names, it enforces ordinary
-    /// nominal input rules. The default requires each actual type to satisfy [`Type::is_refined_by`] before
-    /// establishing relationships. Families that accept inputs requiring runtime checks or equivalent exact
+    /// Unlike [`Self::from_local_declarations`], which treats declared identities as local names, it enforces
+    /// ordinary nominal input rules. The default requires each actual type to satisfy [`Type::is_refined_by`]
+    /// before establishing relationships. Families that accept inputs requiring runtime checks or equivalent exact
     /// representations override this function, keeping complete-signature consistency and guard obligations in the
     /// returned facts. Neither input validation nor establishment converts values or performs runtime checks.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
@@ -521,20 +522,19 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
         Self::from_local_declarations(declared, actual)
     }
 
-    /// Creates refinement facts by comparing the complete `actual` signature with `declared`, treating declared
-    /// identities as local names for this comparison. Bounds-compatible actual identities may instantiate different
-    /// declared identities. Programs and regions construct their input refinements with [`Self::new`];
-    /// guards and code replaying a body with prepared inputs call this function directly.
-    /// Identities connected through matched input pairs form a class, which may contain several identities in either
-    /// scope. An exact fact observed in any pair applies to every identity in its class. A fact outside an identity's
-    /// bounds, or inconsistent with another fact about the same identity, is rejected.
-    /// Correspondences without an exact fact do not determine an exact value.
-    /// Relationships that the supplied types do not prove are recorded by
-    /// [`Self::type_identities_requiring_runtime_checks`]; they require the original program's or region's input
+    /// Creates a new [`TypeRefinements`] instance by comparing the complete `actual` signature with `declared`,
+    /// treating declared identities as local names for this comparison. Bounds-compatible actual identities may
+    /// instantiate different declared identities. Programs and regions construct their input refinements with
+    /// [`Self::new`]; guards and code replaying a body with prepared inputs call this function directly. Identities
+    /// connected through matched input pairs form a class, which may contain several identities in either scope. An
+    /// exact fact observed in any pair applies to every identity in its class. A fact outside an identity's bounds,
+    /// or inconsistent with another fact about the same identity, is rejected. Correspondences without an exact fact
+    /// do not determine an exact value. Relationships that the supplied types do not prove are recorded by
+    /// [`Self::type_identities_requiring_runtime_checks`]. They require the original program's or region's input
     /// checks, or a guard, before the facts may be used to execute a specialized body. This constructor never performs
     /// a runtime check.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
@@ -560,7 +560,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// `closed_identities` only identifies which identities may establish facts during validation. It does not contain
     /// concrete extents or inspect runtime value payloads.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
@@ -586,10 +586,9 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// types, in first-occurrence order. Those relationships still require runtime checking.
     /// These obligations are independent of exact conditional facts. Implementations may report conservative
     /// obligations for identities sharing an input member (refer to the
-    /// [standalone query](crate::programs::types::type_identities_requiring_runtime_checks)).
+    /// [standalone query](type_identities_requiring_runtime_checks)).
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
-    ///
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     fn type_identities_requiring_runtime_checks(&self) -> &[T::Identity];
 
     /// Returns the invocation's groups of related declared and actual identities, in first-observation order.
@@ -599,8 +598,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// relationships between the supplied inputs, conditional on those relationships being satisfied. Using the
     /// classes never replaces the runtime checks that the inputs require.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
-    ///
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, T::Identity>>
     where
         T::Identity: 'o;
@@ -614,7 +612,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// refined at the latter. Refinements never add metadata that is not a fact about an identity (e.g., an array's
     /// sharding or layout).
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
@@ -631,7 +629,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// identities also carried by a reference whose type cannot change. Other identities in the same supplied type
     /// are still refined.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
@@ -660,7 +658,7 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// may require a residual checked value. The result is a representation justified by checking the complete input
     /// signature, rather than a runtime check performed by this type-level function.
     ///
-    /// See the [examples on `TypeRefinements`](TypeRefinements#examples).
+    /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///
     /// # Parameters
     ///
