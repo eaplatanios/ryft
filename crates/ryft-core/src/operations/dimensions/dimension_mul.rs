@@ -58,10 +58,9 @@ impl Mul for DimensionValue {
     fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
         let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while multiplying dimensions with inputs {}={}, {}={}",
-                self.r#type().dimension(),
+                "dimension arithmetic overflow in `{}`; got left={}, right={}",
+                DIMENSION_MUL_OPERATION_NAME,
                 self.extent(),
-                right.r#type().dimension(),
                 right.extent(),
             ),
         })?;
@@ -160,6 +159,18 @@ mod tests {
         assert_eq!((left.clone() * &right).extent(), 21);
         assert_eq!((&left * right.clone()).extent(), 21);
         assert_eq!((&left * &right).extent(), 21);
+
+        // Host arithmetic overflow reports operand roles rather than treating exact extents as variable names.
+        let left = DimensionValue::constant(MAX_DIMENSION_EXTENT).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            left.mul(&right).unwrap_err().downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ArithmeticOverflow {
+                message: format!(
+                    "dimension arithmetic overflow in `dimension_mul`; got left={MAX_DIMENSION_EXTENT}, right=3",
+                ),
+            }),
+        );
     }
 
     #[test]

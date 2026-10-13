@@ -58,10 +58,8 @@ impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {
         let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while adding dimensions with inputs {}={}, {}={}",
-                self.r#type().dimension(),
+                "dimension arithmetic overflow in `{DIMENSION_ADD_OPERATION_NAME}`; got left={}, right={}",
                 self.extent(),
-                right.r#type().dimension(),
                 right.extent(),
             ),
         })?;

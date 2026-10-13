@@ -50,20 +50,13 @@ impl<A: Value<Type = ArrayType>> From<DimensionSubOperation> for ArrayIrOperatio
 
 impl Sub for DimensionValue {
     fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| {
-            let left_variable = self.r#type().dimension().to_string();
-            let right_variable = right.r#type().dimension().to_string();
-            DimensionError::RequirementViolation {
-                message: format!(
-                    "{} >= {}; observed {}={}, {}={}",
-                    left_variable,
-                    right_variable,
-                    left_variable,
-                    self.extent(),
-                    right_variable,
-                    right.extent(),
-                ),
-            }
+        let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| DimensionError::RequirementViolation {
+            message: format!(
+                "`{}` requires left >= right; got left={}, right={}",
+                DIMENSION_SUB_OPERATION_NAME,
+                self.extent(),
+                right.extent(),
+            ),
         })?;
 
         // The observed extents are validated before the operation derives the exact result type,
@@ -167,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "1 >= 3; observed 1=1, 3=3")]
+    #[should_panic(expected = "`dimension_sub` requires left >= right; got left=1, right=3")]
     fn test_dimension_sub_operator_panics_on_capability_error() {
         let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());

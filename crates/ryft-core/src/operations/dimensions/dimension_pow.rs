@@ -95,11 +95,9 @@ impl DimensionPow for DimensionValue {
         let extent =
             checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
-                    "dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
-                     {}={}, {}={}",
-                    self.r#type().dimension(),
+                    "dimension arithmetic overflow in `{}`; got left={}, right={}",
+                    DIMENSION_POW_OPERATION_NAME,
                     self.extent(),
-                    right.r#type().dimension(),
                     right.extent(),
                 ),
             })?;
@@ -176,6 +174,17 @@ mod tests {
                 .unwrap()
                 .extent(),
             81,
+        );
+
+        let left = DimensionValue::constant(MAX_DIMENSION_EXTENT).unwrap();
+        let right = DimensionValue::constant(2).unwrap();
+        assert_eq!(
+            left.dimension_pow(&right).unwrap_err().downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ArithmeticOverflow {
+                message: format!(
+                    "dimension arithmetic overflow in `dimension_pow`; got left={MAX_DIMENSION_EXTENT}, right=2",
+                ),
+            }),
         );
     }
 

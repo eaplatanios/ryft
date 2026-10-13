@@ -54,15 +54,11 @@ impl<A: Value<Type = ArrayType>> From<DimensionRemOperation> for ArrayIrOperatio
 impl Rem for DimensionValue {
     fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
         if right.extent() == 0 {
-            let left_variable = self.r#type().dimension().to_string();
-            let right_variable = right.r#type().dimension().to_string();
             return Err(DimensionError::RequirementViolation {
                 message: format!(
-                    "{} > 0; observed {}={}, {}={}",
-                    right_variable,
-                    left_variable,
+                    "`{}` requires right > 0; got left={}, right={}",
+                    DIMENSION_REM_OPERATION_NAME,
                     self.extent(),
-                    right_variable,
                     right.extent(),
                 ),
             }
