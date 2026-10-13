@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
@@ -7,10 +8,14 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::types::arrays::{ArrayTypeRefinements, DimensionObservation};
 use crate::axes::Axis;
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
-use crate::programs::{ProgramError, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::{
+    ProgramError, Type, TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeRefinements, type_identities_needing_runtime_checks,
+};
 
 /// Largest runtime dimension extent that every supported backend representation can carry. Host values use [`usize`],
 /// while compiled dimension Single Static Assignment (SSA) values use signed 64-bit scalars. On narrower hosts every
@@ -232,29 +237,20 @@ impl DimensionVariable {
         self.payload.bounds
     }
 
-    /// Records the renaming of `declared` to `actual` in `renaming`. A different existing target for `declared`
-    /// is accepted only when both targets' bounds prove the same single extent, in which case the first target is
-    /// retained as a representative of that concrete instantiation without equating their identities. Every other
-    /// different existing target is a conflicting renaming.
-    ///
-    /// This function does not check bounds. Callers must first check that the bounds of `declared` contain the bounds
-    /// of `actual`, so that each caller reports a bounds violation with diagnostics phrased in terms of its own types
-    /// (e.g., [`DimensionType::extend_identity_renaming`] and
-    /// [`ArrayType::extend_identity_renaming`](crate::ArrayType::extend_identity_renaming)).
-    pub(crate) fn extend_identity_renaming(
-        declared: &Self,
-        actual: &Self,
-        renaming: &mut TypeIdentityRenaming<Self>,
-    ) -> Result<(), TypeError> {
-        if let Some(extent) = actual.bounds().extent()
-            && renaming.target(declared).is_some_and(|existing| existing.bounds().extent() == Some(extent))
-        {
-            // Several first-class reads can reify one source dimension as independently named exact literals.
-            // Keep the first representative when both bounds prove the same single extent. This does not equate
-            // the nominal identities; it only chooses a valid representative for this concrete instantiation.
-            return Ok(());
+    /// Returns the target of this [`DimensionVariable`] in `renaming` (itself when `renaming` does not rename it),
+    /// after checking that the target's bounds are contained in this variable's bounds.
+    pub fn renamed(&self, renaming: &TypeIdentityRenaming<Self>) -> Result<Self, TypeError> {
+        let variable = renaming.rename(self);
+        if !self.bounds().contains_bounds(variable.bounds()) {
+            return Err(TypeError::invalid(format!(
+                "cannot rename dimension variable {} with bounds {} to {} with bounds {}",
+                self,
+                self.bounds(),
+                variable,
+                variable.bounds(),
+            )));
         }
-        renaming.insert(declared.clone(), actual.clone())
+        Ok(variable)
     }
 }
 
@@ -299,17 +295,22 @@ impl TypeIdentity for DimensionVariable {
     }
 }
 
-/// [`Type`] of a [`DimensionValue`](crate::DimensionValue). A value with this type defines `variable` as an ordinary
-/// Single Static Assignment (SSA) value. Array axes may refer to that same [`DimensionVariable`], while arithmetic
-/// relationships between dimension values remain explicit operation edges in the [`Program`](crate::Program) graph.
+/// [`Type`] of a first-class dimension value, described by a [`Dimension`] exactly like one array axis.
+/// A static type (e.g., `dimension<3>`) describes a value whose extent is known, such as every eager
+/// [`DimensionValue`](crate::DimensionValue), and has no identity, exactly like a [`Dimension::Static`] array axis.
+/// A symbolic type describes a value whose extent is only known at runtime and defines its [`DimensionVariable`] as
+/// an ordinary Single Static Assignment (SSA) value. Array axes may refer to that same [`DimensionVariable`], while
+/// arithmetic relationships between dimension values remain explicit operation edges in the [`Program`](crate::Program)
+/// graph.
 ///
-/// A [`DimensionType`] is strictly its [`DimensionVariable`] identity plus that variable's authoritative bounds.
-/// Concrete extents observed at execution boundaries are deliberately *not* part of the type (i.e., structural type
-/// equality, hashing, display, and retained-compilation cache identity must not distinguish two calls whose dynamic
-/// extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead live in the
-/// complete-signature [`TypeRefinements`](crate::TypeRefinements) environment established from boundary inputs. A
-/// variable defined by an instruction inside a program needs no input-boundary refinement (its producing instruction
-/// closes the identity structurally and establishes its concrete value when the program executes).
+/// A symbolic [`DimensionType`] is strictly its [`DimensionVariable`] identity plus that variable's authoritative
+/// bounds. Concrete extents observed at execution boundaries are deliberately *not* part of such a type (i.e.,
+/// structural type equality, hashing, display, and retained-compilation cache identity must not distinguish two calls
+/// whose dynamic extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead
+/// live in the complete-signature [`TypeRefinements`] environment established from boundary inputs, where a static
+/// dimension type that meets a symbolic one binds its variable to the static extent. A variable defined by an
+/// instruction inside a program needs no input-boundary refinement (its producing instruction closes the identity
+/// structurally and establishes its concrete value when the program executes).
 ///
 /// # Motivation
 ///
@@ -329,12 +330,13 @@ impl TypeIdentity for DimensionVariable {
 ///     polymorphic.
 ///   - **One Compiled Artifact Across Extents:** Concrete extents are not part of the type, so retained compilations
 ///     are keyed by the symbolic signature and reused across every admitted extent, with the boundary
-///     [`TypeRefinements`](crate::TypeRefinements) environment binding actual extents per call.
+///     [`TypeRefinements`] environment binding actual extents per call.
 ///
 /// The restriction this type encodes is therefore one of _provenance_. Ryft supports three increasingly dynamic tiers:
 ///
-///   1. **Tier 1 — Static Extents:** A [`Dimension::Static`] axis or an exact singleton-bounded dimension is known
-///      completely while tracing.
+///   1. **Tier 1 — Static Extents:** A [`Dimension::Static`] axis, a static dimension type (e.g., that of every eager
+///      [`DimensionValue`](crate::DimensionValue)), or an exact singleton-bounded dimension is known completely while
+///      tracing.
 ///   2. **Tier 2 — Input-Derived Extents:** Dimension inputs, dynamic axes of array inputs,
 ///      [`DimensionSize`](crate::DimensionSize) results, and explicit arithmetic over those values remain symbolic
 ///      while tracing but are determined by the program boundary.
@@ -344,19 +346,20 @@ impl TypeIdentity for DimensionVariable {
 ///
 /// The tier-3 gateway keeps the trace-time type invariant intact because its output type is a fresh variable plus
 /// declared bounds, which are computable before execution like every other dimension type. Its producing instruction
-/// makes that variable an internal identity, so it neither appears in nor needs an input-boundary
-/// [`TypeRefinements`](crate::TypeRefinements) entry. Execution reads the scalar and checks the observed extent against
-/// the declared bounds before the value may control array geometry. Backend representations are more permissive. For
-/// example, a StableHLO [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary
-/// runtime integer tensor with no provenance requirement, so lowering does not need this machinery. The restriction is
-/// a frontend type-system choice: an _unchecked_ data-derived extent would make output types depend on unbounded
-/// runtime values, and data-dependent dynamism also remains unevenly supported across backends (refer to the
-/// [dynamism in StableHLO](https://openxla.org/stablehlo/dynamism) documentation for more information). The
-/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each tier-2 or tier-3
-/// dynamic extent inside a static envelope that backends can plan buffers and generate loops against.
+/// makes that variable an internal identity, so it neither appears in nor needs an input-boundary [`TypeRefinements`]
+/// entry. Execution reads the scalar and checks the observed extent against the declared bounds before the value may
+/// control array geometry. Backend representations are more permissive. For example, a StableHLO
+/// [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary runtime integer tensor
+/// with no provenance requirement, so lowering does not need this machinery. The restriction is a frontend type-system
+/// choice: an _unchecked_ data-derived extent would make output types depend on unbounded runtime values, and
+/// data-dependent dynamism also remains unevenly supported across backends (refer to the
+/// [dynamism in StableHLO](https://openxla.org/stablehlo/dynamism) documentation for more information).
+/// The authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each tier-2
+/// or tier-3 dynamic extent inside a static envelope that backends can plan buffers and generate loops against.
 ///
 /// Note that constructing a type with [`DimensionType::new`] creates a fresh variable identity while converting
-/// an existing [`DimensionVariable`] through [`From`] preserves its identity, name, and bounds.
+/// an existing [`DimensionVariable`] through [`From`] preserves its identity, name, and bounds. A static type is
+/// converted from a [`Dimension::Static`] extent instead.
 ///
 /// # Example
 ///
@@ -378,8 +381,9 @@ impl TypeIdentity for DimensionVariable {
 /// with the concrete extent bound at each execution boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionType {
-    /// [`DimensionVariable`] defined by values of this type.
-    variable: DimensionVariable,
+    /// [`Dimension`] described by values of this type: a static extent, or the [`DimensionVariable`]
+    /// that such values define.
+    dimension: Dimension,
 }
 
 impl DimensionType {
@@ -390,21 +394,49 @@ impl DimensionType {
         Self::from(DimensionVariable::new(name, bounds))
     }
 
-    /// Returns the [`DimensionVariable`] defined by values of this [`DimensionType`].
+    /// Returns the [`Dimension`] described by this [`DimensionType`], whose [`Display`] rendering is the name of its
+    /// variable if it is symbolic, and its extent if it is static.
     #[inline]
-    pub fn variable(&self) -> &DimensionVariable {
-        &self.variable
+    pub fn dimension(&self) -> &Dimension {
+        &self.dimension
     }
 
-    /// Returns the authoritative [`DimensionBounds`] of this [`DimensionType`].
+    /// Returns an owned [`Dimension`] with singleton-bounded variables replaced by their exact static extents.
+    /// Variables with wider bounds retain their identity, and static dimensions retain their extent. Unlike
+    /// [`Self::dimension`], this can simplify a symbolic representation; the stored dimension remains unchanged.
+    #[inline]
+    pub fn simplified_dimension(&self) -> Dimension {
+        self.extent().map_or_else(|| self.dimension.clone(), Dimension::Static)
+    }
+
+    /// Returns the [`DimensionVariable`] defined by values of this [`DimensionType`] if it is symbolic,
+    /// and [`None`] if it is static.
+    #[inline]
+    pub fn variable(&self) -> Option<&DimensionVariable> {
+        self.dimension.variable()
+    }
+
+    /// Returns the [`DimensionVariable`] defined by values of this [`DimensionType`] if it is symbolic, and otherwise a
+    /// fresh variable whose singleton bounds admit only its extent. This is the variable that decoding a runtime value
+    /// into this type defines (e.g., [`DimensionFromScalar`](crate::DimensionFromScalar)), which checks the decoded
+    /// extent against these bounds.
+    #[inline]
+    pub fn to_variable(&self) -> DimensionVariable {
+        match &self.dimension {
+            Dimension::Static(_) => DimensionVariable::new(self.dimension.to_string(), self.bounds()),
+            Dimension::Dynamic(variable) => variable.clone(),
+        }
+    }
+
+    /// Returns the authoritative [`DimensionBounds`] of this [`DimensionType`], which admit only its extent
+    /// if it is static.
     #[inline]
     pub fn bounds(&self) -> DimensionBounds {
-        self.variable.bounds()
+        self.dimension.bounds()
     }
 
-    /// Returns the exact extent implied by this type's bounds when they admit exactly one value, and [`None`] for
-    /// every wider range. This is derived metadata, not stored state: it exists so exact-constant dimensions (e.g.,
-    /// [`DimensionValue::constant`](crate::DimensionValue::constant) literals) stay recognizably static.
+    /// Returns the exact extent of this [`DimensionType`] when it is static or its bounds admit exactly one value,
+    /// and [`None`] for every wider range.
     #[inline]
     pub fn extent(&self) -> Option<usize> {
         self.bounds().extent()
@@ -418,98 +450,110 @@ impl DimensionType {
         self.bounds().upper()?.checked_sub(1).map(|maximum| maximum.min(MAX_DIMENSION_EXTENT))
     }
 
-    /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become
-    /// a static dimension. All other cases retain this type's [`DimensionVariable`] as a dynamic dimension.
+    /// Returns `true` if values of this [`DimensionType`] and of `other` provably have equal extents (i.e., if both
+    /// define the same [`DimensionVariable`] or their bounds admit the same single extent; refer to the documentation
+    /// of [`Dimension::has_equal_extents`] for more information). Two static types are considered equal exactly when
+    /// their extents are.
     #[inline]
-    pub fn to_dimension(&self) -> Dimension {
-        self.extent().map_or_else(|| Dimension::Dynamic(self.variable.clone()), Dimension::Static)
+    pub fn has_equal_extents(&self, other: &Self) -> bool {
+        self.dimension.has_equal_extents(&other.dimension)
     }
 
-    /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared
-    /// bounds) and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming` using
-    /// [`DimensionVariable::extend_identity_renaming`]. A different existing target is accepted only when both
-    /// targets prove the same single extent. Otherwise, it is a conflicting renaming.
+    /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared bounds)
+    /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming` when both types are
+    /// symbolic. A static type has no identity to rename or to rename to: a static `actual` instead binds the declared
+    /// variable to its extent in `refinements`, exactly like a static array axis does in
+    /// [`ArrayType::extend_renaming_and_refinements`](crate::ArrayType::extend_renaming_and_refinements),
+    /// so that a later signature member observing a different extent for the same variable is rejected. As there,
+    /// callers check that no variable is both renamed and bound using
+    /// [`ArrayTypeRefinements::require_disjoint_from`] once after folding over the complete signature.
     ///
     /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
     /// an entire signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::arrays::ArrayIrType)'s, which
     /// encounters dimension types as individual elements of a mixed signature. It is a separate function so that
     /// those callers can thread one shared [`TypeIdentityRenaming`] through every pair of the signature. Sharing the
     /// accumulator is what makes a declared [`DimensionVariable`] that appears in several signature positions rename
-    /// consistently. Distinct targets are rejected unless both admit the same single extent, in which case the first
-    /// target is retained as a representative of that concrete instantiation without equating their identities.
-    ///
-    /// This function is an associated function of [`DimensionType`] rather than a generic [`TypeIdentityRenaming`]
-    /// function because both the bounds check and the single-extent exception are dimension semantics that the generic
-    /// renaming of arbitrary [`TypeIdentity`]s cannot express.
+    /// consistently.
     ///
     /// # Example
     ///
-    /// Given the variables `n: [0, 8)`, `m: [0, 8)`, and `k: [0, 4)`, folding over a declared signature behaves as
-    /// follows:
+    /// Given the variables `n: [0, 8)`, `m: [0, 8)`, and `k: [0, 4)`, folding over a declared signature behaves
+    /// as follows:
     ///
-    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<m>, dimension<m>)`: Records the renaming
-    ///     `n -> m` and accepts its consistent repetition.
+    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<m>, dimension<m>)`: Records the renaming `n -> m`
+    ///     and accepts its consistent repetition.
     ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<m>, dimension<k>)`: Fails because `n` would be
     ///     renamed to both `m` and `k`.
-    ///   - `(dimension<k>)` instantiated by `(dimension<n>)`: Fails because the declared bounds `[0, 4)` do not
-    ///     contain the actual bounds `[0, 8)`.
-    pub(crate) fn extend_identity_renaming(
+    ///   - `(dimension<k>)` instantiated by `(dimension<n>)`: Fails because the declared bounds `[0, 4)` do not contain
+    ///     the actual bounds `[0, 8)`.
+    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<3>, dimension<3>)`: Records no renaming but the
+    ///     static binding `n = 3`, and accepts its consistent repetition.
+    ///   - `(dimension<n>, dimension<n>)` instantiated by `(dimension<3>, dimension<4>)`: Fails because `n` is bound
+    ///     to static extent `3` and then observed as `4`.
+    pub(crate) fn extend_renaming_and_refinements(
         declared: &Self,
         actual: &Self,
         renaming: &mut TypeIdentityRenaming<DimensionVariable>,
+        refinements: &mut ArrayTypeRefinements,
     ) -> Result<(), TypeError> {
         if !declared.is_refined_by(actual) {
             return Err(TypeError::invalid(format!(
                 "dimension type {actual} cannot instantiate declared type {declared}",
             )));
         }
-        DimensionVariable::extend_identity_renaming(&declared.variable, &actual.variable, renaming)
+        match (declared.variable(), &actual.dimension) {
+            (Some(declared), Dimension::Dynamic(actual)) => renaming.insert(declared.clone(), actual.clone()),
+            (Some(declared), Dimension::Static(extent)) => refinements.bind(declared, *extent),
+            (None, _) => Ok(()),
+        }
     }
 }
 
 impl Display for DimensionType {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(extent) = self.extent() {
-            write!(formatter, "dimension<{extent}>")
-        } else {
-            write!(formatter, "dimension<{} ∈ {}>", self.variable, self.bounds())
+        match (self.extent(), &self.dimension) {
+            (Some(extent), _) => write!(formatter, "dimension<{extent}>"),
+            (None, dimension) => write!(formatter, "dimension<{dimension} ∈ {}>", self.bounds()),
         }
     }
 }
 
 impl Type for DimensionType {
     type Identity = DimensionVariable;
-    type Refinements = ();
+    type Refinements = DimensionTypeRefinements;
 
     #[inline]
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-        std::iter::once((TypeIdentityPosition::Definition, &self.variable))
+        self.variable().into_iter().map(|variable| (TypeIdentityPosition::Definition, variable))
     }
 
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+    fn derive_identity_renaming<
+        'a,
+        D: IntoIterator<Item = &'a Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'a Self, IntoIter: ExactSizeIterator>,
+    >(
+        declared: D,
+        actual: A,
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+    where
+        Self: 'a,
+    {
         let mut renaming = TypeIdentityRenaming::new();
+        let mut refinements = ArrayTypeRefinements::default();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::extend_identity_renaming(declared, actual, &mut renaming)
+            Self::extend_renaming_and_refinements(declared, actual, &mut renaming, &mut refinements)
         })?;
+        refinements.require_disjoint_from(&renaming)?;
         Ok(renaming)
     }
 
     #[inline]
     fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-        let variable = renaming.rename(&self.variable);
-        if !self.bounds().contains_bounds(variable.bounds()) {
-            return Err(TypeError::invalid(format!(
-                "cannot rename dimension variable {} with bounds {} to {variable} with bounds {}",
-                self.variable,
-                self.bounds(),
-                variable.bounds(),
-            )));
+        match self.variable() {
+            Some(variable) => Ok(Self::from(variable.renamed(renaming)?)),
+            None => Ok(self.clone()),
         }
-        Ok(Self::from(variable))
     }
 
     #[inline]
@@ -533,10 +577,123 @@ impl Type for DimensionType {
     }
 }
 
+impl From<Dimension> for DimensionType {
+    #[inline]
+    fn from(dimension: Dimension) -> Self {
+        Self { dimension }
+    }
+}
+
 impl From<DimensionVariable> for DimensionType {
     #[inline]
     fn from(variable: DimensionVariable) -> Self {
-        Self { variable }
+        Self { dimension: Dimension::Dynamic(variable) }
+    }
+}
+
+// TODO(eaplatanios): Review this.
+/// [`TypeRefinements`] established for a complete [`DimensionType`] signature. They follow the rules of first-class
+/// dimension members in the composite universe (refer to
+/// [`ArrayIrTypeRefinements`](crate::arrays::types::ir::ArrayIrTypeRefinements)): each actual dimension must have
+/// bounds within its declared bounds, a differently named actual identity is linked to the declared one, and exact
+/// each connected class shares its exact fact, so that a repeated declared identity rejects actual inputs of different
+/// extents (e.g., `[dimension<n>, dimension<n>]` entered with extents 2 and 3). The formal and actual facts stay in
+/// separate scopes, as documented on [`ArrayTypeRefinements`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DimensionTypeRefinements {
+    /// Formal and actual dimension facts, shared with the array refinement machinery.
+    dimensions: ArrayTypeRefinements,
+}
+
+// TODO(eaplatanios): Review this.
+impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
+    fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<DimensionType>,
+        A::Item: Borrow<DimensionType>,
+    {
+        let declared = declared.into_iter().collect::<Vec<_>>();
+        let actual = actual.into_iter().collect::<Vec<_>>();
+        let dimensions = ArrayTypeRefinements::from_observations(|observer| {
+            visit_type_signature_pairs(
+                declared.iter().map(Borrow::borrow),
+                actual.iter().map(Borrow::borrow),
+                |declared, actual| {
+                    ArrayTypeRefinements::observe_dimension_type_pair(declared, actual, &mut |observation| {
+                        observer(observation)
+                    })
+                },
+            )
+        })?;
+        let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
+        let unproven = type_identities_needing_runtime_checks::<DimensionType, _>(&declared, &actual)?;
+        Ok(Self { dimensions: dimensions.with_identities_needing_runtime_checks(unproven) })
+    }
+
+    fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, <DimensionType as Type>::Identity>>
+    where
+        <DimensionType as Type>::Identity: 'o,
+    {
+        self.dimensions.identity_classes()
+    }
+
+    fn identities_needing_runtime_checks(&self) -> &[DimensionVariable] {
+        self.dimensions.identities_needing_runtime_checks()
+    }
+
+    fn validate_refinement<D: IntoIterator, A: IntoIterator>(
+        &self,
+        declared: D,
+        actual: A,
+        closed_identities: &[DimensionVariable],
+    ) -> Result<(), TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<DimensionType>,
+        A::Item: Borrow<DimensionType>,
+    {
+        // Validation is formal-only: it checks outputs against the formal facts and never records actual facts.
+        let mut refinements = self.dimensions.clone();
+        visit_type_signature_pairs(declared, actual, |declared, actual| {
+            ArrayTypeRefinements::observe_dimension_type_pair(declared, actual, &mut |observation| match observation {
+                DimensionObservation::Formal(variable, extent) => {
+                    refinements.validate_or_bind(variable, extent, closed_identities)
+                }
+                DimensionObservation::Actual(..) | DimensionObservation::Correspondence(..) => Ok(()),
+            })
+        })
+    }
+
+    fn refine_declared(
+        &self,
+        r#type: &DimensionType,
+        preserved_identities: &[DimensionVariable],
+    ) -> Result<DimensionType, TypeError> {
+        Ok(DimensionType::from(self.dimensions.refine_dimension(r#type.dimension(), preserved_identities)))
+    }
+
+    fn refine_actual(
+        &self,
+        r#type: &DimensionType,
+        preserved_identities: &[DimensionVariable],
+    ) -> Result<DimensionType, TypeError> {
+        Ok(DimensionType::from(self.dimensions.refine_actual_dimension(r#type.dimension(), preserved_identities)))
+    }
+
+    fn retype_actual(
+        &self,
+        declared: &DimensionType,
+        actual: &DimensionType,
+        preferred_identities: &[DimensionVariable],
+    ) -> Result<DimensionType, TypeError> {
+        Ok(DimensionType::from(self.dimensions.retype_actual_dimension(
+            declared.dimension(),
+            actual.dimension(),
+            preferred_identities,
+        )))
     }
 }
 
@@ -1057,7 +1214,98 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::operations::DimensionOperation;
+    use crate::operations::GuardOperation;
+    use crate::parameters::Placeholder;
+    use crate::programs::{Operation, ProgramBuilder};
+
     use super::*;
+
+    #[test]
+    fn test_dimension_type_refinements_from_local_declarations() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, m] = ["n", "m"].map(|name| DimensionType::new(name, bounds));
+        let exact = |extent: usize| DimensionType::from(Dimension::Static(extent));
+
+        // A repeated declared identity rejects actual inputs of different extents, and exact facts propagate to the
+        // formal identity and to a linked actual identity.
+        assert_eq!(
+            DimensionTypeRefinements::from_local_declarations(&[n.clone(), n.clone()], &[exact(2), exact(3)]),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 2,
+                actual: 3,
+            })),
+        );
+        let refinements =
+            DimensionTypeRefinements::from_local_declarations(&[n.clone(), n.clone()], &[m.clone(), exact(2)]).unwrap();
+        assert_eq!(refinements.refine_declared(&n, &[]), Ok(exact(2)));
+        assert_eq!(refinements.refine_declared(&n, std::slice::from_ref(n.variable().unwrap())), Ok(n.clone()));
+        assert_eq!(refinements.refine_actual(&m, &[]), Ok(exact(2)));
+
+        // Actual bounds must lie within the declared bounds.
+        let wide = DimensionType::new("wide", DimensionBounds::positive(Some(16)).unwrap());
+        assert_eq!(
+            DimensionTypeRefinements::from_local_declarations(std::slice::from_ref(&n), std::slice::from_ref(&wide)),
+            Err(TypeError::invalid(format!("type {wide} does not refine declared type {n}"))),
+        );
+
+        // Validation checks outputs against the formal facts only.
+        let closed = [n.variable().unwrap().clone()];
+        assert_eq!(refinements.validate_refinement(std::slice::from_ref(&n), &[exact(2)], &closed), Ok(()));
+        assert_eq!(
+            refinements.validate_refinement(std::slice::from_ref(&n), &[exact(3)], &closed),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 2,
+                actual: 3,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_dimension_type_refinements_identity_classes() {
+        let formal = DimensionType::new("formal", DimensionBounds::non_negative(Some(8)).unwrap());
+        let actual = DimensionType::new("actual", DimensionBounds::non_negative(Some(8)).unwrap());
+        let refinements = DimensionTypeRefinements::from_local_declarations([&formal], [&actual]).unwrap();
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![TypeIdentityClass::new(
+                std::slice::from_ref(formal.variable().unwrap()),
+                std::slice::from_ref(actual.variable().unwrap()),
+                false,
+            )],
+        );
+    }
+
+    #[test]
+    fn test_dimension_type_programs_check_repeated_identities() {
+        // A standalone dimension program and an entry guard over dimensions both reject different extents for a
+        // repeated identity, like their composite counterparts.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let first = builder.add_input(n.clone());
+        builder.add_input(n.clone());
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let value = |extent: usize| DimensionValue::constant(extent).unwrap();
+        let mismatch = Err(ProgramError::Type(TypeError::from(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_string(),
+            expected: 2,
+            actual: 3,
+        })));
+        assert_eq!(program.interpret(vec![value(2), value(2)]), Ok(vec![value(2)]));
+        assert_eq!(program.interpret(vec![value(2), value(3)]), mismatch);
+        let exact = |extent: usize| DimensionType::from(Dimension::Static(extent));
+        let guard = GuardOperation::new("region", vec![n.clone(), n]);
+        assert_eq!(guard.infer_output_types(&[exact(2), exact(2)], &[]), Ok(vec![exact(2), exact(2)]));
+        assert_eq!(
+            guard.infer_output_types(&[exact(2), exact(3)], &[]).map_err(ProgramError::Type),
+            mismatch.map(|_: Vec<DimensionValue>| Vec::new()),
+        );
+    }
 
     #[test]
     fn test_dimension_bounds() {
@@ -1145,58 +1393,26 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_variable_extend_identity_renaming() {
-        let declared = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
-        let wide = DimensionVariable::new("wide", DimensionBounds::non_negative(Some(8)).unwrap());
-        let other_wide = DimensionVariable::new("other_wide", DimensionBounds::non_negative(Some(8)).unwrap());
-        let seven = DimensionVariable::new("seven", DimensionBounds::new(7, Some(8)).unwrap());
-        let another_seven = DimensionVariable::new("another_seven", DimensionBounds::new(7, Some(8)).unwrap());
-        let six = DimensionVariable::new("six", DimensionBounds::new(6, Some(7)).unwrap());
-
-        // A renaming is recorded once and its consistent repetition is accepted.
-        let mut renaming = TypeIdentityRenaming::new();
-        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &wide, &mut renaming), Ok(()));
-        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &wide, &mut renaming), Ok(()));
-        assert_eq!(renaming.replacements(), &[(declared.clone(), wide.clone())]);
-        assert_eq!(
-            DimensionVariable::extend_identity_renaming(&declared, &other_wide, &mut renaming),
-            Err(TypeError::invalid("type identity `declared` is renamed to both `wide` and `other_wide`")),
-        );
-
-        // Distinct targets that prove the same single extent keep the first one as the representative, while
-        // targets that prove different extents still conflict.
-        let mut renaming = TypeIdentityRenaming::new();
-        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &seven, &mut renaming), Ok(()));
-        assert_eq!(DimensionVariable::extend_identity_renaming(&declared, &another_seven, &mut renaming), Ok(()));
-        assert_eq!(renaming.replacements(), &[(declared.clone(), seven.clone())]);
-        assert_eq!(
-            DimensionVariable::extend_identity_renaming(&declared, &six, &mut renaming),
-            Err(TypeError::invalid("type identity `declared` is renamed to both `seven` and `six`")),
-        );
-    }
-
-    #[test]
     fn test_dimension_type() {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::new(1, Some(65)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::new(1, Some(33)).unwrap());
         let fresh = DimensionType::new("declared", declared_variable.bounds());
         let another_fresh = DimensionType::new(String::from("declared"), declared_variable.bounds());
-        assert_eq!(fresh.variable().name(), "declared");
+        assert_eq!(fresh.variable().unwrap().name(), "declared");
         assert_eq!(fresh.bounds(), declared_variable.bounds());
-        assert_ne!(fresh.variable(), &declared_variable);
+        assert_ne!(fresh.variable(), Some(&declared_variable));
         assert_ne!(fresh.variable(), another_fresh.variable());
 
         let declared = DimensionType::from(declared_variable.clone());
         let actual = DimensionType::from(actual_variable.clone());
 
-        assert_eq!(declared.variable(), &declared_variable);
+        assert_eq!(declared.variable(), Some(&declared_variable));
         assert_eq!(DimensionType::from(declared_variable.clone()), declared);
         assert_eq!(declared.bounds(), DimensionBounds::new(1, Some(65)).unwrap());
         assert_eq!(declared.to_string(), "dimension<declared ∈ [1, 65)>");
         assert!(!declared.is_scalar());
         assert!(!declared.is_complex());
         assert!(declared.is_refined_by(&actual));
-        assert_eq!(declared.to_dimension(), Dimension::Dynamic(declared_variable.clone()));
 
         // A dimension type is strictly identity plus bounds. Exact singleton bounds are the only source of a static
         // extent, and no concrete boundary observation participates in the type itself.
@@ -1207,7 +1423,6 @@ mod tests {
         assert_eq!(exact_type.extent(), Some(7));
         assert_eq!(exact_type.maximum_extent(), Some(7));
         assert_eq!(exact_type.to_string(), "dimension<7>");
-        assert_eq!(exact_type.to_dimension(), Dimension::Static(7));
         assert!(declared.is_refined_by(&exact_type));
         assert!(!exact_type.is_refined_by(&declared));
 
@@ -1238,18 +1453,29 @@ mod tests {
             )),
         );
 
-        // Separate exact definitions can represent the same proven extent without becoming nominally equal.
+        // Static types bind a repeated declared variable to their extents, which must agree. Separate symbolic
+        // definitions remain distinct identities even when their bounds admit the same single extent.
+        let seven = DimensionType::from(Dimension::Static(7));
+        let eight = DimensionType::from(Dimension::Static(8));
+        assert_eq!(
+            DimensionType::derive_identity_renaming(
+                &[declared.clone(), declared.clone()],
+                &[seven.clone(), seven.clone()]
+            )
+            .map(|renaming| renaming.is_identity()),
+            Ok(true),
+        );
+        assert_eq!(
+            DimensionType::derive_identity_renaming(&[declared.clone(), declared.clone()], &[seven, eight]),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "declared".to_string(),
+                expected: 7,
+                actual: 8,
+            })),
+        );
         let second_exact = DimensionType::new("another_seven", exact_type.bounds());
-        let renaming = DimensionType::derive_identity_renaming(
-            &[declared.clone(), declared.clone()],
-            &[exact_type.clone(), second_exact.clone()],
-        )
-        .unwrap();
-        assert_eq!(renaming.replacements(), &[(declared_variable.clone(), exact_type.variable().clone())]);
-        assert_ne!(exact_type.variable(), second_exact.variable());
-        let eight = DimensionType::new("eight", DimensionBounds::new(8, Some(9)).unwrap());
         assert!(
-            DimensionType::derive_identity_renaming(&[declared.clone(), declared.clone()], &[exact_type, eight],)
+            DimensionType::derive_identity_renaming(&[declared.clone(), declared.clone()], &[exact_type, second_exact])
                 .is_err()
         );
 
@@ -1259,10 +1485,23 @@ mod tests {
             DimensionType::derive_identity_renaming(&[declared.clone(), declared], &[actual.clone(), other.clone()],),
             Err(TypeError::invalid(format!(
                 "type identity `declared` is renamed to both `{}` and `{}`",
-                actual.variable(),
-                other.variable(),
+                actual.dimension(),
+                other.dimension(),
             ))),
         );
+    }
+
+    #[test]
+    fn test_dimension_type_simplified_dimension() {
+        let declared_variable = DimensionVariable::new("declared", DimensionBounds::new(1, Some(65)).unwrap());
+        let declared = DimensionType::from(declared_variable.clone());
+        assert_eq!(declared.simplified_dimension(), Dimension::Dynamic(declared_variable));
+
+        let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
+        let exact_type = DimensionType::from(exact_variable.clone());
+        assert_eq!(exact_type.simplified_dimension(), Dimension::Static(7));
+        // Simplification leaves the stored symbolic representation and its identity unchanged.
+        assert_eq!(exact_type.dimension(), &Dimension::Dynamic(exact_variable));
     }
 
     #[test]

@@ -35,7 +35,9 @@ pub enum EffectClass {
 
     /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other effects is not
     /// observable. Operations with this effect must not be folded away or get eliminated, but independent unordered-I/O
-    /// effects may execute in any order.
+    /// effects may execute in any order. In particular, a compiled program may execute an unordered effect before a
+    /// failing [`OrderedAssertion`](Self::OrderedAssertion) (including a [`GuardOperation`](crate::GuardOperation))
+    /// that precedes it in program order, which only ordered effects are guaranteed to follow.
     UnorderedIo,
 
     /// Observable access to mutable state whose execution order relative to other [`OrderedState`](Self::OrderedState)
