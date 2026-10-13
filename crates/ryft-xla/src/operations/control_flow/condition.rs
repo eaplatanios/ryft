@@ -10,7 +10,9 @@ use crate::experimental::lowering::{
     CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects,
 };
 use crate::experimental::ops::FlatXlaProgram;
-use crate::operations::control_flow::{lower_control_flow_region, lower_refined_region_input};
+use crate::operations::control_flow::{
+    lower_control_flow_region, lower_refined_region_input, lower_region_guard, lowered_effect_classes,
+};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
@@ -56,9 +58,21 @@ pub(crate) fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, O: LowerableOperationFam
         })
         .collect::<Result<Vec<_>, _>>()?;
     let branch_inputs = branch_inputs.as_slice();
+    // Both branches declare the same inputs, so guarding their shared entry before the conditional checks exactly what
+    // eager entry validation checks for the selected branch. The guard runs before the branch tokens are captured.
+    lower_region_guard(
+        CONDITION_OPERATION_NAME,
+        &branch_input_types,
+        &input_types[1..],
+        &input_values[1..],
+        effect_tokens,
+        block,
+        context,
+        location,
+    )?;
     // Each ordered class used by either branch is captured and returned independently. Both branches carry the union
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
-    let threaded_effects = true_branch.effects().classes().union(false_branch.effects().classes());
+    let threaded_effects = lowered_effect_classes(true_branch)?.union(lowered_effect_classes(false_branch)?);
     let mut entry_effect_tokens = *effect_tokens;
     for effect in token_threaded_effects(threaded_effects) {
         let token = current_or_new_token(effect, effect_tokens, block, location)?;
@@ -171,6 +185,7 @@ mod tests {
         unproject_plain_program, xla_identity_branch, xla_neg_branch,
     };
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -214,6 +229,147 @@ mod tests {
         assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_condition_threads_the_io_dependency_of_an_guard_out_of_its_branches() {
+        use ryft_core::{GuardOperation, PrintOperation};
+
+        // Each branch's only effect is an entry guard, which joins its assertion token into the ordered I/O chain so
+        // that later I/O follows the check. The conditional must thread that chain out of its branches, so the print
+        // after it consumes an I/O token that the conditional returns.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new_static(DataType::F64, [2]);
+        let branch = || {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let dimension = builder.add_input(m.clone().into());
+            let array = builder.add_input(array_type.clone().into());
+            let declared: Vec<ArrayIrType> = vec![
+                n.clone().into(),
+                ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into(),
+            ];
+            builder
+                .add_instruction(GuardOperation::new("branch", declared), Vec::new(), vec![dimension, array], None)
+                .unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_region(branch().entry_region_ref());
+        let false_region = builder.import_region(branch().entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let dimension = builder.add_input(m.clone().into());
+        let array = builder.add_input(array_type.clone().into());
+        let selected = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, dimension, array],
+                None,
+            )
+            .unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![selected], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
+            &[array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let conditional = module.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
+        let conditional_results = conditional.trim().split_once(':').unwrap().0;
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let print_token =
+            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
+        assert!(print_token.starts_with(&format!("{conditional_results}#")), "{module}");
+    }
+
+    #[test]
+    fn test_condition_threads_the_io_dependency_of_guards_that_lowering_synthesizes() {
+        use ryft_core::PrintOperation;
+
+        // The outer branches are pure in the source program, but each contains an inner conditional whose mixed entry
+        // (a symbolic `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard
+        // during lowering. The outer conditional must thread that guard's I/O dependency out of its branches too, so
+        // the print after it consumes an I/O token that the outer conditional returns.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new_static(DataType::F64, [2]);
+        let inner_branch = || {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(n.clone().into());
+            let array =
+                builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let outer_branch = || {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let true_region = builder.import_region(inner_branch().entry_region_ref());
+            let false_region = builder.import_region(inner_branch().entry_region_ref());
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let dimension = builder.add_input(m.clone().into());
+            let array = builder.add_input(array_type.clone().into());
+            let selected = builder
+                .add_instruction(
+                    XlaOperation::Condition(ConditionOperation::new()),
+                    vec![true_region, false_region],
+                    vec![predicate, dimension, array],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        assert!(outer_branch().effects().classes().is_empty());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let true_region = builder.import_region(outer_branch().entry_region_ref());
+        let false_region = builder.import_region(outer_branch().entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let dimension = builder.add_input(m.clone().into());
+        let array = builder.add_input(array_type.clone().into());
+        let selected = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, predicate, dimension, array],
+                None,
+            )
+            .unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![selected], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
+            &[array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let conditional = module.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
+        let conditional_results = conditional.trim().split_once(':').unwrap().0;
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let print_token =
+            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
+        assert!(print_token.starts_with(&format!("{conditional_results}#")), "{module}");
     }
 
     #[test]
@@ -644,6 +800,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let client = execution_client();
+        ensure_assertion_handler_registered(&client).unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
         builder.add_input(extent_type.clone().into());
         let input = builder.add_input(dynamic_type.clone().into());
@@ -687,6 +844,21 @@ mod tests {
                     &[],
                 ),
                 Ok(vec![MixedValue::Array(expected, vec![3])]),
+            );
+
+            // Lowering retypes each branch input independently, so only the entry guard rejects a dimension that
+            // disagrees with the static array extent, before either branch runs.
+            let error = execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Dimension(4), MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("input dimension `extent` must have one extent at the entry of `condition`"),
+                "{error}",
             );
         }
     }

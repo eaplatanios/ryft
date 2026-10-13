@@ -10,8 +10,8 @@ use std::hash::{Hash, Hasher};
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayTypeRefinements,
-    DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, DimensionOperation,
+    DimensionRefinements, DimensionValue, MAX_DIMENSION_EXTENT,
 };
 use crate::contexts::EagerContext;
 use crate::parameters::Placeholder;
@@ -171,14 +171,14 @@ impl BlockMapping {
             .take(remaining)
             .map(|r#type| builder.add_input(r#type))
             .collect::<Vec<_>>();
-        let mut bindings = ArrayTypeRefinements::default();
+        let mut bindings = DimensionRefinements::default();
         for (offset, (formal, value)) in self.program.input_types().into_iter().skip(remaining).zip(values).enumerate()
         {
             let ArrayIrType::Dimension(formal) = formal else { unreachable!() };
             let position = remaining + offset;
             for (input, r#type) in self.program.input_types().iter().take(remaining).enumerate() {
                 let ArrayIrType::Dimension(r#type) = r#type else { unreachable!() };
-                if r#type.variable() == formal.variable() {
+                if formal.variable().is_some() && r#type.variable() == formal.variable() {
                     return Err(ProgramError::from(TypeError::invalid(format!(
                         "block mapping parameter {position} shares a dimension identity with remaining input {input}",
                     )))
@@ -188,7 +188,9 @@ impl BlockMapping {
             let value = DimensionValue::new(formal.clone(), value.extent())
                 .map_err(TypeError::from)
                 .map_err(ProgramError::from)?;
-            bindings.bind(formal.variable(), value.extent()).map_err(ProgramError::from)?;
+            if let Some(variable) = formal.variable() {
+                bindings.bind(variable, value.extent()).map_err(ProgramError::from)?;
+            }
             inputs.push(builder.add_constant(ArrayIrValue::Dimension(value)));
         }
         let outputs = builder.splice_program(&self.program, &inputs)?;

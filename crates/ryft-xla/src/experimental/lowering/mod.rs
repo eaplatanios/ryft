@@ -197,7 +197,9 @@ impl LoweredXlaModule {
 ///
 /// Ordered assertions and ordered I/O intentionally use independent chains. This preserves program order within
 /// each observable class without introducing an ordering relationship between unrelated classes. Unordered I/O has
-/// no token slot.
+/// no token slot. Entry guards are the one exception: they replace an entry validation that precedes everything the
+/// entry guards, so their lowering joins the assertion chain into the ordered-I/O chain (refer to
+/// `operations::assertions::lower_guard`).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct EffectTokens<'b, 'c: 'b, 't: 'c> {
     /// Current ordered-assertion token, created lazily by the first runtime assertion in this scope.
@@ -285,8 +287,12 @@ where
 /// into an ordinary token-threaded effect.
 pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
     // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered-I/O slot,
-    // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`.
-    let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
+    // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`. A scope that threads the
+    // assertion token also threads the I/O slot, because an entry guard inside it joins its assertion token into the
+    // I/O chain (refer to `lower_guard`), and that dependency must reach the I/O that follows the scope.
+    let ordered_io = effects.contains(EffectClass::OrderedIo)
+        || effects.contains(EffectClass::DeviceOrderedIo)
+        || effects.contains(EffectClass::OrderedAssertion);
     effects
         .contains(EffectClass::OrderedAssertion)
         .then_some(EffectClass::OrderedAssertion)
@@ -708,7 +714,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
-            Print, Assert, CustomCall, CustomFunction, CustomFunctionTranspose,
+            Print, Assert, Guard, Retype, CustomCall, CustomFunction, CustomFunctionTranspose,
         )
     }
 }
@@ -746,6 +752,8 @@ impl LowerableOperation for XlaOperation {
             Dimension => projected(DimensionType),
             Compare,
             Assert,
+            Guard,
+            Retype,
             DimensionSize,
             ReferenceNew,
             ReferenceRead,
@@ -1375,7 +1383,7 @@ where
     // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
     // calls, in which case every `jit_call` inlines exactly as before.
-    let nested_functions = Rc::new(collect_jit_call_functions(program));
+    let nested_functions = Rc::new(collect_jit_call_functions(program)?);
     {
         let mut module_block = module.body()?;
         for key in &named_compositions.order {

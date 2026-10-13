@@ -20,7 +20,9 @@ use crate::experimental::lowering::{
 };
 use crate::experimental::ops::FlatXlaProgram;
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
+use crate::operations::control_flow::{
+    lower_refined_region_input, lower_refined_region_outputs, lower_region_guard, lowered_effect_classes,
+};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
@@ -41,11 +43,8 @@ use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowe
 /// carries and the remaining values are stacked operands, followed by the runtime length when the length is dynamic.
 /// Reference state is discharged before lowering.
 pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    scan: &ScanOperation<ArrayIrType>,
     body_program: &FlatXlaProgram<O>,
-    carry_count: usize,
-    length: &Dimension,
-    reverse: bool,
-    unroll: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayIrType],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -56,6 +55,7 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamil
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let (carry_count, length, reverse, unroll) = (scan.carry_count(), scan.length(), scan.reverse(), scan.unroll());
     let body_input_types = body_program.input_types();
     let body_output_types = body_program.output_types();
     // The checked scan signature includes an index supplied by this loop rather than an operation operand.
@@ -102,6 +102,7 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamil
             ),
         });
     }
+    let entry_values = input_values;
     let mut converted_input_values = input_values.to_vec();
     for (index, carry_type) in carry_types.iter().enumerate() {
         converted_input_values[index] =
@@ -196,6 +197,22 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamil
         carries.extend(y_accumulators);
         Ok(carries)
     };
+
+    // The body enters with the carries and with slices of the stacked inputs, whose identities the declared stacked
+    // types carry unchanged next to the leading length axis. Guarding the original carries and stacks therefore checks
+    // what eager entry validation checks, which happens whatever the trip count is, so the guard precedes the
+    // zero-length and the fully unrolled paths too.
+    let entry_types = scan.declared_input_types(&body_input_types).map_err(ProgramError::from)?;
+    lower_region_guard(
+        SCAN_OPERATION_NAME,
+        &entry_types,
+        &input_types[..operand_count],
+        entry_values,
+        effect_tokens,
+        block,
+        context,
+        location,
+    )?;
 
     // A zero-length scan runs no iteration and returns its initial carries and empty stacked outputs. This also
     // applies to a dynamic length whose bounds admit only zero: constructing a loop body would otherwise emit
@@ -364,7 +381,7 @@ fn lower_scan_loop<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     } = *inputs;
     // The loop carries one trailing token per ordered class used by the body. Straight-line body copies update the
     // enclosing scope's chains directly, while pure scans emit no token machinery.
-    let threaded_effects = body_program.effects().classes();
+    let threaded_effects = lowered_effect_classes(body_program)?;
     let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
         match length {
             ScanLoopLength::Static(length) => Ok(lower_static_index_constants(&[length], block, context, location)?[0]),
@@ -681,11 +698,8 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             }
         }
         let results = lower_scan_to_while(
+            self,
             body,
-            self.carry_count(),
-            self.length(),
-            self.reverse(),
-            self.unroll(),
             input_values,
             input_types,
             &mut lowerer.block,
@@ -734,6 +748,7 @@ mod tests {
         MixedValue, dynamic_dimension, execute_mixed_program, test_vector_type,
     };
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -1945,7 +1960,8 @@ mod tests {
         // A scan's initial carries only need to refine the carry types, so a static `f64[3]` initial carry feeds a
         // carry with the bounded dynamic type `f64[rows]`. The carry outputs take the static extent that the inputs
         // establish for `rows`, so the bounded loop results are sliced back to `f64[3]`. Two iterations of
-        // `(a, b) -> (a, a + b)` compute `[a, 2a + b]`.
+        // `(a, b) -> (a, a + b)` compute `[a, 2a + b]`. The dynamic carry leaves `rows = 3` unproven, so an entry guard
+        // checks its runtime size before the loop.
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let body = {
@@ -1984,9 +2000,11 @@ mod tests {
             program.output_types(),
             vec![ArrayIrType::Array(static_type.clone()), ArrayIrType::Array(static_type)],
         );
+        let client = execution_client();
+        ensure_assertion_handler_registered(&client).unwrap();
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                &client,
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
@@ -1999,6 +2017,164 @@ mod tests {
                 MixedValue::Array(vec![12.0, 24.0, 36.0], vec![3]),
             ]),
         );
+        let error = execute_mixed_program(
+            &client,
+            &program,
+            &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]), MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])],
+            &[2],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("input dimension `rows` must have one extent at the entry of `scan`"), "{error}");
+    }
+
+    #[test]
+    fn test_scan_guards_its_entry_on_every_lowering_path() {
+        // The entry of the `(a, b) -> (a, a + b)` scan relates a bounded dynamic `f64[rows]` carry to a static `f64[3]`
+        // carry, and eager entry validation checks that relationship whatever the trip count is. A zero-length scan, a
+        // fully unrolled scan, and a looping scan therefore all reject a runtime `rows` of 2.
+        let static_type = ArrayType::new_static(DataType::F64, [3]);
+        let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let first = builder.add_input(carry_type.clone().into());
+            let second = builder.add_input(carry_type.clone().into());
+            let sum = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![first, second], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![first, sum],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let client = execution_client();
+        ensure_assertion_handler_registered(&client).unwrap();
+        for (length, unroll, expected) in
+            [(0, 1, vec![10.0, 20.0, 30.0]), (2, 1, vec![12.0, 24.0, 36.0]), (2, 2, vec![12.0, 24.0, 36.0])]
+        {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let region = builder.import_region(body.entry_region_ref());
+            let dynamic_input = builder.add_input(carry_type.clone().into());
+            let static_input = builder.add_input(static_type.clone().into());
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Scan(ScanOperation::new(2, Dimension::Static(length)).with_unroll(unroll).unwrap()),
+                    vec![region],
+                    vec![dynamic_input, static_input],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap();
+            let inputs = [
+                MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
+                MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3]),
+            ];
+            assert_eq!(
+                execute_mixed_program(&client, &program, &inputs, &[3]),
+                Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Array(expected, vec![3])]),
+                "length {length}, unroll factor {unroll}",
+            );
+            let error = execute_mixed_program(&client, &program, &inputs, &[2]).unwrap_err().to_string();
+            assert!(
+                error.contains("input dimension `rows` must have one extent at the entry of `scan`"),
+                "length {length}, unroll factor {unroll}: {error}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_entry_keeps_the_memory_placement_of_stacked_inputs() {
+        // The entry of a scan over host-pinned slices declares its stacked inputs in host-pinned memory too, exactly as
+        // core `scan` validation does, so the entry check accepts host-pinned stacks whatever the trip count is.
+        let memory = ryft_core::Memory::Host { pinned: true };
+        let slice_type = ArrayType::new_static(DataType::F64, [3]).with_memory(memory);
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let slice = builder.add_input(slice_type.clone().into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        for length in [0, 2] {
+            let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]).with_memory(memory);
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let region = builder.import_region(body.entry_region_ref());
+            let stack = builder.add_input(stacked_type.clone().into());
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    vec![region],
+                    vec![stack],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &[stacked_type.clone()],
+                &[stacked_type.clone()],
+                "main",
+                None,
+                None,
+            );
+            assert!(module.is_ok(), "length {length}: {module:?}");
+        }
+    }
+
+    #[test]
+    fn test_scan_entry_admits_stacks_sharded_along_the_scan_axis_over_auto_mesh_axes() {
+        // A stack whose scan axis is sharded over an `Auto` mesh axis has replicated slices, which match a replicated
+        // body declaration. The entry check uses the declared stacked types of core `scan` validation, which omit
+        // shardings, so it accepts such a stack whatever the trip count is.
+        use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let slice = builder.add_input(slice_type.clone().into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        for length in [0, 4] {
+            let stacked_type = ArrayType::new_static(DataType::F64, [length])
+                .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+                .unwrap();
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let region = builder.import_region(body.entry_region_ref());
+            let stack = builder.add_input(stacked_type.clone().into());
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Scan(ScanOperation::new(0, Dimension::Static(length))),
+                    vec![region],
+                    vec![stack],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let output_type = program.output_types().remove(0);
+            let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
+            let module =
+                to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[output_type], "main", None, None);
+            assert!(module.is_ok(), "length {length}: {module:?}");
+        }
     }
 
     #[test]

@@ -3700,9 +3700,11 @@ impl<'c> XlaDomain<'c> {
                     actual.clone().with_sharding(declared.sharding().cloned()).map_err(ArrayError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let input_refinements =
-                <ArrayType as Type>::Refinements::establish(program.input_types.iter(), refinement_input_types.iter())
-                    .map_err(ProgramError::from)?;
+            let input_refinements = <ArrayType as Type>::Refinements::from_local_declarations(
+                program.input_types.iter(),
+                refinement_input_types.iter(),
+            )
+            .map_err(ProgramError::from)?;
             (input_refinements, Some(actual_input_types))
         };
 
@@ -5584,6 +5586,9 @@ fn array_data_dependent_padding_discipline(
         }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
+        // Entry guards and `retype`s narrow or widen bounded-dynamic values explicitly: the physical buffer is sliced or
+        // padded, and every axis that stays dynamic gets its logical size back.
+        ArrayOperation::Guard(_) | ArrayOperation::Retype(_) => RyftMasked,
         ArrayOperation::Assert(_)
         | ArrayOperation::Zero(_)
         | ArrayOperation::ZeroLike(_)
@@ -5666,7 +5671,7 @@ fn array_data_dependent_padding_discipline(
 
 /// Classifies every XLA operation by the bounded-dynamic padding discipline it requires.
 fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::{Propagated, Unsupported};
+    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported};
 
     match operation {
         XlaOperation::Array(operation) => array_data_dependent_padding_discipline(operation),
@@ -5689,6 +5694,8 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         XlaOperation::Kernel(_) => {
             Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
         }
+        // Entry guards and `retype`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
+        XlaOperation::Guard(_) | XlaOperation::Retype(_) => RyftMasked,
         XlaOperation::ShardMap(_) => {
             Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
         }
@@ -6587,7 +6594,7 @@ fn validate_compiled_output_refinements(
         }
     }
     input_refinements
-        .validate(
+        .validate_refinement(
             declared_output_types.iter(),
             outputs.iter().map(|output| output.r#type().into_owned()),
             closed_identities.as_slice(),
@@ -16398,7 +16405,7 @@ mod tests {
         // An unroll factor that does not divide the runtime length runs the remaining iterations in a second loop, and
         // factors beyond the length's upper bound are clamped to it.
         for unroll in [1, 2, 4, usize::MAX] {
-            let scan = ScanOperation::new(1, length_type.to_dimension()).with_unroll(unroll).unwrap();
+            let scan = ScanOperation::new(1, length_type.simplified_dimension()).with_unroll(unroll).unwrap();
             let outputs = domain
                 .bind(
                     XlaOperation::Scan(scan),

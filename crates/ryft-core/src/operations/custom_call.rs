@@ -44,8 +44,9 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionSource, DimensionType, DimensionValue,
-    DimensionVariable, Layout, RaggedAxis, Sharding, ShardingDimension, TiledLayout,
+    ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionRefinements,
+    DimensionSource, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis, Sharding, ShardingDimension,
+    TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -69,8 +70,8 @@ use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, EmptyRegionDriver, MemberOperation, Operation, OperationFormatter,
-    OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value, ValueDomainDispatch, ValueProjection,
+    OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
@@ -813,12 +814,11 @@ impl CustomCallRaggedContract {
     fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         let mut contract = self.clone();
         for binding in &mut contract.input_bindings {
-            binding.dimension =
-                DimensionType::from(binding.dimension.clone()).rename_identities(renaming)?.variable().clone();
+            binding.dimension = binding.dimension.renamed(renaming)?;
         }
         for binding in &mut contract.output_bindings {
             if let CustomCallRaggedOutputBinding::Fresh { dimension, .. } = binding {
-                *dimension = DimensionType::from(dimension.clone()).rename_identities(renaming)?.variable().clone();
+                *dimension = dimension.renamed(renaming)?;
             }
         }
         Ok(contract)
@@ -879,7 +879,8 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member
 /// of the array IR (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one trailing first-class
 /// dimension input per dynamic axis occurrence in the declared outputs, ordered first by output and then by axis, and
-/// type inference verifies that each input defines the exact variable referenced by its corresponding output axis.
+/// type inference verifies that each input either defines its corresponding output axis's variable or supplies an
+/// exact extent within that variable's bounds, refining the output axis to that extent.
 /// These logical result extents do not enter the foreign kernel ABI: only the leading array inputs are passed to the
 /// kernel. Eager execution and backend lowering use the trailing inputs to verify or attach the declared logical sizes
 /// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
@@ -887,10 +888,10 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 ///
 /// Type inference also validates the configuration: attribute names must be unique (including within nested
 /// dictionaries), declared input layouts must match the rank of their inputs, each alias must connect an input and an
-/// output of identical types (and identical declared layouts), and any [`CustomCallRaggedContract`] must be consistent
-/// with the complete array signature. Output types declared without a sharding inherit the manual-axis variation of
-/// the inputs, placed replicated on their mesh, because opaque code cannot be assumed to produce the same result on
-/// every device.
+/// output of identical types after extent refinement (and identical declared layouts), and any
+/// [`CustomCallRaggedContract`] must be consistent with the complete array signature. Output types declared without a
+/// sharding inherit the manual-axis variation of the inputs, placed replicated on their mesh, because opaque code
+/// cannot be assumed to produce the same result on every device.
 ///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
@@ -1160,6 +1161,48 @@ impl CustomCallOperation {
         })
     }
 
+    /// Returns the number of array inputs of a mixed invocation with `input_types`, the refinements that its trailing
+    /// first-class output-extent inputs establish, and this call's declared output types refined by them. Each trailing
+    /// extent either defines the identity of its declared output axis or has an exact type that refines that axis to
+    /// its extent (refer to `DimensionRefinements::bind_dimension_input`).
+    fn refine_declared_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+    ) -> Result<(usize, ArrayTypeRefinements, Vec<ArrayType>), TypeError> {
+        let dynamic_output_dimensions = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter_map(Dimension::variable)
+            .collect::<Vec<_>>();
+        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimensions but only {} inputs were \
+                 provided",
+                dynamic_output_dimensions.len(),
+                input_types.len(),
+            )));
+        };
+        let mut refinements = DimensionRefinements::default();
+        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
+            let input_type = <&DimensionType>::try_from(input_type)?;
+            if !refinements.bind_dimension_input(expected_variable, input_type)? {
+                return Err(TypeError::invalid(format!(
+                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input defines dimension variable \
+                     `{}`, but the corresponding declared output axis refers to `{expected_variable}`",
+                    input_type.dimension(),
+                )));
+            }
+        }
+        let refinements = ArrayTypeRefinements::from(refinements);
+        let output_types = self
+            .output_types
+            .iter()
+            .map(|output_type| refinements.refine_declared(output_type, &[]))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((array_input_count, refinements, output_types))
+    }
+
     /// Returns the number of trailing first-class output-extent inputs this call consumes in the mixed universe, which
     /// is one per dynamic axis occurrence across its declared outputs.
     fn dynamic_output_dimension_count(&self) -> usize {
@@ -1213,8 +1256,11 @@ impl CustomCallOperation {
             .collect()
     }
 
-    /// Returns the layout required by an aliased input at its unchanged or batch-prefixed logical shape. An
-    /// incompatible shape is left to alias validation, rather than changing geometry to satisfy an alias.
+    /// Returns the layout required by an aliased input at its unchanged or batch-prefixed logical shape. The declared
+    /// output shape may be dynamic in the mixed universe, where trailing extent inputs refine it to the input's shape
+    /// (e.g., an `f32[2]` input aliased to a declared `f32[rows]` output), so any shape that refines the declared one
+    /// is laid out. An incompatible shape is left to alias validation, rather than changing geometry to satisfy an
+    /// alias.
     fn alias_input_layout(
         &self,
         input_index: usize,
@@ -1231,7 +1277,7 @@ impl CustomCallOperation {
             Some(dimension) => output_type.with_inserted_dimension(0, dimension.clone())?,
             None => output_type.clone(),
         };
-        if input_type.shape() != expected_type.shape() {
+        if !expected_type.shape().is_refined_by(input_type.shape()) {
             return Ok(None);
         }
         Ok(match (output_type.layout(), batch_dimension) {
@@ -1336,7 +1382,8 @@ impl CustomCallOperation {
         if self.input_output_aliases.is_empty() {
             return Ok(inputs);
         }
-        let batch_dimension = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.to_dimension();
+        let batch_dimension =
+            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         inputs
             .into_iter()
             .enumerate()
@@ -1460,15 +1507,15 @@ impl CustomCallOperation {
     }
 
     /// Validates the attributes, declared input layouts, aliases, and ragged contract of this operation against its
-    /// array input types, which both universes share.
-    fn validate_configuration(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
+    /// array input types and effective output types, which both universes share.
+    fn validate_configuration(&self, input_types: &[&ArrayType], output_types: &[ArrayType]) -> Result<(), TypeError> {
         if let Some(name) = CustomCallAttribute::duplicate_name(self.attributes.as_slice()) {
             return Err(TypeError::invalid(format!(
                 "`{CUSTOM_CALL_OPERATION_NAME}` declares attribute `{name}` more than once",
             )));
         }
         self.validate_input_layouts(input_types)?;
-        self.validate_input_output_aliases(input_types)?;
+        self.validate_input_output_aliases(input_types, output_types)?;
         self.validate_ragged_contract(input_types)
     }
 
@@ -1502,8 +1549,12 @@ impl CustomCallOperation {
         Ok(())
     }
 
-    /// Validates flat input/output aliases against the array inputs and declared input layouts of this operation.
-    fn validate_input_output_aliases(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
+    /// Validates flat input/output aliases against the array inputs, effective outputs, and declared input layouts.
+    fn validate_input_output_aliases(
+        &self,
+        input_types: &[&ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<(), TypeError> {
         for alias in &self.input_output_aliases {
             let Some(input_type) = input_types.get(alias.input_index) else {
                 return Err(TypeError::invalid(format!(
@@ -1513,11 +1564,11 @@ impl CustomCallOperation {
                     input_types.len(),
                 )));
             };
-            let Some(output_type) = self.output_types.get(alias.output_index) else {
+            let Some(output_type) = output_types.get(alias.output_index) else {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to output {} but the call has {} outputs",
                     alias.output_index,
-                    self.output_types.len(),
+                    output_types.len(),
                 )));
             };
             if *input_type != output_type {
@@ -2038,7 +2089,7 @@ impl Operation for CustomCallOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let array_input_types = input_types.iter().collect::<Vec<_>>();
-        self.validate_configuration(array_input_types.as_slice())?;
+        self.validate_configuration(array_input_types.as_slice(), &self.output_types)?;
 
         // The homogeneous universe has no way to ground a dynamic result extent: only the mixed form accepts the
         // trailing first-class dimension inputs that define one.
@@ -2334,8 +2385,8 @@ impl_differentiable_operation! {
 
 // In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input per
 // dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference verifies
-// that each input defines exactly the variable referenced by its output axis. The trailing inputs never reach the
-// foreign kernel; they only ground the declared logical result extents.
+// that each input defines its output axis's variable or refines it to an exact extent. The trailing inputs never reach
+// the foreign kernel; they only ground the declared logical result extents.
 impl MemberOperation<ArrayIrType> for CustomCallOperation {
     fn infer_parent_region_input_types(
         &self,
@@ -2352,34 +2403,16 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
-        let dynamic_output_dimensions = self
-            .output_types
-            .iter()
-            .flat_map(|output_type| output_type.shape().dimensions())
-            .filter_map(Dimension::variable)
-            .collect::<Vec<_>>();
-        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
-            return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimensions but only {} inputs were \
-                 provided",
-                dynamic_output_dimensions.len(),
-                input_types.len(),
-            )));
-        };
+        let (array_input_count, refinements, output_types) = self.refine_declared_output_types(input_types)?;
         let array_input_types =
             input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
-        self.validate_configuration(array_input_types.as_slice())?;
-        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
-            let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
-            if actual_variable != expected_variable {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input defines dimension variable \
-                     `{actual_variable}`, but the corresponding declared output axis refers to \
-                     `{expected_variable}`",
-                )));
-            }
-        }
-        Ok(self.infer_array_output_types(array_input_types.as_slice())?.into_iter().map(Into::into).collect())
+        // Aliases compare the effective output contract: an exact trailing extent can make a symbolic declaration
+        // match a concrete input. Keep ragged validation on the declared identities and manual variation separate.
+        self.validate_configuration(array_input_types.as_slice(), output_types.as_slice())?;
+        self.infer_array_output_types(array_input_types.as_slice())?
+            .iter()
+            .map(|output_type| Ok(refinements.refine_declared(output_type, &[])?.into()))
+            .collect()
     }
 
     #[inline]
@@ -2412,7 +2445,7 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_parent_output_types(input_types.as_slice(), &[])?;
-        let array_input_count = inputs.len() - self.dynamic_output_dimension_count();
+        let (array_input_count, _, output_types) = self.refine_declared_output_types(input_types.as_slice())?;
         let array_inputs = inputs[..array_input_count]
             .iter()
             .cloned()
@@ -2423,7 +2456,12 @@ where
             .cloned()
             .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = <C::Value as ValueProjection<ArrayType>>::Projected::custom_call(self, array_inputs.iter())?;
+        // The projected kernel sees the declaration refined by the concrete invocation's extents, so its own alias
+        // validation and allocation agree with the mixed boundary rather than seeing the unrefined symbolic declaration
+        // again. Metadata that inference only inherits (e.g., manual variation sharding) stays undeclared.
+        let operation = Self { output_types, ..self.clone() };
+        let outputs =
+            <C::Value as ValueProjection<ArrayType>>::Projected::custom_call(&operation, array_inputs.iter())?;
         check_count!("output", outputs, self.output_types.len(), ProgramError);
         let mut output_extents = output_extents.into_iter();
         for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
@@ -2514,7 +2552,8 @@ where
         for extent in extents {
             extent.validate_replicated_dimension()?;
         }
-        let batch_dimension = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.to_dimension();
+        let batch_dimension =
+            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         if extents.is_empty() && batch_dimension.value().is_some() {
             return batch_projected_operation(context, self, inputs);
         }
@@ -2801,8 +2840,9 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue,
-        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, ShardingDimension, StridedLayout, Tile, TileDimension,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, ShardingDimension, StridedLayout,
+        Tile, TileDimension,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingError, BatchingTracer,
@@ -3667,6 +3707,108 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_call_type_inference_array_ir_exact_alias_outputs() {
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let concrete_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = CustomCallOperation::new("identity", vec![symbolic_type.clone()])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[concrete_type.clone().into(), DimensionType::from(Dimension::Static(3)).into()],
+                &[],
+            ),
+            Ok(vec![concrete_type.clone().into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(&[symbolic_type.clone().into(), length.clone().into()], &[]),
+            Ok(vec![symbolic_type.clone().into()]),
+        );
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[concrete_type.clone().into(), DimensionType::from(Dimension::Static(4)).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` alias `0->0` requires matching input and output types but input 0 has type \
+                 `f32[3]` and output 0 has type `f32[4]`",
+            )),
+        );
+
+        // An exact extent refines the output to `f32[3]`, which a symbolic `f32[length]` input no longer matches.
+        assert_eq!(
+            operation.infer_parent_output_types(
+                &[symbolic_type.clone().into(), DimensionType::from(Dimension::Static(3)).into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`custom_call` alias `0->0` requires matching input and output types but input 0 has type \
+                 `f32[length]` and output 0 has type `f32[3]`",
+            )),
+        );
+
+        // Conflicting extents for a repeated identity are rejected before the alias is compared.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let square = CustomCallOperation::new(
+            "identity",
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into()]))],
+        )
+        .with_input_output_alias(0, 0)
+        .unwrap();
+        assert_eq!(
+            square.infer_parent_output_types(
+                &[
+                    ArrayType::new_static(DataType::F32, [3, 3]).into(),
+                    DimensionType::from(Dimension::Static(3)).into(),
+                    DimensionType::from(Dimension::Static(4)).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "rows".to_string(),
+                expected: 3,
+                actual: 4,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_specialization_exact_alias_outputs() {
+        // Replaying an independently built symbolic call at exact inputs must apply the same alias contract as type
+        // inference, which compares the alias against the output refined by its exact extent.
+        let length = DimensionType::new("length", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
+        let concrete_type = ArrayType::new_static(DataType::F32, [3]);
+        let operation = CustomCallOperation::new("identity", vec![symbolic_type.clone()])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(symbolic_type.into());
+        let extent = builder.add_input(length.into());
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input, extent], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let specialized = program
+            .specialize(&[concrete_type.into(), DimensionType::from(Dimension::Static(3)).into()])
+            .unwrap();
+        assert_eq!(
+            specialized.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:dimension<3> .
+                let %2:f32[3] = custom_call [target=identity, input_output_alias=0->0] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_custom_call_type_inference_manual_variation() {
         // Opaque code cannot be assumed to agree across devices, so an output declared without a sharding inherits
         // the inputs' manual variation, placed replicated on their mesh, whereas a declared sharding is kept as is.
@@ -3704,7 +3846,7 @@ mod tests {
             Ok(vec![varying_input.clone().into(), invariant_input.into()]),
         );
         let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.to_dimension()]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_type.clone()]);
         assert_eq!(
             operation.infer_parent_output_types(&[varying_input.into(), length.into()], &[]),
@@ -3793,7 +3935,7 @@ mod tests {
 
         // Mixed calls declare layouts only for their leading array inputs, excluding trailing dimension inputs.
         let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.to_dimension()]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_type.clone()])
             .with_input_layouts([Some(column_major)]);
         assert_eq!(
@@ -4333,11 +4475,13 @@ mod tests {
 
         impl CustomCall for IdentityKernelArray {
             fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
-                _operation: &CustomCallOperation,
+                operation: &CustomCallOperation,
                 inputs: I,
             ) -> Result<Vec<Self>, ProgramError> {
                 let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 1);
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                operation.infer_output_types(input_types.as_slice(), &[])?;
                 Ok(inputs)
             }
         }
@@ -4351,7 +4495,7 @@ mod tests {
         let length = DimensionType::new("length", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = CustomCallOperation::new(
             "identity",
-            vec![ArrayType::new(DataType::F32, Shape::new(vec![length.to_dimension()]))],
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![length.simplified_dimension()]))],
         );
         let input = ArrayIrValue::Array(IdentityKernelArray(Array::vector(vec![1.0f32, 2.0]).unwrap()));
         let extent = ArrayIrValue::Dimension(DimensionValue::new(length.clone(), 2).unwrap());
@@ -4362,11 +4506,23 @@ mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "`custom_call` output 0 axis 0 has extent 2, but its explicit extent input is 3",
         ));
-        let wrong_identity = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        // An eager extent is typed exactly, so any extent within the declared axis bounds refines that axis, while an
+        // extent outside them is rejected.
+        let literal_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(ArrayIrValue::custom_call(&operation, [&input, &literal_extent]), Ok(vec![input.clone()]));
+        let aliased = operation.clone().with_input_output_alias(0, 0).unwrap();
+        assert_eq!(ArrayIrValue::custom_call(&aliased, [&input, &literal_extent]), Ok(vec![input.clone()]));
         assert!(matches!(
-            ArrayIrValue::custom_call(&operation, [&input, &wrong_identity]),
+            ArrayIrValue::custom_call(&aliased, [&input, &wrong_extent]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`custom_call` output-extent input defines dimension variable `2`, but the \
+                if message == "`custom_call` alias `0->0` requires matching input and output types but input 0 has \
+                               type `f32[2]` and output 0 has type `f32[3]`",
+        ));
+        let out_of_bounds = ArrayIrValue::Dimension(DimensionValue::constant(7).unwrap());
+        assert!(matches!(
+            ArrayIrValue::custom_call(&operation, [&input, &out_of_bounds]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`custom_call` output-extent input defines dimension variable `7`, but the \
                                corresponding declared output axis refers to `length`",
         ));
     }
@@ -5129,6 +5285,56 @@ mod tests {
                     },
                 ]
                 in (%2)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_batching_array_ir_sequential_refined_aliased_layouts() -> Result<(), ProgramError> {
+        // The declared output `f32[rows]` aliases the `f32[2]` slice that each loop trip receives, and its trailing
+        // extent input refines it to `f32[2]`. The slice is therefore laid out like the declared output, so that the
+        // alias holds at the refined output type.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4))?);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4))?);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = trace.input(DimensionType::from(batch.clone()).into());
+        let input = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let rows_extent = trace.input(DimensionType::from(Dimension::Static(2)).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent);
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        let operation = CustomCallOperation::new("ryft.test.aliased_layout", vec![output_type])
+            .with_input_output_alias(0, 0)?
+            .with_batching(CustomCallBatching::Sequential { unroll: None });
+        let inputs = [ArrayIrBatch::new(input, BatchAxis::new(0))?, ArrayIrBatch::replicated(rows_extent)];
+        let (outputs, evidence) = operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs)?.into_parts();
+        assert!(evidence.is_empty());
+        let output_id = outputs[0].value().atom_id()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder; 3],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 4)>, %1:f32[batch, 2], %2:dimension<2> .
+                let %3:dimension<2>, %4:f32[batch, 2] = scan [carry_count=1, length=batch, reverse=false] %2 %1 %0 [
+                    body={
+                        lambda %0:i64[], %1:dimension<2>, %2:f32[2] .
+                        let %3:dimension<2> = dimension_size [axis=0] %2
+                            %4:f32[2][layout=tiled{0:T(2)}] = broadcast [output_axes=[0], output_layout=tiled{0:T(2)}] \
+                %2 %3
+                            %5:f32[2][layout=tiled{0:T(2)}] = custom_call [target=ryft.test.aliased_layout, \
+                input_output_alias=0->0, batching=sequential] %4 %1
+                        in (%1, %5)
+                    },
+                ]
+                in (%4)
             "}
             .trim_end(),
         );

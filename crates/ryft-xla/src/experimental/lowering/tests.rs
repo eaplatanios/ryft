@@ -15,6 +15,7 @@ use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as Pj
 use crate::experimental::domains::XlaDomain;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::ops::{FlatXlaProgram, XlaProgramBuilder as CompositeXlaProgramBuilder};
+use crate::operations::assertions::ensure_assertion_handler_registered;
 use crate::operations::jit_call::JitCallOperation;
 use crate::operations::sharding::shard_map::to_mlir_module;
 use crate::tests::{values_from_bytes, values_to_bytes};
@@ -116,6 +117,8 @@ pub(crate) fn execute_mixed_program(
     let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
     let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
     let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
+    // Lowering may synthesize runtime checks (e.g., entry guards of mixed region entries), so register their handler.
+    ensure_assertion_handler_registered(client)?;
     let executable =
         client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())?;
     let device = executable.addressable_devices()?.remove(0);

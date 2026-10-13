@@ -30,6 +30,7 @@ use crate::experimental::lowering::regions::lower_nested_program_inline;
 use crate::experimental::lowering::types::lower_array_ir_type;
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens};
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
+use crate::operations::control_flow::lowered_effect_classes;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaDomain, XlaLowerer, XlaValue};
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
@@ -242,9 +243,14 @@ fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
 /// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
 /// that occurs at least twice (per [`JitCallProgramKey`] identity). Single-occurrence callees are left to inline, so
 /// modules without repeated calls lower exactly as before.
+///
+/// # Errors
+///
+/// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
+/// [`lowered_effect_classes`]).
 pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
     program: &XlaProgram<Input, Output, O>,
-) -> JitCallFunctionMap<O>
+) -> Result<JitCallFunctionMap<O>, LoweringError>
 where
     Input: Parameterized<XlaConstant>,
     Output: Parameterized<XlaConstant>,
@@ -258,8 +264,9 @@ where
     for key in order {
         let (count, program) = counts.remove(&key).expect("every ordered key was counted");
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
-        // caller's effect token in program order; a shared token-free function could not preserve that ordering.
-        if count < 2 || !program.effects().classes().is_empty() {
+        // caller's effect token in program order; a shared token-free function could not preserve that ordering. That
+        // includes the entry guards that lowering synthesizes for the callee's nested control flow.
+        if count < 2 || !lowered_effect_classes(&program)?.is_empty() {
             continue;
         }
         let symbol = format!("jit_call_{}", map.order.len());
@@ -268,7 +275,7 @@ where
         map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
         map.order.push(key);
     }
-    map
+    Ok(map)
 }
 
 /// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
@@ -309,8 +316,8 @@ pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFa
         let input_values = (0..function.input_types.len())
             .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
             .collect::<Vec<_>>();
-        // Deduplicated callees are pure by construction (`collect_jit_call_functions` skips effectful programs),
-        // so the shared function body never creates an effect token.
+        // Deduplicated callees are pure by construction (`collect_jit_call_functions` skips programs whose lowering
+        // has effects, including synthesized entry guards), so the shared function body never creates an effect token.
         let mut effect_tokens = EffectTokens::default();
         let outputs = lower_nested_program_inline(
             &function.program,
@@ -1744,6 +1751,152 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_repeated_jit_call_callees_with_synthesized_guards_inline_and_order_later_io() {
+        use ryft_core::PrintOperation;
+
+        // The repeated callee is pure in the source program, but its inner conditional's mixed entry (a symbolic
+        // `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard during lowering.
+        // A shared token-free function could not order that guard, so the callee inlines at both call sites, and the
+        // print after them consumes a token that the guards produce.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type = ArrayType::new_static(DataType::F64, [2]);
+        let branch = || {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(n.clone().into());
+            let array =
+                builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let true_region = builder.import_region(branch().entry_region_ref());
+            let false_region = builder.import_region(branch().entry_region_ref());
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let dimension = builder.add_input(m.clone().into());
+            let array = builder.add_input(array_type.clone().into());
+            let selected = builder
+                .add_instruction(
+                    XlaOperation::Condition(ConditionOperation::new()),
+                    vec![true_region, false_region],
+                    vec![predicate, dimension, array],
+                    None,
+                )
+                .unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                        vec![selected],
+                        vec![Placeholder; 3],
+                        vec![Placeholder],
+                    )
+                    .unwrap(),
+            )
+        };
+        assert!(callee.effects().classes().is_empty());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let dimension = builder.add_input(m.clone().into());
+        let array = builder.add_input(array_type.clone().into());
+        add_xla_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
+        let selected = add_xla_jit_call(&mut builder, &callee, vec![predicate, dimension, array]);
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![selected], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
+            &[array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!module.contains("func.func private"), "{module}");
+        assert_eq!(module.matches("@ryft.assert").count(), 2, "{module}");
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let print_token =
+            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
+        let definition = module.lines().find(|line| line.trim().starts_with(&format!("{print_token} = "))).unwrap();
+        assert!(!definition.contains("stablehlo.after_all  :"), "{module}");
+    }
+
+    #[test]
+    fn test_repeated_jit_call_callees_with_extent_validations_inline_and_order_later_assertions() {
+        // The repeated callee is pure in the source program, but its `zero[n, n]` constructor consumes a symbolic
+        // `dimension<n>` and an exact `dimension<2>`, so type inference refines it to `f64[2, 2]` and lowering validates
+        // that `n = 2` at runtime. A shared token-free function could not order those validations, so the callee inlines
+        // at both call sites, and the explicit assertion after them continues their assertion chain.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let callee = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let symbolic = builder.add_input(n.clone().into());
+            let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
+            let zero = builder
+                .add_instruction(
+                    XlaOperation::Zero(ZeroOperation::new(ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![n.simplified_dimension(), n.simplified_dimension()]),
+                    ))),
+                    Vec::new(),
+                    vec![symbolic, exact],
+                    None,
+                )
+                .unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        assert!(callee.effects().classes().is_empty());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let symbolic = builder.add_input(n.clone().into());
+        let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        add_xla_jit_call(&mut builder, &callee, vec![symbolic, exact]);
+        let zero = add_xla_jit_call(&mut builder, &callee, vec![symbolic, exact]);
+        builder
+            .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![zero], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::Boolean)],
+            &[output_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!module.contains("func.func private"), "{module}");
+        assert_eq!(module.matches("@ryft.assert").count(), 3, "{module}");
+        let assertion = module.lines().find(|line| line.contains("required predicate")).unwrap();
+        let assertion_token = assertion
+            .split_once("@ryft.assert(")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0
+            .rsplit_once(", ")
+            .unwrap()
+            .1;
+        let definition = module.lines().find(|line| line.trim().starts_with(&format!("{assertion_token} = "))).unwrap();
+        assert!(definition.contains("@ryft.assert"), "{module}");
     }
 
     #[test]

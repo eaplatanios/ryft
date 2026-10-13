@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayType, AssertOperation, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
-    DimensionType, EffectClass, Operation,
+    DimensionType, DimensionVariable, EffectClass, GUARD_OPERATION_NAME, GuardOperation, Operation, RetypeOperation,
+    Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -23,6 +24,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::experimental::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::lower_compare_to_mlir;
+use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -212,28 +214,13 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Option<ValueRef<'b, 'c, 't>>, LoweringError> {
-    check_count!("output", output_types, declared_types.len(), ProgramError);
-    let dynamic_count = declared_types
-        .iter()
-        .flat_map(|r#type| r#type.shape().dimensions())
-        .filter_map(Dimension::variable)
-        .count();
-    check_count!("input", input_values, dynamic_count, ProgramError);
-    check_count!("input", input_types, input_values.len(), ProgramError);
-    let mut inputs = input_values.iter().zip(input_types);
+    let checks = output_extent_checks(declared_types, input_types, output_types)?;
+    check_count!("input", input_values, input_types.len(), ProgramError);
     let mut checked = Vec::new();
     let mut validation = None;
-    let dimensions = declared_types
-        .iter()
-        .zip(output_types)
-        .flat_map(|(declared, output)| declared.shape().dimensions().iter().zip(output.shape().dimensions()));
-    for (declared, output) in dimensions {
-        let Dimension::Dynamic(variable) = declared else { continue };
-        let (&value, input_type) = inputs.next().unwrap();
-        let input_type =
-            <&DimensionType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-        let Dimension::Static(extent) = *output else { continue };
-        if input_type.extent() == Some(extent) || checked.contains(&(value, extent)) {
+    for (index, variable, extent) in checks {
+        let value = input_values[index];
+        if checked.contains(&(value, extent)) {
             continue;
         }
         checked.push((value, extent));
@@ -259,6 +246,74 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
         });
     }
     Ok(validation)
+}
+
+/// Returns `true` if lowering an operation whose complete output signature declares `declared_types` emits runtime
+/// assertions that validate its extent operands (refer to [`lower_output_extent_validation`]). Such assertions are
+/// effects that lowering synthesizes, because the operation itself declares none, so the enclosing scopes must thread
+/// their tokens (refer to [`lowered_effect_classes`](crate::operations::control_flow::lowered_effect_classes)). An
+/// instruction with fewer inputs than the declared dynamic axes does not size them with extent operands (e.g., a
+/// homogeneous array constructor), so lowering validates nothing for it.
+///
+/// # Parameters
+///
+///   - `declared_types`: Declared output types, which consume one extent operand per dynamic axis, in axis order.
+///   - `input_types`: Types of all instruction inputs, which end with the extent operands of the declared dynamic axes.
+///   - `output_types`: Refined output types, which correspond to `declared_types`.
+pub(crate) fn validates_output_extents(
+    declared_types: &[ArrayType],
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayIrType],
+) -> Result<bool, LoweringError> {
+    let dynamic_count = declared_types
+        .iter()
+        .flat_map(|r#type| r#type.shape().dimensions())
+        .filter_map(Dimension::variable)
+        .count();
+    let Some(extent_offset) = input_types.len().checked_sub(dynamic_count) else {
+        return Ok(false);
+    };
+    let output_types = output_types
+        .iter()
+        .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LoweringError::Tracing(error.into()))?;
+    Ok(!output_extent_checks(declared_types, &input_types[extent_offset..], &output_types)?.is_empty())
+}
+
+/// Returns the checks that [`lower_output_extent_validation`] emits before deduplicating them by operand value: for
+/// each extent operand of a declared dynamic axis whose refined output extent its own type does not prove, its index
+/// among the `input_types` of the extent operands, the declared identity of its axis, and the refined extent.
+fn output_extent_checks<'d>(
+    declared_types: &'d [ArrayType],
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayType],
+) -> Result<Vec<(usize, &'d DimensionVariable, usize)>, LoweringError> {
+    check_count!("output", output_types, declared_types.len(), ProgramError);
+    let dynamic_count = declared_types
+        .iter()
+        .flat_map(|r#type| r#type.shape().dimensions())
+        .filter_map(Dimension::variable)
+        .count();
+    check_count!("input", input_types, dynamic_count, ProgramError);
+    let mut inputs = input_types.iter().enumerate();
+    let mut checks = Vec::new();
+    let dimensions = declared_types
+        .iter()
+        .zip(output_types)
+        .flat_map(|(declared, output)| declared.shape().dimensions().iter().zip(output.shape().dimensions()));
+    for (declared, output) in dimensions {
+        let Dimension::Dynamic(variable) = declared else { continue };
+        let (index, input_type) = inputs.next().unwrap();
+        let input_type =
+            <&DimensionType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+        if let Dimension::Static(extent) = *output
+            && input_type.extent() != Some(extent)
+        {
+            checks.push((index, variable, extent));
+        }
+    }
+    Ok(checks)
 }
 
 /// Name of the typed XLA FFI custom call that reports failed runtime assertions.
@@ -918,22 +973,23 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
     if valid {
         return Ok(());
     }
+    // Static types label operands by their literal extents. Report operand roles instead, retaining meaningful
+    // symbolic names as additional context without making the observed values look like numeric self-assignments.
+    let observation = |role: &str, name: &str, value: i64| {
+        if name == role || name.parse::<i64>().is_ok() {
+            format!("{role}={value}")
+        } else {
+            format!("{role} (`{name}`)={value}")
+        }
+    };
+    let observations = format!("{}, {}", observation("left", left_name, left), observation("right", right_name, right));
     Err(match kind {
-        ASSERT_ADD_KIND => format!(
-            "dimension arithmetic overflow while adding dimensions with inputs {left_name}={left}, \
-             {right_name}={right}",
+        ASSERT_ADD_KIND | ASSERT_MUL_KIND | ASSERT_POW_KIND => format!(
+            "dimension arithmetic overflow in `dimension_{kind}`; got {observations}",
         ),
-        ASSERT_SUB_KIND => format!("{left_name} >= {right_name}; observed {left_name}={left}, {right_name}={right}"),
-        ASSERT_MUL_KIND => format!(
-            "dimension arithmetic overflow while multiplying dimensions with inputs {left_name}={left}, \
-             {right_name}={right}",
-        ),
-        ASSERT_POW_KIND => format!(
-            "dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
-             {left_name}={left}, {right_name}={right}",
-        ),
+        ASSERT_SUB_KIND => format!("`dimension_sub` requires left >= right; got {observations}"),
         ASSERT_DIV_KIND | ASSERT_REM_KIND => {
-            format!("{right_name} > 0; observed {left_name}={left}, {right_name}={right}")
+            format!("`dimension_{kind}` requires right > 0; got {observations}")
         }
         _ => unreachable!(),
     })
@@ -1133,6 +1189,313 @@ fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i
         )));
     }
     Ok(i64::from_ne_bytes(scalar_bytes(buffer, memory)?))
+}
+
+/// Lowers the runtime check of an [`GuardOperation`] over `values`, whose actual types are `actual_types`, against
+/// the guard's `declared_types`. Every occurrence of a declared dimension identity (an array axis or a first-class
+/// dimension member) is observed as an `i64` extent, which is static when its actual type fixes it and read at runtime
+/// otherwise, and an assertion requires each occurrence to equal the first. Pairs that are both static were already
+/// checked when the guard was typed and emit nothing.
+///
+/// Ordered assertions and ordered I/O normally use independent token chains. An entry guard instead joins its
+/// assertion token into the ordered-I/O chain, so every later ordered I/O effect (including those inside the region
+/// whose entry it guards) is ordered after the check, exactly as the entry validation that it replaces precedes the
+/// region. Ordinary assertions keep their independent chain.
+///
+/// # Parameters
+///
+///   - `boundary`: Diagnostic name of the guarded boundary.
+///   - `declared_types`: Declared types of the guarded members.
+///   - `values`: Lowered values of the guarded members.
+///   - `actual_types`: Actual types of `values`, which refine `declared_types`.
+pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
+    boundary: &str,
+    declared_types: &[ArrayIrType],
+    values: &[ValueRef<'b, 'c, 't>],
+    actual_types: &[ArrayIrType],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    check_count!("input", values, declared_types.len(), ProgramError);
+    check_count!("input", actual_types, declared_types.len(), ProgramError);
+    // Each occurrence is either a static extent or a lowered runtime `i64` extent.
+    let mut occurrences = Vec::<(DimensionVariable, Result<usize, ValueRef<'b, 'c, 't>>)>::new();
+    for ((declared, &value), actual) in declared_types.iter().zip(values).zip(actual_types) {
+        match (declared, actual) {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) if declared.rank() == actual.rank() => {
+                for (axis, (declared, actual)) in
+                    declared.shape().dimensions().iter().zip(actual.shape().dimensions()).enumerate()
+                {
+                    let Dimension::Dynamic(variable) = declared else { continue };
+                    let extent = match actual {
+                        Dimension::Static(extent) => Ok(*extent),
+                        Dimension::Dynamic(_) => {
+                            Err(lower_runtime_dimension_size_i64(value, axis, block, context, location)?)
+                        }
+                    };
+                    occurrences.push((variable.clone(), extent));
+                }
+            }
+            (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
+                let Some(variable) = declared.variable() else { continue };
+                occurrences.push((variable.clone(), actual.extent().ok_or(value)));
+            }
+            (declared, actual) => {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "`{GUARD_OPERATION_NAME}` of `{boundary}` cannot check actual type `{actual}` against \
+                         declared type `{declared}`",
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut guarded = false;
+    for (index, (variable, extent)) in occurrences.iter().enumerate() {
+        let Some((_, first)) = occurrences[..index].iter().find(|(previous, _)| previous == variable) else {
+            continue;
+        };
+        if first.is_ok() && extent.is_ok() {
+            continue;
+        }
+        let mut lower_extent = |extent: &Result<usize, ValueRef<'b, 'c, 't>>| match extent {
+            Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
+            Err(value) => Ok::<_, LoweringError>(*value),
+        };
+        let expected = lower_extent(first)?;
+        let actual = lower_extent(extent)?;
+        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, actual, expected, block, location)?;
+        lower_assert_to_custom_call(
+            GUARD_OPERATION_NAME,
+            &format!("input dimension `{variable}` must have one extent at the entry of `{boundary}`"),
+            &["expected".to_string(), "actual".to_string()],
+            None,
+            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64)],
+            &[predicate, expected, actual],
+            effect_tokens,
+            block,
+            context,
+            location,
+        )?;
+        guarded = true;
+    }
+
+    // Later ordered I/O of both ordered I/O classes, which share one token slot, follows the check: the assertion token
+    // joins the I/O chain, which every scope that threads the assertion token also threads (refer to
+    // `token_threaded_effects`). Unordered effects have no token and are not ordered after the check.
+    if guarded {
+        let assertion = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
+        let joined = match effect_tokens.get(EffectClass::OrderedIo) {
+            Some(io) => block
+                .append_operation(stable_hlo::after_all(&[io, assertion], location)?)?
+                .result(0)
+                .expect("stablehlo.after_all should return one result")
+                .as_ref(),
+            None => assertion,
+        };
+        effect_tokens.set(EffectClass::OrderedIo, joined);
+    }
+    Ok(())
+}
+
+impl LowerableOperation for GuardOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let declared_types = self.declared_types().iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+        let input_types = input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+        let output_types = output_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+        lower_guard_with_outputs(self.boundary(), &declared_types, input_values, &input_types, &output_types, lowerer)
+    }
+}
+
+impl LowerableOperation for GuardOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_guard_with_outputs(
+            self.boundary(),
+            self.declared_types(),
+            input_values,
+            input_types,
+            output_types,
+            lowerer,
+        )
+    }
+}
+
+/// Makes every returned value depend on all the supplied value producers and the optional assertion token. A single
+/// barrier carries tensors and tokens together, so even conversions of otherwise unchanged values follow the check,
+/// and a proof-carrying cast cannot discard the dependencies of its witnesses. The original effect token remains the
+/// ordered-effect chain's current token; the barrier only supplies dependencies to its value consumers.
+fn lower_dependency_barrier<'b, 'c: 'b, 't: 'c>(
+    values: &[ValueRef<'b, 'c, 't>],
+    assertion_token: Option<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    if values.is_empty() || (values.len() == 1 && assertion_token.is_none()) {
+        return Ok(values.to_vec());
+    }
+    let inputs = values.iter().copied().chain(assertion_token).collect::<Vec<_>>();
+    let barrier = block.append_operation(stable_hlo::optimization_barrier(&inputs, location)?)?;
+    Ok((0..values.len()).map(|index| barrier.result(index).unwrap().as_ref()).collect())
+}
+
+/// Lowers an [`GuardOperation`] instruction: emits its check with [`lower_guard`], makes every output
+/// depend on the check, and converts each input to its output type with [`lower_retype`]. The conversions only
+/// re-describe values that the check has related, including outputs that narrow some axes and give others a
+/// [retained](GuardOperation::retained) identity.
+fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    boundary: &str,
+    declared_types: &[ArrayIrType],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayIrType],
+    output_types: &[ArrayIrType],
+    lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("output", output_types, input_values.len(), ProgramError);
+    lower_guard(
+        boundary,
+        declared_types,
+        input_values,
+        input_types,
+        &mut lowerer.effect_tokens,
+        &mut lowerer.block,
+        lowerer.context,
+        lowerer.location,
+    )?;
+    let values = lower_dependency_barrier(
+        input_values,
+        lowerer.effect_tokens.ordered_assertion,
+        &mut lowerer.block,
+        lowerer.location,
+    )?;
+    values
+        .iter()
+        .zip(input_types)
+        .zip(output_types)
+        .map(|((&value, input_type), output_type)| {
+            lower_retype(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
+        })
+        .collect()
+}
+
+/// Converts the lowered `value` of type `input_type` to the lowered representation of the compatible `output_type`
+/// (refer to [`RetypeOperation`] and [`GuardOperation`]). First-class dimensions lower to `i64` scalars whatever
+/// their type, and types that differ only in metadata lower to the same tensor type, so those values are returned
+/// unchanged. The value is converted through the type whose axes are static wherever either type is static: narrowing
+/// a bounded dynamic axis to a static extent slices the physical buffer (refer to [`lower_refined_region_outputs`]),
+/// and then widening a static axis to a bounded dynamic one, or moving a dynamic axis to another identity with another
+/// physical bound, pads or slices it and restores its runtime size (refer to [`lower_refined_region_input`]). Neither
+/// conversion checks runtime extents, which is why ryft-core emits them only behind a check such as an entry guard.
+pub(crate) fn lower_retype<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayIrType,
+    output_type: &ArrayIrType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let intermediate_type = match (input_type, output_type) {
+        (ArrayIrType::Array(input), ArrayIrType::Array(output)) if input.rank() == output.rank() => {
+            let dimensions = input
+                .shape()
+                .dimensions()
+                .iter()
+                .zip(output.shape().dimensions())
+                .map(|(input, output)| match (input, output) {
+                    (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
+                    _ => input.clone(),
+                })
+                .collect();
+            ArrayIrType::Array(input.clone().with_shape(Shape::new(dimensions)))
+        }
+        _ => input_type.clone(),
+    };
+    let value = lower_refined_region_outputs(
+        vec![value],
+        std::slice::from_ref(input_type),
+        std::slice::from_ref(&intermediate_type),
+        block,
+        context,
+        location,
+    )?
+    .remove(0);
+    lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
+}
+
+impl LowerableOperation for RetypeOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("output", output_types, 1, ProgramError);
+        let (Some(_), Some(input_type)) = (input_values.first(), input_types.first()) else {
+            return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", self.name()) });
+        };
+        // The cast only converts the first input, but its proof witnesses and preceding assertion must remain real
+        // dependencies. This also orders tangent conversions whose witnesses are unconverted primal inputs.
+        let values = lower_dependency_barrier(
+            input_values,
+            lowerer.effect_tokens.ordered_assertion,
+            &mut lowerer.block,
+            lowerer.location,
+        )?;
+        Ok(vec![lower_retype(
+            values[0],
+            &input_type.clone().into(),
+            &output_types[0].clone().into(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?])
+    }
+}
+
+impl LowerableOperation for RetypeOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("output", output_types, 1, ProgramError);
+        let (Some(_), Some(input_type)) = (input_values.first(), input_types.first()) else {
+            return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", self.name()) });
+        };
+        // Witness values can carry a preceding check even when their geometry is already represented by the types.
+        // Keep those producers, and the current assertion token, ahead of the proof-carrying conversion.
+        let values = lower_dependency_barrier(
+            input_values,
+            lowerer.effect_tokens.ordered_assertion,
+            &mut lowerer.block,
+            lowerer.location,
+        )?;
+        Ok(vec![lower_retype(
+            values[0],
+            input_type,
+            &output_types[0],
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?])
+    }
 }
 
 impl LowerableOperation for AssertOperation<ArrayType> {
@@ -1363,6 +1726,364 @@ mod tests {
         assert_ne!(print_token, assertion_token, "{module}",);
     }
 
+    #[test]
+    fn test_lower_guard_orders_later_io_after_the_check() {
+        use ryft_core::{DimensionType, PrintOperation, Shape};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::operations::debugging::ensure_print_handler_registered;
+        use crate::tests::execution_client;
+
+        // `[dimension<n>, f32[n]]` entered with a symbolic `dimension<m>` and an exact `f32[2]` needs one runtime
+        // check.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let declared: Vec<ArrayIrType> =
+            vec![n.clone().into(), ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into()];
+        let array_type = ArrayType::new_static(DataType::F64, [2]);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let dimension = builder.add_input(m.into());
+        let array = builder.add_input(array_type.clone().into());
+        builder
+            .add_instruction(GuardOperation::new("region", declared), Vec::new(), vec![dimension, array], None)
+            .unwrap();
+        let printed = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![array], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![printed], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[ArrayType::scalar(DataType::I64), array_type.clone()],
+            &[array_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        // The print's token is the guard assertion's output token, so the print cannot run before the check.
+        let assertion = module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
+        let assertion_token = assertion.trim().split_once(" = ").unwrap().0;
+        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
+        let print_token =
+            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
+        assert_eq!(print_token, assertion_token, "{module}");
+        assert!(assertion.contains(r#"actor = "guard""#), "{module}");
+
+        let client = execution_client();
+        ensure_assertion_handler_registered(&client).unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let values = MixedValue::Array(vec![1.0, 2.0], vec![2]);
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Dimension(2), values.clone()], &[]),
+            Ok(vec![values.clone()]),
+        );
+        let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(5), values], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_retype_converts_bounded_dynamic_values() {
+        use ryft_core::{AddOperation, Shape};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(exact);
+        let second = builder.add_input(symbolic.clone());
+        let narrowed = builder
+            .add_instruction(
+                GuardOperation::new("region", vec![symbolic.clone(), symbolic]),
+                Vec::new(),
+                vec![first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), narrowed, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2]),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2])]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
+
+        // The forward-mode derivative narrows the bounded dynamic tangent with a `retype`, which slices its physical
+        // buffer to the static extent.
+        let jvp = program.jvp().unwrap();
+        assert!(jvp.to_string().contains("retype"), "{jvp}");
+        let tangents =
+            [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &jvp,
+                &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
+                &[2, 2],
+            ),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])]),
+        );
+
+        // The pullback widens the static cotangent back to the bounded dynamic input with a `retype` that the residual
+        // primal input witnesses, which pads its physical buffer and restores the logical extent.
+        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert!(pullback.to_string().contains("retype"), "{pullback}");
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &pullback,
+                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), inputs[1].clone()],
+                &[2],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Dimension(2),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_lower_guard_widens_values_to_retained_identities() {
+        use ryft_core::{AddOperation, Shape, Typed};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // `[f64[m], f64[2], f64[k]]` entering `[f64[n], f64[n], f64[n]]` with a retained `m` checks `m = k = 2` and
+        // returns all three values at `f64[m]`: the exact value is padded to the bound of `m`, and the value of `k`,
+        // whose bound is larger, is sliced to the checked extent before it is padded, so their sum is well typed.
+        let wide = DimensionBounds::positive(Some(9)).unwrap();
+        let n = DimensionType::new("n", wide);
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let k = DimensionType::new("k", wide);
+        let vector = |dimension: &DimensionType| -> ArrayIrType {
+            ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(vector(&m));
+        let second = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
+        let third = builder.add_input(vector(&k));
+        let guard = GuardOperation::new("region", vec![vector(&n), vector(&n), vector(&n)])
+            .with_retained(vec![m.to_variable()]);
+        let outputs = builder.add_instruction(guard, Vec::new(), vec![first, second, third], None).unwrap().to_vec();
+        assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
+        assert_eq!(builder.atoms()[outputs[2].index()].r#type().as_ref(), &vector(&m));
+        let partial = builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![outputs[0], outputs[1]], None)
+            .unwrap()[0];
+        let sum = builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![partial, outputs[2]], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [
+            MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]),
+            MixedValue::Array(vec![3.0, 4.0], vec![2]),
+            MixedValue::Array(vec![5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![8]),
+        ];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2, 2]),
+            Ok(vec![MixedValue::Array(vec![9.0, 12.0], vec![2]), MixedValue::Dimension(2)]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
+        assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_guard_renames_values_to_retained_identities() {
+        use ryft_core::{AddOperation, Typed};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // `[f64[m], f64[k]]` entering `[f64[n], f64[n]]` with a retained `m` checks `m = k` without an exact extent and
+        // returns both values at `f64[m]`: the value of `k`, whose physical bound is larger, is sliced down to the
+        // bound of `m` and keeps its runtime size, so their sum is well typed.
+        let wide = DimensionBounds::positive(Some(9)).unwrap();
+        let n = DimensionType::new("n", wide);
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let k = DimensionType::new("k", wide);
+        let vector = |dimension: &DimensionType| -> ArrayIrType {
+            ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(vector(&m));
+        let second = builder.add_input(vector(&k));
+        let guard = GuardOperation::new("region", vec![vector(&n), vector(&n)]).with_retained(vec![m.to_variable()]);
+        let outputs = builder.add_instruction(guard, Vec::new(), vec![first, second], None).unwrap().to_vec();
+        assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &vector(&m));
+        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), outputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [
+            MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]),
+            MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], vec![8]),
+        ];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2, 2]),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap_err().to_string();
+        assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_guard_orders_bounded_conversions_after_the_check() {
+        use ryft_core::{
+            AddOperation, ArrayReferenceDischarge, PartialValue, ReferenceReadOperation, ReferenceType, TracingContext,
+        };
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::experimental::ops::XlaOperation;
+        use crate::tests::execution_client;
+
+        let client = execution_client();
+        for composite in [false, true] {
+            // Both members fit the declared bound. Only the guard proves that the wider member fits the retained
+            // member's smaller physical buffer; an invalid extent of 6 must fail before it can be restored on bound 4.
+            let wide = DimensionBounds::positive(Some(9)).unwrap();
+            let declared = DimensionType::new("n", wide);
+            let retained = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+            let other = DimensionType::new("k", wide);
+            let vector = |dimension: &DimensionType| {
+                ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()]))
+            };
+            let input_types = vec![vector(&retained), vector(&other)];
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let first = builder.add_input(ReferenceType::new(input_types[0].clone()).into());
+            let second = builder.add_input(ReferenceType::new(input_types[1].clone()).into());
+            let reads = [first, second]
+                .into_iter()
+                .map(|reference| {
+                    builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()
+                        [0]
+                })
+                .collect();
+            let guard: XlaOperation = if composite {
+                GuardOperation::<ArrayIrType>::new("region", vec![vector(&declared).into(), vector(&declared).into()])
+                    .with_retained(vec![retained.to_variable()])
+                    .into()
+            } else {
+                GuardOperation::<ArrayType>::new("region", vec![vector(&declared), vector(&declared)])
+                    .with_retained(vec![retained.to_variable()])
+                    .into()
+            };
+            let guarded = builder.add_instruction(guard, Vec::new(), reads, None).unwrap().to_vec();
+            let sum =
+                builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), guarded, None).unwrap()[0];
+            let source = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            // Exercise the public specialization and reference-discharge boundaries before differentiating and
+            // lowering. These read-only external bindings become the two explicit initial-state array arguments.
+            let context = TracingContext::<XlaConstant, XlaOperation>::new();
+            let inputs = source.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
+            let evaluation = source.partially_evaluate_in_context(&context, &inputs).unwrap();
+            let discharged = evaluation.program().clone().discharge_references::<ArrayReferenceDischarge>(0).unwrap();
+            assert_eq!(discharged.external_reference_bindings().len(), 2);
+            assert!(discharged.external_reference_bindings().iter().all(|binding| binding.output_index().is_none()));
+            let program = discharged.program();
+            let module =
+                to_mlir_module_for_program(program, &[], &input_types, &vec![vector(&retained)], "main", None, None)
+                    .unwrap();
+            let assertion = module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
+            let token = assertion.trim().split_once(" = ").unwrap().0;
+            let barrier = module.lines().find(|line| line.contains("stablehlo.optimization_barrier")).unwrap();
+            let entry_value = |index| {
+                module
+                    .lines()
+                    .find(|line| line.contains(&format!("stablehlo.set_dimension_size %arg{index},")))
+                    .unwrap()
+                    .trim()
+                    .split_once(" = ")
+                    .unwrap()
+                    .0
+            };
+            assert!(barrier.contains(&format!("{}, {}, {token}", entry_value(0), entry_value(1))), "{module}");
+            let values = barrier.trim().split_once(':').unwrap().0;
+            assert!(module.contains(&format!("stablehlo.get_dimension_size {values}#1")), "{module}");
+            let addition = module.lines().find(|line| line.contains("stablehlo.add ")).unwrap();
+            assert!(addition.contains(&format!("{values}#0")), "{module}");
+
+            let inputs = [
+                MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]),
+                MixedValue::Array(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0], vec![8]),
+            ];
+            assert_eq!(
+                execute_mixed_program(&client, program, &inputs, &[2, 2]),
+                Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)]),
+            );
+            let error = execute_mixed_program(&client, program, &inputs, &[2, 6]).unwrap_err().to_string();
+            assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
+
+            // The tangent cast has its own data input. Its primal proof witnesses and the assertion token must be
+            // real dependencies even though neither is numerically used by the representation conversion.
+            let jvp = program.jvp().unwrap();
+            let tangent_module = to_mlir_module_for_program(
+                &jvp,
+                &[],
+                &vec![input_types[0].clone(), input_types[1].clone(), input_types[0].clone(), input_types[1].clone()],
+                &vec![vector(&retained), vector(&retained)],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let assertion = tangent_module.lines().find(|line| line.contains("@ryft.assert")).unwrap();
+            let token = assertion.trim().split_once(" = ").unwrap().0;
+            let entry_value = |index| {
+                tangent_module
+                    .lines()
+                    .find(|line| line.contains(&format!("stablehlo.set_dimension_size %arg{index},")))
+                    .unwrap()
+                    .trim()
+                    .split_once(" = ")
+                    .unwrap()
+                    .0
+            };
+            let barrier = tangent_module
+                .lines()
+                .find(|line| {
+                    line.contains(&format!("stablehlo.optimization_barrier {}, {},", entry_value(3), entry_value(1),))
+                })
+                .unwrap();
+            assert!(barrier.contains(token), "{tangent_module}");
+            let values = barrier.trim().split_once(':').unwrap().0;
+            assert!(tangent_module.contains(&format!("stablehlo.get_dimension_size {values}#0")), "{tangent_module}");
+            let inputs = [inputs[0].clone(), inputs[1].clone(), inputs[0].clone(), inputs[1].clone()];
+            assert_eq!(
+                execute_mixed_program(&client, &jvp, &inputs, &[2, 2, 2, 2]),
+                Ok(vec![
+                    MixedValue::Array(vec![4.0, 6.0], vec![2]),
+                    MixedValue::Array(vec![4.0, 6.0], vec![2]),
+                    MixedValue::Dimension(2),
+                    MixedValue::Dimension(2),
+                ]),
+            );
+            let error = execute_mixed_program(&client, &jvp, &inputs, &[2, 6, 2, 6]).unwrap_err().to_string();
+            assert!(error.contains("must have one extent at the entry of `region`"), "{error}");
+        }
+    }
+
     /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.
     fn eager_dimension(name: &str, extent: usize) -> DimensionValue {
         DimensionValue::new(DimensionType::new(name, DimensionBounds::unbounded()), extent).unwrap()
@@ -1475,8 +2196,8 @@ mod tests {
     #[test]
     fn test_validate_arithmetic_matches_eager_checked_diagnostics() {
         // The host callback recomputes each checked predicate, so its wording must match the eager path exactly for
-        // the same inputs; these pairs fail on both paths and must render identically. Eager dimension values have
-        // static types, which both paths name by their extents (e.g., when a program is traced from eager values).
+        // the same inputs; these pairs fail on both paths and must render identically. Literal type labels from eager
+        // dimensions must be reported as operand roles, just as when a program is traced from eager values.
         let compiled = |kind, left: i64, right: i64| {
             validate_arithmetic(kind, &left.to_string(), left, &right.to_string(), right).unwrap_err()
         };
@@ -1497,19 +2218,15 @@ mod tests {
             eager_message(eager_dimension("left", 3).dimension_pow(&eager_dimension("right", 64)).unwrap_err()),
         );
 
-        // Addition and multiplication of two constructible extents cannot overflow the eager `usize` computation on
-        // 64-bit hosts (the sum of two values at most `i64::MAX` fits in `usize`, and construction already rejects
-        // larger extents with the backend-width diagnostic), so their overflow wording is pinned against the shared
-        // template instead of a reproduced eager error.
+        // These addition and multiplication pairs exceed the signed backend limit but fit the eager `usize`
+        // computation on 64-bit hosts, so their overflow wording is pinned directly.
         assert_eq!(
             compiled(ASSERT_ADD_KIND, i64::MAX - 1, 2),
-            "dimension arithmetic overflow while adding dimensions with inputs 9223372036854775806=9223372036854775806, \
-             2=2",
+            "dimension arithmetic overflow in `dimension_add`; got left=9223372036854775806, right=2",
         );
         assert_eq!(
             compiled(ASSERT_MUL_KIND, i64::MAX / 2, 3),
-            "dimension arithmetic overflow while multiplying dimensions with inputs \
-             4611686018427387903=4611686018427387903, 3=3",
+            "dimension arithmetic overflow in `dimension_mul`; got left=4611686018427387903, right=3",
         );
     }
 
@@ -1524,33 +2241,34 @@ mod tests {
 
         assert_eq!(
             validate_arithmetic(ASSERT_ADD_KIND, "left", i64::MAX, "right", 1),
-            Err("dimension arithmetic overflow while adding dimensions with inputs left=9223372036854775807, \
-                 right=1"
+            Err("dimension arithmetic overflow in `dimension_add`; got left=9223372036854775807, right=1"
                 .to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_SUB_KIND, "left", 2, "right", 3),
-            Err("left >= right; observed left=2, right=3".to_string()),
+            Err("`dimension_sub` requires left >= right; got left=2, right=3".to_string()),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_MUL_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow while multiplying dimensions with inputs left=9223372036854775807, \
-                 right=2"
+            Err("dimension arithmetic overflow in `dimension_mul`; got left=9223372036854775807, right=2"
                 .to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_POW_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
-                 left=9223372036854775807, right=2"
+            Err("dimension arithmetic overflow in `dimension_pow`; got left=9223372036854775807, right=2"
                 .to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 0),
-            Err("right > 0; observed left=7, right=0".to_string()),
+            Err("`dimension_div` requires right > 0; got left=7, right=0".to_string()),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_REM_KIND, "left", 7, "right", 0),
-            Err("right > 0; observed left=7, right=0".to_string()),
+            Err("`dimension_rem` requires right > 0; got left=7, right=0".to_string()),
+        );
+        assert_eq!(
+            validate_arithmetic(ASSERT_SUB_KIND, "rows", 2, "columns", 3),
+            Err("`dimension_sub` requires left >= right; got left (`rows`)=2, right (`columns`)=3".to_string()),
         );
         assert_eq!(
             validate_arithmetic("unknown", "left", 1, "right", 1),

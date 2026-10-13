@@ -1136,9 +1136,10 @@ mod tests {
             FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
         };
 
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
         use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
         use crate::operations::assertions::ensure_assertion_handler_registered;
-        use crate::tests::execution_client;
 
         const TARGET: &str = "ryft.test.validated_nullary_extent";
         static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1183,7 +1184,12 @@ mod tests {
             }
         }
 
-        let client = execution_client();
+        // The counting handler writes its results through host pointers, so this test always runs on the CPU client
+        // rather than on the configured execution platform, whose result buffers may live in device memory.
+        let client = load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_assertion_handler_registered(&client).unwrap();
         REGISTRATION
             .get_or_init(|| {

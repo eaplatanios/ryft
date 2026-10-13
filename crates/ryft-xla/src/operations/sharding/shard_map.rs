@@ -25,6 +25,7 @@ use crate::experimental::lowering::{
     token_threaded_effects,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
+use crate::operations::control_flow::lowered_effect_classes;
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, ToMlir, XlaDomain, XlaLowerer};
 
@@ -322,8 +323,7 @@ where
     // `OrderedIo` bodies never reach this point: shard-map boundary validation rejects them when a body is traced or
     // attached (refer to `ShardMapError::OrderedIoNotSupported`), so only `DeviceOrderedIo` and unordered effects are
     // threaded through the manual computation.
-    let effects = program.effects();
-    let threaded_effects = token_threaded_effects(effects.classes()).collect::<Vec<_>>();
+    let threaded_effects = token_threaded_effects(lowered_effect_classes(program)?).collect::<Vec<_>>();
     let mut local_input_tensor_types = local_input_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))

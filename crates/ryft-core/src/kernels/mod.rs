@@ -86,8 +86,8 @@ pub mod transforms;
 pub mod validation;
 
 pub use authoring::{
-    KernelCall, dot, for_loop, shape_div_ceil, static_extent, tile_load, tile_store, tiled_call,
-    whole_array_parameter, zeros,
+    KernelCall, dot, for_loop, shape_div_ceil, static_extent, tile_load, tile_store, tiled_call, whole_array_parameter,
+    zeros,
 };
 pub use calls::{
     KERNEL_CALL_OPERATION_NAME, KERNEL_SCHEMA_VERSION, KernelCallOperation, KernelDefinition, KernelError,

@@ -16,20 +16,20 @@ use ryft_core::{
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation, LiteralIdentity,
-    Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
-    NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationProvider, OrOperation,
-    PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
+    GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
+    LiteralIdentity, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationProvider,
+    OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
     Parameter, PowOperation, PrintOperation, Program, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
-    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
-    TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming, Typed,
-    UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
+    ReshapeOperation, ReshardOperation, RetypeOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
+    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
+    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
     XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_macros::Parameter;
@@ -422,6 +422,14 @@ where
     /// Ordered assertion with optional scalar diagnostic inputs.
     Assert(AssertOperation<ArrayIrType>),
 
+    /// Runtime check of the identity relationships of an entry that the actual input types do not prove, which
+    /// returns its inputs narrowed by the facts that those relationships prove.
+    #[ryft(guard)]
+    Guard(GuardOperation<ArrayIrType>),
+
+    /// Conversion of a value to a compatible array or first-class dimension type.
+    Retype(RetypeOperation<ArrayIrType>),
+
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
@@ -656,6 +664,8 @@ where
             ArrayIrOperation::Dimension(operation) => Self::Dimension(operation),
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
             ArrayIrOperation::Assert(operation) => Self::Assert(operation),
+            ArrayIrOperation::Guard(operation) => Self::Guard(operation),
+            ArrayIrOperation::Retype(operation) => Self::Retype(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
@@ -861,6 +871,8 @@ impl_array_operation_conversion!(
 );
 
 impl_array_operation_conversion!(AssertOperation<ArrayType>);
+impl_array_operation_conversion!(GuardOperation<ArrayType>);
+impl_array_operation_conversion!(RetypeOperation<ArrayType>);
 
 impl<Constant> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for XlaOperation<Constant>
 where

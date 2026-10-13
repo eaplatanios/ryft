@@ -21,7 +21,8 @@ use crate::experimental::lowering::{
 use crate::experimental::ops::FlatXlaProgram;
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::control_flow::{
-    lower_control_flow_region, lower_refined_region_input, lower_refined_region_outputs,
+    lower_control_flow_region, lower_refined_region_input, lower_refined_region_outputs, lower_region_guard,
+    lowered_effect_classes,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::reductions::lower_reduce_to_mlir;
@@ -58,6 +59,18 @@ pub(crate) fn lower_while_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFami
             ),
         });
     }
+    // The condition and the body share the loop state's declared types. Guarding the initial entry before the loop
+    // checks what eager entry validation checks, because later iterations enter with the body's own typed outputs.
+    lower_region_guard(
+        WHILE_OPERATION_NAME,
+        &state_types,
+        input_types,
+        input_values,
+        effect_tokens,
+        block,
+        context,
+        location,
+    )?;
     // Inputs only need to refine the state types, so each one is converted to the lowered type of its state first.
     let input_values = input_values
         .iter()
@@ -85,7 +98,7 @@ pub(crate) fn lower_while_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFami
     // Therefore, an effectful scalar condition is evaluated before the loop and after each body execution, with its
     // predicate carried through the loop state. This preserves exactly-once condition effects and lets the body
     // return their updated tokens. Batched predicates already use the same carried-predicate shape for masking.
-    let condition_effects = condition.effects().classes();
+    let condition_effects = lowered_effect_classes(condition)?;
     let iteration_bound = while_op.iteration_bound();
     // Bounded loops also thread pure predicates so reaching the bound skips the condition computation entirely,
     // including any nested pure loop that would otherwise diverge on the final state.
@@ -99,7 +112,7 @@ pub(crate) fn lower_while_to_while<'b, 'c: 'b, 't: 'c, O: LowerableOperationFami
     let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
     // Carry one trailing token for each ordered class used by either nested program. Each class advances independently
     // through the body; a body that is pure for one active class returns that class's entry token unchanged.
-    let threaded_effects = condition_effects.union(body.effects().classes());
+    let threaded_effects = condition_effects.union(lowered_effect_classes(body)?);
     let threaded_effect_count = token_threaded_effects(threaded_effects).count();
     // State layout: `[counter?, states..., predicate?, ordered-effect tokens...]`.
     let predicate_index = counter_offset + state_count;
@@ -583,6 +596,7 @@ mod tests {
         MixedValue, dynamic_dimension, execute_mixed_program, unproject_plain_program, xla_identity_branch,
     };
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder as CompositeXlaProgramBuilder};
+    use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::execution_client;
     use crate::to_mlir_module_for_program;
 
@@ -1063,6 +1077,7 @@ mod tests {
         // the bounded dynamic type `f64[rows]`. The static input is padded to the bound of the state type and given its
         // extent as its runtime size before it enters the loop. Because `rows` is loop-invariant, the outputs take its
         // static extent, so the bounded loop results are sliced back to `f64[3]`. One iteration computes `[a, a + b]`.
+        // The dynamic input leaves `rows = 3` unproven, so an entry guard checks its runtime size before the loop.
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let condition = {
@@ -1127,46 +1142,54 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<3xf64>, %arg2: tensor<i32>) -> (tensor<3xf64>, tensor<3xf64>) {
                     %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                    %c = stablehlo.constant dense<3> : tensor<i32>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %3 = stablehlo.compare EQ, %c, %2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %4 = stablehlo.after_all  : !stablehlo.token
+                    %5 = stablehlo.custom_call @ryft.assert(%3, %2, %c, %4) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `rows` must have one extent at the entry of `while`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %c_0 = stablehlo.constant dense<3> : tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                    %1 = stablehlo.pad %arg1, %cst, low = [0], high = [1], interior = [0] : (tensor<3xf64>, tensor<f64>) -> tensor<4xf64>
-                    %2 = stablehlo.set_dimension_size %1, %c, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
-                    %c_1 = stablehlo.constant dense<true> : tensor<i1>
-                    %3:4 = stablehlo.while(%iterArg = %c_0, %iterArg_4 = %0, %iterArg_5 = %2, %iterArg_6 = %c_1) : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
+                    %6 = stablehlo.pad %arg1, %cst, low = [0], high = [1], interior = [0] : (tensor<3xf64>, tensor<f64>) -> tensor<4xf64>
+                    %7 = stablehlo.set_dimension_size %6, %c_0, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i64>
+                    %c_2 = stablehlo.constant dense<true> : tensor<i1>
+                    %8:4 = stablehlo.while(%iterArg = %c_1, %iterArg_5 = %0, %iterArg_6 = %7, %iterArg_7 = %c_2) : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
                     cond {
-                      %c_7 = stablehlo.constant dense<1> : tensor<i64>
-                      %8 = stablehlo.compare LT, %iterArg, %c_7, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                      %9 = stablehlo.and %iterArg_6, %8 : tensor<i1>
-                      stablehlo.return %9 : tensor<i1>
-                    } do {
-                      %8 = stablehlo.add %iterArg_4, %iterArg_5 : tensor<?xf64, #stablehlo.bounds<4>>
-                      %c_7 = stablehlo.constant dense<1> : tensor<i64>
-                      %9 = stablehlo.add %iterArg, %c_7 : tensor<i64>
                       %c_8 = stablehlo.constant dense<1> : tensor<i64>
-                      %10 = stablehlo.compare LT, %9, %c_8, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                      %11 = "stablehlo.if"(%10) ({
-                        %c_9 = stablehlo.constant dense<true> : tensor<i1>
-                        stablehlo.return %c_9 : tensor<i1>
+                      %13 = stablehlo.compare LT, %iterArg, %c_8, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %14 = stablehlo.and %iterArg_7, %13 : tensor<i1>
+                      stablehlo.return %14 : tensor<i1>
+                    } do {
+                      %13 = stablehlo.add %iterArg_5, %iterArg_6 : tensor<?xf64, #stablehlo.bounds<4>>
+                      %c_8 = stablehlo.constant dense<1> : tensor<i64>
+                      %14 = stablehlo.add %iterArg, %c_8 : tensor<i64>
+                      %c_9 = stablehlo.constant dense<1> : tensor<i64>
+                      %15 = stablehlo.compare LT, %14, %c_9, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %16 = "stablehlo.if"(%15) ({
+                        %c_10 = stablehlo.constant dense<true> : tensor<i1>
+                        stablehlo.return %c_10 : tensor<i1>
                       }, {
-                        stablehlo.return %iterArg_6 : tensor<i1>
+                        stablehlo.return %iterArg_7 : tensor<i1>
                       }) : (tensor<i1>) -> tensor<i1>
-                      stablehlo.return %9, %iterArg_4, %8, %11 : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
+                      stablehlo.return %14, %iterArg_5, %13, %16 : tensor<i64>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>, tensor<i1>
                     }
-                    %c_2 = stablehlo.constant dense<4> : tensor<i32>
-                    %4 = stablehlo.set_dimension_size %3#1, %c_2, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xf64>
-                    %5 = stablehlo.slice %4 [0:3] : (tensor<4xf64>) -> tensor<3xf64>
                     %c_3 = stablehlo.constant dense<4> : tensor<i32>
-                    %6 = stablehlo.set_dimension_size %3#2, %c_3, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xf64>
-                    %7 = stablehlo.slice %6 [0:3] : (tensor<4xf64>) -> tensor<3xf64>
-                    return %5, %7 : tensor<3xf64>, tensor<3xf64>
+                    %9 = stablehlo.set_dimension_size %8#1, %c_3, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xf64>
+                    %10 = stablehlo.slice %9 [0:3] : (tensor<4xf64>) -> tensor<3xf64>
+                    %c_4 = stablehlo.constant dense<4> : tensor<i32>
+                    %11 = stablehlo.set_dimension_size %8#2, %c_4, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xf64>
+                    %12 = stablehlo.slice %11 [0:3] : (tensor<4xf64>) -> tensor<3xf64>
+                    return %10, %12 : tensor<3xf64>, tensor<3xf64>
                   }
                 }
             "#},
         );
+        let client = execution_client();
+        ensure_assertion_handler_registered(&client).unwrap();
         assert_eq!(
             execute_mixed_program(
-                &execution_client(),
+                &client,
                 &program,
                 &[
                     MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]),
@@ -1179,6 +1202,15 @@ mod tests {
                 MixedValue::Array(vec![11.0, 22.0, 33.0], vec![3]),
             ]),
         );
+        let error = execute_mixed_program(
+            &client,
+            &program,
+            &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]), MixedValue::Array(vec![10.0, 20.0, 30.0], vec![3])],
+            &[2],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("input dimension `rows` must have one extent at the entry of `while`"), "{error}");
     }
 
     #[test]

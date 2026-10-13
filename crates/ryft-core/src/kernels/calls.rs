@@ -30,7 +30,7 @@ use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, FlatProgram, InputRegionProvenance, InstructionId, Operation, OperationFormatter, ProgramBuilder,
     ProgramError, ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    Type, TypeError, TypeRefinements, TypeIdentityRenaming, Typed,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -185,9 +185,9 @@ impl KernelParameter {
     }
 
     /// Specializes declared full array shapes before constructing parameters or tracing a body. Canonical
-    /// [`ArrayTypeRefinements`] checks enforce bounds and agreement of repeated dimension identities across
-    /// all parameters, including outputs. Every supplied actual shape must be static; unresolved output dimensions
-    /// are rejected rather than inferred from unrelated inputs or runtime contents.
+    /// [`ArrayTypeRefinements`](crate::ArrayTypeRefinements) checks enforce bounds and agreement of repeated dimension
+    /// identities across all parameters, including outputs. Every supplied actual shape must be static; unresolved
+    /// output dimensions are rejected rather than inferred from unrelated inputs or runtime contents.
     ///
     /// Actual types must refine the declarations, including declared dtype, memory, layout, and sharding constraints.
     /// Only their shapes are copied: additional actual layout or sharding information does not become a declaration
@@ -202,7 +202,7 @@ impl KernelParameter {
         parameters: Vec<(ArrayType, KernelParameterAccess, BlockMapping)>,
         actual_types: &[ArrayType],
     ) -> Result<Vec<Self>, KernelError> {
-        ArrayTypeRefinements::establish(parameters.iter().map(|(r#type, _, _)| r#type), actual_types)?;
+        ArrayTypeRefinements::new(parameters.iter().map(|(r#type, _, _)| r#type), actual_types)?;
         parameters
             .into_iter()
             .zip(actual_types)
@@ -317,7 +317,8 @@ impl KernelCallOperation {
                         metadata.mapping.program().input_types().iter().take(axis).enumerate()
                     {
                         let ArrayIrType::Dimension(first_type) = first_type else { unreachable!() };
-                        if first_type.variable() == r#type.variable()
+                        if first_type.variable().is_some()
+                            && first_type.variable() == r#type.variable()
                             && (maximum > 1 || maximum_extents[first_axis] > 1)
                         {
                             return Err(KernelError::MappingInputIdentity { parameter, first_axis, second_axis: axis });
@@ -359,7 +360,9 @@ impl KernelCallOperation {
             if actual.bounds().upper().is_none() || !actual.bounds().contains_bounds(required.bounds()) {
                 return Err(TypeError::invalid(format!("coordinate {axis} bounds do not admit the grid")).into());
             }
-            if coordinate_types[..axis].iter().any(|earlier| earlier.variable() == actual.variable()) {
+            if actual.variable().is_some()
+                && coordinate_types[..axis].iter().any(|earlier| earlier.variable() == actual.variable())
+            {
                 return Err(
                     TypeError::invalid(format!("coordinate {axis} repeats an earlier coordinate identity")).into()
                 );
@@ -490,7 +493,7 @@ impl KernelCallOperation {
                     .zip(values)
                     .map(|(r#type, value)| {
                         let ArrayIrType::Dimension(r#type) = r#type else { unreachable!() };
-                        value.to_dimension(r#type.variable().clone())
+                        value.to_dimension(r#type.to_variable())
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 Ok(KernelParameter { mapping: parameter.mapping.specialize(&dimensions)?, ..parameter.clone() })
@@ -541,7 +544,7 @@ impl KernelCallOperation {
                 identities.push(variable.clone());
             }
         }
-        identities.extend(self.coordinate_types.iter().map(|coordinate| coordinate.variable().clone()));
+        identities.extend(self.coordinate_types.iter().filter_map(DimensionType::variable).cloned());
         identities.extend(
             self.prefetch_types
                 .iter()
@@ -1186,6 +1189,8 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Tag(_)
                 | ArrayOperation::Rematerialize(_)
                 | ArrayOperation::Assert(_)
+                | ArrayOperation::Guard(_)
+                | ArrayOperation::Retype(_)
                 | ArrayOperation::Print(_)
                 | ArrayOperation::CustomFunction(_)
                 | ArrayOperation::LinearCall(_) => {}
@@ -1240,6 +1245,8 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::CustomFunction(_)
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
+            | ArrayIrOperation::Guard(_)
+            | ArrayIrOperation::Retype(_)
             | ArrayIrOperation::Rematerialize(_) => {}
             // Kernel definitions reject `shard_map` instructions (refer to `KernelError::UnsupportedOperation`), so no
             // definition reaches this arm. The `Debug` rendering above would nevertheless encode every boundary field
@@ -1895,7 +1902,7 @@ mod tests {
         };
         for value in [-1i32, 8] {
             let array = Array::scalar(value).unwrap();
-            let expected = array.to_dimension(offset.variable().clone()).unwrap_err();
+            let expected = array.to_dimension(offset.variable().unwrap().clone()).unwrap_err();
             assert_eq!(operation.specialize_prefetch(&[array]).unwrap_err(), KernelError::Program(expected));
         }
         assert_eq!(

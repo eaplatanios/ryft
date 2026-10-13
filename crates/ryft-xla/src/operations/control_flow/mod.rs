@@ -1,7 +1,10 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, DataType, Dimension, EffectClasses, RematerializationOptimizationBarrier, Shape,
+    ArrayIrType, ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension,
+    EffectClass, EffectClasses, GuardOperation, IotaOperation, OneOperation, Parameterized, ProgramError,
+    RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
+    WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -15,7 +18,8 @@ use crate::experimental::lowering::types::{
     reshape_dimension_i64,
 };
 use crate::experimental::lowering::{CollectiveLoweringState, EffectTokens, token_threaded_effects};
-use crate::experimental::ops::FlatXlaProgram;
+use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaProgram};
+use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{LowerableOperationFamily, LoweringError};
 
@@ -28,14 +32,143 @@ pub(crate) mod select;
 /// StableHLO lowering of `while`.
 pub(crate) mod r#while;
 
+/// Lowers the entry guard of a region entered with `values` of the `actual_types`, before any conversion to the
+/// region's declared input types. Region entry lowering retypes each input independently, so a relationship between
+/// inputs that their actual types leave unproven (e.g., a `dimension<n>` input that must equal the extent of an exact
+/// `f32[3]` input entering `f32[n]`) is checked by an [`GuardOperation`] before the region runs, exactly as eager
+/// region entry validation would reject it. Static extents are checked as constants and dynamic ones are read from the
+/// values, so the guard needs no conversion and can precede every path that the region entry takes (including paths
+/// that never run the region). Entries whose actual types prove every relationship emit nothing.
+///
+/// # Parameters
+///
+///   - `boundary`: Name of the operation whose region is entered.
+///   - `declared_types`: Declared input types of the region.
+///   - `actual_types`: Types of the values entering the region.
+///   - `values`: Lowered values entering the region, of the `actual_types`.
+pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
+    boundary: &str,
+    declared_types: &[ArrayIrType],
+    actual_types: &[ArrayIrType],
+    values: &[ValueRef<'b, 'c, 't>],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let Some((guard, members)) =
+        GuardOperation::for_entry(boundary, declared_types, actual_types).map_err(ProgramError::from)?
+    else {
+        return Ok(());
+    };
+    let member_values = members.iter().map(|&index| values[index]).collect::<Vec<_>>();
+    let member_types = members.iter().map(|&index| actual_types[index].clone()).collect::<Vec<_>>();
+    lower_guard(
+        boundary,
+        guard.declared_types(),
+        &member_values,
+        &member_types,
+        effect_tokens,
+        block,
+        context,
+        location,
+    )
+}
+
+/// Returns the [`EffectClasses`] whose tokens lowering `program` threads: its source effect classes, plus
+/// [`EffectClass::OrderedAssertion`] when lowering synthesizes an assertion anywhere in it, at any depth. Lowering
+/// synthesizes the entry guard of a nested `condition`, `while`, or `scan` whose inputs leave relationships of its
+/// region entry unproven (refer to [`lower_region_guard`]), and the validation of the extent operands that a
+/// dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call consumes for output
+/// axes that type inference refined to static extents (refer to `validates_output_extents`). A region that contains
+/// such an assertion must thread its tokens out (refer to `token_threaded_effects`) even when its source program is
+/// pure, so that later assertions and I/O follow it: an entry guard joins its assertion token into the ordered I/O
+/// chain, and every assertion advances the ordered-assertion chain.
+pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &XlaProgram<ProgramInput, ProgramOutput, O>,
+) -> Result<EffectClasses, LoweringError>
+where
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+{
+    let classes = program.effects().classes();
+    if classes.contains(EffectClass::OrderedAssertion) {
+        return Ok(classes);
+    }
+    for region in program.regions().iter() {
+        for instruction in region.instructions() {
+            let input_types = instruction
+                .inputs()
+                .iter()
+                .map(|id| region.atoms()[id.index()].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let first_region_input_types = || -> Result<Vec<ArrayIrType>, LoweringError> {
+                let id = instruction.regions().first().copied().ok_or_else(|| {
+                    ProgramError::MalformedProgram("control flow without an attached region".to_string())
+                })?;
+                Ok(program.region(id)?.input_types())
+            };
+            let operation = instruction.operation();
+            let entry = if operation.projected_payload::<ConditionOperation<ArrayIrType>>().is_some() {
+                Some((CONDITION_OPERATION_NAME, first_region_input_types()?, input_types.get(1..).unwrap_or_default()))
+            } else if operation.projected_payload::<WhileOperation<ArrayIrType>>().is_some() {
+                // Both loop regions share the state types, so the condition's input types are the entry types.
+                Some((WHILE_OPERATION_NAME, first_region_input_types()?, input_types.as_slice()))
+            } else if let Some(scan) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
+                let entry_types =
+                    scan.declared_input_types(&first_region_input_types()?).map_err(ProgramError::from)?;
+                let entry_count = entry_types.len().min(input_types.len());
+                Some((SCAN_OPERATION_NAME, entry_types, &input_types[..entry_count]))
+            } else {
+                None
+            };
+            if let Some((boundary, declared, actual)) = entry
+                && declared.len() == actual.len()
+                && GuardOperation::for_entry(boundary, &declared, actual).map_err(ProgramError::from)?.is_some()
+            {
+                return Ok(classes.union(EffectClasses::single(EffectClass::OrderedAssertion)));
+            }
+            let output_types = || {
+                instruction
+                    .outputs()
+                    .iter()
+                    .map(|id| region.atoms()[id.index()].r#type().into_owned())
+                    .collect::<Vec<_>>()
+            };
+            let extent_signature = if let Some(zero) = operation.projected_payload::<ZeroOperation<ArrayType>>() {
+                Some((std::slice::from_ref(zero.r#type()), output_types()))
+            } else if let Some(one) = operation.projected_payload::<OneOperation<ArrayType>>() {
+                Some((std::slice::from_ref(one.r#type()), output_types()))
+            } else if let Some(iota) = operation.projected_payload::<IotaOperation<ArrayType>>() {
+                Some((std::slice::from_ref(iota.r#type()), output_types()))
+            } else if let Some(generator) = operation.projected_payload::<RngBitGeneratorOperation<ArrayIrType>>() {
+                // The generator's first output is its state, and only its bits have the declared output type.
+                Some((std::slice::from_ref(generator.output_type()), output_types().into_iter().skip(1).collect()))
+            } else {
+                operation
+                    .projected_payload::<CustomCallOperation>()
+                    .map(|custom_call| (custom_call.output_types(), output_types()))
+            };
+            if let Some((declared, outputs)) = extent_signature
+                && validates_output_extents(declared, &input_types, &outputs)?
+            {
+                return Ok(classes.union(EffectClasses::single(EffectClass::OrderedAssertion)));
+            }
+        }
+    }
+    Ok(classes)
+}
+
 /// Converts the lowered value of one control-flow input to the lowered type of the region input that it feeds, which
-/// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`). Regions
-/// receive every input at its declared type, and refinements that only add metadata (e.g., shardings or layouts) lower
-/// to the same tensor type, so those inputs are returned unchanged. A static extent that refines a bounded dynamic
-/// dimension lowers to a different tensor type. Such an input is exposed as its full physical buffer, padded up to the
-/// physical bound of the declared type along every refined axis, and then given the runtime size of every dynamic
-/// dimension of the declared type with `stablehlo.set_dimension_size`: the static extent for a refined axis, and the
-/// input's own runtime size for an axis that stays dynamic.
+/// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`), or more
+/// generally to a type whose dynamic axes take either a static extent of the input or the runtime size of a dynamic
+/// axis of the input (e.g., the outputs of an entry guard or a `retype`). Regions receive every input at its declared
+/// type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type, so those
+/// inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a dynamic dimension
+/// whose physical bound differs from the declared one, lower to different tensor types. Such an input is exposed as its
+/// full physical buffer, padded up (or sliced down) to the physical bound of the declared type along every such axis,
+/// and then given the runtime size of every dynamic dimension of the declared type with `stablehlo.set_dimension_size`:
+/// the static extent for a refined axis, and the input's own runtime size for an axis that stays dynamic.
 pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
@@ -48,7 +181,13 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         return Ok(value);
     };
     let dimension_pairs = declared_type.shape().dimensions().iter().zip(input_type.shape().dimensions());
-    if !dimension_pairs.clone().any(|pair| matches!(pair, (Dimension::Dynamic(_), Dimension::Static(_)))) {
+    if !dimension_pairs.clone().any(|pair| match pair {
+        (Dimension::Dynamic(_), Dimension::Static(_)) => true,
+        (Dimension::Dynamic(declared), Dimension::Dynamic(input)) => {
+            declared.bounds().upper() != input.bounds().upper()
+        }
+        _ => false,
+    }) {
         return Ok(value);
     }
 
@@ -78,11 +217,13 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     let physical_input_type = physical_bound_type(input_type)?;
     let physical_type = physical_bound_type(declared_type)?;
     let rank = declared_type.rank();
+    // Negative padding slices a physical buffer down to a smaller bound, which keeps every element within the runtime
+    // size, because that size lies within both bounds.
     let mut high_padding = vec![0; rank];
     for axis in 0..rank {
         let bound = physical_type.shape().dimensions()[axis].value().unwrap();
         let extent = physical_input_type.shape().dimensions()[axis].value().unwrap();
-        high_padding[axis] = reshape_dimension_i64(bound - extent)?;
+        high_padding[axis] = reshape_dimension_i64(bound)? - reshape_dimension_i64(extent)?;
     }
     let padding_value =
         lower_unplaced_constant_output(&[ArrayType::scalar(declared_type.data_type())], 0, block, context, location)?

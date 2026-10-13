@@ -9,10 +9,10 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-use crate::arrays::{Dimension, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
+use crate::arrays::{Dimension, DimensionError, DimensionVariable, MAX_DIMENSION_EXTENT};
 use crate::axes::{Axis, AxisError};
 use crate::parameters::Parameter;
-use crate::programs::{Type, TypeError, TypeIdentityRenaming};
+use crate::programs::{TypeError, TypeIdentityRenaming};
 
 /// Errors constructing a grid or binding its runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -264,9 +264,7 @@ impl Grid {
                 .map(|dimension| {
                     let extent = match &dimension.extent {
                         Dimension::Static(extent) => Dimension::Static(*extent),
-                        Dimension::Dynamic(variable) => Dimension::Dynamic(
-                            DimensionType::from(variable.clone()).rename_identities(renaming)?.variable().clone(),
-                        ),
+                        Dimension::Dynamic(variable) => Dimension::Dynamic(variable.renamed(renaming)?),
                     };
                     Ok(GridDimension { extent, name: dimension.name.clone(), execution: dimension.execution })
                 })

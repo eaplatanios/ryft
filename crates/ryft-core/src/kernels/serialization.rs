@@ -74,7 +74,7 @@ pub enum KernelSerializationError {
 }
 
 /// Independent transport schema version; it is not the semantic-key encoding version.
-const SOURCE_SCHEMA_VERSION: u32 = 3;
+const SOURCE_SCHEMA_VERSION: u32 = 4;
 
 /// Maximum total physical bytes allocated for decoded literals, including layout padding.
 const MAXIMUM_LITERAL_BYTES: usize = 64 * 1024 * 1024;
@@ -161,7 +161,7 @@ enum WireMemory {
 #[serde(deny_unknown_fields)]
 enum WireType {
     Array(WireArrayType),
-    Dimension(usize),
+    Dimension(WireDimension),
     Reference(WireArrayType),
 }
 
@@ -175,7 +175,6 @@ enum WireValue {
         bytes: Vec<u8>,
     },
     Dimension {
-        identity: usize,
         extent: usize,
     },
 }
@@ -327,7 +326,7 @@ struct WireCall {
     #[serde(deserialize_with = "bounded_records")]
     parameters: Vec<WireParameter>,
     #[serde(deserialize_with = "bounded_records")]
-    coordinates: Vec<usize>,
+    coordinates: Vec<WireDimension>,
     #[serde(deserialize_with = "bounded_records")]
     prefetch: Vec<WireArrayType>,
 }
@@ -502,7 +501,7 @@ enum WireOperation {
         bound: Option<usize>,
     },
     Condition,
-    DimensionFromScalar(usize),
+    DimensionFromScalar(WireDimension),
     DimensionToScalar,
     TileLoad {
         #[serde(deserialize_with = "bounded_records")]
@@ -546,24 +545,24 @@ enum WireOperation {
     ReferenceAddUpdate,
     ReferenceAtomicAddUpdate,
     DimensionAdd {
-        left: usize,
-        right: usize,
+        left: WireDimension,
+        right: WireDimension,
     },
     DimensionSub {
-        left: usize,
-        right: usize,
+        left: WireDimension,
+        right: WireDimension,
     },
     DimensionMul {
-        left: usize,
-        right: usize,
+        left: WireDimension,
+        right: WireDimension,
     },
     DimensionDiv {
-        left: usize,
-        right: usize,
+        left: WireDimension,
+        right: WireDimension,
     },
     DimensionRem {
-        left: usize,
-        right: usize,
+        left: WireDimension,
+        right: WireDimension,
     },
 }
 
@@ -711,7 +710,7 @@ impl Encoder {
     fn r#type(&mut self, r#type: &ArrayIrType) -> Result<WireType, KernelSerializationError> {
         Ok(match r#type {
             ArrayIrType::Array(r#type) => WireType::Array(self.array_type(r#type)?),
-            ArrayIrType::Dimension(r#type) => WireType::Dimension(self.identity(r#type.variable())),
+            ArrayIrType::Dimension(r#type) => WireType::Dimension(self.dimension(r#type.dimension())),
             ArrayIrType::Reference(r#type) => WireType::Reference(self.array_type(r#type.referent())?),
         })
     }
@@ -730,9 +729,7 @@ impl Encoder {
                 }
                 WireValue::Array { r#type: self.array_type(&value.r#type())?, bytes: value.logical_bytes() }
             }
-            ArrayIrValue::Dimension(value) => {
-                WireValue::Dimension { identity: self.identity(value.r#type().variable()), extent: value.extent() }
-            }
+            ArrayIrValue::Dimension(value) => WireValue::Dimension { extent: value.extent() },
             ArrayIrValue::Reference(_) => return Err(unsupported("reference literal")),
         })
     }
@@ -830,7 +827,7 @@ impl Encoder {
                 })
             })
             .collect::<Result<_, KernelSerializationError>>()?;
-        let coordinates = call.coordinate_types().iter().map(|r#type| self.identity(r#type.variable())).collect();
+        let coordinates = call.coordinate_types().iter().map(|r#type| self.dimension(r#type.dimension())).collect();
         let prefetch = call.prefetch_types().iter().map(|r#type| self.array_type(r#type)).collect::<Result<_, _>>()?;
         Ok(WireCall { grid, parameters, coordinates, prefetch })
     }
@@ -906,8 +903,8 @@ impl Encoder {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
                         WireOperation::DimensionAdd {
-                            left: self.identity(operation.left_type().variable()),
-                            right: self.identity(operation.right_type().variable()),
+                            left: self.dimension(operation.left_type().dimension()),
+                            right: self.dimension(operation.right_type().dimension()),
                         }
                     }
                     DimensionOperation::Sub(operation) => {
@@ -919,8 +916,8 @@ impl Encoder {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
                         WireOperation::DimensionSub {
-                            left: self.identity(operation.left_type().variable()),
-                            right: self.identity(operation.right_type().variable()),
+                            left: self.dimension(operation.left_type().dimension()),
+                            right: self.dimension(operation.right_type().dimension()),
                         }
                     }
                     DimensionOperation::Mul(operation) => {
@@ -932,8 +929,8 @@ impl Encoder {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
                         WireOperation::DimensionMul {
-                            left: self.identity(operation.left_type().variable()),
-                            right: self.identity(operation.right_type().variable()),
+                            left: self.dimension(operation.left_type().dimension()),
+                            right: self.dimension(operation.right_type().dimension()),
                         }
                     }
                     DimensionOperation::Div(operation) => {
@@ -945,8 +942,8 @@ impl Encoder {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
                         WireOperation::DimensionDiv {
-                            left: self.identity(operation.left_type().variable()),
-                            right: self.identity(operation.right_type().variable()),
+                            left: self.dimension(operation.left_type().dimension()),
+                            right: self.dimension(operation.right_type().dimension()),
                         }
                     }
                     DimensionOperation::Rem(operation) => {
@@ -958,8 +955,8 @@ impl Encoder {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
                         WireOperation::DimensionRem {
-                            left: self.identity(operation.left_type().variable()),
-                            right: self.identity(operation.right_type().variable()),
+                            left: self.dimension(operation.left_type().dimension()),
+                            right: self.dimension(operation.right_type().dimension()),
                         }
                     }
                     operation => return Err(unsupported(operation.name())),
@@ -969,7 +966,7 @@ impl Encoder {
                 ArrayIrOperation::While(operation) => WireOperation::While { bound: operation.iteration_bound() },
                 ArrayIrOperation::Condition(_) => WireOperation::Condition,
                 ArrayIrOperation::DimensionFromScalar(operation) => {
-                    WireOperation::DimensionFromScalar(self.identity(operation.output_type().variable()))
+                    WireOperation::DimensionFromScalar(self.dimension(operation.output_type().dimension()))
                 }
                 ArrayIrOperation::DimensionToScalar(_) => WireOperation::DimensionToScalar,
                 ArrayIrOperation::ReferenceNew(_) => WireOperation::ReferenceNew,
@@ -1017,10 +1014,18 @@ impl Decoder {
 
     /// Validates static extents before passing them to type constructors.
     fn dimension(&self, dimension: WireDimension) -> Result<Dimension, KernelSerializationError> {
+        Ok(self.dimension_type(dimension)?.simplified_dimension())
+    }
+
+    /// Reconstructs a first-class dimension type, keeping a symbolic type's identity even when its bounds admit a
+    /// single extent.
+    fn dimension_type(&self, dimension: WireDimension) -> Result<DimensionType, KernelSerializationError> {
         match dimension {
-            WireDimension::Static(extent) if extent <= MAX_DIMENSION_EXTENT => Ok(Dimension::Static(extent)),
+            WireDimension::Static(extent) if extent <= MAX_DIMENSION_EXTENT => {
+                Ok(DimensionType::from(Dimension::Static(extent)))
+            }
             WireDimension::Static(extent) => Err(invalid(format!("dimension extent {extent} exceeds backend width"))),
-            WireDimension::Dynamic(index) => Ok(self.identity(index)?.to_dimension()),
+            WireDimension::Dynamic(index) => self.identity(index),
         }
     }
 
@@ -1065,7 +1070,7 @@ impl Decoder {
     fn r#type(&self, wire: WireType) -> Result<ArrayIrType, KernelSerializationError> {
         Ok(match wire {
             WireType::Array(r#type) => self.array_type(r#type)?.into(),
-            WireType::Dimension(index) => self.identity(index)?.into(),
+            WireType::Dimension(dimension) => self.dimension_type(dimension)?.into(),
             WireType::Reference(r#type) => ReferenceType::new(self.array_type(r#type)?).into(),
         })
     }
@@ -1094,9 +1099,7 @@ impl Decoder {
                 self.literal_bytes.set(allocated);
                 Array::from_logical_bytes(r#type, &bytes)?.into()
             }
-            WireValue::Dimension { identity, extent } => {
-                DimensionValue::new(self.identity(identity)?, extent).map_err(ProgramError::from)?.into()
-            }
+            WireValue::Dimension { extent } => DimensionValue::constant(extent).map_err(ProgramError::from)?.into(),
         })
     }
 
@@ -1144,8 +1147,8 @@ impl Decoder {
                 ArrayIrOperation::While(WhileOperation::new().with_iteration_bound(bound)?).into()
             }
             WireOperation::Condition => ArrayIrOperation::Condition(ConditionOperation::new()).into(),
-            WireOperation::DimensionFromScalar(index) => ArrayIrOperation::DimensionFromScalar(
-                DimensionFromScalarOperation::new(self.identity(index)?.variable().clone()),
+            WireOperation::DimensionFromScalar(dimension) => ArrayIrOperation::DimensionFromScalar(
+                DimensionFromScalarOperation::for_type(self.dimension_type(dimension)?),
             )
             .into(),
             WireOperation::DimensionToScalar => ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation).into(),
@@ -1181,27 +1184,27 @@ impl Decoder {
                 ArrayIrOperation::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new()).into()
             }
             WireOperation::DimensionAdd { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Add(
-                DimensionAddOperation::new(&self.identity(left)?, &self.identity(right)?)
+                DimensionAddOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
             ))
             .into(),
             WireOperation::DimensionSub { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Sub(
-                DimensionSubOperation::new(&self.identity(left)?, &self.identity(right)?)
+                DimensionSubOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
             ))
             .into(),
             WireOperation::DimensionMul { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Mul(
-                DimensionMulOperation::new(&self.identity(left)?, &self.identity(right)?)
+                DimensionMulOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
             ))
             .into(),
             WireOperation::DimensionDiv { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Div(
-                DimensionDivOperation::new(&self.identity(left)?, &self.identity(right)?)
+                DimensionDivOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
             ))
             .into(),
             WireOperation::DimensionRem { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Rem(
-                DimensionRemOperation::new(&self.identity(left)?, &self.identity(right)?)
+                DimensionRemOperation::new(&self.dimension_type(left)?, &self.dimension_type(right)?)
                     .map_err(ProgramError::from)?,
             ))
             .into(),
@@ -1350,7 +1353,11 @@ impl Decoder {
             })
             .collect::<Result<_, KernelSerializationError>>()?;
         let prefetch = wire.prefetch.into_iter().map(|r#type| self.array_type(r#type)).collect::<Result<_, _>>()?;
-        let coordinates = wire.coordinates.into_iter().map(|index| self.identity(index)).collect::<Result<_, _>>()?;
+        let coordinates = wire
+            .coordinates
+            .into_iter()
+            .map(|coordinate| self.dimension_type(coordinate))
+            .collect::<Result<_, _>>()?;
         Ok(KernelCallOperation::from_parts(grid, parameters, prefetch, coordinates)?)
     }
 }
@@ -1876,7 +1883,9 @@ mod tests {
         let right = DimensionType::new("right", bounds);
         let operation = DimensionMulOperation::new(&left, &right).unwrap();
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(left.variable().clone(), DimensionVariable::new("renamed", bounds)).unwrap();
+        renaming
+            .insert(left.variable().unwrap().clone(), DimensionVariable::new("renamed", bounds))
+            .unwrap();
         let operation = operation.rename_type_identities(&renaming).unwrap();
         let operation = KernelOperation::Portable(ArrayIrOperation::Dimension(DimensionOperation::Mul(operation)));
         assert_eq!(
@@ -1958,7 +1967,7 @@ mod tests {
         let definition: KernelDefinition =
             KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |_| Ok(())).unwrap();
         let mut wire: serde_json::Value = serde_json::to_value(definition).unwrap();
-        wire["call"]["coordinates"][0] = serde_json::json!(999);
+        wire["call"]["coordinates"][0] = serde_json::json!({ "Dynamic": 999 });
         assert_eq!(
             serde_json::from_value::<KernelDefinition>(wire).unwrap_err().to_string(),
             "invalid serialized kernel source: dimension identity 999 is out of bounds",
