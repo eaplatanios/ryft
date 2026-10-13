@@ -14,14 +14,14 @@ define_dimension_arithmetic_operation!(
     Sub,
     sub,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("{} - {}", left.variable(), right.variable())
+        format!("{} - {}", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
         if left_maximum < right_lower {
             return Err(DimensionError::RequirementViolation {
-                message: format!("{} >= {} is impossible from declared bounds", left.variable(), right.variable()),
+                message: format!("{} >= {} is impossible from declared bounds", left.dimension(), right.dimension()),
             });
         }
         let bounds = DimensionBounds::new(
@@ -50,20 +50,27 @@ impl<A: Value<Type = ArrayType>> From<DimensionSubOperation> for ArrayIrOperatio
 
 impl Sub for DimensionValue {
     fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
+            let left_variable = self.r#type().dimension().to_string();
+            let right_variable = right.r#type().dimension().to_string();
             DimensionError::RequirementViolation {
                 message: format!(
-                    "{left_variable} >= {right_variable}; observed {left_variable}={}, {right_variable}={}",
+                    "{} >= {}; observed {}={}, {}={}",
+                    left_variable,
+                    right_variable,
+                    left_variable,
                     self.extent(),
+                    right_variable,
                     right.extent(),
                 ),
             }
         })?;
+
+        // The observed extents are validated before the operation derives the exact result type,
+        // so that eager diagnostics report them rather than a proof from the inputs' exact bounds.
+        let operation = DimensionSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(output_type, extent)?)
     }
 }
@@ -160,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "left >= right; observed left=1, right=3")]
+    #[should_panic(expected = "1 >= 3; observed 1=1, 3=3")]
     fn test_dimension_sub_operator_panics_on_capability_error() {
         let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());

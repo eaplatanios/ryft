@@ -16,7 +16,7 @@ define_dimension_arithmetic_operation!(
     Add,
     add,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("{} + {}", left.variable(), right.variable())
+        format!("{} + {}", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
@@ -56,18 +56,21 @@ impl<A: Value<Type = ArrayType>> From<DimensionAddOperation> for ArrayIrOperatio
 
 impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
                 "dimension arithmetic overflow while adding dimensions with inputs {}={}, {}={}",
-                self.r#type().variable(),
+                self.r#type().dimension(),
                 self.extent(),
-                right.r#type().variable(),
+                right.r#type().dimension(),
                 right.extent(),
             ),
         })?;
+
+        // The observed extents are validated before the operation derives the exact result type,
+        // so that eager diagnostics report them rather than a proof from the inputs' exact bounds.
+        let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(output_type, extent)?)
     }
 }
@@ -213,7 +216,7 @@ mod tests {
             panic!("expected the dimension addition to fold to a known value");
         };
         assert_eq!(output.extent(), 10);
-        assert_eq!(output.r#type().bounds(), output_type.bounds());
+        assert_eq!(output.r#type().extent(), Some(10));
 
         let (traced_type, traced_program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |left| {

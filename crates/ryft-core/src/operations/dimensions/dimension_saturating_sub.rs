@@ -13,7 +13,7 @@ define_dimension_arithmetic_operation!(
     DimensionSaturatingSubOperation, DIMENSION_SATURATING_SUB_OPERATION_NAME,
     DimensionSaturatingSub, dimension_saturating_sub,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("max(0, {} - {})", left.variable(), right.variable())
+        format!("max(0, {} - {})", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;

@@ -17,14 +17,14 @@ define_dimension_arithmetic_operation!(
     Div,
     div,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("{} / {}", left.variable(), right.variable())
+        format!("{} / {}", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (_, right_maximum) = right.bounds().representable_extent_range()?;
         if right_maximum == 0 {
             return Err(DimensionError::RequirementViolation {
-                message: format!("{} > 0 is impossible from declared bounds", right.variable()),
+                message: format!("{} > 0 is impossible from declared bounds", right.dimension()),
             });
         }
         let positive_right_lower = right.bounds().lower().max(1);
@@ -53,21 +53,27 @@ impl<A: Value<Type = ArrayType>> From<DimensionDivOperation> for ArrayIrOperatio
 
 impl Div for DimensionValue {
     fn div(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionDivOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
+            let left_variable = self.r#type().dimension().to_string();
+            let right_variable = right.r#type().dimension().to_string();
             return Err(DimensionError::RequirementViolation {
                 message: format!(
-                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
+                    "{} > 0; observed {}={}, {}={}",
+                    right_variable,
+                    left_variable,
                     self.extent(),
+                    right_variable,
                     right.extent(),
                 ),
             }
             .into());
         }
+
+        // The observed extents are validated before the operation derives the exact result type,
+        // so that eager diagnostics report them rather than a proof from the inputs' exact bounds.
+        let operation = DimensionDivOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(output_type, self.extent() / right.extent())?)
     }
 }

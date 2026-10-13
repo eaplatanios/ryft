@@ -62,12 +62,9 @@ impl DimensionSizeOperation {
             .into());
         }
 
-        let output_variable = match &input_dimension {
-            Dimension::Static(_) => DimensionVariable::new(format!("size(axis={position})"), input_dimension.bounds()),
-            Dimension::Dynamic(variable) => variable.clone(),
-        };
-
-        Ok(Self { axis: position, input_dimension, output_type: DimensionType::from(output_variable) })
+        // A static axis has a static size, while reading a dynamic axis defines that axis's variable.
+        let output_type = DimensionType::from(input_dimension.clone());
+        Ok(Self { axis: position, input_dimension, output_type })
     }
 
     /// Returns the normalized non-negative input axis of this [`DimensionSizeOperation`].
@@ -155,14 +152,17 @@ impl Operation for DimensionSizeOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         self.validate_input_type(&input_types[0])?;
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        let bounds = input_type.shape().dimensions()[self.axis].bounds();
+        let actual_dimension = &input_type.shape().dimensions()[self.axis];
 
-        // Dimension variables have immutable bounds. A concrete refinement therefore defines a new exact-bound
-        // identity, which program replay relates to the original definition before validating downstream uses.
-        let output_type = if bounds == self.output_type.bounds() {
-            self.output_type.clone()
-        } else {
-            DimensionType::new(self.output_type.variable().name(), bounds)
+        // Dimension variables have immutable bounds. A static refinement of the axis therefore makes the size static,
+        // while a narrower dynamic refinement defines a new identity with those bounds, which program replay relates
+        // to the original definition before validating downstream uses.
+        let output_type = match actual_dimension {
+            Dimension::Static(_) => DimensionType::from(actual_dimension.clone()),
+            Dimension::Dynamic(_) if actual_dimension.bounds() == self.output_type.bounds() => self.output_type.clone(),
+            Dimension::Dynamic(_) => {
+                DimensionType::new(self.output_type.dimension().to_string(), actual_dimension.bounds())
+            }
         };
 
         Ok(vec![output_type.into()])
@@ -420,7 +420,7 @@ mod tests {
         // Dynamic axes preserve their identity and normalize negative axis indices.
         assert_eq!(operation.axis(), 0);
         assert_eq!(operation.input_dimension(), &Dimension::Dynamic(variable.clone()));
-        assert_eq!(operation.output_type().variable(), &variable);
+        assert_eq!(operation.output_type().variable(), Some(&variable));
         assert_eq!(operation.to_string(), "dimension_size [axis=0]");
 
         // Static axes produce a fresh exact-bounds dimension.
@@ -475,8 +475,8 @@ mod tests {
         let (ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)) = output_types else {
             panic!("expected two dimension output types");
         };
-        assert_eq!(first.variable(), &variable);
-        assert_eq!(second.variable(), &variable);
+        assert_eq!(first.variable(), Some(&variable));
+        assert_eq!(second.variable(), Some(&variable));
         assert!(program.type_identity_signature().internal_identities().is_empty());
 
         let [first_instruction, second_instruction] = program.instructions() else {
@@ -511,7 +511,9 @@ mod tests {
         );
         let dynamic = array.dimension_size(0).unwrap();
         let r#static = array.dimension_size(-1).unwrap();
-        assert!(matches!(dynamic.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.variable() == &items));
+        assert!(
+            matches!(dynamic.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.variable() == Some(&items))
+        );
         assert!(matches!(r#static.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.extent() == Some(3)));
         let builder = context.builder().borrow();
         let [read, literal] = builder.instructions() else {
@@ -552,7 +554,7 @@ mod tests {
                 {
                     input_types = [ArrayType::new(
                         DataType::F32,
-                        Shape::new(vec![Dimension::Dynamic(dimension_type.variable().clone())]),
+                        Shape::new(vec![dimension_type.dimension().clone()]),
                     ).into()],
                     error = "`dimension_size` input axis 0 dimension `other` does not refine declared \
                              dimension `extent`",
@@ -565,7 +567,7 @@ mod tests {
             .unwrap();
         let refined_output = <&DimensionType>::try_from(&refined_output[0]).unwrap();
         assert_eq!(refined_output.extent(), Some(5));
-        assert_ne!(refined_output.variable(), &variable);
+        assert_ne!(refined_output.variable(), Some(&variable));
 
         assert_eq!(
             operation.infer_output_types(
@@ -618,7 +620,7 @@ mod tests {
         renaming.insert(variable, renamed.clone()).unwrap();
         let renamed_operation = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed_operation.input_dimension(), &Dimension::Dynamic(renamed.clone()));
-        assert_eq!(renamed_operation.output_type().variable(), &renamed);
+        assert_eq!(renamed_operation.output_type().variable(), Some(&renamed));
     }
 
     #[test]
@@ -651,8 +653,8 @@ mod tests {
         let [ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)] = output_types.as_slice() else {
             panic!("expected two imported dimension output types");
         };
-        assert_eq!(first.variable(), &variable);
-        assert_eq!(second.variable(), &variable);
+        assert_eq!(first.variable(), Some(&variable));
+        assert_eq!(second.variable(), Some(&variable));
         assert_eq!(imported.instructions().len(), 2);
         assert_eq!(imported.to_string(), program.to_string());
     }

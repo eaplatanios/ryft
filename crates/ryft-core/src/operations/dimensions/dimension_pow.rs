@@ -17,7 +17,7 @@ define_dimension_arithmetic_operation!(
     DimensionPow,
     dimension_pow,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("{} ^ {}", left.variable(), right.variable())
+        format!("{} ^ {}", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
@@ -92,20 +92,23 @@ impl<A: Value<Type = ArrayType>> From<DimensionPowOperation> for ArrayIrOperatio
 
 impl DimensionPow for DimensionValue {
     fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionPowOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent =
             checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
                     "dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
                      {}={}, {}={}",
-                    self.r#type().variable(),
+                    self.r#type().dimension(),
                     self.extent(),
-                    right.r#type().variable(),
+                    right.r#type().dimension(),
                     right.extent(),
                 ),
             })?;
+
+        // The observed extents are validated before the operation derives the exact result type,
+        // so that eager diagnostics report them rather than a proof from the inputs' exact bounds.
+        let operation = DimensionPowOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(output_type, extent)?)
     }
 }
@@ -283,9 +286,7 @@ mod tests {
         let PartialEvaluationOutput::Known(output) = &evaluation.outputs()[0] else {
             panic!("expected the zero-exponent power to evaluate to a known constant");
         };
-        assert_eq!(output.extent(), 1);
-        assert_eq!(output.r#type().variable().name(), "value ^ 0");
-        assert_eq!(output.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
+        assert_eq!(output, &DimensionValue::constant(1).unwrap());
         assert!(evaluation.program().instructions().is_empty());
     }
 }

@@ -12,18 +12,18 @@ define_dimension_arithmetic_operation!(
     DimensionRemOperation, DIMENSION_REM_OPERATION_NAME,
     Rem, rem,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("{} % {}", left.variable(), right.variable())
+        format!("{} % {}", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (_, left_maximum) = left.bounds().representable_extent_range()?;
         let (_, right_maximum) = right.bounds().representable_extent_range()?;
         if right_maximum == 0 {
             return Err(DimensionError::RequirementViolation {
-                message: format!("{} > 0 is impossible from declared bounds", right.variable()),
+                message: format!("{} > 0 is impossible from declared bounds", right.dimension()),
             });
         }
         let bounds = if right.bounds().lower() > 0
-            && (left.variable() == right.variable() || left_maximum == 0 || right.extent() == Some(1))
+            && (left.has_equal_extents(right) || left_maximum == 0 || right.extent() == Some(1))
         {
             DimensionBounds::new(0, Some(1))?
         } else if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
@@ -53,21 +53,27 @@ impl<A: Value<Type = ArrayType>> From<DimensionRemOperation> for ArrayIrOperatio
 
 impl Rem for DimensionValue {
     fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionRemOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
+            let left_variable = self.r#type().dimension().to_string();
+            let right_variable = right.r#type().dimension().to_string();
             return Err(DimensionError::RequirementViolation {
                 message: format!(
-                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
+                    "{} > 0; observed {}={}, {}={}",
+                    right_variable,
+                    left_variable,
                     self.extent(),
+                    right_variable,
                     right.extent(),
                 ),
             }
             .into());
         }
+
+        // The observed extents are validated before the operation derives the exact result type,
+        // so that eager diagnostics report them rather than a proof from the inputs' exact bounds,
+        let operation = DimensionRemOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(output_type, self.extent() % right.extent())?)
     }
 }

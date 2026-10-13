@@ -17,7 +17,7 @@ define_dimension_arithmetic_operation!(
     DimensionMax,
     dimension_max,
     output_name = |left: &DimensionType, right: &DimensionType| {
-        format!("max({}, {})", left.variable(), right.variable())
+        format!("max({}, {})", left.dimension(), right.dimension())
     },
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
@@ -26,7 +26,7 @@ define_dimension_arithmetic_operation!(
         Ok((bounds, false))
     },
     fold = |left: &DimensionType, right: &DimensionType| {
-        if left.variable() == right.variable()
+        if left.has_equal_extents(right)
             || left.bounds().lower() >= right.maximum_extent().unwrap_or(MAX_DIMENSION_EXTENT)
         {
             Some(OperationFoldOutput::Input(0))

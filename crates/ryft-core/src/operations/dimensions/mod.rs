@@ -80,7 +80,7 @@
 //! # }
 //! ```
 
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+use crate::arrays::{Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::{Operation, OperationFoldOutput, Type, TypeError, TypeIdentityRenaming};
@@ -145,7 +145,9 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     ) -> Result<DimensionBounds, DimensionError>;
 
     /// Infers this operation's output [`DimensionType`]s after validating the provided input [`DimensionType`]s.
-    /// Proven input folds preserve the selected input's bounds while still allocating a fresh output identity.
+    /// Proven input folds preserve the selected input's bounds while still allocating a fresh output identity, and
+    /// bounds that admit a single extent (e.g., for static inputs) describe a static output, which defines no identity
+    /// just like a static array axis.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types.iter().zip([self.left_type(), self.right_type()]).enumerate().try_for_each(
@@ -191,7 +193,10 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
             }
         }
 
-        Ok(vec![DimensionType::new(self.output_name(), bounds)])
+        Ok(vec![match bounds.extent() {
+            Some(extent) => DimensionType::from(Dimension::Static(extent)),
+            None => DimensionType::new(self.output_name(), bounds),
+        }])
     }
 }
 
@@ -287,15 +292,22 @@ mod tests {
         assert_ne!(output[0].variable(), left.variable());
         assert_ne!(output[0].variable(), right.variable());
 
-        // Actual input types refine the output bounds, and every inference creates a fresh output identity.
+        // Actual input types refine the output bounds. Every inference creates a fresh output identity, unless
+        // the refined bounds admit a single extent, which describes a static output without an identity.
         let inputs = [
-            DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap()),
+            DimensionType::new("left", DimensionBounds::new(3, Some(7)).unwrap()),
             DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap()),
         ];
         let output = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
         let repeated = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
-        assert_eq!(output[0].extent(), Some(8));
+        assert_eq!(output[0].bounds(), DimensionBounds::new(5, Some(9)).unwrap());
         assert_ne!(output[0].variable(), repeated[0].variable());
+        let exact_inputs = [
+            DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap()),
+            DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap()),
+        ];
+        let output = ArithmeticDimensionOperation::infer_output_types(&operation, &exact_inputs).unwrap();
+        assert_eq!(output, vec![DimensionType::from(Dimension::Static(8))]);
 
         assert_eq!(
             ArithmeticDimensionOperation::infer_output_types(&operation, std::slice::from_ref(&left)),
@@ -330,8 +342,10 @@ mod tests {
         let renamed_left = DimensionType::new("renamed_left", left.bounds());
         let renamed_right = DimensionType::new("renamed_right", right.bounds());
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(left.variable().clone(), renamed_left.variable().clone()).unwrap();
-        renaming.insert(right.variable().clone(), renamed_right.variable().clone()).unwrap();
+        renaming.insert(left.variable().unwrap().clone(), renamed_left.variable().unwrap().clone()).unwrap();
+        renaming
+            .insert(right.variable().unwrap().clone(), renamed_right.variable().unwrap().clone())
+            .unwrap();
         let renamed = metadata.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
