@@ -65,6 +65,7 @@
 
 use crate::arrays::{ArrayIrType, ArrayType};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::programs::{Operation, Type, TypeError, TypeIdentityPosition, TypeRefinements};
 
@@ -102,6 +103,13 @@ pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<T
 
     /// Returns the operation that restores a residual from temporal storage, if conversion is required.
     fn residual_from_storage(residual_type: &T) -> Result<Option<Self>, TypeError>;
+
+    /// Returns the operation that recovers a residual of type `residual_type` from a value of type `carrier_type` that
+    /// already carries the residual's identity (e.g., the size of the array axis that a first-class dimension
+    /// describes), or `None` when `carrier_type` carries no such identity. A rebuilt loop body uses this instead of
+    /// restoring the residual from temporal storage when one of its inputs already establishes that identity, because
+    /// the restored residual would define the identity a second time.
+    fn residual_from_carrier(residual_type: &T, carrier_type: &T) -> Result<Option<Self>, TypeError>;
 }
 
 impl TemporalResidualType for ArrayType {
@@ -119,6 +127,11 @@ impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O 
 
     #[inline]
     fn residual_from_storage(_residual_type: &ArrayType) -> Result<Option<Self>, TypeError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn residual_from_carrier(_residual_type: &ArrayType, _carrier_type: &ArrayType) -> Result<Option<Self>, TypeError> {
         Ok(None)
     }
 }
@@ -143,7 +156,10 @@ impl TemporalResidualType for ArrayIrType {
 
 impl<O> TemporalResidualOperation<ArrayIrType> for O
 where
-    O: Operation<Type = ArrayIrType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+    O: Operation<Type = ArrayIrType>
+        + From<DimensionFromScalarOperation>
+        + From<DimensionSizeOperation>
+        + From<DimensionToScalarOperation>,
 {
     fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
@@ -160,15 +176,34 @@ where
     fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
-            ArrayIrType::Dimension(r#type) => {
-                Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
-            }
+            ArrayIrType::Dimension(r#type) => Some(Self::from(DimensionFromScalarOperation::for_type(r#type.clone()))),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(
                     "a reference cannot be stored as a temporal residual; references are threaded as carries",
                 ));
             }
         })
+    }
+
+    fn residual_from_carrier(
+        residual_type: &ArrayIrType,
+        carrier_type: &ArrayIrType,
+    ) -> Result<Option<Self>, TypeError> {
+        // Only array axes are recovered. A first-class dimension of the same type is the residual itself, which callers
+        // reuse directly, and reading the extent of a reference's referent would need a reference access.
+        let (ArrayIrType::Dimension(residual_type), ArrayIrType::Array(carrier_type)) = (residual_type, carrier_type)
+        else {
+            return Ok(None);
+        };
+        carrier_type
+            .shape()
+            .dimensions()
+            .iter()
+            .position(|dimension| {
+                residual_type.variable().is_some_and(|variable| dimension.variable() == Some(variable))
+            })
+            .map(|axis| Ok(Self::from(DimensionSizeOperation::new(carrier_type, axis)?)))
+            .transpose()
     }
 }
 
@@ -201,7 +236,7 @@ pub(crate) fn refine_output_types<T: Type>(
     declared_output_types: &[T],
     aliased_input: impl Fn(usize) -> Option<usize>,
 ) -> Result<Vec<T>, TypeError> {
-    let refinements = T::Refinements::establish(declared_input_types, input_types)?;
+    let refinements = T::Refinements::new(declared_input_types, input_types)?;
     let symbolic_identities = declared_output_types
         .iter()
         .flat_map(Type::identities)
@@ -215,7 +250,7 @@ pub(crate) fn refine_output_types<T: Type>(
                 return Ok(aliased_input(index)
                     .map_or_else(|| declared_output_type.clone(), |input_index| input_types[input_index].clone()));
             }
-            refinements.refine(declared_output_type, symbolic_identities.as_slice())
+            refinements.refine_declared(declared_output_type, symbolic_identities.as_slice())
         })
         .collect()
 }

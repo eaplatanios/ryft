@@ -409,8 +409,8 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         // these equivalent representations without accepting a merely broader transpose result. In particular,
         // `f32[n]` with non-singleton bounds, a different extent, or unrelated non-exact identities still fail.
         if transpose_output_types != transpose.output_types()
-            && (T::Refinements::establish(transpose_output_types.iter(), transpose.output_types().iter()).is_err()
-                || T::Refinements::establish(transpose.output_types().iter(), transpose_output_types.iter()).is_err())
+            && (T::Refinements::new(transpose_output_types.iter(), transpose.output_types().iter()).is_err()
+                || T::Refinements::new(transpose.output_types().iter(), transpose_output_types.iter()).is_err())
         {
             check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` transpose output"), [
                 &transpose_output_types,

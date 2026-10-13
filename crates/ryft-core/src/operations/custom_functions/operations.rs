@@ -1845,13 +1845,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             let cotangent_types =
                 self.input_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
             if cotangent_types != backward.output_types()
-                && (<V::Type as Type>::Refinements::establish(cotangent_types.iter(), backward.output_types().iter())
+                && (<V::Type as Type>::Refinements::new(cotangent_types.iter(), backward.output_types().iter())
                     .is_err()
-                    || <V::Type as Type>::Refinements::establish(
-                        backward.output_types().iter(),
-                        cotangent_types.iter(),
-                    )
-                    .is_err())
+                    || <V::Type as Type>::Refinements::new(backward.output_types().iter(), cotangent_types.iter())
+                        .is_err())
             {
                 check_types!(@same, format!("`{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` backward rule output"), [
                     &cotangent_types,

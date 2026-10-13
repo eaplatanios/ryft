@@ -6885,14 +6885,14 @@ mod tests {
 
         // The residual while keeps all four state elements, but its body folds `factor * factor` to a constant and
         // rebuilds the invariant `factor` output as a constant, while the dimension still flows from its state input to
-        // its output.
+        // its output. The known dimension is an eager value, typed exactly, so the residual body is specialized to it.
         assert_eq!(evaluation.program.instructions().len(), 1);
         let residual_instruction = &evaluation.program.instructions()[0];
         let residual_body = evaluation.program.region_ref(residual_instruction.regions()[1]).unwrap().to_program();
         assert_eq!(
             residual_body.to_string(),
             indoc! {"
-                lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[], %2:f64[], %3:f64[] .
+                lambda %0:dimension<5>, %1:f64[], %2:f64[], %3:f64[] .
                 let %4:f64[] = const 1.0
                     %5:f64[] = sub %1 %4
                     %6:f64[] = const 9.0
@@ -6942,10 +6942,8 @@ mod tests {
         let extent_type =
             DimensionType::from(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
         let counter_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let vector_type = ArrayIrType::Array(ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
-        ));
+        let vector_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()])));
         let state_types = vec![ArrayIrType::Dimension(extent_type.clone()), counter_type.clone(), vector_type];
 
         let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -7009,11 +7007,19 @@ mod tests {
             ])
             .unwrap();
 
-        // The residual while keeps the original body, so the vector still flows from its state input to its output.
+        // The residual while keeps the vector state, which still flows from its state input to its output. The known
+        // dimension and vector are eager values, typed exactly, so the residual body is specialized to them.
         assert_eq!(evaluation.program.instructions().len(), 1);
         let residual_instruction = &evaluation.program.instructions()[0];
         let residual_body = evaluation.program.region_ref(residual_instruction.regions()[1]).unwrap().to_program();
-        assert_eq!(residual_body.to_string(), body.to_string());
+        assert_eq!(
+            residual_body.to_string(),
+            indoc! {"
+                lambda %0:dimension<5>, %1:f64[], %2:f64[5] .
+                let %3:f64[] = const 1.0
+                    %4:f64[] = sub %1 %3
+                in (%0, %4, %2)"},
+        );
 
         // Interpreting the residual program reproduces the original program.
         let arguments = evaluation
