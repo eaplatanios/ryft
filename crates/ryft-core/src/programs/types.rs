@@ -794,11 +794,10 @@ impl<V: Typed + ?Sized> Typed for &V {
 /// let proven = [Some(&exact), Some(&exact)];
 /// assert!(identities_with_runtime_checks(&declared, &proven).unwrap().is_empty());
 /// ```
-pub fn identities_with_runtime_checks<T: Type>(
-    declared: &[impl Borrow<T>],
+pub fn identities_with_runtime_checks<T: Type, D: Borrow<T>>(
+    declared: &[D],
     actual: &[Option<&T>],
 ) -> Result<Vec<T::Identity>, TypeError> {
-    // TODO(eaplatanios): Review this.
     if declared.len() != actual.len() {
         return Err(TypeError::invalid(format!(
             "declared type count {} does not match actual type count {}",
