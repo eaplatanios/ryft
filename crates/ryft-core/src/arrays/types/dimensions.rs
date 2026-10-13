@@ -1021,10 +1021,34 @@ impl DimensionRefinements {
         &self.identities_needing_runtime_checks
     }
 
-    // TODO(eaplatanios): Review from here onwards.
+    /// Validates `extent` against the recorded extent of the declared identity `variable`. A matching recorded
+    /// extent is accepted and a conflicting one is rejected, regardless of membership in `closed_identities`.
+    /// If no extent has been recorded, `variable` must belong to `closed_identities`; the extent is then recorded using
+    /// [`Self::record_declared_extent`]. This allows an output to supply the first exact extent of an identity declared
+    /// by a program's inputs or defined within its body, while rejecting facts for unrelated identities.
+    /// [`TypeRefinements::validate_refinement`] uses this policy when validating outputs against input refinements.
+    pub fn validate_declared_extent(
+        &mut self,
+        variable: &DimensionVariable,
+        extent: usize,
+        closed_identities: &[DimensionVariable],
+    ) -> Result<(), TypeError> {
+        match self.class_extent(variable, TypeIdentityKind::Declared) {
+            Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
+                dimension: variable.to_string(),
+                expected,
+                actual: extent,
+            }
+            .into()),
+            Some(_) => Ok(()),
+            None if closed_identities.contains(variable) => self.record_declared_extent(variable, extent),
+            None => Err(TypeError::invalid(format!(
+                "dimension identity {variable} does not belong to the validated boundary signature",
+            ))),
+        }
+    }
 
     /// Records one concrete extent for the declared identity `variable`, rejecting a conflicting extent fact.
-    #[inline]
     pub fn record_declared_extent(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
         let index = match self.class_index(variable, TypeIdentityKind::Declared) {
             Some(index) => index,
@@ -1065,33 +1089,7 @@ impl DimensionRefinements {
         }
     }
 
-    /// Validates `extent` against the recorded extent of the declared identity `variable`. A matching recorded extent
-    /// is accepted and a conflicting one is rejected, regardless of membership in `closed_identities`.
-    ///
-    /// If no extent has been recorded, `variable` must belong to `closed_identities`; the extent is then recorded using
-    /// [`Self::record_declared_extent`]. This allows an output to supply the first exact extent of an identity declared
-    /// by a program's inputs or defined within its body, while rejecting facts for unrelated identities.
-    /// [`TypeRefinements::validate_refinement`] uses this policy when validating outputs against input refinements.
-    pub fn validate_declared_extent(
-        &mut self,
-        variable: &DimensionVariable,
-        extent: usize,
-        closed_identities: &[DimensionVariable],
-    ) -> Result<(), TypeError> {
-        match self.class_extent(variable, TypeIdentityKind::Declared) {
-            Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
-                dimension: variable.to_string(),
-                expected,
-                actual: extent,
-            }
-            .into()),
-            Some(_) => Ok(()),
-            None if closed_identities.contains(variable) => self.record_declared_extent(variable, extent),
-            None => Err(TypeError::invalid(format!(
-                "dimension identity {variable} does not belong to the validated boundary signature",
-            ))),
-        }
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Rejects a [`DimensionVariable`] that one signature member binds to a static extent while another member renames
     /// it to a variable whose bounds do not specify that exact extent. A singleton target bound equal to the static
