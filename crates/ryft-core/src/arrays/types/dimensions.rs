@@ -503,7 +503,7 @@ impl DimensionType {
         }
         match (declared.variable(), &actual.dimension) {
             (Some(declared), Dimension::Dynamic(actual)) => renaming.insert(declared.clone(), actual.clone()),
-            (Some(declared), Dimension::Static(extent)) => refinements.bind(declared, *extent),
+            (Some(declared), Dimension::Static(extent)) => refinements.record_declared_extent(declared, *extent),
             (None, _) => Ok(()),
         }
     }
@@ -800,7 +800,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
         visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::dimension_refinement_facts(declared, actual).try_for_each(|refinement_fact| match refinement_fact? {
                 DimensionRefinementFact::Declared(variable, extent) => {
-                    refinements.validate_or_bind(variable, extent, closed_identities)
+                    refinements.validate_declared_extent(variable, extent, closed_identities)
                 }
                 DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
             })
@@ -842,9 +842,9 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
 
 /// Shared dimension identity facts used by array, first-class dimension, and composite array IR [`TypeRefinements`].
 /// [`Type`]-specific [`TypeRefinements`] implementations validate their input signatures and collect these facts.
-/// Operations can also construct an empty set with [`Default`] and record exact extents with [`Self::bind`] or
-/// [`Self::bind_dimension_input`]. To apply such facts to array types, convert this set into
-/// [`ArrayTypeRefinements`](crate::ArrayTypeRefinements).
+/// Operations can also construct an empty set with [`Default`] and record exact extents with
+/// [`Self::record_declared_extent`] or [`Self::record_input_refinement`]. To apply such facts
+/// o array types, convert this set into [`ArrayTypeRefinements`](crate::ArrayTypeRefinements).
 ///
 /// Facts are kept in two separate scopes. Formal facts bind identities of the declared signature (e.g., the formal `n`
 /// of a region declared as `f32[n]` that receives an `f32[3]`) and apply to declared, intermediate, and output types
@@ -1006,7 +1006,7 @@ impl DimensionRefinements {
     }
 
     /// Records one concrete extent for the declared identity `variable`, rejecting a conflicting extent fact.
-    pub fn bind(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
+    pub fn record_declared_extent(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
         let index = match self.class_index(variable, TypeIdentityKind::Declared) {
             Some(index) => index,
             None => {
@@ -1020,18 +1020,16 @@ impl DimensionRefinements {
         self.bind_class(index, variable, extent, TypeIdentityKind::Declared)
     }
 
-    /// Accepts the first-class dimension input of type `input_type` for a dynamic output axis whose identity is
-    /// `variable`, as dynamic constructors and other operations whose inputs supply output extents require. An input
-    /// that defines `variable` itself keeps that identity in the output. An exact input (i.e., one whose bounds admit a
-    /// single extent, such as the type of an eager dimension value) whose extent lies within `variable`'s bounds binds
-    /// `variable` to that extent, so that refining the output type with these refinements replaces the axis by that
-    /// static extent. Returns whether the input is accepted.
+    /// Records the refinement supplied by a dimension input of type `input_type` for an output axis named `variable`.
+    /// An input with the same identity is accepted without recording an extent. An input with an exact extent within
+    /// `variable`'s bounds records that extent using [`Self::record_declared_extent`]; refining the output type then
+    /// replaces the axis with a static dimension. Returns `true` for these accepted inputs and `false` otherwise.
     ///
     /// # Errors
     ///
-    /// Returns an error when an exact input conflicts with an extent already bound for `variable` (e.g., two inputs of
-    /// extents 2 and 3 for a repeated axis).
-    pub fn bind_dimension_input(
+    /// Returns an error when an exact input conflicts with an extent already recorded for `variable` (e.g., two inputs
+    /// of extents 2 and 3 for a repeated axis).
+    pub fn record_input_refinement(
         &mut self,
         variable: &DimensionVariable,
         input_type: &DimensionType,
@@ -1041,36 +1039,21 @@ impl DimensionRefinements {
         }
         match input_type.extent() {
             Some(extent) if variable.bounds().contains(extent) => {
-                self.bind(variable, extent)?;
+                self.record_declared_extent(variable, extent)?;
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    /// Validates one observed extent against an established input fact, or binds it when `variable` belongs to the
-    /// validated boundary's closed identity signature. This is the validation-phase counterpart of [`Self::bind`]. For
-    /// a variable that already has a recorded extent, the two behave identically (i.e., a matching extent is accepted
-    /// and a differing one is rejected). They differ on a variable with no recorded fact. [`Self::bind`]
-    /// treats the refinement set as *open* and records the first supplied extent, which is correct while
-    /// establishing facts from a complete input signature, where every variable may legitimately appear for the
-    /// first time, as in [`TypeRefinements::from_local_declarations`] and
-    /// [`ArrayType::extend_renaming_and_refinements`][extend_renaming_and_refinements].
+    /// Validates `extent` against the recorded extent of the declared identity `variable`. A matching recorded extent
+    /// is accepted and a conflicting one is rejected, regardless of membership in `closed_identities`.
     ///
-    /// [`Self::validate_or_bind`] instead admits an unrecorded variable only when it appears in `closed_identities`,
-    /// the boundary's complete closed identity set (i.e., an identity established by the formal input signature, whose
-    /// first concrete fact may only become observable at an output, such as a first-class dimension input whose type is
-    /// strictly identity plus bounds, or an identity defined by an instruction inside the program or region). In either
-    /// case it delegates to [`Self::bind`] so repeated extent facts across several outputs must still agree; this is
-    /// sound without inspecting runtime payloads because structural region closure already proves that every output
-    /// reference identity is consumed or defined. Every variable outside the closed set is rejected, because an extent
-    /// claimed for an identity foreign to the boundary cannot be justified. In short, use [`Self::bind`] where
-    /// comparisons *establish* facts, and use this function where extent facts must be *justified* against the boundary's
-    /// identity set, as [`TypeRefinements::validate_refinement`] does when checking an output signature against the
-    /// facts established from its input boundary.
-    ///
-    /// [extend_renaming_and_refinements]: crate::arrays::types::arrays::ArrayType::extend_renaming_and_refinements
-    pub fn validate_or_bind(
+    /// If no extent has been recorded, `variable` must belong to `closed_identities`; the extent is then recorded using
+    /// [`Self::record_declared_extent`]. This allows an output to supply the first exact extent of an identity declared
+    /// by a program's inputs or defined within its body, while rejecting facts for unrelated identities.
+    /// [`TypeRefinements::validate_refinement`] uses this policy when validating outputs against input refinements.
+    pub fn validate_declared_extent(
         &mut self,
         variable: &DimensionVariable,
         extent: usize,
@@ -1084,7 +1067,7 @@ impl DimensionRefinements {
             }
             .into()),
             Some(_) => Ok(()),
-            None if closed_identities.contains(variable) => self.bind(variable, extent),
+            None if closed_identities.contains(variable) => self.record_declared_extent(variable, extent),
             None => Err(TypeError::invalid(format!(
                 "dimension identity {variable} does not belong to the validated boundary signature",
             ))),
@@ -2133,12 +2116,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_refinements() {
+    fn test_dimension_refinements_record_declared_extent() {
         let first = DimensionVariable::new("first", DimensionBounds::non_negative(Some(8)).unwrap());
         let mut isolated = DimensionRefinements::default();
-        isolated.bind(&first, 3).unwrap();
-        isolated.bind(&first, 3).unwrap();
-        let error = isolated.bind(&first, 4).unwrap_err();
+        isolated.record_declared_extent(&first, 3).unwrap();
+        isolated.record_declared_extent(&first, 3).unwrap();
+        let error = isolated.record_declared_extent(&first, 4).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "first".to_string(), expected: 3, actual: 4 }),
@@ -2149,10 +2132,10 @@ mod tests {
         );
         assert_eq!(isolated.refine_declared_dimension(&first.clone().into(), &[]), Dimension::Static(3));
 
-        // Binding a declared identity does not reuse a fact for the same identity object in the actual scope.
+        // Recording a declared extent does not reuse a fact for the same identity object in the actual scope.
         let mut scoped =
             DimensionRefinements::from_refinement_facts([Ok(DimensionRefinementFact::Actual(&first, 2))]).unwrap();
-        scoped.bind(&first, 3).unwrap();
+        scoped.record_declared_extent(&first, 3).unwrap();
         assert_eq!(scoped.refine_declared_dimension(&first.clone().into(), &[]), Dimension::Static(3));
         assert_eq!(scoped.refine_actual_dimension(&first.into(), &[]), Dimension::Static(2));
     }
@@ -2165,7 +2148,7 @@ mod tests {
             DimensionRefinementFact::Correspondence(&formal, &actual),
         )])
         .unwrap();
-        let error = refinements.bind(&formal, 2).unwrap_err();
+        let error = refinements.record_declared_extent(&formal, 2).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::BindingOutOfBounds {
