@@ -1381,42 +1381,39 @@ pub(crate) enum DimensionRefinementFact<'o> {
     Correspondence(&'o DimensionVariable, &'o DimensionVariable),
 }
 
-// TODO(eaplatanios): Review this.
-/// Determines how dimension comparisons derive [`DimensionRefinementFact`]s from declared and actual types.
-///
-/// [`Self::Refinement`] and [`Self::LocalDeclarations`] accept an exact actual extent when it satisfies the declared
-/// dimension, whether that extent comes from a static dimension or an identity with singleton bounds. For example,
-/// comparing declared `f32[n]` with actual `f32[2]` contributes the declared fact `n = 2` in either mode when `n`
-/// admits `2`. These two modes differ when the actual extent is unknown and when both dimensions are identical, as
-/// described below. Their facts remain conditional on any required runtime checks succeeding.
-/// [`Self::IdentityRenaming`] instead produces substitutions that preserve the signature without adding runtime checks.
-/// All modes inspect types only.
+/// Selects how declared and supplied dimensions are compared and which [`DimensionRefinementFact`]s are recorded.
+/// [`Self::Refinement`] and [`Self::LocalDeclarations`] accept an exact supplied extent when it satisfies the declared
+/// dimension, whether it comes from a static dimension or a variable whose bounds fix its extent. For example,
+/// comparing declared `f32[n]` with supplied `f32[2]` records `n = 2` in either mode when `n` admits `2`. Their rules
+/// differ for unknown extents and identical dimensions, as described below. These facts depend on any required runtime
+/// input checks succeeding. [`Self::IdentityRenaming`] instead records structural substitutions without assuming
+/// relationships that would require additional runtime checks. All modes inspect types only.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DimensionComparison {
-    /// Applies ordinary array-axis refinement rules and skips identical dimensions because they add no new refinement.
-    /// When the actual extent is unknown, it must use the declared identity: `f32[n]` accepts `f32[n]` but rejects
-    /// `f32[m]` for distinct identities `n` and `m`, even when their bounds match. The identical pair contributes no
-    /// facts. Used for ordinary array admission, output validation, and dynamic-to-static refinement visits.
+    /// Applies ordinary array-axis refinement rules. Identical dimensions are accepted and contribute no facts.
+    /// When the supplied extent is unknown, it must use the same dimension variable as the declaration: `f32[n]`
+    /// accepts `f32[n]` but rejects `f32[m]` for distinct variables `n` and `m`, even when their bounds match.
+    /// Used for ordinary array input and output validation.
     Refinement,
 
-    /// Treats declared identities as local names and collects facts for complete refinement construction, as in
-    /// [`TypeRefinements::from_local_declarations`]. With unknown extents, `f32[n]` accepts `f32[m]` when `m`'s bounds
-    /// fit within `n`'s bounds and contributes `Correspondence(n, m)`.
-    ///
-    /// Identical identities also contribute facts: comparing `f32[n]` with `f32[n]` relates the declared `n` to the
-    /// actual `n`, which are stored in separate scopes. Thus declared `[f32[n], f32[n]]` compared with actual
-    /// `[f32[n], f32[2]]` propagates the second pair's extent `2` to both scopes' `n`. Identical singleton identities
-    /// additionally contribute their exact extents. First-class dimension types also use this mode because their
-    /// compatibility depends on bounds rather than matching identity names.
+    /// Tracks declared and supplied variables separately and records relationships between them, as in
+    /// [`TypeRefinements::from_local_declarations`]. With unknown extents, declared `f32[n]` accepts supplied `f32[m]`
+    /// when `m`'s bounds fit within `n`'s bounds and records `Correspondence(n, m)`. Comparing `f32[n]` with `f32[n]`
+    /// also records a relationship between the declared and supplied uses of `n`. Thus, declared `[f32[n], f32[n]]`
+    /// compared with supplied `[f32[n], f32[2]]` propagates the second pair's extent `2` to both uses of `n`, provided
+    /// its bounds admit `2`. Matching the same variable also records its exact extent when its bounds fix that extent.
+    /// Dimension value types use this mode because their compatibility depends on bounds rather than requiring the
+    /// same variable.
     LocalDeclarations,
 
-    /// Produces structural identity substitutions for [`Type::derive_identity_renaming`]. Dynamic dimensions retain
-    /// their actual identities, including explicit self-substitutions and singleton identities. Target bounds must
-    /// fit within the declared bounds; actual static dimensions instead contribute declared extent facts.
-    ///
-    /// Static array axes require equal static actual axes. First-class dimensions validate bounds and produce no
-    /// substitution when the declared dimension is static. The complete signature must also reject conflicting
-    /// substitutions or extents and validate their agreement. Refer to [`Type::derive_identity_renaming`] for examples.
+    /// Records substitutions from declared variables to supplied variables for [`Type::derive_identity_renaming`].
+    /// The supplied variable's bounds must fit within the declared variable's bounds. It remains the substitution
+    /// target even when its extent is known; comparing a variable with itself records an explicit self-substitution.
+    /// A supplied static dimension instead records an exact extent for the declared variable. A declared static array
+    /// axis requires an equal static supplied axis. A declared static [`DimensionType`] also accepts a supplied
+    /// variable whose bounds fix it to that extent, and records no substitution. The complete signature must reject
+    /// conflicting substitutions or extents and validate their agreement. Refer to [`Type::derive_identity_renaming`]
+    /// for examples.
     IdentityRenaming,
 }
 
