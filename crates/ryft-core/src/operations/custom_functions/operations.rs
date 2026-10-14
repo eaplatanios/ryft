@@ -7120,7 +7120,7 @@ mod tests {
                 let extent = builder.add_constant(Array::scalar(1i32).unwrap().into());
                 let variable = DimensionVariable::new("extent", DimensionBounds::new(0, None).unwrap());
                 builder
-                    .add_instruction(DimensionFromScalarOperation::new(variable), Vec::new(), vec![extent], None)
+                    .add_instruction(DimensionFromScalarOperation::new(variable.into()), Vec::new(), vec![extent], None)
                     .unwrap();
             }
             builder
@@ -8971,10 +8971,9 @@ mod tests {
         let invalid_extent = backward.add_constant(Array::scalar(-1i32).unwrap().into());
         backward
             .add_instruction(
-                DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "extent",
-                    DimensionBounds::new(0, None).unwrap(),
-                )),
+                DimensionFromScalarOperation::new(
+                    DimensionVariable::new("extent", DimensionBounds::new(0, None).unwrap()).into(),
+                ),
                 Vec::new(),
                 vec![invalid_extent],
                 None,

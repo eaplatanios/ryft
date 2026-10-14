@@ -1088,7 +1088,7 @@ impl<
         }
         let input_type = batch.unbatched_type();
         let input_extent_dimensions =
-            input_extents.iter().map(|extent| extent.r#type().to_dimension()).collect::<Vec<_>>();
+            input_extents.iter().map(|extent| extent.r#type().simplified_dimension()).collect::<Vec<_>>();
         let value = if input_type.shape().dimensions() == input_extent_dimensions {
             batch.value().clone()
         } else {
@@ -2110,8 +2110,8 @@ mod tests {
             Err(BatchingError::UnsupportedOperation { message: "extent 8 must be divisible by extent 0".to_string() }),
         );
 
-        // Bounded extent types are checked by staged assertions, which the eager parent evaluates immediately: a
-        // divisor whose lower bound is zero must be positive, and the dividend must be divisible by the divisor.
+        // Eager dimension values are typed exactly, so values created from bounded types are checked on the host too.
+        // Staged values with bounded types are checked by staged assertions instead (refer to the staging tests).
         let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(17)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(9)).unwrap());
         let left = DimensionValue::new(left_type.clone(), 8).unwrap();
@@ -2120,27 +2120,21 @@ mod tests {
             DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &right).unwrap().extent(),
             4,
         );
-        let zero = DimensionValue::new(right_type, 0).unwrap();
-        let error = ProgramError::from(
-            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &zero).unwrap_err(),
+        assert_eq!(
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(
+                &context,
+                &left,
+                &DimensionValue::new(right_type, 0).unwrap(),
+            ),
+            Err(BatchingError::UnsupportedOperation { message: "extent 8 must be divisible by extent 0".to_string() }),
         );
         assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::Failed {
-                message: "collective divisor must be positive".to_string(),
-                observations: vec![("divisor".to_string(), "0".to_string())],
-            }),
-        );
-        let left = DimensionValue::new(left_type, 7).unwrap();
-        let error = ProgramError::from(
-            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(&context, &left, &right).unwrap_err(),
-        );
-        assert_eq!(
-            error.downcast_custom::<AssertionError>(),
-            Some(&AssertionError::Failed {
-                message: "collective extent must be divisible by the participant count".to_string(),
-                observations: vec![("extent".to_string(), "7".to_string()), ("divisor".to_string(), "2".to_string())],
-            }),
+            DynamicArrayExtentBatchingPolicy::divide_extents_exactly(
+                &context,
+                &DimensionValue::new(left_type, 7).unwrap(),
+                &right,
+            ),
+            Err(BatchingError::UnsupportedOperation { message: "extent 7 must be divisible by extent 2".to_string() }),
         );
     }
 
@@ -2200,7 +2194,7 @@ mod tests {
             .unwrap();
         let quotient = ValueProjection::<DimensionType>::into_projected(outputs[0].clone()).unwrap();
         assert_eq!(quotient.extent(), 4);
-        assert_eq!(quotient.r#type().bounds(), DimensionBounds::new(0, Some(17)).unwrap());
+        assert_eq!(quotient.r#type().extent(), Some(4));
         let error = program
             .interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 7).unwrap()),
@@ -2281,7 +2275,7 @@ mod tests {
             .unwrap();
         let quotient = ValueProjection::<DimensionType>::into_projected(outputs[0].clone()).unwrap();
         assert_eq!(quotient.extent(), 4);
-        assert_eq!(quotient.r#type().bounds(), DimensionBounds::new(0, Some(17)).unwrap());
+        assert_eq!(quotient.r#type().extent(), Some(4));
         let error = program
             .interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(left_type, 7).unwrap()),
@@ -2528,7 +2522,7 @@ mod tests {
             ),
             Ok(vec![ArrayIrType::from(ArrayType::new(
                 DataType::F32,
-                Shape::new(vec![dynamic_extent_type.to_dimension(), Dimension::Static(3)]),
+                Shape::new(vec![dynamic_extent_type.simplified_dimension(), Dimension::Static(3)]),
             ))]),
         );
 

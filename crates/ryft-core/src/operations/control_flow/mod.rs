@@ -176,7 +176,7 @@ where
     fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
-            ArrayIrType::Dimension(r#type) => Some(Self::from(DimensionFromScalarOperation::for_type(r#type.clone()))),
+            ArrayIrType::Dimension(r#type) => Some(Self::from(DimensionFromScalarOperation::new(r#type.clone()))),
             ArrayIrType::Reference(_) => {
                 return Err(TypeError::invalid(
                     "a reference cannot be stored as a temporal residual; references are threaded as carries",

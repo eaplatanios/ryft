@@ -10187,7 +10187,7 @@ mod tests {
         let counter = body_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
         let iteration = body_builder
             .add_instruction(
-                TestIrOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
+                TestIrOperation::from(DimensionFromScalarOperation::new(iteration_variable.into())),
                 Vec::new(),
                 vec![counter],
                 None,

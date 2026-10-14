@@ -1272,7 +1272,7 @@ impl<
                             );
                             let axis_index = transpose_context
                                 .bind(
-                                    DimensionFromScalarOperation::new(axis_index_variable),
+                                    DimensionFromScalarOperation::new(axis_index_variable.into()),
                                     Vec::new(),
                                     std::slice::from_ref(&axis_index),
                                 )?
@@ -3143,44 +3143,76 @@ mod tests {
                 .unwrap(),
             ],
         );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_batching_array_ir_replicated_ragged() {
+        // Only staged dimensions can name a ragged dimension (eager dimensions carry exact types), so the parent of
+        // these cases is a trace.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let two =
+            ArrayIrBatch::replicated(trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())));
+        let length = ArrayIrBatch::replicated(trace.input(DimensionType::from(variable.clone()).into()));
+        let context = BatchingContext::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        )
+        .with_axis_name("x".to_string());
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
 
         // A replicated ragged input carries a replicated result extent of its bounded ragged dimension, and the gather
         // broadcasts its scalar extents along the participant axis.
+        let input = ArrayIrBatch::replicated(trace.input(ArrayType::new_static(DataType::F32, [3]).into()))
+            .with_ragged_axes(vec![RaggedAxis::new(
+                0,
+                trace.input(ArrayType::new_static(DataType::I32, []).into()),
+                variable.clone(),
+                Vec::new(),
+            )])
+            .unwrap();
+        let (outputs, _) = operation
+            .batch_in_parent(&context, &EmptyRegionDriver, &[input, two.clone(), length.clone()])
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis_position(), None);
+        let ragged_axis = &outputs[0].ragged_axes()[0];
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!((ragged_axis.axis(), ragged_axis.dimension(), ragged_axis.extent_axes()), (1, &variable, &[0][..]));
         assert_eq!(
-            operation
-                .batch_in_parent(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[
-                        ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 0.0]).unwrap()))
-                            .with_ragged_axes(vec![RaggedAxis::new(
-                                0,
-                                ArrayIrValue::Array(Array::scalar(2i32).unwrap()),
-                                variable.clone(),
-                                Vec::new(),
-                            )])
-                            .unwrap(),
-                        extent(2),
-                        ArrayIrBatch::replicated(ArrayIrValue::Dimension(
-                            DimensionValue::new(DimensionType::from(variable.clone()), 2).unwrap(),
-                        )),
-                    ],
-                )
+            ragged_axis.extents().r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+        );
+        assert_eq!(
+            outputs[0].unbatched_type(),
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![2.into(), variable.clone().into()]))),
+        );
+
+        // A mapped ragged input must supply its per-item extents through a mapped result extent.
+        let mapped_input =
+            ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into()), BatchAxis::new(0))
                 .unwrap()
-                .into_parts()
-                .0,
-            vec![
-                ArrayIrBatch::replicated(ArrayIrValue::Array(
-                    Array::matrix(2, 3, vec![1.0f32, 2.0, 0.0, 1.0, 2.0, 0.0]).unwrap(),
-                ))
                 .with_ragged_axes(vec![RaggedAxis::new(
                     1,
-                    ArrayIrValue::Array(Array::vector(vec![2i32, 2]).unwrap()),
+                    trace.input(ArrayType::new_static(DataType::I32, [2]).into()),
                     variable,
                     vec![0],
                 )])
-                .unwrap(),
-            ],
+                .unwrap();
+        assert_eq!(
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[mapped_input, two, length]).map(|_| ()),
+            Err(BatchingError::InvalidBatchMetadata {
+                message: "untiled `parallel_all_gather` output axis 1 must carry mapped extents for bounded ragged \
+                          dimension `length`"
+                    .to_string(),
+            }),
         );
     }
 
@@ -3235,26 +3267,6 @@ mod tests {
             untiled.batch_in_parent(&context("y"), &EmptyRegionDriver, &[ragged.clone(), extent(2), mapped_extent]),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_all_gather` does not support bounded ragged dimension `length` on input 0"
-                    .to_string(),
-            }),
-        );
-
-        // A mapped ragged input must supply its per-item extents through a mapped result extent.
-        assert_eq!(
-            untiled.batch_in_parent(
-                &context("x"),
-                &EmptyRegionDriver,
-                &[
-                    ragged,
-                    extent(2),
-                    ArrayIrBatch::replicated(ArrayIrValue::Dimension(
-                        DimensionValue::new(DimensionType::from(variable), 3).unwrap(),
-                    )),
-                ],
-            ),
-            Err(BatchingError::InvalidBatchMetadata {
-                message: "untiled `parallel_all_gather` output axis 1 must carry mapped extents for bounded ragged \
-                          dimension `length`"
                     .to_string(),
             }),
         );
