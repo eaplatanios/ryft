@@ -553,7 +553,7 @@ impl Type for ArrayType {
     {
         DimensionRefinements::derive_identity_renaming(type_signature_pairs(declared, actual)?.flat_map(
             |(declared, actual)| {
-                ArrayTypeRefinements::array_refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
+                ArrayTypeRefinements::refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
             },
         ))
     }
@@ -681,9 +681,9 @@ impl ArrayTypeRefinements {
     /// Returns the [`DimensionRefinementFact`]s for one declared and one actual array type, or their comparison error.
     /// Validates non-shape metadata and rank before comparing corresponding axes. [`DimensionComparison`] determines
     /// whether distinct dimension variables with unknown extents are accepted and whether identical dimensions
-    /// contribute facts, as in [`DimensionRefinements::dimension_refinement_facts`]. Structural comparisons
-    /// preserve substitutions rather than infer conditional exact extents from supplied variables.
-    pub(crate) fn array_refinement_facts<'o>(
+    /// contribute facts, as in [`DimensionRefinements::refinement_facts`]. Structural comparisons preserve
+    /// substitutions rather than infer conditional exact extents from supplied variables.
+    pub(crate) fn refinement_facts<'o>(
         declared: &'o ArrayType,
         actual: &'o ArrayType,
         comparison: DimensionComparison,
@@ -699,12 +699,11 @@ impl ArrayTypeRefinements {
             Some(TypeError::invalid(message))
         };
         let dimensions = error.is_none().then(|| declared.shape().dimensions().iter().zip(actual.shape().dimensions()));
-        error
-            .into_iter()
-            .map(Err)
-            .chain(dimensions.into_iter().flatten().flat_map(move |(declared, actual)| {
-                DimensionRefinements::dimension_refinement_facts(declared, actual, comparison)
-            }))
+        error.into_iter().map(Err).chain(
+            dimensions.into_iter().flatten().flat_map(move |(declared, actual)| {
+                DimensionRefinements::refinement_facts(declared, actual, comparison)
+            }),
+        )
     }
 }
 
@@ -716,14 +715,14 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         D::Item: Borrow<ArrayType>,
         A::Item: Borrow<ArrayType>,
     {
-        // Ordinary admission retains nominal axes; the complete establishment below checks their relationships.
+        // Ordinary admission retains nominal axes; comparing the complete signature below checks their relationships.
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
         visit_type_signature_pairs(
             declared.iter().map(Borrow::borrow),
             actual.iter().map(Borrow::borrow),
             |declared, actual| {
-                Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement)
+                Self::refinement_facts(declared, actual, DimensionComparison::Refinement)
                     .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
             },
         )?;
@@ -741,9 +740,7 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         let actual = actual.into_iter().collect::<Vec<_>>();
         let refinements = DimensionRefinements::from_refinement_facts(
             type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?.flat_map(
-                |(declared, actual)| {
-                    Self::array_refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
-                },
+                |(declared, actual)| Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations),
             ),
         )?;
         let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
@@ -778,14 +775,14 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(
-                |refinement_fact| match refinement_fact? {
+            Self::refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(|refinement_fact| {
+                match refinement_fact? {
                     DimensionRefinementFact::Declared(variable, extent) => {
                         refinements.dimensions.validate_declared_extent(variable, extent, closed_identities)
                     }
                     DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
-                },
-            )
+                }
+            })
         })
     }
 
@@ -1641,7 +1638,8 @@ mod tests {
         let declared = ArrayType::new(F32, Shape::new(vec![first.clone().into(), second.clone().into(), 2.into()]));
         let supplied = ArrayType::new(F32, Shape::new(vec![2.into(), 2.into(), actual.clone().into()]));
         let refinements = ArrayTypeRefinements::from_local_declarations([&declared], [&supplied]).unwrap();
-        // Equal exact extents do not join unrelated formal or actual identities, including isolated observations.
+
+        // Equal exact extents do not join unrelated declared or actual identities, including isolated observations.
         assert_eq!(
             refinements.identity_classes().collect::<Vec<_>>(),
             vec![
@@ -1812,7 +1810,7 @@ mod tests {
         )
         .unwrap();
 
-        // Every established identity is replaced by its extent, while an identity without a fact stays symbolic.
+        // A variable with a recorded exact extent is replaced by that extent; other variables stay symbolic.
         let declared = ArrayType::new(F32, Shape::new(vec![rows.clone().into(), cols.clone().into(), depth.into()]));
         assert_eq!(
             refinements.refine_declared(&declared, &[]),
@@ -1843,7 +1841,7 @@ mod tests {
             Ok(sharded.clone().with_shape(Shape::new(vec![Dimension::Static(3)]))),
         );
 
-        // Facts are established from the complete signature, so an identity that a caller excludes when refining still
+        // Facts are derived from the complete signature, so an identity that a caller excludes when refining still
         // takes part in conflict detection.
         assert_eq!(
             ArrayTypeRefinements::from_local_declarations(

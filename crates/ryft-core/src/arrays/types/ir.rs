@@ -291,15 +291,15 @@ impl ReferenceMemberType for ArrayIrType {
     }
 }
 
-/// [`TypeRefinements`] established while refining one complete [`ArrayIrType`] signature. Array members and reference
-/// referents follow the [`ArrayTypeRefinements`] rules and share the [`DimensionRefinements`] declared and actual
-/// scopes with first-class dimension members, so array shapes and first-class dimension inputs must agree. A dimension
-/// member must have actual bounds within its declared bounds. Local establishment links differently named dimension
-/// and array-axis identities, sharing exact facts across those links; ordinary nominal input admission still restricts
-/// array axes. A dimension member with singleton bounds contributes its exact extent. Wider dimension bounds establish
-/// no concrete fact; their declared variable belongs to the boundary's closed identity set (refer to the documentation
-/// of [`TypeIdentitySignature`](crate::TypeIdentitySignature) for more information), which lets output validation
-/// record its first concrete extent and reject inconsistent later extents.
+/// [`TypeRefinements`] for one complete [`ArrayIrType`] signature. Array members and reference referents follow the
+/// [`ArrayTypeRefinements`] rules and share the [`DimensionRefinements`] declared and actual scopes with first-class
+/// dimension members, so array shapes and first-class dimension inputs must agree. A dimension member must have actual
+/// bounds within its declared bounds. Matching local declarations relates distinct dimension and array-axis identities,
+/// sharing exact facts across those links; ordinary nominal input admission still restricts array axes. A dimension
+/// member with singleton bounds contributes its exact extent. Wider dimension bounds supply no concrete fact; their
+/// declared variable belongs to the boundary's closed identity set (refer to the documentation of
+/// [`TypeIdentitySignature`](crate::TypeIdentitySignature) for more information), which lets
+/// output validation record its first concrete extent and reject inconsistent later extents.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayIrTypeRefinements {
     /// [`ArrayTypeRefinements`] shared by array members and reference referents across the complete signature.
@@ -307,10 +307,13 @@ pub struct ArrayIrTypeRefinements {
 }
 
 impl ArrayIrTypeRefinements {
-    /// Returns the refinement facts for a matching composite member pair.
-    /// Arrays and reference referents use array admission rules; first-class dimensions use dimension bounds.
-    /// A mismatched kind yields its existing kind error before any facts. `comparison` applies to array axes;
-    /// first-class dimension members use bounds-based comparison, with structural substitutions only when requested.
+    /// Returns the [`DimensionRefinementFact`]s for one declared and one actual [`ArrayIrType`], or their comparison
+    /// error. Validates matching kinds before comparing arrays, reference referents, or dimension values. Arrays and
+    /// reference referents use [`ArrayTypeRefinements::refinement_facts`] with the requested [`DimensionComparison`].
+    /// Dimension values use [`DimensionTypeRefinements::refinement_facts`] with bounds-based
+    /// [`DimensionComparison::LocalDeclarations`] rules, or [`DimensionComparison::IdentityRenaming`] when requested.
+    /// Structural comparisons preserve substitutions rather than infer conditional exact extents from supplied
+    /// variables.
     fn refinement_facts<'o>(
         declared: &'o ArrayIrType,
         actual: &'o ArrayIrType,
@@ -345,7 +348,7 @@ impl ArrayIrTypeRefinements {
             .into_iter()
             .map(Err)
             .chain(array_pair.into_iter().flat_map(move |(declared, actual)| {
-                ArrayTypeRefinements::array_refinement_facts(declared, actual, comparison)
+                ArrayTypeRefinements::refinement_facts(declared, actual, comparison)
             }))
             .chain(dimension_pair.into_iter().flat_map(move |(declared, actual)| {
                 let comparison = match comparison {
@@ -354,7 +357,7 @@ impl ArrayIrTypeRefinements {
                     }
                     DimensionComparison::IdentityRenaming => DimensionComparison::IdentityRenaming,
                 };
-                DimensionTypeRefinements::dimension_refinement_facts(declared, actual, comparison)
+                DimensionTypeRefinements::refinement_facts(declared, actual, comparison)
             }))
     }
 }
@@ -367,8 +370,8 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
         D::Item: Borrow<ArrayIrType>,
         A::Item: Borrow<ArrayIrType>,
     {
-        // Member admission follows its existing array, dimension, or reference rules.
-        // Establishment then checks identities shared within and between all member kinds.
+        // Member admission follows its existing array, dimension, or reference rules. Comparing the complete signature
+        // then checks variables shared within and between all member kinds.
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
         visit_type_signature_pairs(
@@ -426,8 +429,7 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
         D::Item: Borrow<ArrayIrType>,
         A::Item: Borrow<ArrayIrType>,
     {
-        // Validation is formal-only meaning that it checks outputs against the formal facts and never records actual
-        // facts or correspondences from output comparisons.
+        // Output validation uses declared-scope facts and never records actual-scope facts or correspondences.
         let mut refinements = self.arrays.dimension_refinements().clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(|refinement_fact| {
@@ -594,7 +596,7 @@ mod tests {
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
 
-        // Repeated observations of one dynamic array identity establish one concrete refinement and reject a later
+        // Repeated occurrences of one dynamic array variable record one exact extent and reject a later
         // conflicting extent.
         let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
         let declared_array =
@@ -658,7 +660,7 @@ mod tests {
         );
 
         // A dimension member with wider bounds contributes no concrete fact. Its variable instead belongs to the
-        // boundary's closed identity signature, so output validation may establish the concrete extent for it on first
+        // boundary's closed identity signature, so output validation may record its concrete extent on the first
         // refinement fact and must reject an inconsistent repeated refinement fact within the same validated signature.
         let declared_dimension = ArrayIrType::Dimension(DimensionType::from(batch.clone()));
         let refinements = ArrayIrTypeRefinements::from_local_declarations(
@@ -737,7 +739,7 @@ mod tests {
         }
 
         // An identity outside the boundary's closed signature stays rejected, and an internally defined identity may
-        // establish its first fact exactly like an input-signature identity.
+        // receive its first fact exactly like an input-signature identity.
         let unrelated = DimensionVariable::new("unrelated", DimensionBounds::non_negative(Some(8)).unwrap());
         let unrelated_array =
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(unrelated.clone())])));
@@ -921,9 +923,8 @@ mod tests {
             ArrayIrTypeRefinements::from_local_declarations(declared, actual).unwrap()
         };
 
-        // Swapped identities keep separate formal and actual facts: the formal fact `m = 2` fixes the actual `n` that
-        // enters it, while the actual `m` entering the formal `n` stays symbolic. Reordering the members changes
-        // nothing.
+        // Swapped variables keep separate declared and actual facts: declared `m = 2` fixes the supplied `n` matched
+        // with it, while the supplied `m` matched with declared `n` stays symbolic, regardless of member order.
         let declared = [dimension(&n), dimension(&m), vector(m.clone().into())];
         let actual = [dimension(&m), dimension(&n), vector(Dimension::Static(2))];
         for permutation in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
@@ -937,8 +938,8 @@ mod tests {
             assert_eq!(refinements.refine_declared(&vector(m.clone().into()), &[]), Ok(vector(Dimension::Static(2))));
         }
 
-        // A repeated actual identity propagates a formal fact to the actual identity and from it to every other formal
-        // identity that it enters, regardless of member order.
+        // A repeated supplied variable propagates a declared fact to every declared variable matched with it,
+        // regardless of member order.
         let declared = [dimension(&n), dimension(&p), vector(n.clone().into())];
         let actual = [dimension(&m), dimension(&m), vector(Dimension::Static(2))];
         for permutation in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
@@ -964,7 +965,7 @@ mod tests {
         assert_eq!(refinements.refine_actual(&dimension(&k), &[]), Ok(exact(2)));
         assert_eq!(refinements.refine_declared(&vector(p.clone().into()), &[]), Ok(vector(Dimension::Static(2))));
 
-        // A static formal extent proves the extent of an actual identity with singleton bounds, and an identity with
+        // A static declared extent proves the extent of an actual identity with singleton bounds, and an identity with
         // singleton bounds that appears on both sides is exact in both scopes.
         let singleton = DimensionVariable::new("singleton", DimensionBounds::new(2, Some(3)).unwrap());
         let refinements = from_local_declarations(&[vector(Dimension::Static(2))], &[vector(singleton.clone().into())]);
@@ -1003,13 +1004,13 @@ mod tests {
             })),
         );
 
-        // A repeated formal identity entered by distinct symbolic actual identities is admitted without a fact,
-        // since their equality stays a runtime entry check.
+        // A repeated declared identity entered by distinct symbolic actual identities is admitted without a fact,
+        // since their equality still requires a runtime input check.
         let refinements = from_local_declarations(&[dimension(&n), dimension(&n)], &[dimension(&m), dimension(&k)]);
         assert_eq!(refinements.refine_actual(&dimension(&m), &[]), Ok(dimension(&m)));
         assert_eq!(refinements.refine_declared(&dimension(&n), &[]), Ok(dimension(&n)));
 
-        // Nominal admission rejects a differently named array axis. Establishment records the local relationship,
+        // Nominal admission rejects a distinct array-axis variable. Local declarations record the relationship,
         // whose supplied representation can prove it without any runtime check.
         assert!(ArrayIrTypeRefinements::new(&[vector(n.clone().into())], &[vector(m.clone().into())]).is_err());
         let renamed =
@@ -1051,7 +1052,7 @@ mod tests {
         let actual = [dimension(&second), dimension(&first), vector(Dimension::Static(2))];
         let refinements = ArrayIrTypeRefinements::from_local_declarations(&declared, &actual).unwrap();
 
-        // Swapping the same identity objects does not connect their separate formal and actual nodes.
+        // Swapping the same identity objects does not connect their separate declared and actual nodes.
         assert_eq!(
             refinements.identity_classes().collect::<Vec<_>>(),
             vec![
@@ -1078,7 +1079,7 @@ mod tests {
         )
         .unwrap();
 
-        // Validation checks outputs only against formal facts, including those implied through actual identities,
+        // Validation checks outputs only against declared facts, including those implied through actual identities,
         // and an actual-only fact cannot justify an output identity that is foreign to the boundary.
         let closed = [n.clone(), p.clone()];
         assert_eq!(
@@ -1100,7 +1101,7 @@ mod tests {
             ))),
         );
 
-        // Identities that must stay symbolic (e.g., changing carries) keep their identity despite formal facts.
+        // Identities that must stay symbolic (e.g., changing carries) keep their identity despite declared facts.
         assert_eq!(
             refinements.refine_declared(&vector(p.clone().into()), std::slice::from_ref(&p)),
             Ok(vector(p.into())),
@@ -1176,12 +1177,12 @@ mod tests {
             Ok(matrix(vec![Dimension::Static(2), Dimension::Static(3)])),
         );
 
-        // An actual identity that the invocation never related to a formal fact keeps its identity and bounds.
+        // An actual identity that the invocation never related to a declared fact keeps its identity and bounds.
         let unrelated =
             ArrayIrType::Dimension(DimensionType::new("unrelated", DimensionBounds::new(3, Some(4)).unwrap()));
         assert_eq!(refinements.refine_actual(&unrelated, &[]), Ok(unrelated));
 
-        // With no exact formal fact, the actual dimension keeps its independent identity and narrower bounds.
+        // With no exact declared fact, the actual dimension keeps its independent identity and narrower bounds.
         let symbolic = ArrayIrTypeRefinements::from_local_declarations([&declared], [&actual]).unwrap();
         assert_eq!(symbolic.refine_actual(&actual, &[]), Ok(actual));
     }

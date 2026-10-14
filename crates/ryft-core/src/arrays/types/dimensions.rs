@@ -72,7 +72,7 @@ pub enum DimensionError {
         /// Diagnostic name of the shared dynamic dimension variable.
         dimension: String,
 
-        /// Extent established by an earlier occurrence.
+        /// Extent recorded for an earlier occurrence.
         expected: usize,
 
         /// Conflicting extent observed at this occurrence.
@@ -307,10 +307,10 @@ impl TypeIdentity for DimensionVariable {
 /// bounds. Concrete extents observed at execution boundaries are deliberately *not* part of such a type (i.e.,
 /// structural type equality, hashing, display, and retained-compilation cache identity must not distinguish two calls
 /// whose dynamic extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead
-/// live in the complete-signature [`TypeRefinements`] environment established from boundary inputs, where a static
-/// dimension type that meets a symbolic one binds its variable to the static extent. A variable defined by an
-/// instruction inside a program needs no input-boundary refinement (its producing instruction closes the identity
-/// structurally and establishes its concrete value when the program executes).
+/// live in the complete-signature [`TypeRefinements`] instance constructed from input types, where a static dimension
+/// type that meets a symbolic one binds its variable to the static extent. A variable defined by an instruction inside
+/// a program needs no input-boundary refinement (its producing instruction closes the identity structurally and
+/// computes its concrete value when the program executes).
 ///
 /// # Motivation
 ///
@@ -492,11 +492,7 @@ impl Type for DimensionType {
     {
         DimensionRefinements::derive_identity_renaming(type_signature_pairs(declared, actual)?.flat_map(
             |(declared, actual)| {
-                DimensionTypeRefinements::dimension_refinement_facts(
-                    declared,
-                    actual,
-                    DimensionComparison::IdentityRenaming,
-                )
+                DimensionTypeRefinements::refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
             },
         ))
     }
@@ -667,12 +663,12 @@ impl From<&DimensionVariable> for Dimension {
     }
 }
 
-/// [`TypeRefinements`] established for a complete [`DimensionType`] signature. They follow the rules of
-/// first-class dimension members in the composite array universe: each actual dimension must have bounds within its
-/// declared bounds, a differently named actual identity is linked to the declared one, and each connected class shares
-/// its exact fact, so that a repeated declared identity rejects actual inputs of different extents (e.g.,
-/// `[dimension<n>, dimension<n>]` supplied with extents `2` and `3`). The declared and actual facts stay
-/// in separate scopes, as documented on [`DimensionRefinements`].
+/// [`TypeRefinements`] for a complete [`DimensionType`] signature. They follow the rules of first-class dimension
+/// members in the composite array universe: each actual dimension must have bounds within its declared bounds, a
+/// differently named actual identity is linked to the declared one, and each connected class shares its exact fact, so
+/// that a repeated declared identity rejects actual inputs of different extents (e.g., `[dimension<n>, dimension<n>]`
+/// supplied with extents `2` and `3`). The declared and actual facts stay in separate scopes, as documented on
+/// [`DimensionRefinements`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DimensionTypeRefinements {
     /// Underlying [`DimensionRefinements`].
@@ -683,7 +679,7 @@ impl DimensionTypeRefinements {
     /// Returns the [`DimensionRefinementFact`]s relating the provided [`DimensionType`]s after validating their
     /// bounds. `comparison` selects conditional refinement facts or structural substitutions, as documented on
     /// [`DimensionComparison`].
-    pub(crate) fn dimension_refinement_facts<'t>(
+    pub(crate) fn refinement_facts<'t>(
         declared: &'t DimensionType,
         actual: &'t DimensionType,
         comparison: DimensionComparison,
@@ -694,11 +690,7 @@ impl DimensionTypeRefinements {
                 // A static declared dimension has no identity to substitute. Bounds validation above still permits
                 // a singleton actual identity, unlike structural substitution of a static array axis.
                 (comparison != DimensionComparison::IdentityRenaming || declared.variable().is_some()).then(|| {
-                    DimensionRefinements::dimension_refinement_facts(
-                        declared.dimension(),
-                        actual.dimension(),
-                        comparison,
-                    )
+                    DimensionRefinements::refinement_facts(declared.dimension(), actual.dimension(), comparison)
                 }),
             )
         } else {
@@ -725,9 +717,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
         let actual = actual.into_iter().collect::<Vec<_>>();
         let dimensions = DimensionRefinements::from_refinement_facts(
             type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?.flat_map(
-                |(declared, actual)| {
-                    Self::dimension_refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
-                },
+                |(declared, actual)| Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations),
             ),
         )?;
         let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
@@ -763,7 +753,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
         // Validation is "declared-only". It checks outputs against the declared facts and never records actual facts.
         let mut refinements = self.dimensions.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::dimension_refinement_facts(declared, actual, DimensionComparison::LocalDeclarations).try_for_each(
+            Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations).try_for_each(
                 |refinement_fact| match refinement_fact? {
                     DimensionRefinementFact::Declared(variable, extent) => {
                         refinements.validate_declared_extent(variable, extent, closed_identities)
@@ -827,7 +817,7 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
 /// must still be checked at runtime.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DimensionRefinements {
-    /// Scoped identity classes, in recording order, with each class's exact extent when established.
+    /// Scoped identity classes, in recording order, with each class's exact extent when known.
     classes: Vec<DimensionIdentityClass>,
 
     /// Declared input identities whose relationships the supplied types do not prove.
@@ -1185,12 +1175,12 @@ impl DimensionRefinements {
     /// [`DimensionComparison`] determines whether distinct identities with unknown extents are accepted and whether
     /// identical dimensions contribute facts. Structural comparisons preserve substitutions rather than infer
     /// conditional exact extents from actual identities.
-    pub(crate) fn dimension_refinement_facts<'o>(
+    pub(crate) fn refinement_facts<'o>(
         declared: &'o Dimension,
         actual: &'o Dimension,
         comparison: DimensionComparison,
     ) -> impl Iterator<Item = Result<DimensionRefinementFact<'o>, TypeError>> {
-        // One pair can establish at most three facts: declared extent, actual extent, and their correspondence.
+        // One pair can produce at most three facts: declared extent, actual extent, and their correspondence.
         let mut facts = [None, None, None];
         if comparison == DimensionComparison::Refinement && declared == actual {
             return facts.into_iter().flatten();
@@ -1403,7 +1393,7 @@ pub(crate) enum DimensionRefinementFact<'o> {
 ///
 ///   - [`Self::Refinement`] rejects the first pair. `m` has an unknown extent and is a different variable from `n`.
 ///   - [`Self::LocalDeclarations`] relates declared `n` to supplied `m` and records `n = 2` from the second pair.
-///     Together these facts require both variables to have extent `2`. A runtime input check must establish that
+///     Together these facts require both variables to have extent `2`. A runtime input check must verify that
 ///     the supplied array represented by `m` has that extent before execution relies on these facts.
 ///   - [`Self::IdentityRenaming`] records `n -> m` from the first pair and `n = 2` from the second. The complete
 ///     renaming fails validation because `m`'s bounds do not fix its extent to `2`: substitution alone cannot
@@ -1541,7 +1531,7 @@ impl Shape {
     /// element counts, whereas `[n, 4]` and `[m, 4]` are not proven equal for independent variables `n` and `m`.
     ///
     /// A static zero makes a shape's product zero without multiplying its remaining extents. A scalar has product
-    /// one. Dynamic dimension bounds and relationships between distinct variables are not used to establish equality.
+    /// one. Dynamic dimension bounds and relationships between distinct variables are not used to prove equality.
     /// `Ok(false)` means equality was not proven, not necessarily that the runtime element counts differ. Returns a
     /// [`TypeError`] if either shape's static coefficient overflows [`usize`].
     ///
