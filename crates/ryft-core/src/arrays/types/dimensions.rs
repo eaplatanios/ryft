@@ -1388,6 +1388,30 @@ pub(crate) enum DimensionRefinementFact<'o> {
 /// differ for unknown extents and identical dimensions, as described below. These facts depend on any required runtime
 /// input checks succeeding. [`Self::IdentityRenaming`] instead records structural substitutions without assuming
 /// relationships that would require additional runtime checks. All modes inspect types only.
+///
+/// # Example
+///
+/// Let `n` and `m` be distinct dimension variables, each with bounds admitting extents `0` through `7`.
+/// Compare these complete array input signatures:
+///
+/// ```text
+/// Declared: [f32[n], f32[n]]
+/// Supplied: [f32[m], f32[2]]
+/// ```
+///
+/// Each [`DimensionComparison`] variant handles this differently:
+///
+///   - [`Self::Refinement`] rejects the first pair. `m` has an unknown extent and is a different variable from `n`.
+///   - [`Self::LocalDeclarations`] relates declared `n` to supplied `m` and records `n = 2` from the second pair.
+///     Together these facts require both variables to have extent `2`. A runtime input check must establish that
+///     the supplied array represented by `m` has that extent before execution relies on these facts.
+///   - [`Self::IdentityRenaming`] records `n -> m` from the first pair and `n = 2` from the second. The complete
+///     renaming fails validation because `m`'s bounds do not fix its extent to `2`: substitution alone cannot
+///     preserve the requirement that the two inputs have equal extents.
+///
+/// If `m` instead has bounds fixing its extent to `2`, all three modes accept the signature. The first two derive
+/// exact extent facts while [`Self::IdentityRenaming`] keeps `m` as the substitution target and validates its agreement
+/// with the second pair's extent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DimensionComparison {
     /// Applies ordinary array-axis refinement rules. Identical dimensions are accepted and contribute no facts.
