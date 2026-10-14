@@ -1048,8 +1048,9 @@ impl DimensionRefinements {
         }
     }
 
-    /// Returns a declared dimension with its class's exact extent applied, unless its identity is listed in
-    /// `preserved_identities` (e.g., identities defined by outputs).
+    /// Applies declared-scope extent facts to one dimension, preserving identities in `preserved_identities`.
+    /// Type-specific implementations use this to implement [`TypeRefinements::refine_declared`] for each dimension.
+    /// See that function for the shared contract and the [trait documentation](TypeRefinements#examples) for examples.
     pub(crate) fn refine_declared_dimension(
         &self,
         dimension: &Dimension,
@@ -1064,7 +1065,9 @@ impl DimensionRefinements {
         }
     }
 
-    /// Returns an actual dimension with its class's exact fact applied, unless its identity must remain symbolic.
+    /// Applies actual-scope extent facts to one supplied dimension, preserving identities in `preserved_identities`.
+    /// Type-specific implementations use this to implement [`TypeRefinements::refine_actual`] for each dimension.
+    /// See that function for the shared contract and the [trait documentation](TypeRefinements#examples) for examples.
     pub(crate) fn refine_actual_dimension(
         &self,
         dimension: &Dimension,
@@ -1079,9 +1082,11 @@ impl DimensionRefinements {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the supplied dimension under a retained member of its declared class, or its exact refinement.
+    /// Selects a representation for `actual` using the identity class identified by `declared`, preferring compatible
+    /// identities in `preferred_identities` and otherwise applying actual-scope extent facts. Performs no runtime check
+    /// or conversion. Type-specific implementations use this to implement [`TypeRefinements::retype_actual`] for each
+    /// dimension. See that function for the full selection rules and the
+    /// [trait documentation](TypeRefinements#examples) for examples.
     pub(crate) fn retype_actual_dimension(
         &self,
         declared: &Dimension,
@@ -1126,8 +1131,8 @@ impl DimensionRefinements {
         }
 
         // A wider retained name cannot describe this declared component, even when runtime input checks prove its
-        // extent.
-        // Apply that exact fact instead of preserving the incompatible name through the preserved identity list.
+        // extent. Apply that exact fact instead of preserving the incompatible name through the preserved identity
+        // list.
         let preserves_actual = actual.variable().is_some_and(|variable| {
             preferred_identities.contains(variable) && declared.bounds().contains_bounds(variable.bounds())
         });
@@ -1136,7 +1141,7 @@ impl DimensionRefinements {
 
     /// Derives a structural renaming from facts produced with [`DimensionComparison::IdentityRenaming`].
     /// Validates repeated substitutions and extents as they are consumed, then verifies their agreement across the
-    /// complete signature. Refer to [`Type::derive_identity_renaming`] for the structural contract and examples.
+    /// complete signature. Refer to [`Type::derive_identity_renaming`] for the structural contract and for examples.
     pub(crate) fn derive_identity_renaming<'o>(
         facts: impl IntoIterator<Item = Result<DimensionRefinementFact<'o>, TypeError>>,
     ) -> Result<TypeIdentityRenaming<DimensionVariable>, TypeError> {
@@ -1176,6 +1181,8 @@ impl DimensionRefinements {
         Ok(renaming)
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Returns the refinement facts for one declared and one actual dimension, or their comparison error.
     /// [`DimensionComparison`] determines whether distinct identities with unknown extents are accepted and whether
     /// identical dimensions contribute facts. Structural comparisons preserve substitutions rather than infer
@@ -1191,14 +1198,14 @@ impl DimensionRefinements {
             return facts.into_iter().flatten();
         }
 
-        let mismatch = || {
-            let message = if comparison == DimensionComparison::IdentityRenaming {
+        let mismatch_error = || {
+            TypeError::invalid(if comparison == DimensionComparison::IdentityRenaming {
                 format!("dimension {actual} does not instantiate declared dimension {declared}")
             } else {
                 format!("dimension {actual} does not refine declared dimension {declared}")
-            };
-            TypeError::invalid(message)
+            })
         };
+
         // Structural substitutions retain the actual identity even when its extent is exact. They do not infer
         // conditional extent facts from that identity or accept a dynamic identity in place of a static array axis.
         if comparison == DimensionComparison::IdentityRenaming {
@@ -1212,19 +1219,21 @@ impl DimensionRefinements {
                 (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
                     Some(Ok(DimensionRefinementFact::Declared(declared, *actual)))
                 }
-                _ => Some(Err(mismatch())),
+                _ => Some(Err(mismatch_error())),
             };
             return facts.into_iter().flatten();
         }
+
         // Singleton identities supply the same exact extent as static dimensions while retaining their names.
         let (exact_actual, actual_variable) = match actual {
             Dimension::Static(extent) => (Some(*extent), None),
             Dimension::Dynamic(variable) => (variable.bounds().extent(), Some(variable)),
         };
+
         match (declared, exact_actual, actual_variable) {
             (Dimension::Static(declared_extent), exact_actual, actual_variable) => {
                 if exact_actual != Some(*declared_extent) {
-                    facts[0] = Some(Err(mismatch()));
+                    facts[0] = Some(Err(mismatch_error()));
                 } else if let Some(actual_variable) = actual_variable {
                     facts[0] = Some(Ok(DimensionRefinementFact::Actual(actual_variable, *declared_extent)));
                 }
@@ -1252,13 +1261,13 @@ impl DimensionRefinements {
                         && (comparison == DimensionComparison::Refinement
                             || !declared_variable.bounds().contains_bounds(actual_variable.bounds()))
                     {
-                        Err(mismatch())
+                        Err(mismatch_error())
                     } else {
                         Ok(DimensionRefinementFact::Correspondence(declared_variable, actual_variable))
                     },
                 );
             }
-            (Dimension::Dynamic(_), None, None) => facts[0] = Some(Err(mismatch())),
+            (Dimension::Dynamic(_), None, None) => facts[0] = Some(Err(mismatch_error())),
         }
 
         facts.into_iter().flatten()
