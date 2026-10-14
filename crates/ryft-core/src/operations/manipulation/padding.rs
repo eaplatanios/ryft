@@ -7,9 +7,9 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType,
-    ArrayTypeRefinements, AsArrayType, AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType,
-    DimensionValue, LinearResiduals, RaggedAxis, Shape, materialize_array_tangent,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType,
+    AsDimensionType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
+    RaggedAxis, Shape, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1387,7 +1387,7 @@ impl_differentiable_operation! {
                 })
             }) || output_extents.iter().any(|extent| {
                 <&DimensionType>::try_from(extent.r#type().as_ref())
-                    .is_ok_and(|r#type| matches!(r#type.to_dimension(), Dimension::Dynamic(_)))
+                    .is_ok_and(|r#type| matches!(r#type.simplified_dimension(), Dimension::Dynamic(_)))
             }) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
@@ -1773,7 +1773,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
         let padding_type = padding_type.as_array_type()?;
         let no_padding = vec![0; input_type.rank()];
         validate_pad_inputs(input_type, padding_type, &no_padding, &no_padding, &vec![0; input_type.rank()])?;
-        let extent_dimension = extent.r#type().as_dimension_type()?.to_dimension();
+        let extent_dimension = extent.r#type().as_dimension_type()?.simplified_dimension();
         let axis = axis.into().normalize(input_type.rank())?;
         let mut output_shape = input_type.shape().dimensions().to_vec();
         output_shape[axis] = extent_dimension;
@@ -1875,13 +1875,8 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIr
             interior_padding,
         )?;
         check_count!("input", output_dimensions, input.r#type().rank(), ProgramError);
-
-        // Binding every explicit extent to its dimension identity rejects repeated identities that denote different
-        // runtime sizes.
-        let mut refinements = ArrayTypeRefinements::default();
         for (axis, dimension) in output_dimensions.iter().enumerate() {
             let dimension = <Self as ValueProjection<DimensionType>>::projected(dimension)?;
-            refinements.bind(dimension.r#type().variable(), dimension.extent())?;
             let actual_extent = static_padded_extent(
                 input.dimension_size(axis)?,
                 edge_padding_low[axis],

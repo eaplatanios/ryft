@@ -1164,7 +1164,7 @@ impl CustomCallOperation {
     /// Returns the number of array inputs of a mixed invocation with `input_types`, the refinements that its trailing
     /// first-class output-extent inputs establish, and this call's declared output types refined by them. Each trailing
     /// extent either defines the identity of its declared output axis or has an exact type that refines that axis to
-    /// its extent (refer to `DimensionRefinements::bind_dimension_input`).
+    /// its extent (refer to `DimensionRefinements::record_input_refinement`).
     fn refine_declared_output_types(
         &self,
         input_types: &[ArrayIrType],
@@ -1186,7 +1186,7 @@ impl CustomCallOperation {
         let mut refinements = DimensionRefinements::default();
         for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
             let input_type = <&DimensionType>::try_from(input_type)?;
-            if !refinements.bind_dimension_input(expected_variable, input_type)? {
+            if !refinements.record_input_refinement(expected_variable, input_type)? {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input defines dimension variable \
                      `{}`, but the corresponding declared output axis refers to `{expected_variable}`",

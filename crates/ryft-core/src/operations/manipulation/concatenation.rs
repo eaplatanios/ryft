@@ -187,7 +187,7 @@ impl ConcatenateOperation<ArrayIrType> {
         let rank = inputs[0].rank();
         let axis = Self::normalize_axis(axis, rank)?;
         let static_sum = validate_concatenation_inputs(&inputs, axis)?;
-        let result_dimension = result_extent.to_dimension();
+        let result_dimension = result_extent.simplified_dimension();
         if let Some(static_sum) = static_sum
             && result_dimension != Dimension::Static(static_sum)
         {
@@ -213,8 +213,8 @@ impl ConcatenateOperation<ArrayIrType> {
         };
 
         // A singleton with the same dimension identity already proves the extent equality, even when it is dynamic.
-        let requires_runtime_assertion =
-            static_sum.is_none() && !(inputs.len() == 1 && first.dimension(axis) == result_extent.to_dimension());
+        let requires_runtime_assertion = static_sum.is_none()
+            && !(inputs.len() == 1 && first.dimension(axis) == result_extent.simplified_dimension());
         Ok((axis, output_type, requires_runtime_assertion))
     }
 }

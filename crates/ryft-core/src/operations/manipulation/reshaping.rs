@@ -6,8 +6,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, AsArrayType,
-    Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, AsArrayType, Dimension, DimensionType,
+    DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -1295,17 +1295,11 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for Array
         // Concrete composite values resolve every explicit extent input to its runtime value, so the mixed reshape
         // executes as the ordinary member reshape of the fully resolved output shape.
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let mut refinements = ArrayTypeRefinements::default();
         let output_shape = Shape::new(
             output_dimensions
                 .iter()
                 .map(<Self as ValueProjection<DimensionType>>::projected)
-                .map(|result| {
-                    // Repeated identities describe one extent, even when separate eager values supply them.
-                    let dimension = result?;
-                    refinements.bind(dimension.r#type().variable(), dimension.extent())?;
-                    Ok(Dimension::Static(dimension.extent()))
-                })
+                .map(|result| Ok(Dimension::Static(result?.extent())))
                 .collect::<Result<Vec<_>, ProgramError>>()?,
         );
         Ok(Self::Array(input.reshape_with_output_sharding(output_shape, output_sharding)?))
@@ -1697,9 +1691,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
-        DimensionOperation, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
+        DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, RaggedAxis, Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
@@ -4713,7 +4707,7 @@ mod tests {
         let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(33)).unwrap());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar], None)
+            .add_instruction(DimensionFromScalarOperation::new(total.into()), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
@@ -5414,8 +5408,8 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_dynamic_reshape() {
-        // A concrete composite value resolves every extent input to its runtime value, binding repeated nominal
-        // identities to one extent, and reshapes its array member with the resolved parameters.
+        // A concrete composite value resolves every extent input to its runtime value and reshapes its array member
+        // with the resolved parameters.
         let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap());
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
@@ -5437,18 +5431,13 @@ mod tests {
             )),
         );
 
-        // Repeated nominal dimensions must resolve to one size even when different sizes have a valid product.
+        // Eager dimension values are typed exactly, so values created from one symbolic type are independent extents
+        // rather than occurrences of one shared identity.
         let dimensions = [
             ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 2).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
         ];
-        assert_eq!(
-            input.dynamic_reshape(&dimensions),
-            Err(ProgramError::Type(
-                DimensionError::InputDimensionMismatch { dimension: "extent".to_owned(), expected: 2, actual: 3 }
-                    .into(),
-            )),
-        );
+        assert_eq!(input.dynamic_reshape(&dimensions), Ok(input.clone()));
 
         // Both the reshaped value and every extent must be the corresponding composite member.
         assert_eq!(

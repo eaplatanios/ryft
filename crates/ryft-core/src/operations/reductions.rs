@@ -838,8 +838,9 @@ impl_differentiable_operation! {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // `Sum` transposes by broadcasting the cotangent over the reduced axes. `Mean` also divides by the reduced
             // element count. Every other kind is non-linear and is instead differentiated through the linear operations
-            // staged by its JVP, so it is rejected here regardless of its cotangent. A runtime-sized reduced axis
-            // requires linearization to retain its extent as a first-class residual.
+            // staged by its JVP, so it is rejected here regardless of its cotangent. A runtime-sized reduced axis needs
+            // its extent as a first-class dimension residual, which only linearizing an array IR program retains (the
+            // homogeneous array universe has no dimension values).
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -867,8 +868,9 @@ impl_differentiable_operation! {
             {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "direct transposition of `{}` with kind `{}` over reduced axis {} of {} requires \
-                         linearization so that the runtime extent can be retained as a residual",
+                        "direct transposition of `{}` with kind `{}` over reduced axis {} of {} needs the runtime \
+                         extent of that axis, which only linearizing an array IR program (`ArrayIrType`) retains as a \
+                         dimension residual",
                         operation.name(),
                         operation.kind(),
                         axis,
@@ -3438,8 +3440,9 @@ mod tests {
                 ),
                 Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                     if message == format!(
-                        "direct transposition of `reduce` with kind `{kind}` over reduced axis 0 of [batch, 2] \
-                         requires linearization so that the runtime extent can be retained as a residual",
+                        "direct transposition of `reduce` with kind `{kind}` over reduced axis 0 of [batch, 2] needs \
+                         the runtime extent of that axis, which only linearizing an array IR program (`ArrayIrType`) \
+                         retains as a dimension residual",
                     ),
             ));
         }

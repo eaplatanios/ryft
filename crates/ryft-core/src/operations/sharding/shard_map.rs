@@ -3517,7 +3517,7 @@ where
                         .map_err(TypeError::from)?;
                     value = reshape_array(builder, value, &scalar_type)?;
                 }
-                let operation = DimensionFromScalarOperation::new(target.variable().clone());
+                let operation = DimensionFromScalarOperation::new(target.clone());
                 bind(builder, operation.into(), value)
             }
             _ => reshape_array(builder, value, <&ArrayType>::try_from(target)?),
@@ -5404,7 +5404,7 @@ mod tests {
             )
             .unwrap()[0];
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![count], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![count], None)
             .unwrap()[0];
         let broadcast = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![known_input, dimension], None)
@@ -10206,7 +10206,7 @@ mod tests {
             )
             .unwrap()[0];
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![count], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![count], None)
             .unwrap()[0];
         let broadcast = builder
             .add_instruction(
@@ -10332,13 +10332,15 @@ mod tests {
         // residual, whose dimension identity is defined inside the known half and therefore cannot cross the static
         // boundary.
         let program = dynamic_residual_shard_map_program();
-        let array_type = f32_scalar_type();
+        // The wrapper program declares the map's global placement contracts. Seed its actual entry types, as generic
+        // program replay rejects an unsharded value at a manually sharded entry even though the primitive can adopt it.
+        let input_types = program.input_types();
         let outer = TestContext::new();
-        let known = outer.input(ArrayIrType::Array(array_type.clone()));
+        let known = outer.input(input_types[0].clone());
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
-                &[PartialValue::Known(known), PartialValue::Unknown(ArrayIrType::Array(array_type))],
+                &[PartialValue::Known(known), PartialValue::Unknown(input_types[1].clone())],
             )
             .unwrap();
 
@@ -10351,7 +10353,7 @@ mod tests {
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
-                lambda %0:f32[], %1:f32[] .
+                lambda %0:f32[][sharding={mesh<['x'=2:manual]>, []}], %1:f32[][sharding={mesh<['x'=2:manual]>, []}] .
                 let %2:f32[][sharding={mesh<['x'=2:manual]>, []}] = shard_map [
                     mesh=['x'=2:manual],
                     in_shardings=[{mesh<['x'=2:manual]>, []}, {mesh<['x'=2:manual]>, []}],
@@ -13571,7 +13573,7 @@ mod tests {
             let x = builder.add_input(local_type);
             let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
             let count = builder.add_instruction(convert, Vec::new(), vec![a], None).unwrap()[0];
-            let dimension = DimensionFromScalarOperation::new(extent);
+            let dimension = DimensionFromScalarOperation::new(extent.into());
             let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
             let zero = ArrayOperation::ZeroLike(ZeroLikeOperation::new());
             let zero = builder.add_instruction(zero, Vec::new(), vec![a], None).unwrap()[0];

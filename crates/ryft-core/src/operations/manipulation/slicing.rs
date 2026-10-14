@@ -6,9 +6,9 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
-    ArrayTypeRefinements, AsArrayType, DataType, Dimension, DimensionType, DimensionValue, LinearResiduals,
-    MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape,
+    ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, AsArrayType,
+    DataType, Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding,
+    ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -2268,7 +2268,8 @@ impl<
         }
 
         let batch_axis = input.batch_axis_position().unwrap();
-        let axis_dimension = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.to_dimension();
+        let axis_dimension =
+            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.simplified_dimension();
         let input_dimension = <&ArrayType>::try_from(input.value().r#type().as_ref())?.dimension(batch_axis);
         if input_dimension != axis_dimension {
             return Err(BatchingError::MisalignedBatchAxes {
@@ -3081,19 +3082,12 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
             .with_bounds(policy);
         let strides = operation.strides();
 
-        // Binding every start and size to its dimension identity rejects repeated identities that denote different
-        // runtime extents; the bindings are the validation.
-        let mut refinements = ArrayTypeRefinements::default();
         let bounds = start_indices
             .iter()
             .chain(sizes)
             .cloned()
             .map(ValueProjection::<DimensionType>::into_projected)
-            .map(|result| {
-                let value = result?;
-                refinements.bind(value.r#type().variable(), value.extent())?;
-                Ok::<_, TypeError>(value.extent())
-            })
+            .map(|result| Ok::<_, TypeError>(result?.extent()))
             .collect::<Result<Vec<_>, _>>()?;
 
         let (starts, sizes) = bounds.split_at(rank);
@@ -4403,9 +4397,9 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceDischarge, DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu, i4,
+        ArrayReferenceDischarge, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        DynamicArrayExtentBatchingPolicy, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
+        ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
     use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, batch};
@@ -8143,7 +8137,8 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 5, actual: 1 }),
         );
 
-        // Repeated dimension identities must agree even when calling the eager capability without a program boundary.
+        // Eager dimension values are typed exactly, so values created from one symbolic type are independent extents
+        // rather than occurrences of one shared identity.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
         let start = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 1).unwrap());
         let size = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 2).unwrap());
@@ -8153,10 +8148,7 @@ mod tests {
                 &[size],
                 &[1],
             ),
-            Err(ProgramError::Type(
-                DimensionError::InputDimensionMismatch { dimension: "extent".to_string(), expected: 1, actual: 2 }
-                    .into(),
-            )),
+            Ok(ArrayIrValue::Array(Array::vector(vec![2_i32, 3]).unwrap())),
         );
     }
 
@@ -8186,7 +8178,12 @@ mod tests {
             .unwrap()[0];
         let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
         let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable.clone()), Vec::new(), vec![count], None)
+            .add_instruction(
+                DimensionFromScalarOperation::new(count_variable.clone().into()),
+                Vec::new(),
+                vec![count],
+                None,
+            )
             .unwrap()[0];
         let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder

@@ -39,8 +39,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
-    DimensionVariable, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, DataType, Dimension,
+    DimensionRefinements, DimensionType, DimensionValue, DimensionVariable, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -72,7 +72,7 @@ use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
@@ -328,24 +328,32 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        // The state is followed by one first-class extent input per dynamic output axis, and each extent
-        // must define the dimension variable that the corresponding declared output axis refers to.
+        // The state is followed by one first-class extent input per dynamic output axis. Each extent must define the
+        // dimension variable that the corresponding declared output axis refers to, or have an exact type that refines
+        // that axis to its extent (refer to `DimensionRefinements::record_input_refinement`).
         check_count!("region", region_interfaces, 0, TypeError);
         let dynamic_output_dimensions =
             self.output_type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
         check_count!("input", input_types, dynamic_output_dimensions.len() + 1, TypeError);
         let state_type = <&ArrayType>::try_from(&input_types[0])?;
         let bits_type = self.infer_bits_type(state_type)?;
+        let mut refinements = DimensionRefinements::default();
         for (input_type, expected_variable) in input_types[1..].iter().zip(dynamic_output_dimensions) {
-            let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
-            if actual_variable != expected_variable {
+            let input_type = <&DimensionType>::try_from(input_type)?;
+            if !refinements.record_input_refinement(expected_variable, input_type)? {
                 return Err(TypeError::invalid(format!(
-                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` output-extent input defines dimension variable \
-                     `{actual_variable}`, but the corresponding declared output axis refers to `{expected_variable}`",
+                    "`{}` output-extent input defines dimension variable `{}`, but the corresponding \
+                     declared output axis refers to `{}`",
+                    RNG_BIT_GENERATOR_OPERATION_NAME,
+                    input_type.dimension(),
+                    expected_variable,
                 )));
             }
         }
-        Ok(vec![state_type.clone().into(), bits_type.into()])
+        Ok(vec![
+            state_type.clone().into(),
+            ArrayTypeRefinements::from(refinements).refine_declared(&bits_type, &[])?.into(),
+        ])
     }
 
     #[inline]
@@ -510,7 +518,7 @@ where
 
         // A dynamic batch extent becomes the scan length, which the scan consumes as a trailing runtime input.
         let extent_type = context.axis_extent().r#type();
-        let length = <&DimensionType>::try_from(extent_type.as_ref())?.to_dimension();
+        let length = <&DimensionType>::try_from(extent_type.as_ref())?.simplified_dimension();
         let scan = ScanOperation::<C::Type>::new(output_dimensions.len(), length.clone());
         let mut scan_inputs = output_dimensions
             .iter()

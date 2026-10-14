@@ -1815,7 +1815,7 @@ mod tests {
             let value = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
             let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
             let count = builder.add_instruction(convert, Vec::new(), vec![inputs[1]], None).unwrap()[0];
-            let dimension = DimensionFromScalarOperation::new(length.clone());
+            let dimension = DimensionFromScalarOperation::new(length.clone().into());
             let dimension = builder.add_instruction(dimension, Vec::new(), vec![count], None).unwrap()[0];
             let broadcast = DynamicBroadcastOperation::new(Vec::new());
             let stack = builder.add_instruction(broadcast, Vec::new(), vec![value, dimension], None).unwrap()[0];
@@ -2049,7 +2049,7 @@ mod tests {
                 let convert =
                     ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
                 let extent = builder.add_instruction(convert, Vec::new(), vec![inputs[1]], None).unwrap()[0];
-                let dimension = DimensionFromScalarOperation::new(length);
+                let dimension = DimensionFromScalarOperation::new(length.into());
                 let dimension = builder.add_instruction(dimension, Vec::new(), vec![extent], None).unwrap()[0];
                 let scatter = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled())
                     .with_mesh(mesh.clone());

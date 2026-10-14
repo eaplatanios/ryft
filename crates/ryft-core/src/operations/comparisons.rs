@@ -92,8 +92,7 @@ impl ComparisonDirection {
 
         // Resolved extents take precedence over symbolic identity, including inconsistent concrete inputs supplied
         // directly to partial evaluation rather than through a program's dimension binding validation.
-        let identical =
-            left.variable() == right.variable() && !matches!(exact, [Some(left), Some(right)] if left != right);
+        let identical = left.has_equal_extents(right) && !matches!(exact, [Some(left), Some(right)] if left != right);
         let equal = if identical
             || (left_minimum == left_maximum && right_minimum == right_maximum && left_minimum == right_minimum)
         {
