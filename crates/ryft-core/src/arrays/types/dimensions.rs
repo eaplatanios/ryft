@@ -1342,37 +1342,41 @@ impl DimensionRefinements {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// One connected class of scoped dimension identities and its invocation-local exact fact.
+/// A group of [`DimensionVariable`] identities that must share the same runtime extent. The `declared` and `actual`
+/// lists distinguish the two roles even when the same identity appears on both sides. `extent` stores their shared
+/// extent when known. These relationships apply to one invocation, after any required runtime input checks succeed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DimensionIdentityClass {
-    /// Declared identities, in recording order.
+    /// Declared [`DimensionVariable`] identities, in recording order.
     declared: Vec<DimensionVariable>,
 
-    /// Supplied identities, in recording order.
+    /// Supplied [`DimensionVariable`] identities, in recording order.
     actual: Vec<DimensionVariable>,
 
-    /// Exact extent shared by this class, when known.
+    /// Exact extent shared by this [`DimensionIdentityClass`], when known.
     extent: Option<usize>,
 }
 
-// TODO(eaplatanios): Review this.
-/// A dimension fact derived by comparing declared and actual types for [`DimensionRefinements`].
+/// An exact extent or an equality between identities, derived by comparing declared and supplied dimensions.
+/// [`DimensionRefinements`] combines these facts into identity classes and their known extents. Declared and actual
+/// identities are treated separately, even when the same identity appears on both sides.
 ///
-/// These facts describe how dimensions relate when the supplied values satisfy the declared input signature.
-/// Any required runtime checks must succeed before relying on the facts. Deriving a refinement fact only inspects
-/// types; it neither reads runtime dimension values nor performs those checks.
+/// The facts apply when the supplied values satisfy the declared input requirements, after any required runtime
+/// checks succeed. Deriving them only inspects types; it does not read runtime values or perform those checks.
 ///
-/// For example, declared `dimension<n>` and actual `dimension<m>` with bounds fixing `m` to `2` produce
-/// `Declared(n, 2)`, `Actual(m, 2)`, and `Correspondence(n, m)`.
+/// For example, [`DimensionComparison::LocalDeclarations`] compares declared `dimension<n>` with supplied
+/// `dimension<m>` whose bounds fix its extent to `2`. If `n` admits `2`, this yields `Declared(n, 2)`, `Actual(m, 2)`,
+/// and `Correspondence(n, m)`, meaning that both identities have extent `2` and are related across their declared and
+/// actual roles.
 pub(crate) enum DimensionRefinementFact<'o> {
-    /// The declared identity has this exact extent in the invocation.
+    /// Records the given exact extent for an identity in the declared type.
     Declared(&'o DimensionVariable, usize),
 
-    /// The actual identity has this exact extent in the invocation.
+    /// Records the given exact extent for an identity in the supplied actual type.
     Actual(&'o DimensionVariable, usize),
 
-    /// The declared identity and the actual identity denote the same runtime extent in the invocation.
+    /// Relates the first, declared identity to the second, actual identity such that they must have equal runtime
+    /// extents. Their extents need not be known at tracing, staging, or compilation time.
     Correspondence(&'o DimensionVariable, &'o DimensionVariable),
 }
 
