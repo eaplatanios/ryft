@@ -10,7 +10,8 @@ use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
-    Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape,
+    Dimension, DimensionComparison, DimensionError, DimensionRefinementFact, DimensionRefinements, DimensionVariable,
+    Shape, StaticShape,
 };
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
@@ -18,10 +19,10 @@ use crate::axes::Axis;
 use crate::contexts::EagerContext;
 use crate::operations::collectives::PARALLEL_VARY_OPERATION_NAME;
 use crate::parameters::Parameter;
-use crate::programs::types::visit_type_signature_pairs;
+use crate::programs::types::{type_signature_pairs, visit_type_signature_pairs};
 use crate::programs::{
-    NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueDirectDispatch,
+    NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueDirectDispatch, type_identities_needing_runtime_checks,
 };
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
@@ -395,72 +396,6 @@ impl ArrayType {
         self.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank()))
     }
 
-    /// Checks that `actual` can instantiate `declared` and records what that instantiation implies for the declared
-    /// [`DimensionVariable`]s (variable renamings in `renaming` and static extent bindings in `refinements`) for
-    /// one declared/actual [`ArrayType`] pair.
-    ///
-    /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
-    /// an entire declared/actual signature like [`ArrayType`]'s own, and [`ArrayIrType`](crate::ArrayIrType)'s, which
-    /// encounters array types as individual elements of a mixed signature. It is a separate function so that those
-    /// callers can thread the same two accumulators through every pair of the signature, which is what makes a declared
-    /// [`DimensionVariable`] that appears in several signature positions get checked consistently rather than
-    /// pair-by-pair.
-    ///
-    /// The `actual` type must have the `declared` type's element [`DataType`] and [`Memory`] placement, refine its
-    /// optional [`Layout`] and [`Sharding`], and have the same rank. Each pair of corresponding dimensions then
-    /// contributes:
-    ///
-    ///   - nothing, when both extents are static and equal,
-    ///   - a `declared -> actual` variable renaming in `renaming`, when both dimensions are dynamic and the declared
-    ///     variable's bounds contain the actual variable's bounds, or
-    ///   - a static binding in `refinements`, when the declared dimension is dynamic and its bounds admit the actual
-    ///     static extent; a later member observing a different extent for the same variable is rejected.
-    ///
-    /// Every other combination (e.g., mismatched static extents, a static declared dimension instantiated by a dynamic
-    /// one, or actual bounds the declared variable's bounds do not contain) fails with a [`TypeError`]. A conflict
-    /// _between_ the two accumulators, where one signature position renames a variable that another position binds to
-    /// a static extent, is deliberately left to the signature-folding callers. A singleton target bound equal to the
-    /// static extent is consistent while wider or unequal target bounds conflict. The callers invoke
-    /// [`ArrayTypeRefinements::require_disjoint_from`] once after folding over the complete signature,
-    /// so that detection does not depend on the order in which the two conflicting observations arrive.
-    ///
-    /// # Example
-    ///
-    /// Given the dynamic dimension variables `n: [0, 8)` and `m: [0, 8)`, folding over the declared signature
-    /// `(f32[n, 2], f32[n])` behaves as follows for these actual signatures:
-    ///
-    ///   - `(f32[m, 2], f32[m])`: Records the renaming `n -> m` and accepts its consistent repetition.
-    ///   - `(f32[3, 2], f32[4])`: Fails because `n` is bound to static extent `3` and then observed as `4`.
-    ///   - `(f32[m, 2], f32[3])`: The extension itself succeeds, recording the renaming `n -> m` and the static binding
-    ///     `n = 3`. The caller's subsequent [`ArrayTypeRefinements::require_disjoint_from`] check then rejects the
-    ///     signature.
-    pub fn extend_identity_renaming(
-        declared: &Self,
-        actual: &Self,
-        renaming: &mut TypeIdentityRenaming<DimensionVariable>,
-        refinements: &mut ArrayTypeRefinements,
-    ) -> Result<(), TypeError> {
-        if !declared.non_shape_components_are_refined_by(actual) || declared.rank() != actual.rank() {
-            return Err(TypeError::invalid(format!("type {actual} cannot instantiate declared type {declared}")));
-        }
-        declared.shape().dimensions().iter().zip(actual.shape().dimensions()).try_for_each(
-            |(declared_dimension, actual_dimension)| match (declared_dimension, actual_dimension) {
-                (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => Ok(()),
-                (Dimension::Dynamic(declared), Dimension::Dynamic(actual))
-                    if declared.bounds().contains_bounds(actual.bounds()) =>
-                {
-                    DimensionVariable::extend_identity_renaming(declared, actual, renaming)
-                }
-                (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
-                    refinements.bind(declared, *actual)
-                }
-                _ => Err(TypeError::invalid(format!(
-                    "dimension {actual_dimension} does not instantiate declared dimension {declared_dimension}",
-                ))),
-            },
-        )
-    }
-
     /// Checks that the array inputs of an ordinary operation vary over the same manual mesh axes, which is the
     /// standard variation rule of an operation that computes a function of its inputs on every device independently.
     /// Such an operation's output varies over exactly those axes. Its capability aligns the inputs before binding
@@ -605,17 +540,22 @@ impl Type for ArrayType {
             .map(|variable| (TypeIdentityPosition::Reference, variable))
     }
 
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        let mut renaming = TypeIdentityRenaming::new();
-        let mut refinements = ArrayTypeRefinements::default();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::extend_identity_renaming(declared, actual, &mut renaming, &mut refinements)
-        })?;
-        refinements.require_disjoint_from(&renaming)?;
-        Ok(renaming)
+    fn derive_identity_renaming<
+        't,
+        D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+    >(
+        declared: D,
+        actual: A,
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+    where
+        Self: 't,
+    {
+        DimensionRefinements::derive_identity_renaming(type_signature_pairs(declared, actual)?.flat_map(
+            |(declared, actual)| {
+                ArrayTypeRefinements::array_refinement_facts(declared, actual, DimensionComparison::IdentityRenaming)
+            },
+        ))
     }
 
     #[inline]
@@ -722,77 +662,26 @@ impl From<ReferenceType<NoReferent>> for ArrayType {
     }
 }
 
-/// [`TypeRefinements`] established while refining one complete [`ArrayType`] signature.
+/// [`TypeRefinements`] for a complete [`ArrayType`] signature, backed by a [`DimensionRefinements`] instance. This
+/// adapter validates array metadata and shape pairs, then applies the resulting dimension facts to array axes. Refer
+/// to [`DimensionRefinements`] for the distinction between declared and actual identity scopes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayTypeRefinements {
-    /// Dynamic-[`DimensionVariable`]-to-extent bindings in first-observation order.
-    bindings: Vec<(DimensionVariable, usize)>,
+    /// [`DimensionRefinements`] shared by array axes and, in the composite universe, dimension and reference members.
+    pub(crate) dimensions: DimensionRefinements,
 }
 
+// TODO(eaplatanios): Review this.
 impl ArrayTypeRefinements {
-    /// Records one concrete extent for `variable`, rejecting a conflicting observation.
-    pub fn bind(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
-        match self.bindings.iter().find_map(|(candidate, expected)| (candidate == variable).then_some(*expected)) {
-            Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
-                dimension: variable.to_string(),
-                expected,
-                actual: extent,
-            }
-            .into()),
-            Some(_) => Ok(()),
-            None => {
-                self.bindings.push((variable.clone(), extent));
-                Ok(())
-            }
-        }
-    }
-
-    /// Validates one observed extent against an established input fact, or binds it when `variable` belongs to the
-    /// validated boundary's closed identity signature. This is the validation-phase counterpart of [`Self::bind`].
-    /// For a variable that already has a recorded extent, the two behave identically (i.e., a matching observation
-    /// is accepted and a differing one is rejected). They differ on a variable with no recorded fact. [`Self::bind`]
-    /// treats the refinement set as *open* and records the first observation as a new fact, which is correct while
-    /// establishing facts from a complete input signature (i.e., as [`TypeRefinements::establish`] and
-    /// [`ArrayType::extend_identity_renaming`] do, where every variable may legitimately appear for the first time).
-    /// [`Self::validate_or_bind`] instead admits an unrecorded variable only when it appears in `closed_identities`,
-    /// the boundary's complete closed identity set (i.e., an identity established by the formal input signature, whose
-    /// first concrete fact may only become observable at an output, such as a first-class dimension input whose type is
-    /// strictly identity plus bounds, or an identity defined by an instruction inside the program or region). In either
-    /// case it delegates to [`Self::bind`] so repeated observations across several outputs must still agree; this is
-    /// sound without inspecting runtime payloads because structural region closure already proves that every output
-    /// reference identity is consumed or defined. Every variable outside the closed set is rejected, because an extent
-    /// claimed for an identity foreign to the boundary cannot be justified. In short, use [`Self::bind`] where
-    /// observations *create* facts, and use this function where observations must be *justified* against the boundary's
-    /// identity set, as [`TypeRefinements::validate`] does when checking an output signature against the facts
-    /// established from its input boundary.
-    pub fn validate_or_bind(
-        &mut self,
-        variable: &DimensionVariable,
-        extent: usize,
-        closed_identities: &[DimensionVariable],
-    ) -> Result<(), TypeError> {
-        match self.bindings.iter().find_map(|(candidate, value)| (candidate == variable).then_some(*value)) {
-            Some(expected) if expected != extent => Err(DimensionError::InputDimensionMismatch {
-                dimension: variable.to_string(),
-                expected,
-                actual: extent,
-            }
-            .into()),
-            Some(_) => Ok(()),
-            None if closed_identities.contains(variable) => self.bind(variable, extent),
-            None => Err(TypeError::invalid(format!(
-                "dimension identity {variable} does not belong to the validated boundary signature",
-            ))),
-        }
-    }
-
-    /// Validates that `actual` refines `declared` while visiting each axis where a declared dynamic dimension is met
-    /// by a concrete static extent (i.e., each *dynamic-to-static refinement*). This is the shared per-type validation
-    /// engine behind both [`TypeRefinements::establish`] and [`TypeRefinements::validate`]. The structural refinement
-    /// rules live here exactly once, while the provided `visitor` decides what an observed concrete extent *means*
-    /// (e.g., [`Self::bind`] when establishing facts from an input signature versus [`Self::validate_or_bind`] when
-    /// justifying an output signature against them). It first requires that `actual` refines every non-shape component
-    /// of `declared` and matches its rank, and then walks the two shapes axis by axis:
+    /// Validates that `actual` refines `declared` while visiting each axis where a declared dynamic dimension is met by
+    /// a concrete static extent (i.e., each *dynamic-to-static refinement*). This reports only formal facts: it shares
+    /// its structural refinement rules with [`TypeRefinements::from_local_declarations`], which records facts about
+    /// actual identities and correspondences between formal and actual identities, and it is the per-type engine behind
+    /// [`TypeRefinements::validate_refinement`]. The provided `visitor` decides what an observed concrete extent
+    /// *means* (e.g., [`DimensionRefinements::record_declared_extent`] when collecting facts versus
+    /// [`DimensionRefinements::validate_declared_extent`] when justifying an output signature against established facts).
+    /// It first requires that `actual` refines every non-shape component of
+    /// `declared` and matches its rank, and then walks the two shapes axis by axis:
     ///
     ///   - An actual dynamic dimension with singleton bounds supplies the same concrete proof as a static extent.
     ///     For example, `Array[q]` observed as `Array[t]` with `t` constrained to exactly 2 contributes the fact
@@ -819,91 +708,101 @@ impl ArrayTypeRefinements {
         actual: &ArrayType,
         mut visitor: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
     ) -> Result<(), TypeError> {
-        if !declared.non_shape_components_are_refined_by(actual) || declared.rank() != actual.rank() {
-            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}",)));
-        }
-        declared
-            .shape()
-            .dimensions()
-            .iter()
-            .zip(actual.shape().dimensions())
-            .try_for_each(|(declared, actual)| {
-                if declared == actual {
-                    return Ok(());
-                }
-
-                // Dimension-valued constructor inputs retain their nominal identities even after specialization
-                // proves an exact extent. Use that concrete proof just as for a static axis while retaining the
-                // declared variable as the refinement key, so independent observations must still agree.
-                let exact_actual = match actual {
-                    Dimension::Dynamic(variable) => {
-                        DimensionType::from(variable.clone()).extent().map(Dimension::Static)
-                    }
-                    Dimension::Static(_) => None,
-                };
-                let actual = exact_actual.as_ref().unwrap_or(actual);
-                match (declared, actual) {
-                    (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => Ok(()),
-                    (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) if declared == actual => Ok(()),
-                    (Dimension::Dynamic(declared), Dimension::Static(actual))
-                        if declared.bounds().contains(*actual) =>
-                    {
-                        visitor(declared, *actual)
-                    }
-                    (Dimension::Dynamic(declared), Dimension::Static(actual)) => {
-                        Err(DimensionError::BindingOutOfBounds {
-                            variable: declared.to_string(),
-                            value: *actual,
-                            bounds: declared.bounds(),
-                        }
-                        .into())
-                    }
-                    _ => Err(TypeError::invalid(format!(
-                        "dimension {actual} does not refine declared dimension {declared}",
-                    ))),
-                }
-            })
+        // Identical components contribute nothing here, and only formal facts reach the visitor, which keeps this
+        // contract independent of the actual-scope facts that complete-signature construction records.
+        Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(
+            |refinement_fact| match refinement_fact? {
+                DimensionRefinementFact::Declared(variable, extent) => visitor(variable, extent),
+                DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
+            },
+        )
     }
 
-    /// Rejects a [`DimensionVariable`] that one signature member binds to a static extent while another member renames
-    /// it to a variable whose bounds do not specify that exact extent. A singleton target bound equal to the static
-    /// extent is consistent as first-class dimensions retain a nominal variable even when their extent is statically
-    /// known. Wider bounds do not prove that the two observations agree. Complete signature renaming derivations call
-    /// this after folding over every member, so the check is independent of the order of the observations.
-    pub fn require_disjoint_from(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<(), TypeError> {
-        for (variable, extent) in &self.bindings {
-            if let Some(target) = renaming.target(variable) {
-                if target.bounds().extent() == Some(*extent) {
-                    continue;
-                }
-                return Err(TypeError::invalid(format!(
-                    "dimension variable {variable} is renamed to {target} by one signature member and bound to \
-                     static extent {extent} by another",
-                )));
-            }
-        }
-        Ok(())
+    /// Returns an array pair's dimension facts, validating non-shape metadata and rank first.
+    /// [`DimensionComparison`] determines how axis identities are compared and whether identical dimensions contribute
+    /// facts, following the same rules as the shared dimension comparison helper.
+    pub(crate) fn array_refinement_facts<'o>(
+        declared: &'o ArrayType,
+        actual: &'o ArrayType,
+        comparison: DimensionComparison,
+    ) -> impl Iterator<Item = Result<DimensionRefinementFact<'o>, TypeError>> {
+        let error = if declared.non_shape_components_are_refined_by(actual) && declared.rank() == actual.rank() {
+            None
+        } else {
+            let message = if comparison == DimensionComparison::IdentityRenaming {
+                format!("type {actual} cannot instantiate declared type {declared}")
+            } else {
+                format!("type {actual} does not refine declared type {declared}")
+            };
+            Some(TypeError::invalid(message))
+        };
+        let dimensions = error.is_none().then(|| declared.shape().dimensions().iter().zip(actual.shape().dimensions()));
+        error
+            .into_iter()
+            .map(Err)
+            .chain(dimensions.into_iter().flatten().flat_map(move |(declared, actual)| {
+                DimensionRefinements::dimension_refinement_facts(declared, actual, comparison)
+            }))
     }
 }
 
 impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    fn new<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
         D::Item: Borrow<ArrayType>,
         A::Item: Borrow<ArrayType>,
     {
-        let mut refinements = Self::default();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                refinements.bind(variable, extent)
-            })
-        })?;
-        Ok(refinements)
+        // Ordinary admission retains nominal axes; the complete establishment below checks their relationships.
+        let declared = declared.into_iter().collect::<Vec<_>>();
+        let actual = actual.into_iter().collect::<Vec<_>>();
+        visit_type_signature_pairs(
+            declared.iter().map(Borrow::borrow),
+            actual.iter().map(Borrow::borrow),
+            |declared, actual| {
+                Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement)
+                    .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
+            },
+        )?;
+        Self::from_local_declarations(declared, actual)
     }
 
-    fn validate<D: IntoIterator, A: IntoIterator>(
+    fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<ArrayType>,
+        A::Item: Borrow<ArrayType>,
+    {
+        let declared = declared.into_iter().collect::<Vec<_>>();
+        let actual = actual.into_iter().collect::<Vec<_>>();
+        let refinements = DimensionRefinements::from_refinement_facts(
+            type_signature_pairs(declared.iter().map(Borrow::borrow), actual.iter().map(Borrow::borrow))?.flat_map(
+                |(declared, actual)| {
+                    Self::array_refinement_facts(declared, actual, DimensionComparison::LocalDeclarations)
+                },
+            ),
+        )?;
+        let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
+        let unproven = type_identities_needing_runtime_checks::<ArrayType, _>(&declared, &actual)?;
+        Ok(Self::from(refinements.with_identities_needing_runtime_checks(unproven)))
+    }
+
+    #[inline]
+    fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, <ArrayType as Type>::Identity>>
+    where
+        <ArrayType as Type>::Identity: 'o,
+    {
+        self.dimensions.identity_classes()
+    }
+
+    #[inline]
+    fn identities_needing_runtime_checks(&self) -> &[DimensionVariable] {
+        self.dimensions.identities_needing_runtime_checks()
+    }
+
+    fn validate_refinement<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
         actual: A,
@@ -918,26 +817,63 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
             Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                refinements.validate_or_bind(variable, extent, closed_identities)
+                refinements.dimensions.validate_declared_extent(variable, extent, closed_identities)
             })
         })
     }
 
-    fn refine(&self, declared: &ArrayType, symbolic: &[DimensionVariable]) -> Result<ArrayType, TypeError> {
+    fn refine_declared(
+        &self,
+        r#type: &ArrayType,
+        preserved_identities: &[DimensionVariable],
+    ) -> Result<ArrayType, TypeError> {
+        let dimensions = r#type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| self.dimensions.refine_declared_dimension(dimension, preserved_identities))
+            .collect();
+        Ok(r#type.clone().with_shape(Shape::new(dimensions)))
+    }
+
+    fn refine_actual(
+        &self,
+        r#type: &ArrayType,
+        preserved_identities: &[DimensionVariable],
+    ) -> Result<ArrayType, TypeError> {
+        let dimensions = r#type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| self.dimensions.refine_actual_dimension(dimension, preserved_identities))
+            .collect();
+        Ok(r#type.clone().with_shape(Shape::new(dimensions)))
+    }
+
+    fn retype_actual(
+        &self,
+        declared: &ArrayType,
+        actual: &ArrayType,
+        preferred_identities: &[DimensionVariable],
+    ) -> Result<ArrayType, TypeError> {
+        if declared.rank() != actual.rank() {
+            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
+        }
         let dimensions = declared
             .shape()
             .dimensions()
             .iter()
-            .map(|dimension| match dimension {
-                Dimension::Dynamic(variable) if !symbolic.contains(variable) => self
-                    .bindings
-                    .iter()
-                    .find_map(|(candidate, extent)| (candidate == variable).then_some(Dimension::Static(*extent)))
-                    .unwrap_or_else(|| dimension.clone()),
-                _ => dimension.clone(),
-            })
-            .collect::<Vec<_>>();
-        Ok(declared.clone().with_shape(Shape::new(dimensions)))
+            .zip(actual.shape().dimensions())
+            .map(|(declared, actual)| self.dimensions.retype_actual_dimension(declared, actual, preferred_identities))
+            .collect();
+        Ok(actual.clone().with_shape(Shape::new(dimensions)))
+    }
+}
+
+impl From<DimensionRefinements> for ArrayTypeRefinements {
+    #[inline]
+    fn from(dimensions: DimensionRefinements) -> Self {
+        Self { dimensions }
     }
 }
 
@@ -1438,8 +1374,32 @@ mod tests {
                 .unwrap();
         assert_eq!(renaming.rename(&declared_variable), actual_variable);
         assert_eq!(
-            ArrayType::derive_identity_renaming(std::slice::from_ref(&declared), &[]),
+            ArrayType::derive_identity_renaming(std::slice::from_ref(&declared), &[] as &[ArrayType]),
             Err(TypeError::invalid("declared type count 1 does not match actual type count 0")),
+        );
+
+        // Exact actual bounds do not make an array identity structurally interchangeable with a static axis.
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
+        let symbolic_actual = ArrayType::new(F32, Shape::new(vec![exact.into()]));
+        let static_declared = ArrayType::new_static(F32, [3]);
+        assert_eq!(
+            ArrayType::derive_identity_renaming([&static_declared], [&symbolic_actual]),
+            Err(TypeError::invalid("dimension exact does not instantiate declared dimension 3")),
+        );
+        let refinements = ArrayTypeRefinements::new([&static_declared], [&symbolic_actual]).unwrap();
+        assert_eq!(refinements.refine_actual(&symbolic_actual, &[]), Ok(static_declared));
+
+        // An earlier recorded extent conflict takes precedence over a later metadata mismatch.
+        assert_eq!(
+            ArrayType::derive_identity_renaming(
+                [&declared, &declared, &ArrayType::scalar(F32)],
+                [&ArrayType::new_static(F32, [2]), &ArrayType::new_static(F32, [3]), &ArrayType::scalar(F64)],
+            ),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "declared".to_string(),
+                expected: 2,
+                actual: 3,
+            })),
         );
     }
 
@@ -1457,8 +1417,8 @@ mod tests {
         // Structural consumers must reject the narrower signature rather than silently erase that obligation.
         for actual in [[dynamic_type.clone(), static_type.clone()], [static_type.clone(), dynamic_type.clone()]] {
             assert_eq!(ArrayType::derive_identity_renaming(&declared, &actual), Err(error.clone()));
-            let refinements = ArrayTypeRefinements::establish(&declared, &actual).unwrap();
-            assert_eq!(refinements.refine(&dynamic_type, &[]).unwrap(), static_type);
+            let refinements = ArrayTypeRefinements::from_local_declarations(&declared, &actual).unwrap();
+            assert_eq!(refinements.refine_declared(&dynamic_type, &[]).unwrap(), static_type);
         }
     }
 
@@ -1651,26 +1611,184 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_refinements_bind_repeated_dimensions_across_complete_signatures() {
+    fn test_array_type_refinements_new() {
+        let n = DimensionVariable::new("n", DimensionBounds::non_negative(Some(8)).unwrap());
+        let declared = ArrayType::new(F32, Shape::new(vec![n.clone().into(), n.clone().into()]));
+        let inconsistent = ArrayType::new_static(F32, [2, 3]);
+
+        // Repeated dimensions must agree even when their occurrences belong to just one input type.
+        let error = ArrayTypeRefinements::new([&declared], [&inconsistent]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "n".to_string(), expected: 2, actual: 3 }),
+        );
+        let vector = ArrayType::new(F32, Shape::new(vec![n.clone().into()]));
+        assert!(
+            ArrayTypeRefinements::new(
+                [&vector, &vector],
+                [ArrayType::new_static(F32, [2]), ArrayType::new_static(F32, [3])],
+            )
+            .is_err()
+        );
+
+        // A conditional entry is valid, but its actual type alone does not prove that the array is square.
+        let conditional = ArrayType::new(F32, Shape::new(vec![n.clone().into(), 3.into()]));
+        assert!(!declared.is_refined_by(&conditional));
+        let refinements = ArrayTypeRefinements::new([&declared], [&conditional]).unwrap();
+        assert_eq!(refinements.identities_needing_runtime_checks(), &[n]);
+        assert_eq!(refinements.refine_declared(&declared, &[]).unwrap(), ArrayType::new_static(F32, [3, 3]));
+
+        // Singleton identities prove exact extents without requiring a runtime equality check.
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(2, Some(3)).unwrap());
+        let exact = ArrayType::new(F32, Shape::new(vec![exact.clone().into(), exact.into()]));
+        assert!(!ArrayType::new_static(F32, [2, 2]).is_refined_by(&exact));
+        let refinements = ArrayTypeRefinements::new([ArrayType::new_static(F32, [2, 2])], [&exact]).unwrap();
+        assert!(refinements.identities_needing_runtime_checks().is_empty());
+    }
+
+    #[test]
+    fn test_array_type_refinements_from_local_declarations() {
+        let variable = DimensionVariable::new("length", DimensionBounds::non_negative(Some(8)).unwrap());
+        let vector = ArrayType::new(F32, Shape::new(vec![variable.into()]));
+        let declared = [vector.clone(), vector, ArrayType::scalar(F32)];
+        let actual =
+            [ArrayType::new_static(F32, [2]), ArrayType::new_static(F32, [3]), ArrayType::scalar(DataType::I32)];
+        // Recording the conflicting length stops construction before the later data type mismatch.
+        let error = ArrayTypeRefinements::from_local_declarations(&declared, &actual).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "length".to_string(), expected: 2, actual: 3 }),
+        );
+        // Reject unequal signature lengths before consuming any member or its facts.
+        assert_eq!(
+            ArrayTypeRefinements::from_local_declarations(&declared, &actual[..2]),
+            Err(TypeError::invalid("declared type count 3 does not match actual type count 2")),
+        );
+    }
+
+    #[test]
+    fn test_array_type_refinements_identity_classes() {
+        let first = DimensionVariable::new("first", DimensionBounds::non_negative(Some(8)).unwrap());
+        let second = DimensionVariable::new("second", DimensionBounds::non_negative(Some(8)).unwrap());
+        let actual = DimensionVariable::new("actual", DimensionBounds::new(2, Some(3)).unwrap());
+        let declared = ArrayType::new(F32, Shape::new(vec![first.clone().into(), second.clone().into(), 2.into()]));
+        let supplied = ArrayType::new(F32, Shape::new(vec![2.into(), 2.into(), actual.clone().into()]));
+        let refinements = ArrayTypeRefinements::from_local_declarations([&declared], [&supplied]).unwrap();
+        // Equal exact extents do not join unrelated formal or actual identities, including isolated observations.
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![
+                TypeIdentityClass::new(std::slice::from_ref(&first), &[], true),
+                TypeIdentityClass::new(std::slice::from_ref(&second), &[], true),
+                TypeIdentityClass::new(&[], std::slice::from_ref(&actual), true),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_type_refinements_identity_classes_transitive_order() {
+        let first = DimensionVariable::new("first", DimensionBounds::non_negative(Some(8)).unwrap());
+        let second = DimensionVariable::new("second", DimensionBounds::non_negative(Some(8)).unwrap());
+        let third = DimensionVariable::new("third", DimensionBounds::non_negative(Some(8)).unwrap());
+        let actual_first = DimensionVariable::new("actual_first", DimensionBounds::non_negative(Some(8)).unwrap());
+        let actual_second = DimensionVariable::new("actual_second", DimensionBounds::non_negative(Some(8)).unwrap());
+        let declared = ArrayType::new(
+            F32,
+            Shape::new(vec![
+                first.clone().into(),
+                second.clone().into(),
+                second.clone().into(),
+                third.clone().into(),
+                third.clone().into(),
+                third.clone().into(),
+            ]),
+        );
+        let actual = ArrayType::new(
+            F32,
+            Shape::new(vec![
+                actual_first.clone().into(),
+                actual_first.clone().into(),
+                actual_second.clone().into(),
+                actual_second.clone().into(),
+                actual_first.clone().into(),
+                2.into(),
+            ]),
+        );
+        let refinements = ArrayTypeRefinements::from_local_declarations([&declared], [&actual]).unwrap();
+        // A cycle and a late exact refinement fact form one class, with order independent of temporary union roots.
+        let formal_members = [first.clone(), second, third];
+        let actual_members = [actual_first.clone(), actual_second.clone()];
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![TypeIdentityClass::new(&formal_members, &actual_members, true)],
+        );
+        assert_eq!(refinements.refine_actual(&actual, &[]), Ok(ArrayType::new_static(F32, [2; 6])));
+        // Several immutable references may retain distinct actual names in the checked class.
+        assert_eq!(
+            refinements.retype_actual(
+                &ArrayType::new(F32, Shape::new(vec![first.into()])),
+                &ArrayType::new(F32, Shape::new(vec![actual_second.clone().into()])),
+                &actual_members,
+            ),
+            Ok(ArrayType::new(F32, Shape::new(vec![actual_second.into()]))),
+        );
+    }
+
+    #[test]
+    fn test_array_type_refinements_identity_classes_validate_later_facts() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::non_negative(Some(8)).unwrap());
+        let actual = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(2)).unwrap());
+        let declared = ArrayType::new(F32, Shape::new(vec![formal.clone().into()]));
+        let supplied = ArrayType::new(F32, Shape::new(vec![actual.clone().into()]));
+        let refinements = ArrayTypeRefinements::from_local_declarations([&declared], [&supplied]).unwrap();
+        let error = refinements
+            .validate_refinement([&declared], [&ArrayType::new_static(F32, [2])], std::slice::from_ref(&formal))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds {
+                variable: "actual".to_string(),
+                value: 2,
+                bounds: actual.bounds(),
+            }),
+        );
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![TypeIdentityClass::new(std::slice::from_ref(&formal), std::slice::from_ref(&actual), false)],
+        );
+        // Valid output facts belong to the validation clone, so the invocation's public classes stay unchanged.
+        assert_eq!(
+            refinements.validate_refinement(
+                [&declared],
+                [&ArrayType::new_static(F32, [1])],
+                std::slice::from_ref(&formal)
+            ),
+            Ok(()),
+        );
+        assert!(!refinements.identity_classes().next().unwrap().is_exact());
+    }
+
+    #[test]
+    fn test_array_type_refinements_validate_refinement() {
         let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
         let declared = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
         let actual_two = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]));
         let actual_three = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
 
-        let refinements = ArrayTypeRefinements::establish(
+        let refinements = ArrayTypeRefinements::from_local_declarations(
             &[declared.clone(), declared.clone()],
             &[actual_two.clone(), actual_two.clone()],
         )
         .unwrap();
         assert_eq!(
-            refinements.validate(std::slice::from_ref(&declared), std::slice::from_ref(&actual_two), &[]),
+            refinements.validate_refinement(std::slice::from_ref(&declared), std::slice::from_ref(&actual_two), &[]),
             Ok(()),
         );
         // Exact nominal dimensions prove extents without making distinct non-exact variables interchangeable.
         for extent in [2, 3] {
             let exact = DimensionVariable::new("exact", DimensionBounds::new(extent, Some(extent + 1)).unwrap());
             let actual = ArrayType::new(F32, Shape::new(vec![exact.into()]));
-            let result = refinements.validate(std::slice::from_ref(&declared), &[actual], &[]);
+            let result = refinements.validate_refinement(std::slice::from_ref(&declared), &[actual], &[]);
             if extent == 2 {
                 assert_eq!(result, Ok(()));
             } else {
@@ -1688,17 +1806,20 @@ mod tests {
             F32,
             Shape::new(vec![DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap()).into()]),
         );
-        assert!(refinements.validate(std::slice::from_ref(&declared), &[unrelated], &[]).is_err());
+        assert!(refinements.validate_refinement(std::slice::from_ref(&declared), &[unrelated], &[]).is_err());
 
-        let error = ArrayTypeRefinements::establish(&[declared.clone(), declared.clone()], &[actual_two, actual_three])
-            .unwrap_err();
+        let error = ArrayTypeRefinements::from_local_declarations(
+            &[declared.clone(), declared.clone()],
+            &[actual_two, actual_three],
+        )
+        .unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
         );
 
         let error = ArrayTypeRefinements::default()
-            .validate(
+            .validate_refinement(
                 &[declared.clone(), declared],
                 &[
                     ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])),
@@ -1714,11 +1835,11 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_refinements_refine_declared_types() {
+    fn test_array_type_refinements_refine_declared() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
         let cols = DimensionVariable::new("cols", DimensionBounds::non_negative(Some(8)).unwrap());
         let depth = DimensionVariable::new("depth", DimensionBounds::non_negative(Some(8)).unwrap());
-        let refinements = ArrayTypeRefinements::establish(
+        let refinements = ArrayTypeRefinements::from_local_declarations(
             &[ArrayType::new(F32, Shape::new(vec![rows.clone().into(), cols.clone().into()]))],
             &[ArrayType::new(F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]))],
         )
@@ -1727,7 +1848,7 @@ mod tests {
         // Every established identity is replaced by its extent, while an identity without a fact stays symbolic.
         let declared = ArrayType::new(F32, Shape::new(vec![rows.clone().into(), cols.clone().into(), depth.into()]));
         assert_eq!(
-            refinements.refine(&declared, &[]),
+            refinements.refine_declared(&declared, &[]),
             Ok(declared.clone().with_shape(Shape::new(vec![
                 Dimension::Static(3),
                 Dimension::Static(4),
@@ -1737,7 +1858,7 @@ mod tests {
 
         // Exclusion applies per identity, so a partially excluded type is still refined at its other identities.
         assert_eq!(
-            refinements.refine(&declared, std::slice::from_ref(&rows)),
+            refinements.refine_declared(&declared, std::slice::from_ref(&rows)),
             Ok(declared.clone().with_shape(Shape::new(vec![
                 rows.clone().into(),
                 Dimension::Static(4),
@@ -1751,14 +1872,14 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
         assert_eq!(
-            refinements.refine(&sharded, &[]),
+            refinements.refine_declared(&sharded, &[]),
             Ok(sharded.clone().with_shape(Shape::new(vec![Dimension::Static(3)]))),
         );
 
         // Facts are established from the complete signature, so an identity that a caller excludes when refining still
         // takes part in conflict detection.
         assert_eq!(
-            ArrayTypeRefinements::establish(
+            ArrayTypeRefinements::from_local_declarations(
                 &[
                     ArrayType::new(F32, Shape::new(vec![rows.clone().into()])),
                     ArrayType::new(F32, Shape::new(vec![rows.into()])),

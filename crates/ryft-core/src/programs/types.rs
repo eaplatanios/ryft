@@ -153,7 +153,6 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     ///
     ///   - `declared`: Borrowed types of the complete signature declared by the program or region boundary.
     ///   - `actual`: Corresponding borrowed types supplied at the instantiation site.
-    #[inline]
     fn derive_identity_renaming<
         't,
         D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
