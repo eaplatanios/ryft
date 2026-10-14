@@ -275,15 +275,14 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 
 /// Represents the ability to construct an [`Array`] of ones whose shape includes _dynamic_ (i.e., runtime) dimensions.
 /// Unlike [`One`], this capability supplies each dynamic axis with an explicit dimension value. Static axes retain
-/// their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension identities
-/// require a corresponding input for every occurrence. Each input must have the exact dimension identity declared
-/// by its axis. Repeated inputs must carry the same runtime extent. Conflicting extents are rejected during
-/// interpretation.
+/// their declared sizes. Dynamic axes take their sizes from the inputs in axis order, with one input per dynamic axis,
+/// so a repeated identity consumes one input for every occurrence. Each input either carries the identity declared by
+/// its axis, which the result keeps, or has an exact type (e.g., that of an eager dimension value) whose extent the
+/// axis bounds admit, which makes that axis static in the result. Every occurrence of a repeated identity must carry
+/// the same extent, and conflicting extents are rejected.
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
 /// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
-/// When a dynamic axis has bounds that admit only one extent, the inferred result type represents that axis as static.
-/// Its dimension input is still required because the declared output type contains a dynamic axis.
 ///
 /// # Example
 ///
@@ -561,7 +560,7 @@ mod tests {
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = OneOperation::new(ArrayType::new(
                 DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                Shape::new(vec![extent_type.dimension().clone()]),
             )),
             cases = [
                 {
@@ -620,10 +619,7 @@ mod tests {
         let extent = builder.add_input(extent_type.clone().into());
         let output = builder
             .add_instruction(
-                OneOperation::new(ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
-                )),
+                OneOperation::new(ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]))),
                 Vec::new(),
                 vec![extent],
                 None,
@@ -654,8 +650,7 @@ mod tests {
         // The direct transform context must likewise run the explicit rule rather than taking its all-structural-zero
         // shortcut: a nullary zero cannot recover the dynamic extent after the closure returns.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let (primal, tangent) = context
             .jvp(
@@ -714,8 +709,7 @@ mod tests {
         // Dynamic constructors use their extent inputs only as non-differentiable shape information, so every extent
         // receives a structural-zero cotangent regardless of the output cotangent being live.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let operation = ArrayIrOperation::<Array>::from(OneOperation::new(output_type.clone()));
         let mut context =
             TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
@@ -899,24 +893,42 @@ mod tests {
             context.dynamic_one(&output_type, &[ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
             Err(ProgramError::Type(TypeError::invalid("`one` input 0 must be a dimension but has type f32[]"))),
         );
-        let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 2).unwrap());
+
+        // An eager dimension value is typed exactly, so any value whose extent the axis admits refines it,
+        // while an extent outside the axis bounds is rejected.
+        let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(16)).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other.clone()), 2).unwrap());
+        assert_eq!(
+            context.dynamic_one(&output_type, &[dimension]),
+            Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 2]).unwrap())),
+        );
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 9).unwrap());
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`one` input 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
-                 dimension<size ∈ [0, 8)>",
+                "`one` input 0 has type dimension<9> but the output shape requires dimension<size ∈ [0, 8)>",
             ))),
         );
 
-        // Matching diagnostic names and bounds do not make separately created identities interchangeable.
-        let distinct = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct), 2).unwrap());
+        // Symbolic inputs must define the identity of their axis. Matching diagnostic names and bounds do not make
+        // separately created identities interchangeable.
+        let tracing = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
         assert_eq!(
-            context.dynamic_one(&output_type, &[dimension]),
-            Err(ProgramError::Type(TypeError::invalid(
+            tracing.dynamic_one(&output_type, &[tracing.input(DimensionType::from(other).into())]).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
+                "`one` input 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                 dimension<size ∈ [0, 8)>",
+            )),
+        );
+        let distinct = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        assert_eq!(
+            tracing
+                .dynamic_one(&output_type, &[tracing.input(DimensionType::from(distinct).into())])
+                .unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
                 "`one` input 0 has type dimension<size ∈ [0, 8)> but the output shape requires dimension<size ∈ [0, 8)>",
-            ))),
+            )),
         );
     }
 

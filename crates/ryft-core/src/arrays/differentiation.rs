@@ -87,12 +87,15 @@ where
             return Ok(None);
         };
 
-        let variable = residual_type.variable();
+        // A static residual has no identity for a source to supply.
+        let Some(variable) = residual_type.variable() else {
+            return Ok(None);
+        };
         let source_type = source.r#type();
         let array_type = match source_type.as_ref() {
             ArrayIrType::Dimension(source_type) => {
                 // A matching first-class dimension already is the residual and so we reuse it without staging a read.
-                return Ok((source_type.variable() == variable).then(|| source.clone()));
+                return Ok((source_type.variable() == Some(variable)).then(|| source.clone()));
             }
             ArrayIrType::Reference(reference) => reference.referent(),
             ArrayIrType::Array(array_type) => array_type,
@@ -391,7 +394,7 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
                     if let Some(index) = self.values.iter().position(|value| {
                         matches!(
                             value.r#type().as_ref(),
-                            ArrayIrType::Dimension(r#type) if r#type.variable() == variable
+                            ArrayIrType::Dimension(r#type) if r#type.variable() == Some(variable)
                         )
                     }) {
                         Ok(ExactShapeDimension::Residual(index))
@@ -736,10 +739,7 @@ mod tests {
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(
             DataType::F8E8M0FNU,
-            Shape::new(vec![
-                Dimension::Dynamic(extent_type.variable().clone()),
-                Dimension::Dynamic(extent_type.variable().clone()),
-            ]),
+            Shape::new(vec![extent_type.dimension().clone(), extent_type.dimension().clone()]),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         builder.add_input(dynamic_type.into());
@@ -810,7 +810,7 @@ mod tests {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
-        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(n.variable().clone())]);
+        let shape = Shape::new(vec![Dimension::Static(2), n.dimension().clone()]);
         let (plan, _) = ExactShape::for_residual_zero(&shape);
 
         // Static axes stage dimension constants, while dynamic axes reuse the residual values without staging
@@ -835,26 +835,29 @@ mod tests {
 
     #[test]
     fn test_linear_residuals() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
         let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut residuals = LinearResiduals::<ArrayIrValue<Array>>::new();
+        let mut residuals =
+            LinearResiduals::<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>::new();
         assert!(residuals.values().is_empty());
 
-        // Dynamic dimension definitions share one slot per identity, keyed by variable rather than by value, so a
+        // Symbolic dimension definitions share one slot per identity, keyed by variable rather than by value, so a
         // repeated identity reuses its slot even when the retained value instance differs.
-        let n_value = ArrayIrValue::<Array>::Dimension(DimensionValue::new(n.clone(), 4).unwrap());
+        let n_value = context.input(n.clone().into());
         assert_eq!(residuals.retain(n_value.clone()), 0);
-        assert_eq!(residuals.retain(ArrayIrValue::Dimension(DimensionValue::new(n, 5).unwrap())), 0);
-        let m_value = ArrayIrValue::<Array>::Dimension(DimensionValue::new(m, 2).unwrap());
+        assert_eq!(residuals.retain(context.input(n.into())), 0);
+        let m_value = context.input(m.into());
         assert_eq!(residuals.retain(m_value.clone()), 1);
 
         // Ordinary array residuals stay positional, so equal arrays still occupy distinct slots.
-        let array = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
+        let array = context.input(ArrayType::new_static(DataType::F64, [2]).into());
         assert_eq!(residuals.retain(array.clone()), 2);
         assert_eq!(residuals.retain(array), 3);
 
-        // A dimension whose type pins a concrete extent carries no shareable identity and is never deduplicated.
-        let constant = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        // A static dimension type (e.g., that of an eager dimension value) has no identity to share and so is never
+        // deduplicated.
+        let constant = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned().into());
         assert_eq!(residuals.retain(constant.clone()), 4);
         assert_eq!(residuals.retain(constant), 5);
 
@@ -874,11 +877,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
         let array_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![
-                Dimension::Static(2),
-                Dimension::Dynamic(n.variable().clone()),
-                Dimension::Dynamic(n.variable().clone()),
-            ]),
+            Shape::new(vec![Dimension::Static(2), n.dimension().clone(), n.dimension().clone()]),
         );
 
         // Reading an exact shape binds one `DimensionSize` read per distinct dynamic identity: the static axis
@@ -937,10 +936,10 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
         let shape = Shape::new(vec![
             Dimension::Static(2),
-            Dimension::Dynamic(n.variable().clone()),
+            n.dimension().clone(),
             Dimension::Static(3),
-            Dimension::Dynamic(n.variable().clone()),
-            Dimension::Dynamic(m.variable().clone()),
+            n.dimension().clone(),
+            m.dimension().clone(),
         ]);
 
         // Slots are assigned by first occurrence and the repeated identity reuses slot 0, while the first-axes list
@@ -956,7 +955,7 @@ mod tests {
                 ExactShapeDimension::Residual(1),
             ]),
         );
-        assert_eq!(first_axes, vec![(1, n.variable().clone()), (4, m.variable().clone())]);
+        assert_eq!(first_axes, vec![(1, n.variable().unwrap().clone()), (4, m.variable().unwrap().clone())]);
 
         // Dynamic-constructor input expansion is in axis order and intentionally repeats shared slots.
         assert_eq!(plan.dynamic_dimensions(&["n", "m"]), vec!["n", "n", "m"]);
@@ -1052,7 +1051,7 @@ mod tests {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let context = TestContext::new();
         let projected_context = ProjectedContext::<TestContext, ArrayType>::new(context.clone());
@@ -1099,8 +1098,7 @@ mod tests {
         // A widening element family is materialized from the same primal even though the two types differ. The `f32`
         // tangent of a dynamically shaped `f8e8m0fnu` primal has no exemplar of its own type anywhere, and naming the
         // extent instead of matching the whole type is what makes it constructible.
-        let widening_type =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
+        let widening_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![n.dimension().clone()]));
         let widening_primal = context.input(widening_type.clone().into());
         let widened_tangent_type = widening_type.tangent().unwrap();
         assert_eq!(widened_tangent_type.data_type(), DataType::F32);

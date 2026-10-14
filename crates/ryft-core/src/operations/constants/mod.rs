@@ -50,9 +50,9 @@
 //! # }
 //! ```
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayType, ArrayTypeRefinements, Dimension, DimensionRefinements, DimensionType};
 use crate::operations::Capability;
-use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};
+use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed};
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
 /// constructor. The generated implementation treats the operation's stored [`ArrayType`] as the complete output type
@@ -145,7 +145,7 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                     .filter(|dimension| matches!(dimension, $crate::arrays::Dimension::Dynamic(_)))
                     .count();
                 let mut extents = inputs.iter();
-                let mut refinements = $crate::arrays::ArrayTypeRefinements::default();
+                let mut refinements = $crate::arrays::DimensionRefinements::default();
                 let dimensions = self
                     .r#type()
                     .shape()
@@ -177,7 +177,7 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                             }
 
                             // Repeated stored identities must denote one extent even when replay renames inputs.
-                            refinements.bind(variable, extent.extent())?;
+                            refinements.record_declared_extent(variable, extent.extent())?;
                             Ok($crate::arrays::Dimension::Static(extent.extent()))
                         }
                     })
@@ -229,10 +229,10 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 /// have no input geometry to relate to, so passing them as inputs would only grow the interpreted representation. A
 /// stored type with no dynamic axes is valid with no inputs, although canonical operation-family lifts prefer the
 /// equivalent homogeneous nullary constructor inside the array member family. Dynamic axes retain their declared
-/// identities, including singleton-bounded axes; the explicit dimension inputs bind those identities in the result.
-/// Repeated exact axes may receive independently named inputs proving the same single extent, provided at least one
-/// input defines the stored output identity. This permits repeated reification during specialization without admitting
-/// an ungrounded identity or treating equal non-singleton bounds as nominal equality.
+/// identities when the inputs define exactly those identities. An input with an exact type (i.e., one whose bounds
+/// admit a single extent, such as the type of an eager dimension value) may instead feed an axis of another identity
+/// whose bounds admit that extent, which refines that axis to the extent in the result. Every occurrence of a repeated
+/// identity must then agree on its extent. Equal non-singleton bounds are never treated as nominal equality.
 pub(crate) fn infer_array_ir_constant_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
@@ -251,31 +251,22 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
             input_types.len(),
         )));
     }
+    let mut refinements = DimensionRefinements::default();
     for (index, (input_type, variable)) in input_types.iter().zip(variables).enumerate() {
         let dimension_type = <&DimensionType>::try_from(input_type).map_err(|_| {
             TypeError::invalid(format!("`{name}` input {index} must be a dimension but has type {input_type}"))
         })?;
-        if dimension_type.variable() != variable {
-            // Repeated reads may give one concrete extent separate nominal definitions after specialization.
-            // An exact matching extent is sufficient only when another input grounds the stored identity itself.
-            // Otherwise, the output would still reference an identity that this constructor never received.
-            let required_type = DimensionType::from(variable.clone());
-            if required_type.extent().is_some()
-                && required_type.extent() == dimension_type.extent()
-                && input_types
-                    .iter()
-                    .any(|input| matches!(input, ArrayIrType::Dimension(input) if input.variable() == variable))
-            {
-                continue;
-            }
+        if !refinements.record_input_refinement(variable, dimension_type)? {
             return Err(TypeError::invalid(format!(
-                "`{name}` input {index} has type {dimension_type} but the output shape requires {required_type}",
+                "`{name}` input {index} has type {dimension_type} but the output shape requires {}",
+                DimensionType::from(variable.clone()),
             )));
         }
     }
 
-    // Exact input-variable validation above establishes the declared identity, even when its bounds imply one size.
-    Ok(vec![ArrayIrType::Array(r#type.clone())])
+    // Identities that the inputs define stay in the output, while exact inputs refine their axes to static extents,
+    // so that the output never refers to an identity that no input carries.
+    Ok(vec![ArrayIrType::Array(ArrayTypeRefinements::from(refinements).refine_declared(r#type, &[])?)])
 }
 
 /// Checks that the provided dimension inputs agree with the symbolic shape declared by `type` before a dynamic
@@ -284,18 +275,18 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
 /// including its identity and bounds. The inputs supply values for those dynamic axes at runtime.
 ///
 /// This function checks that there is exactly one input per dynamic axis, that every input has a [`DimensionType`],
-/// and that its dimension variable matches the corresponding output axis. Static axes consume no inputs. It inspects
-/// input types only. It neither reads runtime extents nor constructs an array. Concrete values and their extent bounds
-/// are checked when created or interpreted. This also gives eager capability calls the same shape checks as staged
-/// constructors, without relying on a staging context to run type inference.
+/// and that it either defines the identity of the corresponding output axis or has an exact type whose extent that
+/// axis admits (as eager dimension values do), in which case repeated axes must agree on their extents. Static axes
+/// consume no inputs. It inspects input types only and constructs no array. This also gives eager capability calls
+/// the same shape checks as staged constructors, without relying on a staging context to run type inference.
 ///
 /// # Example
 ///
 /// For an `F32` output with shape `[N, 2, M]`, `dimensions` must contain two values with dimension types `N` and `M`,
 /// in that order. If their runtime extents are `3` and `4`, the constructor produces an array of shape `[3, 2, 4]`.
-/// An array input, a missing input, or inputs ordered as `[M, N]` fail validation. A shape `[N, N]` requires two inputs
-/// of type `N` and thus callers must supply the same extent for both occurrences. A fully static shape `[3, 2]`
-/// requires an empty input slice.
+/// An array input, a missing input, or symbolic inputs ordered as `[M, N]` fail validation. A shape `[N, N]` requires
+/// two inputs that define `N`, or two exact inputs with the same extent. A fully static shape `[3, 2]` requires an
+/// empty input slice.
 ///
 /// # Parameters
 ///
@@ -347,9 +338,10 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
         DimensionVariable, Shape,
     };
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::MemberInterpretableOperation;
     use crate::programs::{EmptyRegionDriver, TypeError};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -458,7 +450,7 @@ mod tests {
     #[test]
     fn test_infer_array_ir_constant_constructor_output_types_singleton_dimensions() {
         let dimension = DimensionType::new("size", DimensionBounds::new(3, Some(4)).unwrap());
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.variable().clone().into(), 2.into()]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone(), 2.into()]));
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &r#type, &[dimension.into()], &[]),
             Ok(vec![ArrayIrType::Array(r#type.clone())]),
@@ -479,12 +471,12 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(8)).unwrap());
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), 2.into(), columns.clone().into()]));
-        let row_extent =
-            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::from(rows.clone()), 3).unwrap());
-        let column_extent =
-            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::from(columns), 4).unwrap());
+        let tracing = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let row_extent = tracing.input(DimensionType::from(rows.clone()).into());
+        let column_extent = tracing.input(DimensionType::from(columns).into());
 
-        // Inputs correspond only to dynamic axes and must follow their order in the stored shape.
+        // Symbolic inputs correspond only to dynamic axes, must follow their order in the stored shape,
+        // and must define the identities of their axes.
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &output_type, &[row_extent.clone(), column_extent.clone()]),
             Ok(()),
@@ -506,7 +498,7 @@ mod tests {
             validate_dynamic_constant_dimensions(
                 "fill",
                 &output_type,
-                &[ArrayIrValue::Array(Array::scalar(3i64).unwrap()), column_extent],
+                &[tracing.input(ArrayType::scalar(DataType::I64).into()), column_extent],
             ),
             Err(ProgramError::Type(TypeError::invalid("`fill` input 0 must be a dimension but has type i64[]"))),
         );
@@ -518,36 +510,27 @@ mod tests {
             Ok(()),
         );
 
-        // Exact repeated reifications can share a grounded output identity; equal values alone cannot ground it.
-        let first = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
-        let second = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
-        let exact = <&DimensionType>::try_from(first.r#type().as_ref()).unwrap().variable().clone();
-        let exact_type = ArrayType::new(DataType::F32, Shape::new(vec![exact.clone().into(), exact.into()]));
-        assert_eq!(validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), second.clone()]), Ok(()));
+        // Exact inputs (e.g., eager dimension values) instead refine axes that admit their extents, and the occurrences
+        // of a repeated axis must then agree on their extents.
+        let two = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        let three = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(validate_dynamic_constant_dimensions("fill", &repeated_type, &[two.clone(), two.clone()]), Ok(()));
         assert_eq!(
-            validate_dynamic_constant_dimensions("fill", &exact_type, &[second.clone(), second]),
-            Err(TypeError::invalid("`fill` input 0 has type dimension<2> but the output shape requires dimension<2>")
-                .into()),
-        );
-        let wider = ArrayIrValue::<Array>::Dimension(
-            DimensionValue::new(DimensionType::new("wider", DimensionBounds::non_negative(Some(8)).unwrap()), 2)
-                .unwrap(),
-        );
-        assert_eq!(
-            validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), wider]),
-            Err(TypeError::invalid(
-                "`fill` input 1 has type dimension<wider ∈ [0, 8)> but the output shape requires dimension<2>",
-            )
+            validate_dynamic_constant_dimensions("fill", &repeated_type, &[two, three]),
+            Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "rows".to_string(),
+                expected: 2,
+                actual: 3,
+            })
             .into()),
         );
+        let nine = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(9).unwrap());
         assert_eq!(
-            validate_dynamic_constant_dimensions(
-                "fill",
-                &exact_type,
-                &[first, ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
-            ),
-            Err(TypeError::invalid("`fill` input 1 has type dimension<3> but the output shape requires dimension<2>")
-                .into()),
+            validate_dynamic_constant_dimensions("fill", &repeated_type, &[nine.clone(), nine]),
+            Err(TypeError::invalid(
+                "`fill` input 0 has type dimension<9> but the output shape requires dimension<rows ∈ [0, 8)>",
+            )
+            .into()),
         );
 
         let static_type = ArrayType::new_static(DataType::F32, [3, 2]);

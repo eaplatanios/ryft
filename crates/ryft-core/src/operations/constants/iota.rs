@@ -314,15 +314,14 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>>
 
 /// Represents the ability to construct an [`Array`] of coordinates whose shape includes _dynamic_ (i.e., runtime)
 /// dimensions. Unlike [`Iota`], this capability supplies each dynamic axis with an explicit dimension value. Static
-/// axes retain their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension
-/// identities require a corresponding input for every occurrence. Each input must have the exact dimension identity
-/// declared by its axis. Repeated inputs must carry the same runtime extent. Conflicting extents are rejected during
-/// interpretation.
+/// axes retain their declared sizes. Dynamic axes take their sizes from the inputs in axis order, with one input per
+/// dynamic axis, so a repeated identity consumes one input for every occurrence. Each input either carries the identity
+/// declared by its axis, which the result keeps, or has an exact type (e.g., that of an eager dimension value) whose
+/// extent the axis bounds admit, which makes that axis static in the result. Every occurrence of a repeated identity
+/// must carry the same extent, and conflicting extents are rejected.
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
 /// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
-/// When a dynamic axis has bounds that admit only one extent, the inferred result type represents that axis as static.
-/// Its dimension input is still required because the declared output type contains a dynamic axis.
 ///
 /// Each element is its zero-based index along the selected axis, converted to the output element data type;
 /// coordinates repeat along the other axes. Complex outputs have zero imaginary components.
@@ -670,11 +669,8 @@ mod tests {
         let extent = builder.add_input(extent_type.clone().into());
         let output = builder
             .add_instruction(
-                IotaOperation::new(
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())])),
-                    0,
-                )
-                .unwrap(),
+                IotaOperation::new(ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()])), 0)
+                    .unwrap(),
                 Vec::new(),
                 vec![extent],
                 None,
@@ -724,8 +720,7 @@ mod tests {
         // Dynamic constructors use their extent inputs only as non-differentiable shape information, so every extent
         // receives a structural zero cotangent regardless of the output cotangent being live.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let operation = ArrayIrOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap());
         let mut context =
             TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
@@ -796,10 +791,8 @@ mod tests {
     #[test]
     fn test_dynamic_iota() {
         let extent_type = DimensionType::new("extent", DimensionBounds::unbounded());
-        let output_type = ArrayType::new(
-            DataType::I32,
-            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone()), Dimension::Static(2)]),
-        );
+        let output_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![extent_type.dimension().clone(), Dimension::Static(2)]));
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
@@ -822,6 +815,7 @@ mod tests {
             Err(TypeError::invalid("`iota` dimension 1 is out of bounds for rank 1").into()),
         );
     }
+
     #[test]
     fn test_dynamic_iota_invalid_dimensions() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -841,23 +835,32 @@ mod tests {
             Err(TypeError::invalid("`iota` input 0 must be a dimension but has type f32[]").into()),
         );
 
-        // Matching diagnostic names and bounds do not make separately created identities interchangeable.
+        // An eager dimension value is typed exactly, so any value refines an unbounded axis.
         let distinct = DimensionVariable::new("extent", DimensionBounds::unbounded());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct), 3).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct.clone()), 3).unwrap());
         assert_eq!(
             context.dynamic_iota(&output_type, 0, &[dimension]),
-            Err(ProgramError::Type(TypeError::invalid(
+            Ok(ArrayIrValue::Array(Array::vector(vec![0i32, 1, 2]).unwrap())),
+        );
+
+        // Symbolic inputs must define the identity of their axis. Matching diagnostic names and bounds do not make
+        // separately created identities interchangeable.
+        let tracing = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            tracing
+                .dynamic_iota(&output_type, 0, &[tracing.input(DimensionType::from(distinct).into())])
+                .unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
                 "`iota` input 0 has type dimension<extent ∈ [0, ∞)> but the output shape requires \
                  dimension<extent ∈ [0, ∞)>",
-            ))),
+            )),
         );
     }
 
     #[test]
     fn test_dynamic_iota_staging() {
         let extent_type = DimensionType::new("extent", DimensionBounds::unbounded());
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = context.input(extent_type.clone().into());
         let output = context.dynamic_iota(&output_type, 0, &[extent]).unwrap();

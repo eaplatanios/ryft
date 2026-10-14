@@ -141,7 +141,7 @@ impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrVa
     fn literal_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => left.literal_eq(right),
-            (Self::Dimension(left), Self::Dimension(right)) => left == right,
+            (Self::Dimension(left), Self::Dimension(right)) => left.literal_eq(right),
             (Self::Reference(left), Self::Reference(right)) => left == right,
             _ => false,
         }
@@ -151,7 +151,7 @@ impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrVa
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Array(array) => array.literal_hash(state),
-            Self::Dimension(dimension) => dimension.hash(state),
+            Self::Dimension(dimension) => dimension.literal_hash(state),
             Self::Reference(reference) => reference.hash(state),
         }
     }
@@ -347,8 +347,6 @@ impl<C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType>>> 
 
 #[cfg(test)]
 mod tests {
-    use std::hash::{BuildHasher, RandomState};
-
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
@@ -362,27 +360,23 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
     use crate::programs::{Atom, Program, ProgramBuilder, Region, RegionArena, RegionId};
-    use crate::tracing::{Tracer, TracingContext};
-
     use crate::tests::literal_hash_of;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
     #[test]
-    fn test_array_ir_dimension_values_share_one_abstract_type() {
-        // The retained-JIT dispatch key is built from `Typed::r#type` of each input, so dimension values with different
-        // runtime extents must report one identical abstract type: a `DimensionType` is strictly identity plus bounds,
-        // and concrete extents never participate in structural type equality, hashing, or display. Otherwise, every
-        // concrete extent would acquire its own compiled specialization, turning a runtime dynamic dimension back into
-        // a static specialization parameter.
+    fn test_array_ir_dimension_values_have_exact_types() {
+        // Eager dimension values are typed exactly, like eager arrays: a value created from a symbolic type reports a
+        // type that admits only its own extent, so values of different extents never share a type. Reusing one JIT
+        // specialization across extents is declared at the JIT boundary instead (refer to
+        // `CompiledFunctionDispatcher::with_staged_input_types`).
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let three = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let four = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
-        assert_eq!(three.r#type().into_owned(), ArrayIrType::Dimension(extent_type));
-        assert_eq!(three.r#type().into_owned(), four.r#type().into_owned());
-        assert_eq!(three.r#type().to_string(), four.r#type().to_string());
-        let hasher = RandomState::new();
-        assert_eq!(hasher.hash_one(three.r#type().as_ref()), hasher.hash_one(four.r#type().as_ref()));
+        let four = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type, 4).unwrap());
+        assert_eq!(three.r#type().to_string(), "dimension<3>");
+        assert_eq!(four.r#type().to_string(), "dimension<4>");
+        assert_ne!(three.r#type().into_owned(), four.r#type().into_owned());
     }
 
     #[test]
@@ -615,13 +609,12 @@ mod tests {
         let nan = ArrayIrValue::<Array>::Array(Array::scalar(f64::NAN).unwrap());
         assert!(nan.literal_eq(&ArrayIrValue::Array(Array::scalar(f64::NAN).unwrap())));
 
-        // Dimension literals follow the dimension value identity.
-        let dimension = DimensionValue::constant(3).unwrap();
-        let dimension_literal = ArrayIrValue::<Array>::Dimension(dimension.clone());
-        let same_dimension_literal = ArrayIrValue::<Array>::Dimension(dimension);
+        // Dimension literals are identical exactly when their extents are, because their static types have no identity.
+        let dimension_literal = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        let same_dimension_literal = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
         assert!(dimension_literal.literal_eq(&same_dimension_literal));
         assert_eq!(literal_hash_of(&dimension_literal), literal_hash_of(&same_dimension_literal));
-        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())));
+        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap())));
 
         // Literals of different kinds are never identical.
         assert!(!dimension_literal.literal_eq(&ArrayIrValue::Array(Array::scalar(3i64).unwrap())));
