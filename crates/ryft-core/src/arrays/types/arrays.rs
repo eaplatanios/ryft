@@ -671,57 +671,11 @@ pub struct ArrayTypeRefinements {
     dimensions: DimensionRefinements,
 }
 
-// TODO(eaplatanios): Review this.
 impl ArrayTypeRefinements {
     /// Returns the underlying [`DimensionRefinements`]s.
     #[inline]
     pub(crate) fn dimension_refinements(&self) -> &DimensionRefinements {
         &self.dimensions
-    }
-
-    /// Validates that `actual` refines `declared` while visiting each axis where a declared dynamic dimension is met by
-    /// a concrete static extent (i.e., each *dynamic-to-static refinement*). This reports only formal facts: it shares
-    /// its structural refinement rules with [`TypeRefinements::from_local_declarations`], which records facts about
-    /// actual identities and correspondences between formal and actual identities, and it is the per-type engine behind
-    /// [`TypeRefinements::validate_refinement`]. The provided `visitor` decides what an observed concrete extent
-    /// *means* (e.g., [`DimensionRefinements::record_declared_extent`] when collecting facts versus
-    /// [`DimensionRefinements::validate_declared_extent`] when justifying an output signature against established facts).
-    /// It first requires that `actual` refines every non-shape component of
-    /// `declared` and matches its rank, and then walks the two shapes axis by axis:
-    ///
-    ///   - An actual dynamic dimension with singleton bounds supplies the same concrete proof as a static extent.
-    ///     For example, `Array[q]` observed as `Array[t]` with `t` constrained to exactly 2 contributes the fact
-    ///     `q = 2`; it does not establish nominal equality between `q` and `t`.
-    ///   - Equal static extents, or dynamic dimensions with the same [`DimensionVariable`], refine trivially and
-    ///     contribute no visit, because no new concrete fact is observed.
-    ///   - A declared dynamic dimension met by a static extent inside its declared bounds is the refinement this
-    ///     function exists to surface: `visitor` is invoked with the declared variable and the observed extent, and
-    ///     any error it returns aborts the walk and propagates to the caller.
-    ///   - A declared dynamic dimension met by a static extent outside its declared bounds fails with
-    ///     [`DimensionError::BindingOutOfBounds`], and every remaining combination (mismatched static extents, distinct
-    ///     dynamic variables, or a static dimension met by a dynamic one) fails as not refining the declared type.
-    ///
-    /// # Parameters
-    ///
-    ///   - `declared`: [`ArrayType`] declared by the boundary signature, whose dynamic dimensions may legitimately be
-    ///     met by concrete extents.
-    ///   - `actual`: Observed [`ArrayType`] that must refine `declared`.
-    ///   - `visitor`: Callback invoked once per in-bounds dynamic-to-static axis, in axis order, with the declared
-    ///     [`DimensionVariable`] and the observed static extent. A repeated variable is visited once per axis that
-    ///     observes it, so visitors are responsible for requiring that repeated observations agree.
-    pub fn visit_dynamic_to_static_refinements(
-        declared: &ArrayType,
-        actual: &ArrayType,
-        mut visitor: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
-    ) -> Result<(), TypeError> {
-        // Identical components contribute nothing here, and only formal facts reach the visitor, which keeps this
-        // contract independent of the actual-scope facts that complete-signature construction records.
-        Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(
-            |refinement_fact| match refinement_fact? {
-                DimensionRefinementFact::Declared(variable, extent) => visitor(variable, extent),
-                DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
-            },
-        )
     }
 
     /// Returns the [`DimensionRefinementFact`]s for one declared and one actual array type, or their comparison error.
@@ -824,9 +778,14 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
     {
         let mut refinements = self.clone();
         visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
-                refinements.dimensions.validate_declared_extent(variable, extent, closed_identities)
-            })
+            Self::array_refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(
+                |refinement_fact| match refinement_fact? {
+                    DimensionRefinementFact::Declared(variable, extent) => {
+                        refinements.dimensions.validate_declared_extent(variable, extent, closed_identities)
+                    }
+                    DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
+                },
+            )
         })
     }
 
