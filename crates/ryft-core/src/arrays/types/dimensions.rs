@@ -11,7 +11,7 @@ use ryft_macros::Parameter;
 
 use crate::axes::Axis;
 use crate::parameters::Parameter;
-use crate::programs::types::{type_signature_pairs, visit_type_signature_pairs};
+use crate::programs::types::type_signature_pairs;
 use crate::programs::{
     ProgramError, Type, TypeError, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition,
     TypeIdentityRenaming, TypeRefinements, type_identities_needing_runtime_checks,
@@ -752,15 +752,14 @@ impl TypeRefinements<DimensionType> for DimensionTypeRefinements {
     {
         // Validation is "declared-only". It checks outputs against the declared facts and never records actual facts.
         let mut refinements = self.dimensions.clone();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::refinement_facts(declared, actual, DimensionComparison::LocalDeclarations).try_for_each(
-                |refinement_fact| match refinement_fact? {
+        type_signature_pairs(declared, actual)?.try_for_each(|(declared, actual)| {
+            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::LocalDeclarations)
+                .try_for_each(|refinement_fact| match refinement_fact? {
                     DimensionRefinementFact::Declared(variable, extent) => {
                         refinements.validate_declared_extent(variable, extent, closed_identities)
                     }
                     DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
-                },
-            )
+                })
         })
     }
 

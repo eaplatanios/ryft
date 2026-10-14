@@ -165,8 +165,8 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
         Self: 't,
     {
         // The default supports unchanged identities. Substitutions require a family-specific structural rule;
-        // conditional establishment cannot prove that metadata may be rewritten without a runtime check.
-        visit_type_signature_pairs::<Self, _, _>(declared, actual, |declared, actual| {
+        // conditional refinement facts cannot prove that metadata may be rewritten without a runtime check.
+        type_signature_pairs(declared, actual)?.try_for_each(|(declared, actual)| {
             if !declared.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
             }
@@ -522,16 +522,14 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     {
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
-        visit_type_signature_pairs::<T, _, _>(
-            declared.iter().map(Borrow::borrow),
-            actual.iter().map(Borrow::borrow),
-            |declared, actual| {
-                if !declared.is_refined_by(actual) {
-                    return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
-                }
-                Ok(())
-            },
-        )?;
+        type_signature_pairs(declared.iter(), actual.iter())?.try_for_each(|(declared, actual)| {
+            let declared: &T = declared.borrow();
+            let actual: &T = actual.borrow();
+            if !declared.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
+            }
+            Ok(())
+        })?;
         Self::from_local_declarations(declared, actual)
     }
 
@@ -720,7 +718,9 @@ impl<T: Type> TypeRefinements<T> for () {
         D::Item: Borrow<T>,
         A::Item: Borrow<T>,
     {
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
+        type_signature_pairs(declared, actual)?.try_for_each(|(declared, actual)| {
+            let declared: &T = declared.borrow();
+            let actual: &T = actual.borrow();
             if !declared.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
             }
@@ -881,7 +881,8 @@ pub fn type_identities_needing_runtime_checks<T: Type, D: Borrow<T>>(
 }
 
 /// Returns corresponding declared/actual [`Type`] signature members, rejecting different lengths with the canonical
-/// type-count diagnostic. Both iterators are checked before any member is consumed.
+/// type-count diagnostic. Both iterators are checked before any member is consumed. Members retain their original
+/// ownership and callers borrow them as needed.
 pub(crate) fn type_signature_pairs<
     D: IntoIterator<IntoIter: ExactSizeIterator>,
     A: IntoIterator<IntoIter: ExactSizeIterator>,
@@ -899,23 +900,6 @@ pub(crate) fn type_signature_pairs<
         )));
     }
     Ok(declared.zip(actual))
-}
-
-/// Zips one complete declared/actual [`Type`] signature and applies `visitor` to each corresponding pair, rejecting
-/// signatures of different lengths with the canonical count diagnostic. This is the shared driver behind complete
-/// signature walks such as [`TypeRefinements::from_local_declarations`], [`TypeRefinements::validate_refinement`],
-/// and [`Type::derive_identity_renaming`], so that every such walk agrees on the length contract and its diagnostic.
-pub(crate) fn visit_type_signature_pairs<
-    T: Type,
-    D: IntoIterator<Item: Borrow<T>, IntoIter: ExactSizeIterator>,
-    A: IntoIterator<Item: Borrow<T>, IntoIter: ExactSizeIterator>,
->(
-    declared: D,
-    actual: A,
-    mut visitor: impl FnMut(&T, &T) -> Result<(), TypeError>,
-) -> Result<(), TypeError> {
-    type_signature_pairs(declared, actual)?
-        .try_for_each(|(declared, actual)| visitor(declared.borrow(), actual.borrow()))
 }
 
 #[allow(clippy::let_unit_value)]

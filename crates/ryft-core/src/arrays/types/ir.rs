@@ -9,7 +9,7 @@ use crate::arrays::types::dimensions::{
     DimensionTypeRefinements, DimensionVariable,
 };
 use crate::parameters::Parameter;
-use crate::programs::types::{type_signature_pairs, visit_type_signature_pairs};
+use crate::programs::types::type_signature_pairs;
 use crate::programs::{
     ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming,
     TypeRefinements, type_identities_needing_runtime_checks,
@@ -374,14 +374,10 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
         // then checks variables shared within and between all member kinds.
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
-        visit_type_signature_pairs(
-            declared.iter().map(Borrow::borrow),
-            actual.iter().map(Borrow::borrow),
-            |declared, actual| {
-                Self::refinement_facts(declared, actual, DimensionComparison::Refinement)
-                    .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
-            },
-        )?;
+        type_signature_pairs(declared.iter(), actual.iter())?.try_for_each(|(declared, actual)| {
+            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement)
+                .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
+        })?;
         Self::from_local_declarations(declared, actual)
     }
 
@@ -431,15 +427,15 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     {
         // Output validation uses declared-scope facts and never records actual-scope facts or correspondences.
         let mut refinements = self.arrays.dimension_refinements().clone();
-        visit_type_signature_pairs(declared, actual, |declared, actual| {
-            Self::refinement_facts(declared, actual, DimensionComparison::Refinement).try_for_each(|refinement_fact| {
-                match refinement_fact? {
+        type_signature_pairs(declared, actual)?.try_for_each(|(declared, actual)| {
+            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement).try_for_each(
+                |refinement_fact| match refinement_fact? {
                     DimensionRefinementFact::Declared(variable, extent) => {
                         refinements.validate_declared_extent(variable, extent, closed_identities)
                     }
                     DimensionRefinementFact::Actual(..) | DimensionRefinementFact::Correspondence(..) => Ok(()),
-                }
-            })
+                },
+            )
         })
     }
 
