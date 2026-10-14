@@ -668,11 +668,17 @@ impl From<ReferenceType<NoReferent>> for ArrayType {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayTypeRefinements {
     /// [`DimensionRefinements`] shared by array axes and, in the composite universe, dimension and reference members.
-    pub(crate) dimensions: DimensionRefinements,
+    dimensions: DimensionRefinements,
 }
 
 // TODO(eaplatanios): Review this.
 impl ArrayTypeRefinements {
+    /// Returns the underlying [`DimensionRefinements`]s.
+    #[inline]
+    pub(crate) fn dimension_refinements(&self) -> &DimensionRefinements {
+        &self.dimensions
+    }
+
     /// Validates that `actual` refines `declared` while visiting each axis where a declared dynamic dimension is met by
     /// a concrete static extent (i.e., each *dynamic-to-static refinement*). This reports only formal facts: it shares
     /// its structural refinement rules with [`TypeRefinements::from_local_declarations`], which records facts about
@@ -718,9 +724,11 @@ impl ArrayTypeRefinements {
         )
     }
 
-    /// Returns an array pair's dimension facts, validating non-shape metadata and rank first.
-    /// [`DimensionComparison`] determines how axis identities are compared and whether identical dimensions contribute
-    /// facts, following the same rules as the shared dimension comparison helper.
+    /// Returns the [`DimensionRefinementFact`]s for one declared and one actual array type, or their comparison error.
+    /// Validates non-shape metadata and rank before comparing corresponding axes. [`DimensionComparison`] determines
+    /// whether distinct dimension variables with unknown extents are accepted and whether identical dimensions
+    /// contribute facts, as in [`DimensionRefinements::dimension_refinement_facts`]. Structural comparisons
+    /// preserve substitutions rather than infer conditional exact extents from supplied variables.
     pub(crate) fn array_refinement_facts<'o>(
         declared: &'o ArrayType,
         actual: &'o ArrayType,
