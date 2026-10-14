@@ -289,7 +289,7 @@ impl KernelCallOperation {
         prefetch_types: Vec<ArrayType>,
     ) -> Result<Self, KernelError> {
         for r#type in &prefetch_types {
-            DimensionFromScalarOperation::new(DimensionVariable::new("prefetch", DimensionBounds::unbounded()))
+            DimensionFromScalarOperation::new(DimensionVariable::new("prefetch", DimensionBounds::unbounded()).into())
                 .infer_output_types(&[ArrayIrType::Array(r#type.clone())], &[])?;
         }
         let maximum_extents = grid

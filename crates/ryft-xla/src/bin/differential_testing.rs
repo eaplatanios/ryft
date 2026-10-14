@@ -491,8 +491,12 @@ fn data_dependent_prefix_program() -> Result<
         None,
     )?[0];
     let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5))?);
-    let count =
-        builder.add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)?[0];
+    let count = builder.add_instruction(
+        DimensionFromScalarOperation::new(count_variable.into()),
+        Vec::new(),
+        vec![count],
+        None,
+    )?[0];
     let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
     let output = builder.add_instruction(
         DynamicSliceOperation::<ArrayIrType>::from_rank(1),

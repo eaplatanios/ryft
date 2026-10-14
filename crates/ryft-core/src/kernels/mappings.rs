@@ -189,7 +189,7 @@ impl BlockMapping {
                 .map_err(TypeError::from)
                 .map_err(ProgramError::from)?;
             if let Some(variable) = formal.variable() {
-                bindings.bind(variable, value.extent()).map_err(ProgramError::from)?;
+                bindings.record_declared_extent(variable, value.extent()).map_err(ProgramError::from)?;
             }
             inputs.push(builder.add_constant(ArrayIrValue::Dimension(value)));
         }

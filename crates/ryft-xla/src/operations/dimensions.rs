@@ -406,10 +406,15 @@ mod tests {
             let left = builder.add_input(scalar_type.clone().into());
             let right = builder.add_input(scalar_type.clone().into());
             let left = builder
-                .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+                .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
                 .unwrap()[0];
             let right = builder
-                .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+                .add_instruction(
+                    DimensionFromScalarOperation::new(right_variable.into()),
+                    Vec::new(),
+                    vec![right],
+                    None,
+                )
                 .unwrap()[0];
             let difference = builder
                 .add_instruction(

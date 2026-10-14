@@ -7206,7 +7206,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let iota = builder
             .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -7375,10 +7375,10 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let batch_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(attention_batch), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(attention_batch.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
 
         // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share it,
@@ -8283,7 +8283,7 @@ mod tests {
 
         let from_scalar = domain
             .bind(
-                ryft_core::DimensionFromScalarOperation::for_type(output.r#type().into_owned()),
+                ryft_core::DimensionFromScalarOperation::new(output.r#type().into_owned()),
                 Vec::new(),
                 &[XlaValue::Array(scalar)],
             )
@@ -8310,7 +8310,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![input], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
             .unwrap()[0];
         let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let program = builder
@@ -8363,28 +8363,18 @@ mod tests {
         let second_input = builder.add_input(input_type.clone().into());
         let third_input = builder.add_input(input_type.clone().into());
         let first = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(first_type.variable().unwrap().clone()),
-                Vec::new(),
-                vec![first_input],
-                None,
-            )
+            .add_instruction(DimensionFromScalarOperation::new(first_type.clone()), Vec::new(), vec![first_input], None)
             .unwrap()[0];
         let second = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(second_type.variable().unwrap().clone()),
+                DimensionFromScalarOperation::new(second_type.clone()),
                 Vec::new(),
                 vec![second_input],
                 None,
             )
             .unwrap()[0];
         let third = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(third_type.variable().unwrap().clone()),
-                Vec::new(),
-                vec![third_input],
-                None,
-            )
+            .add_instruction(DimensionFromScalarOperation::new(third_type.clone()), Vec::new(), vec![third_input], None)
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
@@ -8459,7 +8449,7 @@ mod tests {
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
+                    DimensionFromScalarOperation::new(left_type.clone()),
                     Vec::new(),
                     vec![left_input],
                     None,
@@ -8467,7 +8457,7 @@ mod tests {
                 .unwrap()[0];
             let right = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
+                    DimensionFromScalarOperation::new(right_type.clone()),
                     Vec::new(),
                     vec![right_input],
                     None,
@@ -8876,7 +8866,7 @@ mod tests {
             let size = context.input(input_type.clone().into());
             let limit = context.input(input_type.clone().into());
             let dimension = context
-                .bind(DimensionFromScalarOperation::new(extent.clone()), Vec::new(), &[size])
+                .bind(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), &[size])
                 .unwrap()
                 .remove(0);
             let indices = context
@@ -8979,10 +8969,9 @@ mod tests {
             let size = context.input(input_type.clone().into());
             let dimension = context
                 .bind(
-                    DimensionFromScalarOperation::new(DimensionVariable::new(
-                        "batch",
-                        DimensionBounds::new(0, Some(5)).unwrap(),
-                    )),
+                    DimensionFromScalarOperation::new(
+                        DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap()).into(),
+                    ),
                     Vec::new(),
                     std::slice::from_ref(&size),
                 )
@@ -9061,7 +9050,7 @@ mod tests {
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
+                    DimensionFromScalarOperation::new(left_type.clone()),
                     Vec::new(),
                     vec![left_input],
                     None,
@@ -9069,7 +9058,7 @@ mod tests {
                 .unwrap()[0];
             let right = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
+                    DimensionFromScalarOperation::new(right_type.clone()),
                     Vec::new(),
                     vec![right_input],
                     None,
@@ -9108,21 +9097,21 @@ mod tests {
             (5, 2),
             3,
             (2, 5),
-            "left >= right; observed left=2, right=5",
+            "`dimension_sub` requires left >= right; got left=2, right=5",
         );
         check(
             DimensionOperation::Div(DimensionDivOperation::new(&left_type, &right_type).unwrap()),
             (7, 3),
             2,
             (7, 0),
-            "right > 0; observed left=7, right=0",
+            "`dimension_div` requires right > 0; got left=7, right=0",
         );
         check(
             DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &right_type).unwrap()),
             (7, 3),
             1,
             (7, 0),
-            "right > 0; observed left=7, right=0",
+            "`dimension_rem` requires right > 0; got left=7, right=0",
         );
     }
 
@@ -9149,20 +9138,10 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("left"), Vec::new(), vec![left_input], None)
             .unwrap();
         let left = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(left_type.variable().unwrap().clone()),
-                Vec::new(),
-                vec![left_input],
-                None,
-            )
+            .add_instruction(DimensionFromScalarOperation::new(left_type.clone()), Vec::new(), vec![left_input], None)
             .unwrap()[0];
         let right = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(right_type.variable().unwrap().clone()),
-                Vec::new(),
-                vec![right_input],
-                None,
-            )
+            .add_instruction(DimensionFromScalarOperation::new(right_type.clone()), Vec::new(), vec![right_input], None)
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
@@ -10582,10 +10561,9 @@ mod tests {
         let size = builder.add_input(size_type.clone().into());
         let size = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "size",
-                    DimensionBounds::new(0, Some(4)).unwrap(),
-                )),
+                DimensionFromScalarOperation::new(
+                    DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap()).into(),
+                ),
                 Vec::new(),
                 vec![size],
                 None,
@@ -11568,7 +11546,7 @@ mod tests {
         let size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let broadcast = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
@@ -12299,7 +12277,7 @@ mod tests {
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
             .unwrap()[0];
         let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)
+            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
@@ -12366,7 +12344,7 @@ mod tests {
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
             .unwrap()[0];
         let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)
+            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let mut prefix = || {
@@ -12509,10 +12487,15 @@ mod tests {
         let result_size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
         let input_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(input_extent), Vec::new(), vec![input_size], None)
+            .add_instruction(DimensionFromScalarOperation::new(input_extent.into()), Vec::new(), vec![input_size], None)
             .unwrap()[0];
         let result_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(result_extent), Vec::new(), vec![result_size], None)
+            .add_instruction(
+                DimensionFromScalarOperation::new(result_extent.into()),
+                Vec::new(),
+                vec![result_size],
+                None,
+            )
             .unwrap()[0];
         let input = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, input_dimension], None)
@@ -12575,7 +12558,7 @@ mod tests {
         let size = builder.add_input(size_type.clone().into());
         let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let program = builder
@@ -12593,7 +12576,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let input = builder
             .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -12621,7 +12604,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let input = builder
             .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -12646,7 +12629,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let input = builder
             .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -12672,7 +12655,7 @@ mod tests {
         let size = builder.add_input(size_type.clone().into());
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
@@ -12708,7 +12691,7 @@ mod tests {
         let indices = builder.add_input(indices_type.into());
         let updates = builder.add_input(updates_type.into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let operand = builder
             .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -12955,7 +12938,7 @@ mod tests {
         let value = builder.add_input(value_type.into());
         let global = builder.add_input(global_type.clone().into());
         let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
             .unwrap()[0];
         let dynamic = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)

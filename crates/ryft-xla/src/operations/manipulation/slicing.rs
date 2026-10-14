@@ -763,10 +763,9 @@ mod tests {
             bounds.push(
                 builder
                     .add_instruction(
-                        DimensionFromScalarOperation::new(DimensionVariable::new(
-                            name,
-                            DimensionBounds::new(0, Some(5)).unwrap(),
-                        )),
+                        DimensionFromScalarOperation::new(
+                            DimensionVariable::new(name, DimensionBounds::new(0, Some(5)).unwrap()).into(),
+                        ),
                         Vec::new(),
                         vec![scalar],
                         None,

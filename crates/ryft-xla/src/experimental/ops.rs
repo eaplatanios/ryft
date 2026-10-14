@@ -1730,7 +1730,7 @@ pub(crate) mod tests {
         let predicate = source_builder.add_input(predicate_type.clone().into());
         let scalar = source_builder.add_input(scalar_type.clone().into());
         let gateway = source_builder
-            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![integer], None)
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![integer], None)
             .unwrap()[0];
         let output = source_builder
             .add_instruction(

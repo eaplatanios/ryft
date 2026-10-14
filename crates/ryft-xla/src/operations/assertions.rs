@@ -984,9 +984,9 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
     };
     let observations = format!("{}, {}", observation("left", left_name, left), observation("right", right_name, right));
     Err(match kind {
-        ASSERT_ADD_KIND | ASSERT_MUL_KIND | ASSERT_POW_KIND => format!(
-            "dimension arithmetic overflow in `dimension_{kind}`; got {observations}",
-        ),
+        ASSERT_ADD_KIND | ASSERT_MUL_KIND | ASSERT_POW_KIND => {
+            format!("dimension arithmetic overflow in `dimension_{kind}`; got {observations}",)
+        }
         ASSERT_SUB_KIND => format!("`dimension_sub` requires left >= right; got {observations}"),
         ASSERT_DIV_KIND | ASSERT_REM_KIND => {
             format!("`dimension_{kind}` requires right > 0; got {observations}")
@@ -1586,10 +1586,10 @@ mod tests {
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+            .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
             .unwrap()[0];
         let right_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+            .add_instruction(DimensionFromScalarOperation::new(right_variable.into()), Vec::new(), vec![right], None)
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
@@ -1648,10 +1648,10 @@ mod tests {
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+            .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
             .unwrap()[0];
         let right_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+            .add_instruction(DimensionFromScalarOperation::new(right_variable.into()), Vec::new(), vec![right], None)
             .unwrap()[0];
         let predicate = builder
             .add_instruction(
@@ -2241,8 +2241,7 @@ mod tests {
 
         assert_eq!(
             validate_arithmetic(ASSERT_ADD_KIND, "left", i64::MAX, "right", 1),
-            Err("dimension arithmetic overflow in `dimension_add`; got left=9223372036854775807, right=1"
-                .to_string(),),
+            Err("dimension arithmetic overflow in `dimension_add`; got left=9223372036854775807, right=1".to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_SUB_KIND, "left", 2, "right", 3),
@@ -2250,13 +2249,11 @@ mod tests {
         );
         assert_eq!(
             validate_arithmetic(ASSERT_MUL_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow in `dimension_mul`; got left=9223372036854775807, right=2"
-                .to_string(),),
+            Err("dimension arithmetic overflow in `dimension_mul`; got left=9223372036854775807, right=2".to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_POW_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow in `dimension_pow`; got left=9223372036854775807, right=2"
-                .to_string(),),
+            Err("dimension arithmetic overflow in `dimension_pow`; got left=9223372036854775807, right=2".to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 0),

@@ -861,10 +861,9 @@ mod tests {
         let definition: KernelDefinition = KernelDefinition::trace(template.operation().clone(), |(references, _)| {
             let value = references[0].read()?;
             references[0].context().bind(
-                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "index",
-                    DimensionBounds::new(0, Some(1))?,
-                ))),
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
+                    DimensionVariable::new("index", DimensionBounds::new(0, Some(1))?).into(),
+                )),
                 vec![],
                 &[value.clone()],
             )?;

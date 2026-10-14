@@ -365,7 +365,7 @@ mod tests {
             } else {
                 builder
                     .add_instruction(
-                        DimensionFromScalarOperation::new(dimension_type.variable().unwrap().clone()),
+                        DimensionFromScalarOperation::new(dimension_type.clone()),
                         Vec::new(),
                         vec![size],
                         None,
@@ -1126,7 +1126,7 @@ mod tests {
         let size = parent.input(ArrayType::scalar(DataType::I64).into());
         let output_type = DimensionType::new("output", DimensionBounds::new(0, Some(5)).unwrap());
         let dimension = parent
-            .bind(DimensionFromScalarOperation::new(output_type.variable().unwrap().clone()), Vec::new(), &[size])
+            .bind(DimensionFromScalarOperation::new(output_type.clone()), Vec::new(), &[size])
             .unwrap()
             .remove(0);
         let two = parent.lift(XlaConstant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();

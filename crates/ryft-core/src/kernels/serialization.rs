@@ -1148,7 +1148,7 @@ impl Decoder {
             }
             WireOperation::Condition => ArrayIrOperation::Condition(ConditionOperation::new()).into(),
             WireOperation::DimensionFromScalar(dimension) => ArrayIrOperation::DimensionFromScalar(
-                DimensionFromScalarOperation::for_type(self.dimension_type(dimension)?),
+                DimensionFromScalarOperation::new(self.dimension_type(dimension)?),
             )
             .into(),
             WireOperation::DimensionToScalar => ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation).into(),

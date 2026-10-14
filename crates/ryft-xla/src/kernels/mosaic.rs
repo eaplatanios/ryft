@@ -240,10 +240,9 @@ mod tests {
         let definition = KernelDefinition::<NoKernelExtension>::trace(call, |(references, _)| {
             let value = references[0].read()?;
             references[0].context().bind(
-                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "checked",
-                    DimensionBounds::new(0, Some(10)).unwrap(),
-                ))),
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
+                    DimensionVariable::new("checked", DimensionBounds::new(0, Some(10)).unwrap()).into(),
+                )),
                 vec![],
                 &[value.clone()],
             )?;

@@ -126,7 +126,7 @@ impl DimensionSize<usize, ArrayType> for XlaArray<'_> {
 impl DimensionFromScalar<DimensionValue, ArrayType> for XlaArray<'_> {
     /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
-        let operation = DimensionFromScalarOperation::new(output);
+        let operation = DimensionFromScalarOperation::new(output.into());
         let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {

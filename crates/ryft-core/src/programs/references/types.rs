@@ -4,7 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
-use crate::programs::identities::{NoIdentity, TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::identities::{NoIdentity, TypeIdentityClass, TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
 
 /// [`Type`] that represents a reference to a [`Value`](crate::Value) whose [`Type`] is `T`. A reference type contains
@@ -51,13 +51,18 @@ impl<T: Type> Type for ReferenceType<T> {
     }
 
     #[inline]
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        let declared = declared.iter().map(|r#type| r#type.referent.clone()).collect::<Vec<_>>();
-        let actual = actual.iter().map(|r#type| r#type.referent.clone()).collect::<Vec<_>>();
-        T::derive_identity_renaming(&declared, &actual)
+    fn derive_identity_renaming<
+        't,
+        D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+        A: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+    >(
+        declared: D,
+        actual: A,
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+    where
+        Self: 't,
+    {
+        T::derive_identity_renaming(declared.into_iter().map(Self::referent), actual.into_iter().map(Self::referent))
     }
 
     #[inline]
@@ -91,7 +96,8 @@ impl<T: Type> Type for ReferenceType<T> {
     }
 }
 
-/// Cross-occurrence [`TypeRefinements`] established for a complete [`ReferenceType`] signature.
+/// [`TypeRefinements`] established for a complete [`ReferenceType`] signature, which delegate both the formal and the
+/// actual scope to the refinements of the referent family.
 #[derive(Clone, Debug)]
 pub struct ReferenceTypeRefinements<T: Type> {
     /// Referent refinement state shared across every reference in the signature.
@@ -106,7 +112,21 @@ impl<T: Type> Default for ReferenceTypeRefinements<T> {
 }
 
 impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> {
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    fn new<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<ReferenceType<T>>,
+        A::Item: Borrow<ReferenceType<T>>,
+    {
+        let declared = declared.into_iter().collect::<Vec<_>>();
+        let actual = actual.into_iter().collect::<Vec<_>>();
+        let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
+        let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
+        Ok(Self { referents: T::Refinements::new(declared, actual)? })
+    }
+
+    fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
     where
         D::IntoIter: ExactSizeIterator,
         A::IntoIter: ExactSizeIterator,
@@ -119,10 +139,25 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
         let actual = actual.into_iter().collect::<Vec<_>>();
         let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
         let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
-        Ok(Self { referents: T::Refinements::establish(declared, actual)? })
+        Ok(Self { referents: T::Refinements::from_local_declarations(declared, actual)? })
     }
 
-    fn validate<D: IntoIterator, A: IntoIterator>(
+    #[inline]
+    fn identity_classes<'o>(
+        &'o self,
+    ) -> impl Iterator<Item = TypeIdentityClass<'o, <ReferenceType<T> as Type>::Identity>>
+    where
+        <ReferenceType<T> as Type>::Identity: 'o,
+    {
+        self.referents.identity_classes()
+    }
+
+    #[inline]
+    fn identities_needing_runtime_checks(&self) -> &[T::Identity] {
+        self.referents.identities_needing_runtime_checks()
+    }
+
+    fn validate_refinement<D: IntoIterator, A: IntoIterator>(
         &self,
         declared: D,
         actual: A,
@@ -140,12 +175,39 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
         let actual = actual.into_iter().collect::<Vec<_>>();
         let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
         let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
-        self.referents.validate(declared, actual, closed_identities)
+        self.referents.validate_refinement(declared, actual, closed_identities)
     }
 
     #[inline]
-    fn refine(&self, declared: &ReferenceType<T>, symbolic: &[T::Identity]) -> Result<ReferenceType<T>, TypeError> {
-        Ok(ReferenceType::new(self.referents.refine(&declared.referent, symbolic)?))
+    fn refine_declared(
+        &self,
+        r#type: &ReferenceType<T>,
+        preserved_identities: &[T::Identity],
+    ) -> Result<ReferenceType<T>, TypeError> {
+        Ok(ReferenceType::new(self.referents.refine_declared(&r#type.referent, preserved_identities)?))
+    }
+
+    #[inline]
+    fn refine_actual(
+        &self,
+        r#type: &ReferenceType<T>,
+        preserved_identities: &[T::Identity],
+    ) -> Result<ReferenceType<T>, TypeError> {
+        Ok(ReferenceType::new(self.referents.refine_actual(&r#type.referent, preserved_identities)?))
+    }
+
+    #[inline]
+    fn retype_actual(
+        &self,
+        declared: &ReferenceType<T>,
+        actual: &ReferenceType<T>,
+        preferred_identities: &[T::Identity],
+    ) -> Result<ReferenceType<T>, TypeError> {
+        Ok(ReferenceType::new(self.referents.retype_actual(
+            &declared.referent,
+            &actual.referent,
+            preferred_identities,
+        )?))
     }
 }
 
@@ -255,9 +317,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::DataType;
+    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
     use crate::parameters::Parameter;
     use crate::programs::identities::TypeIdentity;
+    use crate::programs::types::type_identities_needing_runtime_checks;
 
     use super::*;
 
@@ -305,16 +368,29 @@ mod tests {
             .into_iter()
         }
 
-        fn derive_identity_renaming(
-            declared: &[Self],
-            actual: &[Self],
-        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-            Self::Refinements::establish(declared, actual)?;
+        fn derive_identity_renaming<
+            't,
+            D: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+            A: IntoIterator<Item = &'t Self, IntoIter: ExactSizeIterator>,
+        >(
+            declared: D,
+            actual: A,
+        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError>
+        where
+            Self: 't,
+        {
+            let declared = declared.into_iter().collect::<Vec<_>>();
+            let actual = actual.into_iter().collect::<Vec<_>>();
+            let mut refinements = TestTypeRefinements::default();
             let mut renaming = TypeIdentityRenaming::new();
-            for (declared, actual) in declared.iter().zip(actual) {
+            for (declared, actual) in declared.into_iter().zip(actual) {
+                refinements.observe(declared, actual)?;
                 if let (Self::Dynamic(declared), Self::Dynamic(actual)) = (declared, actual) {
                     renaming.insert(*declared, *actual)?;
                 }
+            }
+            if refinements.values.iter().any(|(identity, _)| renaming.target(identity).is_some()) {
+                return Err(TypeError::invalid("a structural substitution cannot mix symbolic and exact observations"));
             }
             Ok(renaming)
         }
@@ -346,6 +422,7 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct TestTypeRefinements {
         values: Vec<(TestIdentity, u8)>,
+        identities_needing_runtime_checks: Vec<TestIdentity>,
     }
 
     impl TestTypeRefinements {
@@ -374,15 +451,15 @@ mod tests {
     }
 
     impl TypeRefinements<TestType> for TestTypeRefinements {
-        fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+        fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
         where
             D::IntoIter: ExactSizeIterator,
             A::IntoIter: ExactSizeIterator,
             D::Item: Borrow<TestType>,
             A::Item: Borrow<TestType>,
         {
-            let declared = declared.into_iter();
-            let actual = actual.into_iter();
+            let declared = declared.into_iter().collect::<Vec<_>>();
+            let actual = actual.into_iter().collect::<Vec<_>>();
             if declared.len() != actual.len() {
                 return Err(TypeError::invalid(format!(
                     "declared type count {} does not match actual type count {}",
@@ -391,13 +468,29 @@ mod tests {
                 )));
             }
             let mut refinements = Self::default();
-            for (declared, actual) in declared.zip(actual) {
+            for (declared, actual) in declared.iter().zip(&actual) {
                 refinements.observe(declared.borrow(), actual.borrow())?;
             }
+            let actual = actual.iter().map(|r#type| Some(r#type.borrow())).collect::<Vec<_>>();
+            refinements.identities_needing_runtime_checks =
+                type_identities_needing_runtime_checks::<TestType, _>(&declared, &actual)?;
             Ok(refinements)
         }
 
-        fn validate<D: IntoIterator, A: IntoIterator>(
+        fn identity_classes<'o>(&'o self) -> impl Iterator<Item = TypeIdentityClass<'o, TestIdentity>>
+        where
+            TestIdentity: 'o,
+        {
+            self.values
+                .iter()
+                .map(|(identity, _)| TypeIdentityClass::new(std::slice::from_ref(identity), &[], true))
+        }
+
+        fn identities_needing_runtime_checks(&self) -> &[TestIdentity] {
+            &self.identities_needing_runtime_checks
+        }
+
+        fn validate_refinement<D: IntoIterator, A: IntoIterator>(
             &self,
             declared: D,
             actual: A,
@@ -425,15 +518,38 @@ mod tests {
             Ok(())
         }
 
-        fn refine(&self, declared: &TestType, symbolic: &[TestIdentity]) -> Result<TestType, TypeError> {
-            Ok(match declared {
-                TestType::Dynamic(identity) if !symbolic.contains(identity) => self
+        fn refine_declared(
+            &self,
+            r#type: &TestType,
+            preserved_identities: &[TestIdentity],
+        ) -> Result<TestType, TypeError> {
+            Ok(match r#type {
+                TestType::Dynamic(identity) if !preserved_identities.contains(identity) => self
                     .values
                     .iter()
                     .find_map(|(candidate, value)| (candidate == identity).then_some(TestType::Static(*value)))
-                    .unwrap_or_else(|| declared.clone()),
-                _ => declared.clone(),
+                    .unwrap_or_else(|| r#type.clone()),
+                _ => r#type.clone(),
             })
+        }
+
+        fn refine_actual(
+            &self,
+            r#type: &TestType,
+            _preserved_identities: &[TestIdentity],
+        ) -> Result<TestType, TypeError> {
+            // This test universe never relates differently named identities, so it has no actual-scope facts.
+            Ok(r#type.clone())
+        }
+
+        fn retype_actual(
+            &self,
+            _declared: &TestType,
+            actual: &TestType,
+            _preferred_identities: &[TestIdentity],
+        ) -> Result<TestType, TypeError> {
+            // Without actual-scope facts, no class has an exact extent to represent.
+            Ok(actual.clone())
         }
     }
 
@@ -460,13 +576,13 @@ mod tests {
         assert!(!static_two.is_complex());
         assert_eq!(static_two.to_string(), "ref<static<2>>");
         assert_eq!(format!("{static_two:?}"), format!("ReferenceType {{ referent: {:?} }}", static_two.referent()));
-        let refinements = ReferenceTypeRefinements::establish(
+        let refinements = ReferenceTypeRefinements::from_local_declarations(
             [declared_type.clone(), declared_type.clone()],
             [static_two.clone(), static_two.clone()],
         )
         .unwrap();
-        assert_eq!(refinements.validate([declared_type.clone()], [static_two.clone()], &[]), Ok(()));
-        let error = ReferenceTypeRefinements::establish(
+        assert_eq!(refinements.validate_refinement([declared_type.clone()], [static_two.clone()], &[]), Ok(()));
+        let error = ReferenceTypeRefinements::from_local_declarations(
             [ReferenceType::new(TestType::Dynamic(declared)), ReferenceType::new(TestType::Dynamic(declared))],
             [static_two, static_three],
         )
@@ -494,19 +610,69 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_type_refinements_refine_the_referent() {
+    fn test_reference_type_refinements_identity_classes() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::non_negative(Some(8)).unwrap());
+        let declared = ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![formal.clone().into()])));
+        let actual = ReferenceType::new(ArrayType::new_static(DataType::F32, [2]));
+        let refinements = ReferenceTypeRefinements::from_local_declarations([&declared], [&actual]).unwrap();
+        assert_eq!(
+            refinements.identity_classes().collect::<Vec<_>>(),
+            vec![TypeIdentityClass::new(std::slice::from_ref(&formal), &[], true)],
+        );
+    }
+
+    #[test]
+    fn test_reference_type_refinements_validate_refinement() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::positive(Some(8)).unwrap());
+        let singleton = DimensionVariable::new("singleton", DimensionBounds::new(2, Some(3)).unwrap());
+        let reference =
+            |dimension: Dimension| ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
+        let refinements = ReferenceTypeRefinements::<ArrayType>::from_local_declarations(
+            &[reference(formal.clone().into())],
+            &[reference(singleton.clone().into())],
+        )
+        .unwrap();
+        assert_eq!(
+            refinements.refine_declared(&reference(formal.clone().into()), &[]),
+            Ok(reference(Dimension::Static(2))),
+        );
+        assert_eq!(refinements.refine_actual(&reference(singleton.into()), &[]), Ok(reference(Dimension::Static(2))));
+        assert_eq!(
+            refinements.validate_refinement(
+                &[reference(formal.clone().into())],
+                &[reference(Dimension::Static(2))],
+                &[]
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            refinements.validate_refinement(
+                &[reference(formal.clone().into())],
+                &[reference(Dimension::Static(3))],
+                &[]
+            ),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: formal.to_string(),
+                expected: 2,
+                actual: 3,
+            })),
+        );
+    }
+
+    #[test]
+    fn test_reference_type_refinements_refine_declared() {
         let identity = TestIdentity(0);
-        let refinements = ReferenceTypeRefinements::<TestType>::establish(
+        let refinements = ReferenceTypeRefinements::<TestType>::from_local_declarations(
             &[ReferenceType::new(TestType::Dynamic(identity))],
             &[ReferenceType::new(TestType::Static(3))],
         )
         .unwrap();
         assert_eq!(
-            refinements.refine(&ReferenceType::new(TestType::Dynamic(identity)), &[]),
+            refinements.refine_declared(&ReferenceType::new(TestType::Dynamic(identity)), &[]),
             Ok(ReferenceType::new(TestType::Static(3))),
         );
         assert_eq!(
-            refinements.refine(&ReferenceType::new(TestType::Dynamic(identity)), &[identity]),
+            refinements.refine_declared(&ReferenceType::new(TestType::Dynamic(identity)), &[identity]),
             Ok(ReferenceType::new(TestType::Dynamic(identity))),
         );
     }

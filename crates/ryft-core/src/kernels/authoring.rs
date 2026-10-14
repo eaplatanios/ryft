@@ -210,7 +210,7 @@ pub fn tile_load<
                     DimensionVariable::new(format!("tile_index_{axis}"), DimensionBounds::new(0, Some(upper))?);
                 context
                     .bind(
-                        ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(variable)),
+                        ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(variable.into())),
                         vec![],
                         &[index.clone()],
                     )?
