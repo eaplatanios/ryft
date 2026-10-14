@@ -1224,7 +1224,7 @@ mod gpu {
                     let invalid = context.lift(ArrayIrValue::Array(Array::scalar(-1i64)?))?;
                     context.bind(
                         ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
-                            DimensionVariable::new("checked", DimensionBounds::new(0, Some(2))?),
+                            DimensionVariable::new("checked", DimensionBounds::new(0, Some(2))?).into(),
                         )),
                         vec![],
                         &[invalid],
@@ -1665,7 +1665,7 @@ mod cutile {
                         .remove(0);
                     context.bind(
                         ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
-                            DimensionVariable::new("checked", DimensionBounds::new(0, Some(2))?),
+                            DimensionVariable::new("checked", DimensionBounds::new(0, Some(2))?).into(),
                         )),
                         vec![],
                         &[integer],

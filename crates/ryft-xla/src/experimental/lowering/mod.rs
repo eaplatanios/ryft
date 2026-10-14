@@ -714,7 +714,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
             Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
-            Print, Assert, Guard, Retype, CustomCall, CustomFunction, CustomFunctionTranspose,
+            Print, Assert, Guard, Cast, CustomCall, CustomFunction, CustomFunctionTranspose,
         )
     }
 }
@@ -753,7 +753,7 @@ impl LowerableOperation for XlaOperation {
             Compare,
             Assert,
             Guard,
-            Retype,
+            Cast,
             DimensionSize,
             ReferenceNew,
             ReferenceRead,

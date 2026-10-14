@@ -7,12 +7,12 @@ use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, Dot
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array, ArrayIrOperation, ArrayIrType,
     ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, AssertionValue, Atan2Operation,
-    AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CeilOperation, ClampOperation,
-    CompareOperation, ComplexOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConjugateOperation,
-    ConstantOperation, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation,
-    CustomCallOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DataType, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CastOperation, CeilOperation,
+    ClampOperation, CompareOperation, ComplexOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    ConjugateOperation, ConstantOperation, ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation,
+    CumulativeOperation, CustomCallOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DataType,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
@@ -25,11 +25,11 @@ use ryft_core::{
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RetypeOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
-    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming,
-    Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
+    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
+    SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, TransposeOperation, Type, TypeError, TypeIdentityRenaming, Typed,
+    UnavailableCustomRules, UpdateSliceOperation, Value, ValueDirectDispatch, ValueProjection, WhileOperation,
     XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_macros::Parameter;
@@ -428,7 +428,7 @@ where
     Guard(GuardOperation<ArrayIrType>),
 
     /// Conversion of a value to a compatible array or first-class dimension type.
-    Retype(RetypeOperation<ArrayIrType>),
+    Cast(CastOperation<ArrayIrType>),
 
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
@@ -665,7 +665,7 @@ where
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
             ArrayIrOperation::Assert(operation) => Self::Assert(operation),
             ArrayIrOperation::Guard(operation) => Self::Guard(operation),
-            ArrayIrOperation::Retype(operation) => Self::Retype(operation),
+            ArrayIrOperation::Cast(operation) => Self::Cast(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
@@ -872,7 +872,7 @@ impl_array_operation_conversion!(
 
 impl_array_operation_conversion!(AssertOperation<ArrayType>);
 impl_array_operation_conversion!(GuardOperation<ArrayType>);
-impl_array_operation_conversion!(RetypeOperation<ArrayType>);
+impl_array_operation_conversion!(CastOperation<ArrayType>);
 
 impl<Constant> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for XlaOperation<Constant>
 where

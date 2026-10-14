@@ -1,6 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ConvertElementTypeOperation, DataType, Dimension, ReducePrecisionOperation, ReductionKind, Shape,
+    ArrayIrType, ArrayType, CastOperation, ConvertElementTypeOperation, DataType, Dimension, Operation,
+    ReducePrecisionOperation, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -12,6 +13,8 @@ use crate::experimental::lowering::types::{
     lower_signed_one_bit_to_mlir, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
     static_dimensions,
 };
+use crate::operations::assertions::lower_dependency_barrier;
+use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::{LowerableOperation, LowerableOperationFamily, LoweringError, XlaLowerer};
 
@@ -226,6 +229,112 @@ impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
     }
+}
+
+impl LowerableOperation for CastOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("output", output_types, 1, ProgramError);
+        let (Some(_), Some(input_type)) = (input_values.first(), input_types.first()) else {
+            return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", self.name()) });
+        };
+        // The cast only converts the first input, but its proof witnesses and preceding assertion must remain real
+        // dependencies. This also orders tangent conversions whose witnesses are unconverted primal inputs.
+        let values = lower_dependency_barrier(
+            input_values,
+            lowerer.effect_tokens.ordered_assertion,
+            &mut lowerer.block,
+            lowerer.location,
+        )?;
+        Ok(vec![lower_cast(
+            values[0],
+            &input_type.clone().into(),
+            &output_types[0].clone().into(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?])
+    }
+}
+
+impl LowerableOperation for CastOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut XlaLowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("output", output_types, 1, ProgramError);
+        let (Some(_), Some(input_type)) = (input_values.first(), input_types.first()) else {
+            return Err(LoweringError::UnsupportedOp { op: format!("`{}` expects at least 1 input", self.name()) });
+        };
+        // Witness values can carry a preceding check even when their geometry is already represented by the types.
+        // Keep those producers, and the current assertion token, ahead of the proof-carrying conversion.
+        let values = lower_dependency_barrier(
+            input_values,
+            lowerer.effect_tokens.ordered_assertion,
+            &mut lowerer.block,
+            lowerer.location,
+        )?;
+        Ok(vec![lower_cast(
+            values[0],
+            input_type,
+            &output_types[0],
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?])
+    }
+}
+
+/// Converts the lowered `value` of type `input_type` to the lowered representation of the compatible `output_type`
+/// (refer to [`CastOperation`] and [`GuardOperation`](ryft_core::GuardOperation)). First-class dimensions lower to `i64` scalars whatever
+/// their type, and types that differ only in metadata lower to the same tensor type, so those values are returned
+/// unchanged. The value is converted through the type whose axes are static wherever either type is static: narrowing
+/// a bounded dynamic axis to a static extent slices the physical buffer (refer to [`lower_refined_region_outputs`]),
+/// and then widening a static axis to a bounded dynamic one, or moving a dynamic axis to another identity with another
+/// physical bound, pads or slices it and restores its runtime size (refer to [`lower_refined_region_input`]). Neither
+/// conversion checks runtime extents, which is why ryft-core emits them only behind a check such as an entry guard.
+pub(crate) fn lower_cast<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayIrType,
+    output_type: &ArrayIrType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let intermediate_type = match (input_type, output_type) {
+        (ArrayIrType::Array(input), ArrayIrType::Array(output)) if input.rank() == output.rank() => {
+            let dimensions = input
+                .shape()
+                .dimensions()
+                .iter()
+                .zip(output.shape().dimensions())
+                .map(|(input, output)| match (input, output) {
+                    (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
+                    _ => input.clone(),
+                })
+                .collect();
+            ArrayIrType::Array(input.clone().with_shape(Shape::new(dimensions)))
+        }
+        _ => input_type.clone(),
+    };
+    let value = lower_refined_region_outputs(
+        vec![value],
+        std::slice::from_ref(input_type),
+        std::slice::from_ref(&intermediate_type),
+        block,
+        context,
+        location,
+    )?
+    .remove(0);
+    lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
 }
 
 /// Preserves rounding information in an intermediate `f32` before conversion to a lower-precision float.
@@ -783,11 +892,11 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::Placeholder;
+    use ryft_core::{DimensionBounds, DimensionType, GuardOperation, Placeholder};
 
     use crate::experimental::lowering::tests::{XlaProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
-    use crate::experimental::ops::XlaArrayConstant;
+    use crate::experimental::ops::{XlaArrayConstant, XlaConstant, XlaProgramBuilder as CompositeXlaProgramBuilder};
 
     use super::*;
 
@@ -859,6 +968,76 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+    #[test]
+    fn test_lower_cast_converts_bounded_dynamic_values() {
+        use ryft_core::{AddOperation, Shape};
+
+        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
+        use crate::tests::execution_client;
+
+        // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
+        let exact: ArrayIrType = ArrayType::new_static(DataType::F64, [2]).into();
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let first = builder.add_input(exact);
+        let second = builder.add_input(symbolic.clone());
+        let narrowed = builder
+            .add_instruction(
+                GuardOperation::new("region", vec![symbolic.clone(), symbolic]),
+                Vec::new(),
+                vec![first, second],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let sum = builder.add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), narrowed, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let client = execution_client();
+        let inputs = [MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Array(vec![3.0, 4.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &inputs, &[2]),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2])]),
+        );
+        let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
+        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
+
+        // The forward-mode derivative narrows the bounded dynamic tangent with a `cast`, which slices its physical
+        // buffer to the static extent.
+        let jvp = program.jvp().unwrap();
+        assert!(jvp.to_string().contains("cast"), "{jvp}");
+        let tangents =
+            [MixedValue::Array(vec![1.0, 1.0], vec![2]), MixedValue::Array(vec![10.0, 20.0, 0.0, 0.0], vec![4])];
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &jvp,
+                &[inputs[0].clone(), inputs[1].clone(), tangents[0].clone(), tangents[1].clone()],
+                &[2, 2],
+            ),
+            Ok(vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Array(vec![11.0, 21.0], vec![2])]),
+        );
+
+        // The pullback widens the static cotangent back to the bounded dynamic input with a `cast` that the residual
+        // primal input witnesses, which pads its physical buffer and restores the logical extent.
+        let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert!(pullback.to_string().contains("cast"), "{pullback}");
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &pullback,
+                &[MixedValue::Array(vec![1.0, 2.0], vec![2]), inputs[1].clone()],
+                &[2],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                MixedValue::Dimension(2),
+            ]),
         );
     }
 }

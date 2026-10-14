@@ -5586,9 +5586,9 @@ fn array_data_dependent_padding_discipline(
         }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
-        // Entry guards and `retype`s narrow or widen bounded-dynamic values explicitly: the physical buffer is sliced or
+        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly: the physical buffer is sliced or
         // padded, and every axis that stays dynamic gets its logical size back.
-        ArrayOperation::Guard(_) | ArrayOperation::Retype(_) => RyftMasked,
+        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
         ArrayOperation::Assert(_)
         | ArrayOperation::Zero(_)
         | ArrayOperation::ZeroLike(_)
@@ -5694,8 +5694,8 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         XlaOperation::Kernel(_) => {
             Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
         }
-        // Entry guards and `retype`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
-        XlaOperation::Guard(_) | XlaOperation::Retype(_) => RyftMasked,
+        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
+        XlaOperation::Guard(_) | XlaOperation::Cast(_) => RyftMasked,
         XlaOperation::ShardMap(_) => {
             Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
         }

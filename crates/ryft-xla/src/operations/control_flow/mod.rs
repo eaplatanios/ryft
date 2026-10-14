@@ -162,7 +162,7 @@ where
 /// Converts the lowered value of one control-flow input to the lowered type of the region input that it feeds, which
 /// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`), or more
 /// generally to a type whose dynamic axes take either a static extent of the input or the runtime size of a dynamic
-/// axis of the input (e.g., the outputs of an entry guard or a `retype`). Regions receive every input at its declared
+/// axis of the input (e.g., the outputs of an entry guard or a `cast`). Regions receive every input at its declared
 /// type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type, so those
 /// inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a dynamic dimension
 /// whose physical bound differs from the declared one, lower to different tensor types. Such an input is exposed as its
