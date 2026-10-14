@@ -1181,9 +1181,7 @@ impl DimensionRefinements {
         Ok(renaming)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the refinement facts for one declared and one actual dimension, or their comparison error.
+    /// Returns the [`DimensionRefinementFact`]s for one declared and one actual dimension, or their comparison error.
     /// [`DimensionComparison`] determines whether distinct identities with unknown extents are accepted and whether
     /// identical dimensions contribute facts. Structural comparisons preserve substitutions rather than infer
     /// conditional exact extents from actual identities.
@@ -1194,7 +1192,7 @@ impl DimensionRefinements {
     ) -> impl Iterator<Item = Result<DimensionRefinementFact<'o>, TypeError>> {
         // One pair can establish at most three facts: declared extent, actual extent, and their correspondence.
         let mut facts = [None, None, None];
-        if declared == actual && comparison == DimensionComparison::Refinement {
+        if comparison == DimensionComparison::Refinement && declared == actual {
             return facts.into_iter().flatten();
         }
 
@@ -1257,13 +1255,13 @@ impl DimensionRefinements {
             }
             (Dimension::Dynamic(declared_variable), None, Some(actual_variable)) => {
                 facts[0] = Some(
-                    if actual_variable != declared_variable
-                        && (comparison == DimensionComparison::Refinement
-                            || !declared_variable.bounds().contains_bounds(actual_variable.bounds()))
+                    if actual_variable == declared_variable
+                        || (comparison == DimensionComparison::LocalDeclarations
+                            && declared_variable.bounds().contains_bounds(actual_variable.bounds()))
                     {
-                        Err(mismatch_error())
-                    } else {
                         Ok(DimensionRefinementFact::Correspondence(declared_variable, actual_variable))
+                    } else {
+                        Err(mismatch_error())
                     },
                 );
             }
@@ -1273,7 +1271,8 @@ impl DimensionRefinements {
         facts.into_iter().flatten()
     }
 
-    /// Finds the class containing `variable` in the requested scope.
+    /// Returns index of the [`DimensionIdentityClass`] in [`Self::classes`] that contains `variable`
+    /// in the specified [`TypeIdentityKind`] scope.
     fn class_index(&self, variable: &DimensionVariable, kind: TypeIdentityKind) -> Option<usize> {
         self.classes.iter().position(|class| match kind {
             TypeIdentityKind::Declared => class.declared.contains(variable),
@@ -1282,9 +1281,10 @@ impl DimensionRefinements {
     }
 
     /// Returns the representative index of the group containing `class_index` during identity-class construction.
-    /// `parent_indices` maps each temporary class index to its parent; a representative is its own parent. Follows
-    /// that chain and shortens it by linking each visited index to its grandparent, making later searches faster.
-    /// These indices refer to temporary classes, not dimension extents or positions in the final class vector.
+    /// `parent_indices` maps each temporary [`DimensionIdentityClass`] index to its parent (a representative is its
+    /// own parent). This function follows that chain and shortens it by linking each visited index to its grandparent,
+    /// making later searches faster. These indices refer to temporary classes, not dimension extents or positions in
+    /// the final class vector.
     fn class_root(parent_indices: &mut [usize], mut class_index: usize) -> usize {
         while parent_indices[class_index] != class_index {
             parent_indices[class_index] = parent_indices[parent_indices[class_index]];
@@ -1293,13 +1293,14 @@ impl DimensionRefinements {
         class_index
     }
 
-    /// Returns the exact extent of the requested scoped identity's class.
-    /// Returns `None` if the identity is absent or its class has no known extent.
+    /// Returns the exact extent of the requested scoped identity's [`DimensionIdentityClass`].
+    /// Returns `None` if the identity is absent or if its class has no known extent.
     fn class_extent(&self, variable: &DimensionVariable, kind: TypeIdentityKind) -> Option<usize> {
         self.class_index(variable, kind).and_then(|index| self.classes[index].extent)
     }
 
-    /// Records a fact at a known class position, validating every other receiving member before publishing it.
+    /// Records a fact at a known [`DimensionIdentityClass`] position, validating every other receiving member
+    /// before publishing it.
     fn record_class_extent(
         &mut self,
         index: usize,
