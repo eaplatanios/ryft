@@ -27,8 +27,8 @@
 //!     An unchecked cast assumes those relationships, for example after a [`GuardOperation`](crate::GuardOperation)
 //!     has checked them. Differentiation and transposition use unchecked casts for tangent and cotangent
 //!     representations whose relationships the primal computation has established. The [`CastType`] type capability
-//!     validates the output type's requirements, such as its element type and layout. The operation checks dimension
-//!     relationships separately.
+//!     infers the output type and validates the complete relationship, including dimension identities, extents,
+//!     element types, and layout constraints.
 //!
 //! Numerical conversion is linear, so differentiation converts the primal and aligns the tangent with the output's
 //! tangent type, transposition converts the cotangent back to the input's cotangent type, and conversions into or
@@ -990,72 +990,163 @@ impl ReducePrecision for Array {
     }
 }
 
-/// Defines which output types a [`CastOperation`] can use for this type family. For arrays, the input and output
-/// must agree on their element [`DataType`], [`Shape`](crate::Shape) rank, and [`Memory`](crate::Memory). Optional
-/// [`Layout`] and [`Sharding`](crate::Sharding) constraints must agree only when both types specify them. An
-/// unspecified field imposes no constraint. For example, an input specifying a layout and an output specifying a
-/// sharding can both describe a value that carries that layout and sharding; two different specified layouts cannot.
-/// This differs from requiring one complete type to refine the other.
+/// Infers the output of a [`CastOperation`] for this type family, validating the complete relationship between its
+/// input, output, and witness types. This includes dimension extents and identities as well as other type properties.
+/// For arrays, element [`DataType`], [`Shape`](crate::Shape) rank, and [`Memory`](crate::Memory) must agree. Optional
+/// [`Layout`] and [`Sharding`](crate::Sharding) constraints must agree when both types specify them; an unspecified
+/// field imposes no constraint. For example, an input specifying a layout and an output specifying a sharding can
+/// describe the same value, whereas two different specified layouts cannot.
 ///
-/// Custom type families implement this capability to use [`CastOperation`]. The operation validates dimension
-/// extents and identity relationships separately through [`TypeRefinements`].
+/// Custom type families implement this capability to use [`CastOperation`]. The built-in implementations use
+/// [`TypeRefinements`] to validate dimension and identity relationships and infer the output's representation.
 pub trait CastType: Type {
-    /// Validates the requirements on `output_type` described by this trait. [`CastOperation`] separately validates
-    /// dimension extents and identity relationships; this method does not inspect runtime values.
-    fn validate_cast_output_type(&self, output_type: &Self) -> Result<(), TypeError>;
+    /// Validates `operation` against `input_types` (the value followed by its witnesses) and returns its inferred
+    /// output type. Both checked and unchecked casts use the same type rules: statically contradictory relationships
+    /// are errors, while relationships requiring runtime checks are permitted. This function does not check runtime
+    /// values; the cast's mode determines whether staged and compiled programs check or assume those relationships.
+    ///
+    /// Without an explicit [relation](CastOperation::relation), one of the input and requested output types
+    /// must refine the other. With a relation, both must instantiate that local declaration, and the original
+    /// [input declaration](CastOperation::input_type) and [witness declarations](CastOperation::witness_types)
+    /// must agree with the supplied types. References and outputs defining identities are unsupported. The inferred
+    /// output preserves names carried by live operands and resolves names lost during concretization to exact extents
+    /// (refer to [`CastOperation::output_type`]). Invalid input counts must return an error, even when called directly.
+    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError>;
 }
 
 impl CastType for DataType {
     #[inline]
-    fn validate_cast_output_type(&self, output_type: &Self) -> Result<(), TypeError> {
-        if self == output_type {
-            Ok(())
-        } else {
-            Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot convert type `{self}` to unrelated type `{output_type}`",
-            )))
-        }
+    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
+        infer_cast_output_type(operation, input_types, |input, output| input == output)
     }
 }
 
 impl CastType for ArrayType {
-    fn validate_cast_output_type(&self, output_type: &Self) -> Result<(), TypeError> {
-        let layout_matches = self.layout().zip(output_type.layout()).is_none_or(|(input, output)| input == output);
-        let sharding_matches =
-            self.sharding().zip(output_type.sharding()).is_none_or(|(input, output)| input == output);
-        if self.data_type() == output_type.data_type()
-            && self.rank() == output_type.rank()
-            && self.memory() == output_type.memory()
-            && layout_matches
-            && sharding_matches
-        {
-            Ok(())
-        } else {
-            Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot convert type `{self}` to unrelated type `{output_type}`",
-            )))
-        }
+    #[inline]
+    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
+        infer_cast_output_type(operation, input_types, array_cast_types_match)
     }
 }
 
 impl CastType for DimensionType {
     #[inline]
-    fn validate_cast_output_type(&self, _output_type: &Self) -> Result<(), TypeError> {
-        // A first-class dimension only needs the dimension and identity checks performed by refinement validation.
-        Ok(())
+    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
+        infer_cast_output_type(operation, input_types, |_, _| true)
     }
 }
 
 impl CastType for ArrayIrType {
-    fn validate_cast_output_type(&self, output_type: &Self) -> Result<(), TypeError> {
-        match (self, output_type) {
-            (Self::Array(input), Self::Array(output)) => input.validate_cast_output_type(output),
-            (Self::Dimension(input), Self::Dimension(output)) => input.validate_cast_output_type(output),
-            _ => Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` cannot convert type `{self}` to unrelated type `{output_type}`",
-            ))),
-        }
+    #[inline]
+    fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
+        infer_cast_output_type(operation, input_types, |input, output| match (input, output) {
+            (Self::Array(input), Self::Array(output)) => array_cast_types_match(input, output),
+            (Self::Dimension(_), Self::Dimension(_)) => true,
+            _ => false,
+        })
     }
+}
+
+/// Compares array properties that a local dimension relation does not constrain. Dimension extents and identities
+/// are validated separately by the scoped refinements in [`infer_cast_output_type`].
+fn array_cast_types_match(input: &ArrayType, output: &ArrayType) -> bool {
+    input.data_type() == output.data_type()
+        && input.rank() == output.rank()
+        && input.memory() == output.memory()
+        && input.layout().zip(output.layout()).is_none_or(|(input, output)| input == output)
+        && input.sharding().zip(output.sharding()).is_none_or(|(input, output)| input == output)
+}
+
+/// Infers a built-in family's complete cast relationship, using `types_match` for properties outside the local
+/// dimension relation. All dimension and identity comparisons use the family's existing [`TypeRefinements`].
+fn infer_cast_output_type<T: Type>(
+    operation: &CastOperation<T>,
+    input_types: &[T],
+    types_match: impl FnOnce(&T, &T) -> bool,
+) -> Result<T, TypeError> {
+    check_count!("input", input_types, 1 + operation.witness_types.len(), TypeError);
+    let input_type = &input_types[0];
+    if let Some(reference) = input_types
+        .iter()
+        .chain(&operation.witness_types)
+        .chain([&operation.output_type])
+        .chain(operation.input_type())
+        .chain(operation.relation())
+        .find(|r#type| r#type.is_reference())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{CAST_OPERATION_NAME}` does not support reference type `{reference}`",
+        )));
+    }
+
+    if operation.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
+        return Err(TypeError::invalid(format!(
+            "`{}` output type `{}` cannot define a type identity",
+            CAST_OPERATION_NAME, operation.output_type,
+        )));
+    }
+
+    // A relation is a local declaration that the value and the output must both instantiate, through scoped
+    // correspondences that admit differently named identities, while the witnesses must instantiate their
+    // declared types.
+    let (refinements, local) = if let Some((declared_input, relation)) = operation.relation.as_deref() {
+        let refinements = T::Refinements::new(
+            std::iter::once(declared_input).chain(&operation.witness_types).collect::<Vec<_>>(),
+            input_types.iter(),
+        )?;
+
+        // Witness identities belong to the surrounding program, while the relation's identities are local. Apply
+        // ambient facts to both sides before checking the local relation, so a concrete witness cannot contradict
+        // an extent determined by the value (e.g., output `a = 5` next to a value of extent `3`).
+        let input = refinements.refine_actual(input_type, &[])?;
+        let output = refinements.refine_declared(&operation.output_type, &[])?;
+        if !types_match(&input, &output) {
+            return Err(TypeError::invalid(format!(
+                "`{CAST_OPERATION_NAME}` cannot convert type `{input}` to unrelated type `{output}`",
+            )));
+        }
+        let local = T::Refinements::from_local_declarations([relation, relation], [&input, &output])?;
+        (refinements, Some(local))
+    } else {
+        // The cast relates the value at the more general of its two types to the witnesses at their declared types.
+        // Static types must not contradict that relationship (e.g., a witness of static extent `5` next to widening
+        // `f32[2]` to `f32[n]`).
+        let (general, specific) = if operation.output_type.is_refined_by(input_type) {
+            (&operation.output_type, input_type)
+        } else if input_type.is_refined_by(&operation.output_type) {
+            (input_type, &operation.output_type)
+        } else {
+            return Err(TypeError::invalid(format!(
+                "`{}` cannot convert type `{}` to unrelated type `{}`",
+                CAST_OPERATION_NAME, input_type, operation.output_type,
+            )));
+        };
+        let refinements = T::Refinements::new(
+            std::iter::once(general).chain(&operation.witness_types).collect::<Vec<_>>(),
+            std::iter::once(specific).chain(&input_types[1..]).collect::<Vec<_>>(),
+        )?;
+        (refinements, None)
+    };
+
+    // Preserve names carried by live operands, including nominal cotangent types. Resolve names lost when declared
+    // operands became concrete, but leave names absent from those declarations alone: ordinary graph validation must
+    // still reject widening to an identity for which the caller supplied no witness.
+    let preserved = operation
+        .output_type
+        .identities()
+        .filter_map(|(_, identity)| {
+            let carries = |r#type: &T| r#type.identities().any(|(_, available)| available == identity);
+            (input_types.iter().any(carries)
+                || !operation.input_type().into_iter().chain(&operation.witness_types).any(carries))
+            .then(|| identity.clone())
+        })
+        .collect::<Vec<_>>();
+    let output = refinements.refine_declared(&operation.output_type, &preserved)?;
+    let output = match local {
+        Some(local) => local.refine_actual(&output, &preserved)?,
+        None => output,
+    };
+
+    Ok(output)
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -1270,82 +1361,7 @@ impl<T: CastType> Operation for CastOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1 + self.witness_types.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        let input_type = &input_types[0];
-        if let Some(reference) = input_types
-            .iter()
-            .chain(&self.witness_types)
-            .chain([&self.output_type])
-            .chain(self.input_type())
-            .chain(self.relation())
-            .find(|r#type| r#type.is_reference())
-        {
-            return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` does not support reference type `{reference}`",
-            )));
-        }
-        if self.output_type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition) {
-            return Err(TypeError::invalid(format!(
-                "`{CAST_OPERATION_NAME}` output type `{}` cannot define a type identity",
-                self.output_type,
-            )));
-        }
-
-        // A relation is a local declaration that the value and the output must both instantiate, through scoped
-        // correspondences that admit differently named identities, while the witnesses must instantiate their declared
-        // types.
-        let (refinements, local) = if let Some((declared_input, relation)) = self.relation.as_deref() {
-            let refinements = T::Refinements::new(
-                std::iter::once(declared_input).chain(&self.witness_types).collect::<Vec<_>>(),
-                input_types.iter(),
-            )?;
-            // Witness identities belong to the surrounding program, while the relation's identities are local.
-            // Apply ambient facts to both sides before checking the local relation, so a concrete witness cannot
-            // contradict an extent determined by the value (e.g., output `a = 5` next to a value of extent 3).
-            let input = refinements.refine_actual(input_type, &[])?;
-            let output = refinements.refine_declared(&self.output_type, &[])?;
-            input.validate_cast_output_type(&output)?;
-            let local = T::Refinements::from_local_declarations([relation, relation], [&input, &output])?;
-            (refinements, Some(local))
-        } else {
-            // The cast relates the value at the more general of its two types to the witnesses at their declared
-            // types. Static types must not contradict that relationship (e.g., a witness of static extent 5 next to
-            // widening `f32[2]` to `f32[n]`).
-            let (general, specific) = if self.output_type.is_refined_by(input_type) {
-                (&self.output_type, input_type)
-            } else if input_type.is_refined_by(&self.output_type) {
-                (input_type, &self.output_type)
-            } else {
-                return Err(TypeError::invalid(format!(
-                    "`{CAST_OPERATION_NAME}` cannot convert type `{input_type}` to unrelated type `{}`",
-                    self.output_type,
-                )));
-            };
-            let refinements = T::Refinements::new(
-                std::iter::once(general).chain(&self.witness_types).collect::<Vec<_>>(),
-                std::iter::once(specific).chain(&input_types[1..]).collect::<Vec<_>>(),
-            )?;
-            (refinements, None)
-        };
-
-        // Preserve names carried by live operands, including nominal cotangent types. Resolve names lost when
-        // declared operands became concrete, but leave names absent from those declarations alone: ordinary graph
-        // validation must still reject widening to an identity for which the caller supplied no witness.
-        let preserved = self
-            .output_type
-            .identities()
-            .filter_map(|(_, identity)| {
-                let carries = |r#type: &T| r#type.identities().any(|(_, available)| available == identity);
-                (input_types.iter().any(carries)
-                    || !self.input_type().into_iter().chain(&self.witness_types).any(carries))
-                .then(|| identity.clone())
-            })
-            .collect::<Vec<_>>();
-        let output = refinements.refine_declared(&self.output_type, &preserved)?;
-        let output = match local {
-            Some(local) => local.refine_actual(&output, &preserved)?,
-            None => output,
-        };
-        Ok(vec![output])
+        Ok(vec![T::infer_cast_output_type(self, input_types)?])
     }
 
     #[inline]
@@ -1713,24 +1729,27 @@ fn cast_array_ir_value<A: Value<Type = ArrayType> + Cast<ArrayType>>(
     value: &ArrayIrValue<A>,
     witnesses: &[ArrayIrValue<A>],
 ) -> Result<ArrayIrValue<A>, ProgramError> {
-    let input_types =
-        std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let operation = CastOperation { witness_types: input_types[1..].to_vec(), ..operation };
-    operation.infer_output_types(&input_types, &[])?;
     if let (ArrayIrValue::Array(value), ArrayIrType::Array(output_type)) = (value, operation.output_type()) {
         let witnesses = witnesses
             .iter()
             .filter_map(|witness| match witness {
-                ArrayIrValue::Array(value) => Some(value.clone()),
-                _ => None,
+                ArrayIrValue::Array(value) => Some(Ok(value.clone())),
+                ArrayIrValue::Dimension(_) => None,
+                ArrayIrValue::Reference(_) => Some(Err(TypeError::invalid(format!(
+                    "`{CAST_OPERATION_NAME}` does not support reference type `{}`",
+                    witness.r#type(),
+                )))),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         return Ok(ArrayIrValue::Array(if operation.is_checked() {
             value.cast(output_type.clone(), &witnesses)?
         } else {
             value.cast_unchecked(output_type.clone(), &witnesses)?
         }));
     }
+    let input_types =
+        std::iter::once(value).chain(witnesses).map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    let operation = CastOperation { witness_types: input_types[1..].to_vec(), ..operation };
     operation.validate_concrete_inputs(&input_types, &[])?;
     Ok(value.clone())
 }
@@ -1782,8 +1801,8 @@ mod tests {
 
     // An independent type family can implement the operation-specific contract without changing TypeRefinements.
     impl CastType for ProjectedMemberType<0> {
-        fn validate_cast_output_type(&self, _output_type: &Self) -> Result<(), TypeError> {
-            Ok(())
+        fn infer_cast_output_type(operation: &CastOperation<Self>, input_types: &[Self]) -> Result<Self, TypeError> {
+            infer_cast_output_type(operation, input_types, |_, _| true)
         }
     }
 
@@ -3293,32 +3312,111 @@ mod tests {
     // TODO(eaplatanios): Review from here onwards.
 
     #[test]
-    fn test_cast_type_validate_cast_output_type() {
+    fn test_cast_type_infer_cast_output_type() {
         check_operation_type_inference!(
             operation = CastOperation::checked(ProjectedMemberType::<0>, Vec::new())
                 .with_relation(ProjectedMemberType::<0>, ProjectedMemberType::<0>),
             cases = [{ input_types = [ProjectedMemberType::<0>], output_types = [ProjectedMemberType::<0>] }],
         );
-        assert_eq!(DataType::F32.validate_cast_output_type(&DataType::F32), Ok(()));
         assert_eq!(
-            DataType::F32.validate_cast_output_type(&DataType::F64),
+            DataType::infer_cast_output_type(&CastOperation::checked(DataType::F32, Vec::new()), &[DataType::F32]),
+            Ok(DataType::F32),
+        );
+        assert_eq!(
+            DataType::infer_cast_output_type(&CastOperation::checked(DataType::F64, Vec::new()), &[DataType::F32]),
             Err(TypeError::invalid("`cast` cannot convert type `f32` to unrelated type `f64`")),
         );
-        let array = ArrayType::new_static(DataType::F32, [2]);
-        assert_eq!(
-            array.validate_cast_output_type(&ArrayType::scalar(DataType::F32)),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[2]` to unrelated type `f32[]`")),
-        );
-        assert_eq!(
-            array.validate_cast_output_type(&array.clone().with_memory(Memory::Host { pinned: true })),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[2]` to unrelated type `f32[2]@Host[Pinned]`")),
-        );
-        // Dimension extents are validated by refinement construction rather than this function.
+
+        // Direct capability calls validate complete shapes, not just element types or element counts, in both modes.
+        let array = ArrayType::new_static(DataType::F32, [2, 3]);
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, p, q] = ["n", "p", "q"].map(|name| DimensionType::new(name, bounds));
+        let relation =
+            ArrayType::new(DataType::F32, Shape::new(vec![p.simplified_dimension(), q.simplified_dimension()]));
+        for constructor in [CastOperation::checked, CastOperation::unchecked] {
+            assert_eq!(
+                ArrayType::infer_cast_output_type(
+                    &constructor(array.clone(), Vec::new()),
+                    std::slice::from_ref(&array),
+                ),
+                Ok(array.clone()),
+            );
+            for output in [
+                ArrayType::scalar(DataType::F32),
+                ArrayType::new_static(DataType::F32, [1, 6]),
+                array.clone().with_memory(Memory::Host { pinned: true }),
+            ] {
+                let unrelated = Err(TypeError::invalid(format!(
+                    "`cast` cannot convert type `{array}` to unrelated type `{output}`",
+                )));
+                let related_error = if output == ArrayType::new_static(DataType::F32, [1, 6]) {
+                    Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                        dimension: "p".to_owned(),
+                        expected: 2,
+                        actual: 1,
+                    }))
+                } else {
+                    unrelated.clone()
+                };
+                let operation = constructor(output, Vec::new());
+                assert_eq!(ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&array)), unrelated);
+                let related = operation.with_relation(array.clone(), relation.clone());
+                assert_eq!(ArrayType::infer_cast_output_type(&related, std::slice::from_ref(&array)), related_error);
+            }
+
+            // A concrete witness can contradict a symbolic output even when each type is individually admissible.
+            let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+            let operation = constructor(symbolic.clone(), vec![symbolic.clone()]);
+            let exact = |extent| ArrayType::new_static(DataType::F32, [extent]);
+            assert_eq!(ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(2)]), Ok(exact(2)));
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[exact(2), exact(3)]),
+                Err(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 2,
+                    actual: 3,
+                })),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[]),
+                Err(TypeError::invalid("expected 2 inputs but got 0")),
+            );
+            assert_eq!(
+                ArrayType::infer_cast_output_type(&operation, &[exact(2)]),
+                Err(TypeError::invalid("expected 2 inputs but got 1")),
+            );
+        }
+
         let dimension = DimensionType::from(Dimension::Static(2));
-        assert_eq!(dimension.validate_cast_output_type(&DimensionType::from(Dimension::Static(3))), Ok(()));
+        let output = DimensionType::from(Dimension::Static(3));
         assert_eq!(
-            ArrayIrType::Array(array).validate_cast_output_type(&ArrayIrType::Dimension(dimension)),
-            Err(TypeError::invalid("`cast` cannot convert type `f32[2]` to unrelated type `dimension<2>`")),
+            DimensionType::infer_cast_output_type(
+                &CastOperation::checked(output, Vec::new()),
+                std::slice::from_ref(&dimension),
+            ),
+            Err(TypeError::invalid("`cast` cannot convert type `dimension<2>` to unrelated type `dimension<3>`")),
+        );
+        assert_eq!(
+            DimensionType::infer_cast_output_type(
+                &CastOperation::checked(n, Vec::new()),
+                std::slice::from_ref(&dimension),
+            ),
+            Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
+        );
+        assert_eq!(
+            ArrayIrType::infer_cast_output_type(
+                &CastOperation::checked(ArrayIrType::Dimension(dimension), Vec::new()),
+                &[ArrayIrType::Array(array.clone())],
+            ),
+            Err(TypeError::invalid("`cast` cannot convert type `f32[2, 3]` to unrelated type `dimension<2>`")),
+        );
+        let reference: ArrayIrType = ReferenceType::new(array.clone()).into();
+        assert_eq!(
+            ArrayIrType::infer_cast_output_type(
+                &CastOperation::checked(array.into(), vec![reference.clone()]),
+                &[ArrayType::new_static(DataType::F32, [2, 3]).into(), reference],
+            ),
+            Err(TypeError::invalid("`cast` does not support reference type `ref<f32[2, 3]>`")),
         );
     }
 
@@ -4472,6 +4570,25 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let vector = |extent: usize| Array::vector(vec![1f32; extent]).unwrap();
         for (checked, mode) in [(true, ", checked=true"), (false, "")] {
+            let rejected = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |value| {
+                    let reference = ArrayIrValue::Reference(ArrayReference::new(value.clone()));
+                    let value = ArrayIrValue::Array(value);
+                    let output = if checked {
+                        value.cast(exact.clone().into(), &[reference])?
+                    } else {
+                        value.cast_unchecked(exact.clone().into(), &[reference])?
+                    };
+                    let ArrayIrValue::Array(output) = output else { panic!("expected an array") };
+                    Ok(output)
+                },
+                exact.clone(),
+            );
+            assert_eq!(
+                rejected.map(|_| ()),
+                Err(ProgramError::Type(TypeError::invalid("`cast` does not support reference type `ref<f32[2]>`"))),
+            );
+
             // A dimension witness has no identity and introduces no relationship with the output. Keep the array
             // witness and let its context perform the cast, including its runtime check in checked mode.
             let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
