@@ -2024,6 +2024,8 @@ impl<
     D: RegionDriver<C::Constant, C::Operation>,
 > ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, D>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
 {
     #[inline]
@@ -3342,6 +3344,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 TracingContext<C::Constant, C::Operation>,
                 Referent = <P as ReferenceDischargePolicy<C>>::Referent,
             >,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
         for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
     {
         let mappings = RegionReplayMappings::new();
@@ -3730,7 +3734,10 @@ impl Default for ReferenceDischargeCaptureScope {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns
     /// the resulting reference-free program together with bindings for its external references.
     ///
@@ -4152,6 +4159,8 @@ impl<
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > ClosedProgram<Capture, V, O, Input, Output>
+where
+    TracingContext<V, O>: StagingContext<Type = Capture::Type, Constant = V, Operation = O>,
 {
     /// Lifts this [`ClosedProgram`]'s captures into leading inputs and rewrites every [`Reference`](crate::Reference)
     /// as explicit immutable state.
@@ -4538,7 +4547,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Add, AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        Add, AddOperation, ConditionOperation, GuardOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
         ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
@@ -4548,7 +4557,7 @@ mod tests {
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::{Instruction, InstructionId};
-    use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
+    use crate::programs::operations::{Operation, OperationFormatter, OperationProjection, OperationProvider};
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::analysis::ReferenceAnalysisError;
@@ -5208,6 +5217,14 @@ mod tests {
                     discharge_positional_region_operation(self, context, driver, inputs, 0, |_| self.clone())
                 }
             }
+        }
+    }
+
+    impl OperationProvider<ListIrType, GuardOperation<ListIrType>> for ListOperation {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<ListIrType>, _input_types: &[&ListIrType]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
         }
     }
 
@@ -9276,6 +9293,13 @@ mod tests {
                 }
             }
 
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Native(operation) => operation.region_slots(),
+                    Self::Call => const { &[RegionSlot::computation("callee")] },
+                }
+            }
+
             fn infer_output_types(
                 &self,
                 input_types: &[ArrayIrType],
@@ -9284,13 +9308,6 @@ mod tests {
                 match self {
                     Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
                     Self::Call => Ok(region_interfaces[0].output_types().to_vec()),
-                }
-            }
-
-            fn region_slots(&self) -> &'static [RegionSlot] {
-                match self {
-                    Self::Native(operation) => operation.region_slots(),
-                    Self::Call => const { &[RegionSlot::computation("callee")] },
                 }
             }
 
@@ -9404,6 +9421,17 @@ mod tests {
 
         impl OperationProjection<ArrayType> for CallingOperation {
             type Projected = ArrayOperation<Array>;
+        }
+
+        impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for CallingOperation {
+            type Operation = Self;
+
+            fn provide(
+                request: GuardOperation<ArrayIrType>,
+                _input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
+            }
         }
 
         impl From<ArrayOperation<Array>> for CallingOperation {
