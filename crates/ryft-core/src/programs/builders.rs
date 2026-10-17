@@ -948,7 +948,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
+        DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::operations::{
@@ -1771,9 +1771,7 @@ mod tests {
         let Atom::Constant(constant) = &builder.atoms()[2] else {
             panic!("expected the singleton replacement to be recorded as a constant atom");
         };
-        assert_eq!(constant.extent(), 1);
-        assert_eq!(constant.r#type().variable().name(), "value ^ 0");
-        assert_eq!(constant.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
+        assert_eq!(constant, &DimensionValue::constant(1).unwrap());
         assert!(builder.instructions().is_empty());
     }
 
@@ -1853,28 +1851,23 @@ mod tests {
             )
             .unwrap();
 
-        for (dimension, error) in [
-            (
-                DimensionValue::new(dimension_type, 4).unwrap(),
-                "dimension variable n is renamed to n by one signature member and bound to static extent 3 by another",
-            ),
-            (
-                DimensionValue::constant(4).unwrap(),
-                "dimension variable n is renamed to 4 by one signature member and bound to static extent 3 by another",
-            ),
-        ] {
-            let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let dimension = destination.add_constant(ArrayIrValue::Dimension(dimension));
-            let array = destination.add_constant(ArrayIrValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap()));
-            assert_eq!(
-                destination.splice_program(&source, &[dimension, array]),
-                Err(ProgramError::Type(TypeError::invalid(error)))
-            );
-            assert_eq!(destination.atoms().len(), 2);
-            assert!(destination.input_ids().is_empty());
-            assert!(destination.instructions().is_empty());
-            assert_eq!(destination.regions.len(), 0);
-        }
+        // A dimension of extent four contradicts the array extent of three that the source relates to it.
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension =
+            destination.add_constant(ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 4).unwrap()));
+        let array = destination.add_constant(ArrayIrValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        assert_eq!(
+            destination.splice_program(&source, &[dimension, array]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 4,
+                actual: 3,
+            }))),
+        );
+        assert_eq!(destination.atoms().len(), 2);
+        assert!(destination.input_ids().is_empty());
+        assert!(destination.instructions().is_empty());
+        assert_eq!(destination.regions.len(), 0);
     }
 
     #[test]

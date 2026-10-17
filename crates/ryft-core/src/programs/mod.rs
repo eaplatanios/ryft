@@ -121,7 +121,10 @@ pub use effects::{
     EffectClass, EffectClassOccurrence, EffectClasses, EffectClassesIterator, Effects, EffectsSummary,
     ReferenceAccessMode, ReferenceEffect,
 };
-pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
+pub use identities::{
+    NoIdentity, TypeIdentity, TypeIdentityClass, TypeIdentityKind, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeIdentitySignature,
+};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{
     ErasedOperation, MemberOperation, Operation, OperationBoundaryPruning, OperationFoldOutput,
@@ -160,7 +163,7 @@ pub use regions::{
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};
-pub use types::{Type, TypeError, TypeRefinements, Typed};
+pub use types::{Type, TypeError, TypeRefinements, Typed, type_identities_needing_runtime_checks};
 pub use values::{
     Concretizable, LiteralIdentity, ParameterProjection, ProjectedValue, Value, ValueDirectDispatch, ValueDispatch,
     ValueDomainDispatch, ValueId, ValueProjection,

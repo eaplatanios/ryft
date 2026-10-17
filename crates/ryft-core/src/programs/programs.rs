@@ -2678,16 +2678,21 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
             ProgramError::MalformedProgram(format!("the instruction has no attached region {region_index}"))
         })?;
         let source = RegionRef::new(self.analysis.arena, region)?;
+
+        // Start with ordinary liveness (i.e., inputs needed by the used outputs, retained effects, or deferred work).
+        // The remaining steps add inputs needed only to preserve the region boundary's validation.
         let pruning = self.analysis.region_pruning(region, used_outputs)?;
         let mut live = source.input_ids().iter().map(|input| pruning.live_atoms[input.index()]).collect::<Vec<_>>();
 
         // The region boundary validates the identities that its inputs share. When the application leaves such a
         // relationship unproven (refer to `unproven_region_identities`), every peer of a retained input remains live
         // even if the body never reads it: dropping one would erase a runtime equality check without necessarily
-        // changing any output type. The closure is transitive because one input can relate several identities. Proven
-        // relationships and independent inputs follow ordinary data and effect liveness, so redundant peers (e.g., two
-        // carries fed by the same `f32[n]` value) stay prunable.
+        // changing any output type. Proven relationships and independent inputs follow ordinary data and effect
+        // liveness, so redundant peers (e.g., two carries fed by the same `f32[n]` value) stay prunable.
         let identities_needing_runtime_checks = &self.unproven_region_identities()?[region_index];
+
+        // Record which identities each declared input carries. An input such as `f32[m, n]` connects two groups
+        // of peers, so retaining it can make inputs carrying either `m` or `n` necessary for validation.
         let declared_identities = source
             .input_types()
             .iter()
@@ -2695,6 +2700,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
             .collect::<Vec<_>>();
         let mut retained_identities = Vec::new();
         let retain = |identities: &[_], retained_identities: &mut Vec<_>| {
+            // Already-proven identities do not create validation dependencies on otherwise unused inputs.
             for identity in identities {
                 if identities_needing_runtime_checks.contains(identity) && !retained_identities.contains(identity) {
                     retained_identities.push(identity.clone());
@@ -2702,12 +2708,17 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
             }
         };
 
+        // Seed validation dependencies from inputs that ordinary liveness kept. A group with no live input does not
+        // become live merely because its members share an unproven identity.
         for (identities, &is_live) in declared_identities.iter().zip(&live) {
             if is_live {
                 retain(identities, &mut retained_identities);
             }
         }
 
+        // Retain peers of those inputs, collecting any further unproven identities they introduce. Repeat until no
+        // input is added: with unproven `m` and `n` in `[f32[m], f32[m, n], f32[n]]`, keeping the last input retains
+        // the middle one, which then requires the first one even if it was visited earlier in the pass.
         loop {
             let mut changed = false;
             for (identities, is_live) in declared_identities.iter().zip(&mut live) {
