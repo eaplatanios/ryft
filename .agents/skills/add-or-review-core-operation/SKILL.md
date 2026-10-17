@@ -1,85 +1,102 @@
 ---
 name: add-or-review-core-operation
-description: Adds support for a new operation type in `ryft-core`, or reviews support for an existing one.
+description: >-
+  Add, change, or review ryft-core operations, value capabilities, providers, and transform rules, including their
+  backend integration. Use for operation correctness, JAX parity, and conventions; not for MLIR dialect wrappers.
 ---
 
-You must look at our implementation of the `ryft_core` operations, in `ryft_core::operations`, and understand our code
-style and conventions around code, documentation, and unit tests. Then, you must either add a new operation that was
-requested by the user, or review the code that corresponds to an existing operation for compliance with all of our
-conventions, and for correctness. You can refer to corresponding JAX operation implementations when reviewing for
-correctness. In general, we aim either for parity with JAX, or to exceed JAX. The Ryft operation implementations should
-never be lacking in any way with respect to the corresponding JAX operations.
+# Add or Review Core Operations
 
-# Instructions
+Implement or review the requested `ryft-core` operation surface, including its public capability APIs, transforms,
+and affected backends. Aim for at least the corresponding JAX primitive's functionality and correctness; record
+unsupported behavior or unverified parity explicitly rather than treating the goal as a verified result.
 
-All the operation code (including code comments), documentation (including the module docstring), and tests must
-strictly abide to all of our conventions, and there must be no correctness mistakes. I have already made a pass over the
-modules in `ryft_core::operations::constants` and `ryft_core::operations::manipulation` and you can use those as
-examples for what I want. Specifically, for each operation I want to have the following ordering:
+## Start Here
 
-1. `*_OPERATION_NAME` constant,
-2. `*Operation` struct type and its impl blocks, with the operation-specific impl blocks appearing in the order:
-   `Operation`, `InterpretableOperation` using the appropriate capability trait bound, `PartiallyEvaluatableOperation`,
-   `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`, `MemberOperation` (when applicable), and
-   `MemberInterpretableOperation` (when applicable),
-3. `*OperationProvider` trait wherever relevant and its impl blocks, and
-4. capability trait and its impl blocks in order: `EagerContext` (for `Array` and then for `ArrayIrValue`),
-   `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`, `DifferentiationContext`,
-   and `TranspositionContext`.
+Read the repository [AGENTS.md](../../../AGENTS.md) for shared workflow, Rust, documentation, and import conventions,
+and the [unit-testing guidelines](../../unit-testing-guidelines.md) before writing or revising tests. This skill
+owns the additional core operation conventions; keep future operation-specific corrections here or in its references.
+Apply the shared conventions to module documentation, public APIs, implementation comments, and tests alike.
 
-You must also leverage any pre-existing macros from `ryft_core::macros` wherever applicable across both production code
-and testing code. Regarding the unit tests, for most simple operations that do not involve edge cases that need testing,
-the tests should look roughly like what I have for `ryft_core::operations::math::add` with `test_<operation name>`,
-`test_<operation name>_type_inference`, `test_<operation name>_interpretation` (using `Array` values),
-`test_<operation name>_partial_evaluation`, `test_<operation name>_batching`, `test_<operation name>_differentiation`,
-and `test_<operation name>_transposition`, in this order. Each test can include multiple assertions and cases internally
-to ensure sufficient coverage.
+Inspect the current source before choosing an implementation pattern. The useful starting points below are paths
+relative to the repository root, not a requirement to read every file for every task:
 
-## Review Coverage
+| Concern                                                 | Source                                                                       |
+|---------------------------------------------------------|------------------------------------------------------------------------------|
+| Operation, provider, member, and projection contracts   | `crates/ryft-core/src/programs/operations.rs`                                |
+| Interpretation and reference discharge                  | `crates/ryft-core/src/interpretation.rs`, `src/programs/references/`         |
+| Capability universes and value dispatch                 | `crates/ryft-core/src/operations/mod.rs`, `src/programs/values.rs`           |
+| Families, bundles, composite values, and batch geometry | `crates/ryft-core/src/arrays/{operations,ir,batching}.rs`                    |
+| Simple operations and tests                             | `crates/ryft-core/src/operations/arithmetic.rs`, especially `AddOperation`   |
+| Construction and shape changes                          | `crates/ryft-core/src/operations/constants/`, `src/operations/manipulation/` |
+| Shared production and testing macros                    | `crates/ryft-core/src/macros.rs`, `src/arrays/macros.rs`                     |
+| Derives and capability projection generation            | `crates/ryft-macros/src/{operations,capabilities}.rs`                        |
+| Transform contracts and replay                          | `crates/ryft-core/src/partial/`, `src/batching.rs`, `src/differentiation/`   |
+| Backend conversion and lowering                         | `crates/ryft-xla/src/operations/`, `src/experimental/{ops.rs,lowering/}`     |
 
-Before fixing findings, record a coverage inventory in the task plan for the complete operation surface, not just
-the changed lines or previously reported issues. Read the repository's testing guidelines and identify the existing
-operation and capability patterns that apply. For each applicable behavior, record the inspected implementation,
-its invariants, verification evidence, and any remaining uncertainty. Mark a case inapplicable only with a reason.
+In a row with a shortened `src/...` path, use the same crate as the first path. Confirm paths and contracts in the
+current checkout; examples are implementation references, not permission to perpetuate a defect or stale convention.
 
-Cover the operation's payload and public APIs, region and type contracts, interpretation, reference discharge,
-partial evaluation, batching, differentiation, transposition, providers and capabilities, and backend integration where
-present. Choose meaningful cases for each rule rather than mechanically testing every combination. For region-carrying
-operations, these include known, symbolic, and unknown inputs; eager and staged execution; selected and unselected
-regions; observable effects and deferred work; zero outputs and structural zeros; static, dynamic, and bounded ragged
-geometry; references and identity-bearing values; placement and manual variation; and nested transform composition
-where supported.
+Load the references that apply before editing:
 
-Trace information across every transform boundary: values and types, region signatures, runtime geometry, reference
-identities, effects, derivative activity, and validation evidence. Verify both their producers and consumers; a locally
-correct rule can still lose information at a boundary. Check direct context binding as well as validated program replay:
-rewriting an operation must not bypass its original primitive contract. Matching primal signatures do not guarantee
-matching compact derivative slots, and replaying separate regions into one scope must preserve local type identities.
-Inspect supported and rejected cases, including empty, singleton, and disconnected inputs or outputs where meaningful.
-Evaluate documented limitations and optimizations against their semantic consequences and the requested JAX parity;
-their presence in comments is not justification for accepting them.
+- [Capabilities and Providers](references/capabilities.md): Used for capability APIs, universe bounds, providers,
+  composite projections, dispatch, generic transform-policy bounds, or backend value integration, including work
+  outside operation modules.
+- [Transform Invariants](references/transforms.md): Used for operation replay, reference validation, partial evaluation,
+  batching, differentiation, transposition, sharding/manual variation, or dynamic/ragged geometry.
+- [Coverage and Final Review](references/review.md): Used for every operation addition or review, and for the affected
+  behaviors of a scoped follow-up. Full operation reviews require the complete inventory, not just the reported bug.
 
-Compare the relevant rules with official JAX implementation sources and distinguish frontend conveniences from
-primitive contracts. Validate deliberate extensions on their own semantics. Use existing tests as evidence, then
-identify adversarial cases those tests do not exercise. Add focused regressions for changed behavior and material
-coverage gaps. Tests involving non-termination or expensive execution must fail deterministically without running
-an unbounded computation.
+## Operation Layout and Construction
 
-Passing tests or repairing discovered issues does not establish review completeness. Check off a behavior only after
-inspecting its code and assessing the adequacy of its evidence. After edits, verify the actual final source and affected
-backend behavior; an earlier compiled binary is evidence for the source it contains, not for later changes. Report
-blocked verification and intentionally unsupported behavior explicitly instead of claiming exhaustive correctness
-or complete parity.
+Group each operation in this order, omitting only implementations that do not apply:
 
-## Final Pass
+1. Its `*_OPERATION_NAME` constant.
+2. Its operation type, inherent functions, and formatting implementations, followed by `Operation`,
+   `ReferenceDischargeableOperation`, `InterpretableOperation` using the appropriate capability bound,
+   `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`,
+   `MemberOperation`, and `MemberInterpretableOperation` implementations.
+3. Its operation provider trait and implementations where relevant.
+4. Its capability trait and implementations. Order explicit context implementations as `EagerContext` for `Array`,
+   `EagerContext` for `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`,
+   `BatchingContext`, `DifferentiationContext`, and `TranspositionContext`.
 
-After you have made all the necessary code changes and are satisfied with the implementation, you must make one final
-pass. In that pass, I want you to review everything related to that operation for correctness and for parity with how
-JAX implements its corresponding operation types. I also want you to review it for compliance with all of our standards
-and conventions (including the documentation strings and the tests in that module). I know this may sound repetitive,
-but I want you to do all this again and keep iterating until all my instructions are followed.
+Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce
+this ordering. Reuse existing production and testing macros from `crate::macros` where applicable, following their
+current contracts and importing them unqualified as required by `AGENTS.md`. For example, elementwise operations
+can use `define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared boilerplate.
 
-Use an independent final review against the coverage inventory, without supplying prior conclusions when they would bias
-that review. Resolve confirmed findings, update their evidence, and revisit affected inventory entries after every fix.
-The final report must state verified outcomes and remaining limitations; do not infer that no undiscovered defects exist
-merely because the final pass found none.
+Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when constructing
+or updating operation output types, and propagate validation errors through existing conversions.
+
+## Terminology
+
+In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
+diagnostics, and tests), following `Instruction::inputs`, `Operation::infer_output_types(.., input_types)`, and
+`InputRegionProvenance::Input`, rather than "operands". Write "region input", "instruction input", or "program
+input" wherever more than one kind appears nearby. Keep "operand" only where a specification uses it as the role
+name of one particular input or inside an attribute name (e.g., the `operand` of StableHLO `gather`, `scatter`, and
+`ragged_all_to_all`, and attributes such as `operand_batching_dims`), and in `ryft-xla` MLIR code. A specification
+that calls every input an operand (e.g., most StableHLO operations or XLA custom calls) is not a reason to keep it.
+
+## Integration and Verification
+
+For a new operation, trace the nearest analogous operation through exports, operation families, providers,
+capability bundles, composite lifting/projection, backend conversions, and lowering dispatch. Update the pieces
+needed by the requested operation; a leaf implementation alone does not establish support. Keep explicit unsupported
+paths and document their actual technical blockers. Review backend contracts as well as core type inference.
+
+Follow the canonical primary test order, macros, and full-program rendering assertions in the
+[Operations, Types, And Attributes testing guidance](../../unit-testing-guidelines.md#operations-types-and-attributes).
+Use `arithmetic.rs` for simple operation layout and the nearest relevant operation for specialized cases. Keep
+reference discharge, region contracts, sharding, and nested-transform regressions beside the behavior they verify.
+Choose finite-difference oracles only where they express the derivative's intended contract.
+
+Run source-matched verification appropriate to the change, starting with focused tests and the required affected
+crate suites. Follow the testing guidelines' backend requirement when staged programs change (at least the
+`ryft-xla --lib` suite) and the repository's macro integration requirement when a core contract consumed by derives
+changes. Use the repository's 300-second command limits and memory/concurrency safeguards. Do not substitute a
+successful type check or an earlier binary for execution of the final changed behavior.
+
+Finish with the independent review in [Coverage and final review](references/review.md). Report the implemented or
+reviewed surface, verification evidence, and remaining limitations without claiming exhaustive correctness.

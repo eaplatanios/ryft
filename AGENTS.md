@@ -36,10 +36,10 @@ When asked to implement a change or add a new feature, you must always follow th
 2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
    analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
    execution.
-3. **Self-Improvement:** After important corrections from the user, update the `AGENTS.md` file such that you do not
-   require the same corrections in the future. Write rules for yourself that will prevent you from making the same
-   mistake in the future. You must ruthlessly iterate on these rules until your rate of making mistakes drops based
-   on those rules.
+3. **Self-Improvement:** After important corrections from the user, update `AGENTS.md` or the authoritative convention
+   file or skill it links to, so that you do not require the same corrections in the future. Write rules for yourself
+   that will prevent you from making the same mistake in the future. You must ruthlessly iterate on these rules until
+   your rate of making mistakes drops based on those rules.
 4. **Verification:** Never consider a task as completed without first proving that it is. Look at the diff between the
    code before and after your changes to determine what changed and needs testing. Then, ask yourself "Would a staff
    engineer approve this? Also, what tests would they want me to run or even add to do so?". Run tests, check the logs,
@@ -77,7 +77,7 @@ as an autonomous bug fixing agent. If you encounter any failing CI tests, go fix
 You must always adhere to the `ryft` conventions around code, style, documentations, and testing, treating this file as
 the authoritative convention source for this repository. If there is any overlapping guidance, alway follow the stricter
 rule. Also, when the user asks for changes to the coding, documentation, or testing style that you use, make sure to
-update this file so that they do not need to remind you again in the future.
+update this file or the authoritative convention file or skill it links to so that they do not need to remind you again.
 
 ### Code Style
 
@@ -90,10 +90,6 @@ update this file so that they do not need to remind you again in the future.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
-- In transform replay code, prefer the established `InterpretableOperation` path for tracer-valued staging unless the
-  user explicitly asks for a different abstraction. If an experimental staging hook or lowering path is removed or
-  superseded, delete its public trait methods, helper functions, and test-only scaffolding instead of leaving unused
-  compatibility layers behind.
 - Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
   `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as
   `crate::Operation::name(self)` or `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is
@@ -102,36 +98,12 @@ update this file so that they do not need to remind you again in the future.
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
 - When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
   inherent methods and trait methods, to the extent possible.
-- For simple capability/provider impls, keep bounds to the minimum needed for the impl target to be well-formed and for
-  the method body to type-check. Do not copy broader bounds from neighboring trait impls unless the provider method
-  itself uses the capability.
-- In capability-focused modules, prefer inlining small single-use local helper functions back into the owning trait
-  impls when that makes the implementation easier to read.
 - For module moves and path migrations, do not introduce compatibility shims or re-export bridges unless the user
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 - For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
-- In `ryft-core` operation modules, group each operation as its `*_OPERATION_NAME` constant, operation type and
-  inherent/formatting implementations, then `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`
-  using the appropriate capability, `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`,
-  `TransposableOperation`, `MemberOperation`, and `MemberInterpretableOperation` implementations where applicable.
-  Follow these with the operation provider trait and its implementations, then the capability trait and its
-  implementations. Order explicit capability context implementations as `EagerContext` for `Array`, `EagerContext` for
-  `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`,
-  `DifferentiationContext`, and `TranspositionContext`. Keep shared blanket implementations and substantial helper
-  submodules shared rather than duplicating them to reproduce this ordering at each call site.
-- In non-trivial batching rules, explain logical and physical axis roles, replicated-input handling, reshape/transpose
-  stages, and sharding restoration with code comments beside the corresponding steps.
-- Keep domain-specific construction and transform-specific execution policy out of the central `Operation` trait.
-  Prefer existing operation providers and the owning transform's validated execution path; add a core hook only when
-  a general operation contract requires it, rather than to simplify one domain's dispatch.
-- Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
-  diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
-  differentiation.
-- Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when
-  constructing or updating operation output types, and propagate validation errors through existing conversions.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -315,8 +287,6 @@ update this file so that they do not need to remind you again in the future.
 - Whenever possible, use existing helper macros instead of duplicating FFI boilerplate like:
   - `ryft-mlir`: `mlir_subtype_trait_impls!`, `mlir_op!`, `mlir_op_trait!`, `mlir_*_op!`, `mlir_pass!`, etc.
   - `ryft-pjrt`: `invoke_pjrt_api_void_fn!`, `invoke_pjrt_api_error_fn!`, `invoke_distributed_api_error_fn!`, etc.
-- When upgrading PJRT or XLA FFI structs, update both the raw `ffi` argument structs and every corresponding safe
-  Rust wrapper, convenience method, and test in the same change; do not stop at the FFI layer after adding new fields.
 
 ## Documentation Style
 
@@ -381,13 +351,6 @@ update this file so that they do not need to remind you again in the future.
   readability-driven sentence breaks.
 - In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
   from free functions in prose.
-- In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
-  diagnostics, and tests), following `Instruction::inputs`, `Operation::infer_output_types(.., input_types)`, and
-  `InputRegionProvenance::Input`, rather than "operands". Write "region input", "instruction input", or "program
-  input" wherever more than one kind appears nearby. Keep "operand" only where a specification uses it as the role
-  name of one particular input or inside an attribute name (e.g., the `operand` of StableHLO `gather`, `scatter`, and
-  `ragged_all_to_all`, and attributes such as `operand_batching_dims`), and in `ryft-xla` MLIR code. A specification
-  that calls every input an operand (e.g., most StableHLO operations or XLA custom calls) is not a reason to keep it.
 
 ## Testing Guidelines
 
@@ -398,73 +361,32 @@ Consult that file before writing or revising unit tests.
 
 ### `ryft-core`
 
-- In transformation rules (e.g., batching, differentiation, transposition, or partial evaluation), give every value
-  that the rule creates (e.g., a constant, `iota`, `zero`, or `one`) and then combines with existing values the
-  placement and manual variation of those values. Operation-level rules and `Context::bind` assume inputs that were
-  aligned when the program was staged, so they do not insert `parallel_vary` the way the value-level capabilities do.
-  Create such a value with that variation directly only when it is a non-differentiable constant, and say so in a
-  comment, because the transpose of the skipped `parallel_vary` is a cross-device sum. Stage any value that can carry
-  a tangent through the value-level capabilities, which call `align_manual_variation`. Cover such rules with a test
-  that runs them inside a manual region with varying inputs.
-- Every value-level capability trait, including dynamic-geometry, dimension, reference, and alignment capabilities, is
-  universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where the universe is a coherence
-  marker that need not be a `Type`, and host types are their own universe), with any other parameters (e.g.,
-  `Transform`, `Binding`, or `Output`) before the universe, and every capability bundle has the same universe parameter
-  with a blanket implementation. Never pin a capability's receiver to one universe through a super-trait such as
-  `Value<Type = ArrayIrType>`: provided functions bound a type view instead (e.g.,
-  `Self: Value<Type: AsArrayType + AsDimensionType>`), implementations name their universe explicitly (e.g.,
-  `DynamicPad<ArrayIrType>`), and a blanket implementation that serves several universes introduces the universe as its
-  own type parameter (e.g., `impl<U, V: Value<Type = U>> X<U> for V`). Capability traits carry the `#[capability]`
-  attribute that checks those conventions, and declare exactly one composite strategy: a projection through
-  `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the composite family plus an
-  eager `ArrayIrValue` delegation (S2), an existing composite-native path (S3), or member-kind dispatch through an
-  operation provider (S4). Give capability functions default bodies only when the default is correct for every
-  implementor (e.g., by composing required functions), and make implementor-dependent functions required instead. Only
-  elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations that
-  `define_elementwise_capability!` generates (and `impl_parameterwise_operator!` for their `std::ops` operators, invoked
-  right after the corresponding `impl_tracer_operator!`), never through derive-generated code. In generic bounds, use
-  each capability's default universe (or a bundle such as `ArrayOperations`) and never mix it with an explicitly named
-  universe for the same value, and never pin `Typed<Type = T>` next to capability bounds at `T`; the trait solver cannot
-  equate `<V as Capability>::Universe` with `<V as Typed>::Type` for generic or projected `V`, so mixed bounds fail to
-  unify and pinned equalities make bounds on `V::Type` unusable. Never bound a universe parameter by `Type`, including
-  in bundle blanket implementations, because host types are universes too, and keep compile-time assertions that host
-  types satisfy the bundles whose members they implement. Every universe's implementation of a capability must honor the
-  same documented contract, including edge cases such as singleton or empty inputs, so test those edge cases for each
-  universe.
-- Document the universe parameter of every trait bounded by `Capability`, including bundles and macro-generated
-  capabilities, with a paragraph that starts with "The universe parameter `T` defaults to the `Capability` universe
-  of the implementor, so that ..." and names the universes that actually implement it (e.g., `ArrayType` and
-  `ArrayIrType`). Place it as the last paragraph before the first section heading of the trait documentation.
-- Hand-written composite projections (i.e., capabilities whose irregular signatures the `#[capability]` attribute cannot
-  project) bound the projected member by the capability (e.g., `V::Projected: Sort<ArrayType>`) and rebuild results
-  through `from_projected`. Never pin `Projected = ProjectedValue<ArrayType, V>`: that serves only composite tracers and
-  forces concrete composite values (e.g., `ArrayIrValue<A>` or a backend's composite value) to duplicate the forwarding.
-- Backend composite values that dispatch through a stateful rich domain (e.g., `ryft-xla`'s `XlaValue`) carry that state
-  (e.g., the session) in every member and in every projected representation, because `ValueProjection::from_projected`
-  is infallible and receives no state. Host-side values enter such a domain through its constants (`Context::lift`),
-  never through a state-less constructor, and host-side semantics that do not depend on the state (e.g., predicate and
-  reference-handle contracts) delegate to the generic `ArrayIrValue` implementations instead of being reimplemented.
+- Use [add-or-review-core-operation](.agents/skills/add-or-review-core-operation/SKILL.md) when adding, changing,
+  or reviewing core operations, value capabilities and providers, transform rules or replay, core reference validation,
+  composite values, or their backend integration, including work outside `operations/`. The skill owns the detailed
+  operation layout, capability, transform, and core input terminology conventions. Consult it for terminology when
+  editing core programs or instructions as well. Keep operation-specific corrections in the skill and its references;
+  shared repository conventions and the testing guidelines remain authoritative for their respective concerns.
 
 ### `ryft-mlir`
 
+- Use [add-mlir-dialect](.agents/skills/add-mlir-dialect/SKILL.md) when adding, updating, or reviewing MLIR dialect
+  wrappers, registration, passes, or custom dialect C API shims. It owns the dialect layout, typed APIs, documentation,
+  coverage, and native shim conventions. Apply it to existing-dialect maintenance as well as new dialects; keep future
+  dialect-specific corrections in that skill. General ownership, FFI, context borrowing, and testing rules still apply.
+- In `ryft-mlir`, do not use `filter_map` or `.ok()` to hide failed wrapper conversions while traversing counted MLIR
+  C API collections. Keep low-level collection APIs iterator-shaped with `impl Iterator<Item = Result<_, Error>>`
+  and make callers collect with `collect::<Result<Vec<_>, _>>()?` or handle each item explicitly.
 - Use this crate and `ryft-pjrt` as the reference style for macro-driven hierarchy modeling over third-party C APIs.
-- Prefer macro-driven patterns for operation/type/attribute wrappers and pass registration.
-- Keep dialect-loading calls before constructing dialect-specific entities when required for safety.
-- Keep paired owned/reference operation types (e.g., `Detached...Operation` and `...OperationRef`) consistent.
-- For operation constructor APIs, pass `location` as the last parameter and use generic `L: Location<'c, 't>`.
-- For operation documentation strings, follow the StableHLO style: explain semantics, include a `# Example` with MLIR
-  rendering, and link to the operation's official documentation. Constructor docstrings link back to the operation
-  semantics and describe non-obvious parameters using the standard `# Parameters` format. Avoid Markdown tables for
-  operands/results; prefer clear Markdown lists instead.
-- For operation constructor documentation strings, avoid boilerplate Rust call examples unless usage is non-obvious.
 
 ### `ryft-pjrt`
 
+- For PJRT API upgrades and argument-struct synchronization, also use
+  [upgrade-xla](.agents/skills/upgrade-xla/SKILL.md); its binding guidance applies even without changing
+  the OpenXLA pin.
 - Prefer API-invocation macros for PJRT calls and keep handle conversion helpers centralized.
 - Keep `ffi` modules at the bottom of files with explicit C struct/function pointer definitions.
 - Continue using `OnceLock` to memoize expensive API queries (e.g., attributes, descriptions, etc.).
-- When upgrading PJRT C API argument structs, add the matching safe Rust wrapper or safe method argument in the same
-  change instead of leaving newly added nested option structs reachable only through `ffi`.
 - When a new PJRT option struct contains pointer fields to owned C API objects, expose a safe owned wrapper for the
   pointee and model the option field as a borrow of that wrapper; do not silently pass null because the wrapper is
   missing.
@@ -515,90 +437,16 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
   struct (e.g., "Refer to the documentation of [`<Ext>Extension::<method>`] for more information.") to
   avoid duplication.
 
-### `ryft-mlir`
-
-- For MLIR dialect operation wrappers, define a special-purpose trait for each operation that exposes the
-  specific attributes, operands, results, and regions supported by that operation. Avoid generic operation-only
-  wrappers when the dialect specification provides more precise semantics.
-- When adding MLIR dialect operation wrappers, audit the pinned TableGen operation definitions for arguments, results,
-  regions, segment-size traits, and builders; do not stop at empty marker traits unless the operation definition itself
-  has no named API surface.
-- In MLIR dialect operation modules, colocate public operation attribute-name constants immediately above the first
-  operation trait, constructor, or macro-generated operation group that references them. Do not collect operation
-  attribute-name constants in a module-level block at the top of the operations file; when a constant is shared across
-  several operations, place it before the first operation group that uses it.
-- In MLIR dialect operation modules, inline operation-specific attribute, segment, and async-token access logic
-  in the owning trait or constructor instead of adding module-level helper functions, unless the helper is genuinely
-  shared across dialect modules. Do not add tiny private wrappers for one-line attribute casts, attribute value
-  extraction, operand segment-size extraction, operand slicing, scalar/array attribute construction, or generic
-  operation-builder setup.
-- When an operation accessor needs one operand/result from an MLIR segment-size range, use
-  `dense_integer_32_array_attribute_segment_range(...)` and validate the returned range length explicitly. Do not use
-  `dense_integer_32_array_attribute_usize_value(...)` as a flat operand/result index because it returns the segment
-  length, not the segment start.
-- In `ryft-mlir`, do not use `filter_map` or `.ok()` to hide failed wrapper conversions while traversing counted MLIR
-  C API collections. Keep low-level collection APIs iterator-shaped with `impl Iterator<Item = Result<_, Error>>`
-  and make callers collect with `collect::<Result<Vec<_>, _>>()?` or handle each item explicitly.
-- In MLIR dialect operation modules, write operation traits and their `mlir_op!` / `mlir_op_trait!` declarations
-  explicitly instead of adding dialect-local macros that generate the wrapper trait definitions.
-- Prefix MLIR-dialect-local declarative macros with the dialect or module prefix (for example, `gpu_`) unless they
-  are intentionally shared across dialect modules.
-- For MLIR dialect attribute tests, follow the StableHLO attribute test structure: add construction/accessor, equality,
-  display/debug, and casting tests for each attribute in the same order in which attributes appear in the module.
-- For MLIR dialect type tests, follow the StableHLO type test structure: add construction/accessor, equality,
-  display/debug, parsing, and casting tests for each type in the same order in which types appear in the module.
-- For MLIR dialect operation tests, mirror the StableHLO operation test structure: build the containing module
-  programmatically with typed operation constructors, assert typed accessors before insertion where practical, verify
-  the module, and compare the canonical `module.to_string()` output. Avoid parsing a module and walking it with helper
-  functions unless the operation has no constructor or the test is explicitly about parsing behavior.
-- For MLIR dialect operation tests, write one focused test per concrete operation in the same order as the operation
-  module. Do not replace per-operation coverage with broad scenario tests that cover many operations at once.
-- In MLIR dialect operation tests, inline trivial context/registry setup at the test site instead of adding tiny helpers
-  that hides only one or two lines of code.
-- When introducing a new MLIR dialect with public wrappers, use the established directory module layout with separate
-  `mod.rs`, `attributes.rs`, `types.rs`, `operations.rs`, and `passes.rs` files as applicable. Do not leave a
-  non-trivial dialect as a flat one-off module.
-- Before claiming support for a new MLIR dialect, audit the complete pinned TableGen surface for dialect attributes,
-  types, operations, and pass hooks, and either implement the full exposed surface or document any intentionally
-  unsupported pieces with the concrete technical blocker.
-
 ### `ryft-xla-sys`
 
-- Preserve the current `build.rs` resolution order: environment-provided artifact -> verified download -> Bazel build.
-- Keep the checksum verification and artifact naming/URL logic explicit and up-to-date.
-- `src/bindings.rs` is the result of code that was generated using `bindgen` and then very slightly edited.
-  If you regenerate it using `bindgen` make sure to apply the same slight edits that we have already applied,
-  after regenerating it. The slight edits are: (1) prepend the manual prelude at the top of the checked-in file
-  (the `#![allow(...)]` attribute, the opaque `PJRT_Api` handle with `GetPjrtApi`, and the opaque
-  `XlaCustomCallStatus` with its two functions), and (2) remove all generated `PJRT_*` and `PLUGIN_Profiler*`
-  items, the generated `XlaCustomCallStatus` items, and the `XLA_FFI_API_MAJOR`/`XLA_FFI_API_MINOR` constants,
-  because `ryft-pjrt` provides its own hand-written ffi modules for the PJRT C API.
-- When upgrading the OpenXLA pin, also sync the `rules_ml_toolchain` pin in `WORKSPACE` and the hermetic toolchain
-  `--repo_env` pins in `.bazelrc` (e.g., `ROCM_DISTRO_VERSION`) with the versions used by the new OpenXLA commit
-  (see `workspace3.bzl` and `third_party/gpus/rocm_configure.bzl` in the OpenXLA repository); mismatches fail the
-  artifact build at repository-rule evaluation time.
-- Keep the Rust and C++ distributed-runtime bridge structs and signatures synchronized.
-- Keep the Rust proto message types in `crates/ryft-xla-sys/src/protos.rs` synchronized with the corresponding `.proto`
-  files in the OpenXLA repository, whenever upgrading our XLA dependency.
-- After publishing or rebuilding `ryft-xla-sys` artifacts, always validate at least one downstream consumer link on
-  each affected platform against the published binary so deployment-target mismatches and stale exported-symbol names
-  are caught before handoff.
-- For OpenXLA / PJRT / MLIR upgrade work, do not stop at smoke tests once core crate code has changed; run the full
-  affected crate `--lib` unit suites so runtime-attribute drift, printer-format churn, and environment-sensitive test
-  assumptions are caught before handoff.
-- For OpenXLA / PJRT / MLIR upgrade work, update the changelog for every crate whose public API, wrappers, tests, or
-  generated bindings changed. E.g., do not stop at `ryft-xla-sys` and `ryft-pjrt` if `ryft-mlir` also changed.
-- When a user asks you to wait for a specific GitHub Actions run before updating `ryft-xla-sys` release metadata,
-  do not report the task as complete until that exact run has reached `completed` and you have refreshed every
-  affected published checksum from the finalized release assets.
-- Put custom `ryft-xla-sys` MLIR dialect C++ bindings under
-  `crates/ryft-xla-sys/src/c++/mlir/dialects/<dialect>.h` and the matching `.cc` file instead of placing
-  dialect-specific shims directly under `src/c++`.
+- Use [upgrade-xla](.agents/skills/upgrade-xla/SKILL.md) for dependency upgrades, native artifact/build metadata,
+  generated bindings, Protobuf synchronization, distributed-runtime bridge maintenance, and release verification.
+  Apply its relevant guidance to focused maintenance as well as full upgrades; keep future upgrade-specific corrections
+  in that skill. For custom MLIR dialect C API bindings, also use
+  [add-mlir-dialect](.agents/skills/add-mlir-dialect/SKILL.md).
 - In custom `ryft-xla-sys` C/C++ and Rust FFI identifiers, use regular UpperCamel acronym casing in function and enum
   type names, such as `Gpu`, `Mlir`, and `Mma`; reserve all-uppercase acronym spelling for all-caps C constants and
   upstream symbols that already use it.
-- Prefix custom MLIR C API extension functions and opaque/helper enum types with `mlir` / `Mlir`, matching the upstream
-  MLIR C API style; do not use project-specific prefixes such as `ryftMlir` / `RyftMlir` for those exported symbols.
 - Use `#pragma once` for source-owned C/C++ headers instead of include guards.
 - In custom C++ FFI shims, inline tiny nullable handle conversions at the getter call site instead of adding local
   helpers when the helper only wraps a null check for one or two nearby functions.
