@@ -14,11 +14,11 @@ use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::{Operation, OperationBoundaryPruning};
 use crate::programs::regions::{
-    Region, RegionArena, RegionDataFlowRegionBoundary, RegionId, RegionInterface, RegionLiveness, RegionRef,
-    reachable_region_mask,
+    InputRegionProvenance, Region, RegionArena, RegionDataFlowRegionBoundary, RegionId, RegionInterface,
+    RegionLiveness, RegionRef, reachable_region_mask,
 };
 use crate::programs::transforms::RegionTransformCache;
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, Typed, type_identities_needing_runtime_checks};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// Mode selecting what a [`Program`] rendering includes. The semantic rendering is the canonical structural fingerprint
@@ -465,7 +465,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// but it may report a dependence that does not exist. Every output of an [`Instruction`] counts as dependent on
     /// all of its inputs, including instructions with nested regions, whose region contents are not inspected. Values
     /// can also flow through writes into and reads from references, which data flow alone does not track, so every
-    /// output of a program whose entry region holds a reference counts as dependent.
+    /// value of a program whose entry region holds a reference counts as dependent. The one exception is an output
+    /// that its [`Operation`] reports as [zero-valued](Operation::is_zero). That output is zero-valued regardless
+    /// of every input, and so it never depends on one, even in a program with references.
     ///
     /// For example, forward-mode differentiation rules use this function on a derived program, whose tangent inputs
     /// and outputs follow its primal ones, to find the tangent outputs that depend on no live tangent input and are
@@ -487,10 +489,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             dependent[self.input_ids()[index].index()] = true;
         }
         for instruction in self.instructions() {
-            if instruction.inputs().iter().any(|input| dependent[input.index()]) {
-                for output in instruction.outputs() {
-                    dependent[output.index()] = true;
-                }
+            let depends = has_references || instruction.inputs().iter().any(|input| dependent[input.index()]);
+            for (index, output) in instruction.outputs().iter().enumerate() {
+                dependent[output.index()] = depends && !instruction.operation().is_zero(index);
             }
         }
         Ok(self.output_ids().iter().map(|output| dependent[output.index()]).collect())
@@ -1872,8 +1873,14 @@ impl<'o, V: Value, O: Operation<Type = V::Type>> RegionPruningAnalysis<'o, V, O>
             let pruning = if instruction.regions().is_empty() {
                 None
             } else {
-                let mut liveness = AttachedRegionLiveness::new(self, instruction.regions());
-                instruction.operation().prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| source.atoms()[input.index()].r#type().into_owned())
+                    .collect();
+                let operation = instruction.operation();
+                let mut liveness = AttachedRegionLiveness::new(self, operation, input_types, instruction.regions());
+                operation.prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
             };
 
             let instruction_pruning = match pruning {
@@ -2569,17 +2576,98 @@ pub(crate) struct AttachedRegionLiveness<'o, 'a, V: Value, O: Operation<Type = V
     /// Analysis that determines the liveness of the attached regions.
     analysis: &'o mut RegionPruningAnalysis<'a, V, O>,
 
-    /// Regions attached to the instruction, in [`Instruction::regions`] order.
+    /// [`Operation`] of the instruction, which derives the types with which its [`Region`]s are entered.
+    operation: &'o O,
+
+    /// Input [`Type`]s of the instruction, in instruction input order.
+    input_types: Vec<V::Type>,
+
+    /// IDs of the [`Region`]s attached to the instruction, in [`Instruction::regions`] order.
     regions: &'o [RegionId],
+
+    /// Identities of each attached region's input signature types whose relationships the application of the
+    /// instruction does not prove, in attachment order. This is an [`Option`] as it is computed on the first query.
+    /// This is a performance optimization because most pruned instructions never ask for this.
+    unproven_region_identities: Option<Vec<Vec<<V::Type as Type>::Identity>>>,
 }
 
 impl<'o, 'a, V: Value, O: Operation<Type = V::Type>> AttachedRegionLiveness<'o, 'a, V, O> {
-    /// Creates liveness queries for `regions`, in attachment order, using the shared `analysis` and its cache.
-    /// Region identifiers must refer to the arena borrowed by `analysis`. Slots and demand masks are validated
-    /// when queried through [`RegionLiveness::used_region_inputs`].
+    /// Creates liveness queries for an application of `operation` to inputs of the types `input_types`, with `regions`
+    /// in attachment order, using the shared `analysis` and its cache. Region identifiers must refer to the arena
+    /// borrowed by `analysis`. Slots and demand masks are validated when queried through
+    /// [`RegionLiveness::used_region_inputs`].
     #[inline]
-    pub(crate) fn new(analysis: &'o mut RegionPruningAnalysis<'a, V, O>, regions: &'o [RegionId]) -> Self {
-        Self { analysis, regions }
+    pub(crate) fn new(
+        analysis: &'o mut RegionPruningAnalysis<'a, V, O>,
+        operation: &'o O,
+        input_types: Vec<V::Type>,
+        regions: &'o [RegionId],
+    ) -> Self {
+        Self { analysis, operation, input_types, regions, unproven_region_identities: None }
+    }
+
+    /// Returns the identities of each attached region's input signature whose relationships the application of the
+    /// instruction does not prove (refer to [`type_identities_needing_runtime_checks`] for more information on this),
+    /// so that only the region boundary checks them. For example, `[f32[m], f32[m]]` or `[f32[3], f32[3]]` entering
+    /// `[f32[n], f32[n]]` proves `n`, while a mixed entry such as `[f32[n], f32[3]]` leaves it to the region boundary
+    /// to check that the runtime extent is `3`.
+    ///
+    /// Entry types come from [`Operation::infer_region_input_types`]. When the operation keeps the declared region
+    /// signature instead (which it also does for mixed entries that admit no specialization), each region input that
+    /// [`Operation::input_region_provenance`] forwards from an instruction input whose type refines the declared one
+    /// enters with that type. Any other region input (e.g., a slice of a stacked input, or an operation-local input)
+    /// has an unknown entry type, which leaves every identity that it carries unproven.
+    fn unproven_region_identities(&mut self) -> Result<&[Vec<<V::Type as Type>::Identity>], ProgramError> {
+        if self.unproven_region_identities.is_none() {
+            let sources = self
+                .regions
+                .iter()
+                .map(|&region| RegionRef::new(self.analysis.arena, region))
+                .collect::<Result<Vec<_>, _>>()?;
+            let interfaces = sources.iter().map(|source| source.interface()).collect::<Vec<_>>();
+            let inferred_entry_types = self.operation.infer_region_input_types(&self.input_types, &interfaces)?;
+            if inferred_entry_types.len() != sources.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` inferred input types for {} regions but has {} attached regions",
+                    self.operation.name(),
+                    inferred_entry_types.len(),
+                    sources.len(),
+                )));
+            }
+            let mut unproven_region_identities = Vec::with_capacity(sources.len());
+            for (region_index, (source, inferred_entry_types)) in sources.iter().zip(inferred_entry_types).enumerate() {
+                let declared_types = source.input_types();
+                let entry_types = match inferred_entry_types.as_ref() {
+                    Some(entry_types) => {
+                        if entry_types.len() != declared_types.len() {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "operation `{}` inferred {} input types for region {} but it has {} inputs",
+                                self.operation.name(),
+                                entry_types.len(),
+                                region_index,
+                                declared_types.len(),
+                            )));
+                        }
+                        entry_types.iter().map(Some).collect::<Vec<_>>()
+                    }
+                    None => declared_types
+                        .iter()
+                        .enumerate()
+                        .map(|(input_index, declared)| {
+                            match self.operation.input_region_provenance(region_index, input_index) {
+                                InputRegionProvenance::Input { index } => {
+                                    self.input_types.get(index).filter(|actual| declared.is_refined_by(actual))
+                                }
+                                InputRegionProvenance::None | InputRegionProvenance::Local => None,
+                            }
+                        })
+                        .collect(),
+                };
+                unproven_region_identities.push(type_identities_needing_runtime_checks(&declared_types, &entry_types)?);
+            }
+            self.unproven_region_identities = Some(unproven_region_identities);
+        }
+        Ok(self.unproven_region_identities.as_deref().unwrap())
     }
 }
 
@@ -2591,7 +2679,50 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionLiveness for AttachedRegionLi
         })?;
         let source = RegionRef::new(self.analysis.arena, region)?;
         let pruning = self.analysis.region_pruning(region, used_outputs)?;
-        Ok(source.input_ids().iter().map(|input| pruning.live_atoms[input.index()]).collect())
+        let mut live = source.input_ids().iter().map(|input| pruning.live_atoms[input.index()]).collect::<Vec<_>>();
+
+        // The region boundary validates the identities that its inputs share. When the application leaves such a
+        // relationship unproven (refer to `unproven_region_identities`), every peer of a retained input remains live
+        // even if the body never reads it: dropping one would erase a runtime equality check without necessarily
+        // changing any output type. The closure is transitive because one input can relate several identities. Proven
+        // relationships and independent inputs follow ordinary data and effect liveness, so redundant peers (e.g., two
+        // carries fed by the same `f32[n]` value) stay prunable.
+        let identities_needing_runtime_checks = &self.unproven_region_identities()?[region_index];
+        let declared_identities = source
+            .input_types()
+            .iter()
+            .map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut retained_identities = Vec::new();
+        let retain = |identities: &[_], retained_identities: &mut Vec<_>| {
+            for identity in identities {
+                if identities_needing_runtime_checks.contains(identity) && !retained_identities.contains(identity) {
+                    retained_identities.push(identity.clone());
+                }
+            }
+        };
+
+        for (identities, &is_live) in declared_identities.iter().zip(&live) {
+            if is_live {
+                retain(identities, &mut retained_identities);
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for (identities, is_live) in declared_identities.iter().zip(&mut live) {
+                if !*is_live && identities.iter().any(|identity| retained_identities.contains(identity)) {
+                    *is_live = true;
+                    retain(identities, &mut retained_identities);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        Ok(live)
     }
 }
 
@@ -2617,7 +2748,7 @@ mod tests {
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
         PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, ScanOperation,
-        WhileOperation,
+        WhileOperation, ZeroLikeOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -3151,17 +3282,25 @@ mod tests {
         ));
 
         // Values can flow through writes into references, which data flow does not track, so every output of a program
-        // that holds a reference counts as dependent, including `index`, which reads no selected input.
+        // that holds a reference counts as dependent, including `index`, which reads no selected input. An explicitly
+        // zero output is the exception, because it is zero regardless of every input.
         let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
         let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
         builder.add_input(ArrayType::scalar(DataType::F32).into());
         let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let read =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let zero = builder
+            .add_instruction(ZeroLikeOperation::<ArrayIrType>::new(), Vec::new(), vec![read], None)
+            .unwrap()[0];
         let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![index, read], vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![index, read, zero],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
             .unwrap();
-        assert_eq!(program.output_dependence(&[1]), Ok(vec![true, true]));
+        assert_eq!(program.output_dependence(&[1]), Ok(vec![true, true, false]));
     }
 
     #[test]
@@ -5501,13 +5640,111 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
+        let instruction = &program.instructions()[0];
+        let input_types = vec![
+            ArrayType::scalar(DataType::Boolean),
+            ArrayType::scalar(DataType::F64),
+            ArrayType::scalar(DataType::F64),
+        ];
         let mut analysis = RegionPruningAnalysis::new(&program.regions);
-        let mut liveness = AttachedRegionLiveness::new(&mut analysis, program.instructions()[0].regions());
+        let mut liveness =
+            AttachedRegionLiveness::new(&mut analysis, instruction.operation(), input_types, instruction.regions());
         assert_eq!(liveness.used_region_inputs(0, &[true, false]), Ok(vec![true, false]));
         assert_eq!(liveness.used_region_inputs(1, &[false, true]), Ok(vec![false, true]));
         assert_eq!(
             liveness.used_region_inputs(2, &[true, true]),
             Err(ProgramError::MalformedProgram("the instruction has no attached region 2".to_string())),
         );
+    }
+
+    #[test]
+    fn test_attached_region_liveness_keeps_unproven_validation_peers() {
+        // An operation that neither infers region input types nor forwards instruction inputs proves no relationship
+        // of the region boundary. The middle input relates `m` and `n`, so retaining the last input keeps the whole
+        // connected boundary, which takes a second pass to reach the leading reference. The independent `p` input can
+        // still be removed, and without data or effects none of the groups is live.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionVariable::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let p = DimensionVariable::new("p", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
+        let reference = builder.add_input(
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(m.clone())]))).into(),
+        );
+        builder.add_input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(m), Dimension::Dynamic(n.clone())]))
+                .into(),
+        );
+        builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(p)])).into());
+        let last = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)])).into());
+        let program = builder
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![last], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        let operation = TestIrOperation::from(ReferenceReadOperation::new());
+        let attached = [program.entry()];
+        let mut analysis = RegionPruningAnalysis::new(&program.regions);
+        let mut liveness = AttachedRegionLiveness::new(&mut analysis, &operation, Vec::new(), &attached);
+        assert_eq!(liveness.used_region_inputs(0, &[true]), Ok(vec![true, true, false, true]));
+        assert_eq!(liveness.used_region_inputs(0, &[false]), Ok(vec![false; 4]));
+
+        // A discarded reference read is observable, so its validation peers remain live even with no used outputs.
+        builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
+        let effectful = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 4], Vec::new())
+            .unwrap();
+        let attached = [effectful.entry()];
+        let mut analysis = RegionPruningAnalysis::new(&effectful.regions);
+        let mut liveness = AttachedRegionLiveness::new(&mut analysis, &operation, Vec::new(), &attached);
+        assert_eq!(liveness.used_region_inputs(0, &[]), Ok(vec![true, true, false, true]));
+    }
+
+    #[test]
+    fn test_attached_region_liveness_prunes_proven_validation_peers() {
+        // Both branches declare `[f32[n], f32[n]]` and return only their first input. The condition proves the shared
+        // `n` when its inputs carry one symbolic identity or one static extent, so the unread second input stays
+        // prunable. A mixed application leaves `n` unproven in either order, so the branch boundary is the only check
+        // that the symbolic input's runtime extent is 3, and the unread input remains live as its witness.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let exact = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let used_branch_inputs = |first: &ArrayType, second: &ArrayType| {
+            let mut branch_builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
+            let branch_input = branch_builder.add_input(symbolic.clone().into());
+            branch_builder.add_input(symbolic.clone().into());
+            let branch = branch_builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![branch_input], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let first = builder.add_input(first.clone().into());
+            let second = builder.add_input(second.clone().into());
+            let branch = builder.import_program(branch);
+            let outputs = builder
+                .add_instruction(
+                    ConditionOperation::<ArrayIrType>::new(),
+                    vec![branch, branch],
+                    vec![predicate, first, second],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder])
+                .unwrap();
+            let instruction = &program.instructions()[0];
+            let input_types = instruction
+                .inputs()
+                .iter()
+                .map(|input| program.atoms()[input.index()].r#type().into_owned())
+                .collect();
+            let mut analysis = RegionPruningAnalysis::new(&program.regions);
+            let mut liveness =
+                AttachedRegionLiveness::new(&mut analysis, instruction.operation(), input_types, instruction.regions());
+            liveness.used_region_inputs(0, &[true]).unwrap()
+        };
+        assert_eq!(used_branch_inputs(&symbolic, &symbolic), vec![true, false]);
+        assert_eq!(used_branch_inputs(&exact, &exact), vec![true, false]);
+        assert_eq!(used_branch_inputs(&symbolic, &exact), vec![true, true]);
+        assert_eq!(used_branch_inputs(&exact, &symbolic), vec![true, true]);
     }
 }

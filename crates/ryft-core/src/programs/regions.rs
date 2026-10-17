@@ -2518,6 +2518,7 @@ mod tests {
         Shape,
     };
     use crate::contexts::EagerContext;
+    use crate::interpretation::ReplayTypeIdentities;
     use crate::operations::{ReferenceNewOperation, ReferenceReadOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -3063,6 +3064,42 @@ mod tests {
         let signature = constant_reference.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
         assert_eq!(signature.internal_identities(), &[constant_identity]);
+    }
+
+    #[test]
+    fn test_replay_type_identities_freshens_constant_definitions() {
+        // Unlike eager dimensions, this existing structural value retains an identity that its constant owns.
+        // A reference to that constant follows the same substitution, while a separate replay gets a fresh owner.
+        let identity = StructuralIdentity::new("constant");
+        let definition = StructuralType::definition(identity.clone());
+        let reference = StructuralType::reference(identity.clone());
+        let mut builder = ProgramBuilder::<StructuralType, StructuralOperation>::new();
+        let defined = builder.add_constant(definition.clone());
+        let referenced = builder.add_constant(reference.clone());
+        let program = builder
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(
+                vec![defined, referenced],
+                Vec::new(),
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        assert_eq!(region.type_identity_signature().internal_identities(), std::slice::from_ref(&identity));
+        let first = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
+        let second = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
+        let first_definition = first.rename_constant(&definition).unwrap();
+        let second_definition = second.rename_constant(&definition).unwrap();
+        assert_ne!(first_definition.definitions, definition.definitions);
+        assert_ne!(second_definition.definitions, definition.definitions);
+        assert_ne!(first_definition.definitions, second_definition.definitions);
+        let first_reference = first.rename_constant(&reference).unwrap();
+        let second_reference = second.rename_constant(&reference).unwrap();
+        assert_eq!(first_reference.references, first_definition.definitions);
+        assert_eq!(second_reference.references, second_definition.definitions);
+
+        // Reusing a replay's constant does not allocate a second identity or mutate the original payload.
+        assert_eq!(first.rename_constant(&definition), Ok(first_definition.clone()));
+        assert_eq!(definition.definitions, vec![identity]);
     }
 
     #[test]
