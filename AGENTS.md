@@ -1,481 +1,141 @@
-# Instructions
+# Working in Ryft
 
-Act like a high-performing senior engineer, always being concise, direct, decisive, and execution-focused.
+Ryft is a Rust framework for numerical computing, program transformations, and compiler/runtime integration.
+Make focused, maintainable changes that fix root causes. Keep APIs small, behavior explicit, and communication concise.
 
-## Principles
+## Instruction Scope and Discovery
 
-- **Simplicity**: Make every change as simple as possible. Impact minimal code. Solve problems with simple,
-  maintainable, production-friendly solutions. Prefer low-complexity code that is easy to read, debug, and modify.
-  Do not overengineer. Do not introduce heavy abstractions, extra layers, or large dependencies for small features.
-  Choose the smallest solution that solves the problem well. Avoid cleverness unless it clearly improves the outcome.
-- **Elegance:** Keep implementations clean, APIs small, behavior explicit, and naming clear. Aim for reusable and
-  well-designed abstractions. Write code that another strong engineer can quickly understand, safely extend, and
-  confidently ship.
-- **No Laziness**: Find root causes and avoid temporary fixes. Remember that you must always act like a senior engineer
-  and not as a junior developer who is reactive and is looking for the quickest, but not necessarily most correct way to
-  fix issues.
-- **Minimize Impact**: Changes should only touch what is necessary. You must always avoid introducing bugs.
+This file owns repository-wide workflow, safeguards, and routing. Detailed conventions have one authoritative home:
+shared references below, scoped crate instructions, or task-specific skills.
 
-## General Instructions
+- Before editing a file, read any nested `AGENTS.md` files along its directory path. Do this even when starting at the
+  repository root; automatic instruction loading may only cover ancestors of the initial working directory. For changes
+  across crates, read each affected crate's instructions.
+- Apply shared conventions throughout the repository. More specific instructions refine them for their stated scope;
+  they do not waive the working-tree/index safeguards below. Follow explicit user instructions over repository defaults.
+  Resolve genuine ambiguity from the owning contract rather than choosing whichever wording seems stricter.
+- Read the relevant references and skills before implementation or review; a link is a routing instruction, not an
+  assumption that its contents were already loaded. Consult a dependency's scoped contracts when changing callers if its
+  ownership, error handling, or API conventions are relevant.
 
-- When moving or reordering code, preserve existing `TODO` comments exactly and keep each one attached to the code it
-  annotated unless the user explicitly asks to resolve or remove it. Audit marker counts after broad mechanical moves.
+## Working-Tree and Index Safeguards
+
+The checkout may contain long-running refactors and concurrent edits. Inspect status and relevant diffs before editing
+and preserve unrelated work, including the user's staged changes.
+
+- Never stage or unstage paths: do not use `git add`, `git rm`, `git rm --cached`, or equivalent index mutations.
+  Delete files with plain `rm` when deletion is in scope; leave staging to the user.
+- Never use `git stash`, `git checkout <path>`, `git reset`, or `git clean` to manage changes. Do not use `git restore`
+  on tracked files except under the complete
+  [staging-worktree restore exception](.agents/staging-worktree-restore-exception.md). That exception is limited to a
+  clean, dedicated staging worktree and never applies to the owner checkout.
+- Inspect committed versions with read-only commands such as `git show HEAD:<path>` and `git diff HEAD -- <path>`.
+- Do not mutate unrelated files to work around builds broken by concurrent edits. Verify in isolation when possible,
+  for example in a throwaway crate outside the workspace depending only on the crates being changed; report blockers.
+- When moving or reordering code, preserve existing `TODO` comments exactly and keep each attached to its annotated code
+  unless the user explicitly asks to resolve or remove it. Audit marker counts after broad mechanical moves.
+- Do not manually edit generated `crates/ryft-xla-sys/src/bindings.rs` except when explicitly regenerating it as part
+  of a version upgrade. Follow the upgrade skill, including its required post-generation adjustments. Avoid unrelated
+  binary/editor artifacts such as `.DS_Store`.
 
 ## Workflow
 
-When asked to implement a change or add a new feature, you must always follow the following steps:
+1. **Understand and Plan.** Inspect the relevant implementation, tests, and current diff. For substantial changes,
+   architectural decisions, or work with multiple dependent phases, write `.tasks/plan_<task_name>.md` with the intended
+   behavior, scope, checkable steps, and verification. Show the plan before implementation so the user can steer it;
+   this is not an approval gate unless they request one. Use the client's plan mode when appropriate and available,
+   without depending on it. Small, clear edits and explicitly waived narrow follow-ups can proceed directly.
+2. **Execute within Scope.** Fix reported bugs using available logs, errors, and tests without requiring hand-holding.
+   Use subagents for independent research, implementation, or review when useful and available, assigning one bounded
+   task to each. Reassess the plan when new evidence invalidates it; do not continue an obsolete approach.
+3. **Review the Design.** Prefer existing abstractions and modules, explicit ownership, and small unsafe boundaries.
+   Avoid unnecessary layers, dependencies, compatibility shims, and cleverness. Before presenting substantial work,
+   check whether a simpler, more coherent solution meets the same requirements.
+4. **Verify.** Inspect the final diff, run checks appropriate to the change, and resolve failures introduced by or
+   directly blocking the requested work. Report unrelated failures instead of expanding the task to repair all CI.
+   Keep completed plan items checked and record a short review of results and remaining limitations.
+5. **Maintain Instructions Selectively.** After a durable user correction, amend its authoritative rule or skill so it
+   need not be repeated. Prefer improving an existing rule over appending another. Keep one-off task facts in the task
+   plan; move specialized guidance to its owner and leave a reference here.
 
-1. **Planning:** Enter plan mode for ANY non-trivial task (e.g., anything that involves 3+ steps or architectural
-   decisions). If something goes sideways, STOP and re-plan immediately; do not keep pushing. Use plan mode for
-   verification steps; not just for building. Always write detailed specifications upfront to reduce ambiguity.
-   You must start tackling non-trivial tasks by writing a plan to `.tasks/plan_<task_name>.md` with checkable items,
-   letting the user modify it before you start executing on it. While executing on a plan, you must mark completed
-   items as such in that file, adding a high-level summary of what you did for each step in a new review section.
-   If the user explicitly waives planning for a narrowly scoped follow-up change, execute directly and keep the change
-   tightly scoped instead of forcing a new plan file.
-2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
-   analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
-   execution.
-3. **Self-Improvement:** After important corrections from the user, update `AGENTS.md` or the authoritative convention
-   file or skill it links to, so that you do not require the same corrections in the future. Write rules for yourself
-   that will prevent you from making the same mistake in the future. You must ruthlessly iterate on these rules until
-   your rate of making mistakes drops based on those rules.
-4. **Verification:** Never consider a task as completed without first proving that it is. Look at the diff between the
-   code before and after your changes to determine what changed and needs testing. Then, ask yourself "Would a staff
-   engineer approve this? Also, what tests would they want me to run or even add to do so?". Run tests, check the logs,
-   demonstrate correctness, and iterate if you are not there yet. When running potentially expensive verification
-   commands locally, start with an explicit timeout of 300 seconds per command unless the user asks for a longer run.
-   Do not let test or benchmark commands sit for many minutes by default. If a Rust verification command causes
-   `rustc` to be killed or to grow to extreme memory use, stop rerunning broad checks and first reduce the generic
-   type surface or trait-solver obligation graph introduced by the change. Never run `git stash` (or any command that
-   mutates unrelated working-tree files) to work around a build broken by concurrent edits in another crate. Those
-   uncommitted changes may belong to a concurrently running agent and a partial `stash pop` can silently drop them. If
-   a crate you depend on is transiently broken by such edits, verify your own change in isolation instead (e.g., a
-   throwaway crate outside the workspace that depends only on the crates you changed). More generally, never run
-   `git checkout <path>`, `git restore <path>`, or `git reset` on tracked files during a session. Large refactors live
-   uncommitted in the working tree for hours, and such commands silently destroy that work. To inspect the committed
-   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead. The
-   sole exception is a clean, dedicated staging worktree used by a reviewed extraction plan after the complete source
-   tree has been committed and pushed to an immutable archive branch. In that worktree only, `git restore
-   --source=<immutable-archive-or-reviewed-integration-ref> -- <explicit-paths>` may restore a documented increment's
-   explicit paths. Verify the staging worktree is clean first; restore a whole path only when the reviewed plan assigns
-   its complete delta to that increment, and use patch mode for paths shared with later work. Never target the worktree
-   root, a directory broader than the increment, a glob, or an unresolved variable. This exception never applies in
-   the owner checkout and does not permit `git checkout <path>`, `git reset`, `git clean`, or `git stash`. Never stage
-   or unstage paths either (e.g., `git add`, `git rm`, or `git rm --cached`); the user curates the index and commits
-   pieces as they go, so delete files with a plain `rm` and leave staging to them.
-5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
-   feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
-   always challenge your work before presenting it.
+## Verification
 
-When given a bug report, just fix it, without asking for hand-holding. Look at any relevant logs, errors, failing tests,
-etc., and then resolve them. Zero context switching should be required from the user for bug fixes; you shouold operate
-as an autonomous bug fixing agent. If you encounter any failing CI tests, go fix them without being told how.
+- Start with checks scoped to the affected crate and behavior. Include integration tests, doctests, and downstream
+  checks when the changed contract warrants them; unit tests alone are not always sufficient. Check the diff before
+  deciding what to run or add, and report exactly what passed, failed, or could not run.
+- Start potentially expensive local verification commands with an explicit **300-second timeout per command**, unless
+  the user requests a longer run. Do not leave tests or benchmarks running for many minutes by default.
+- If `rustc` is killed or uses extreme memory, stop broad retries and diagnose the failure. If new generic types or
+  trait-solver obligations caused it, reduce that surface before rerunning. Do not assume every kill is a type issue.
+- When changing a core trait contract consumed by derive macros, run the corresponding macro integration test crate
+  (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
+- For user-requested renames or removals, run a targeted search afterward to verify that no old identifier references
+  remain in the Ryft codebase.
+- Documentation-only changes need relevant link, instruction, or rustdoc checks; choose verification that can expose
+  actual defects rather than running unrelated builds.
 
-## Conventions
+## Shared Conventions
 
-You must always adhere to the `ryft` conventions around code, style, documentations, and testing, treating this file as
-the authoritative convention source for this repository. If there is any overlapping guidance, alway follow the stricter
-rule. Also, when the user asks for changes to the coding, documentation, or testing style that you use, make sure to
-update this file or the authoritative convention file or skill it links to so that they do not need to remind you again.
+Read each applicable reference; these contain required conventions, not optional background:
 
-### Code Style
+| Work                                                           | Reference                                                       |
+|----------------------------------------------------------------|-----------------------------------------------------------------|
+| Rust code, APIs, imports, naming, errors, lifetimes, or caches | [Rust Conventions](.agents/rust-conventions.md)                 |
+| Documentation, comments, API contracts, or diagrams            | [Documentation Guidelines](.agents/documentation-guidelines.md) |
+| Adding, changing, or reviewing tests                           | [Unit-Testing Guidelines](.agents/unit-testing-guidelines.md)   |
+| Raw C interfaces, unsafe conversions, or safe native wrappers  | [FFI Conventions](.agents/ffi-conventions.md)                   |
 
-- Prioritize correctness and clarity first. Optimize performance only when needed and explicit.
-- Prefer extending existing modules over creating new small files.
-- Order inherent functions as constructors, `with_*` builder functions, field accessors, mutators, extraction or
-  consuming functions, then private helpers. Place `with_*` functions immediately after constructors. Keep private
-  constructors with constructors, merge adjacent inherent impl blocks with identical bounds,
-  and order the corresponding tests by the public functions while keeping edge cases together.
-- Keep unsafe boundaries explicit and small.
-- Prefer explicit ownership and lifetime modeling over implicit behavior.
-- For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
-- Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
-  `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as
-  `crate::Operation::name(self)` or `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is
-  actually required.
-- When replacing a bespoke cross-cutting capability with something more general, prefer a small named trait over a
-  higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
-- When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
-  inherent methods and trait methods, to the extent possible.
-- For module moves and path migrations, do not introduce compatibility shims or re-export bridges unless the user
-  explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
-- For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding
-  redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
-- For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
-  call site instead of extracting a helper that adds indirection without meaningful reuse.
-- When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
-  parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
-  abstraction and keep one source of truth.
-- Prefer putting short and simple type bounds directly in generic type declarations typically including the primary
-  identifying bound for each parameter (e.g., `T: Type`, `V: Value<Type = T>`, `O: Operation<T>`, etc.). Move long or
-  structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`,
-  into `where` clauses.
-- Declare the type-descriptor parameter before the value parameter in generic parameter lists (e.g.,
-  `<T: Type, V: Value<Type = T>>`, not `<V, T>`). Likewise, declare a parameter type before the structure
-  that is parameterized by it (e.g., `Parameterwise<P, S>` and `impl<P: Parameter, S: Parameterized<P>>`).
-- Use `C` for generic parameters whose semantic role is a context or domain (e.g., `Context`, `StagingContext`,
-  `BatchingContext`, `DifferentiationContext`, `Domain`, or `CompilationDomain`), and `D` for driver parameters. When a
-  function accepts a driver, reserve `D` for that driver and use `C` for its context or domain; do not rename the driver
-  to `Driver` to free `D` for a domain. If `C` or `D` would collide with an existing payload, constant, or capture
-  parameter, rename that payload, constant, or capture parameter to a specific name such as `Constant`, `Capture`,
-  or `Payload`.
-- Order type bounds preferably as follows: `Clone`, `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
-  `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
-  `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
-  `SupportsMul`, `SupportsDiv`, etc.
-- Place lifetime bounds before trait bounds within a bound list (e.g., `T: 'static + Send + Sync`, not
-  `T: Send + Sync + 'static`).
-- `Type` requires `Clone + Debug + Display + PartialEq + Parameter`, so a `T: Type` bound already implies all of those.
-  Never write `T: Parameter + PartialEq + Type` (or any subset). Just write `T: Type`.
-- Do not add inherent type accessors that duplicate `Typed::r#type` (e.g., an inherent `r#type()` or `array_type()`
-  returning `&T` on a concrete `Value`): call the `Typed`-provided `r#type()` directly. It returns `Cow::Borrowed`
-  for concrete values, so it is a zero-cost borrow wrap; expression-position uses work through `Deref`, and a
-  longer-lived reference is obtained by binding the `Cow` and calling `.as_ref()`.
-- When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
-  relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
-- When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
-  reparameterized form (e.g., `Input::To<T>`) instead of introducing a separate generic metadata type that is
-  only coupled by matching `ParameterStructure`s.
+Preserve architectural rationale and invariants while improving prose. Follow workspace formatting in `rustfmt.toml`
+(120 columns); detailed import ownership and grouping rules are in the Rust reference.
 
-#### Formatting & Naming
+## Task Skills
 
-- Follow workspace formatting (i.e., `rustfmt.toml`): `max_width = 120`.
-- Write numeric type suffixes without a separating underscore (e.g., `0f32`, `1.0f64`, and `2usize`, instead of
-  `0_f32`, `1.0_f64`, or `2_usize`). Keep underscores used as digit separators where useful.
-- Use import grouping in this order:
-  - `std` imports
-  - third-party crate imports
-  - `crate::...` imports
-  - `super::...` imports
-- For imports from the current crate, use the first module segment after `crate` as the ownership boundary:
-  - Import items owned by a different top-level module through the shortest path that re-exports them, measured in
-    path segments. Both named and glob `pub use` re-exports in module `mod.rs` files count as intentional facades:
-    prefer `crate::arrays::ArrayType` and `crate::programs::Typed` to their deeper defining paths, and fall back to
-    the defining path only when no facade re-exports the item (e.g.,
-    `crate::programs::types::visit_type_signature_pairs`). The one exclusion is crate-root re-exports: in
-    `ryft-core`, never import through `crate::<Item>` (the `lib.rs` re-exports exist for downstream crates); in
-    crates whose root re-exports are the intentional named public API, such as `ryft-xla`, `use crate::{...}` root
-    imports are the shortest facade and are correct.
-  - Import items owned by the same top-level module through their full accessible defining submodule paths, even when
-    an ancestor re-exports them through a shorter facade path. For example, `crate::arrays::addressing` must import
-    `ArrayType` from `crate::arrays::types::arrays::ArrayType`, not from `crate::arrays::ArrayType`. Items defined
-    directly in the shared top-level module remain imported from that module. When the defining module is private to
-    a sibling, use its nearest accessible intentional facade instead of widening module visibility solely for imports.
-  - Group compatible leaf imports from the same exact module path into one brace group (aliased items such as
-    `Complex as ComplexNumber` participate in the group). Keep imports that descend into nested module paths in
-    separate `use` statements, and never merge imports across different `#[cfg]`, visibility, or other attribute
-    boundaries.
-  - Apply the same shortest-path rule to imports from other workspace crates, including their crate roots: when the
-    foreign crate re-exports an item at its root (by name or by glob), import it directly from the root (e.g.,
-    `ryft_core::Typed`, `ryft_core::ArrayType`, `ryft_pjrt::Event`); otherwise import through the shortest module
-    facade that re-exports it. The prohibition on `crate::<Item>` root imports applies only inside the defining
-    crate itself, never to downstream consumers.
-  - When two facades expose an item at the same shortest length, import from the module that owns the item (e.g.,
-    `Tag` from `crate::operations`, not through another module's incidental re-export of it).
-  - Enum-variant imports such as `use crate::arrays::DataType::{F32, F64};` keep their own statement beside the
-    owning type's group, because merging them would require nested brace groups, which are never used.
-  - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
-    inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
-    re-export statements that define the facades.
-  - Test modules follow the same rules for their `crate::...` imports; `use super::*` remains the standard way to
-    bring in the owning module's items.
-  - `rustfmt.toml` sets `imports_granularity = "Module"`, which enforces the grouping rule under nightly `rustfmt`
-    but is inert on stable; it cannot choose the semantically correct facade or defining descendant path, so treat it
-    as grouping assistance only. Do not add `group_imports = "StdExternalCrate"`: it merges `crate` and `super`
-    imports into one group, which conflicts with the import group order above.
-- At in-crate declarative macro call sites, import macros from `crate::macros` (grouping related macros where useful)
-  and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
-- Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
-  function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
-  preferred over spelled-out variants such as `absolute_value`. This also applies to names borrowed from external
-  APIs: spell out abbreviations such as JAX's `prevent_cse` (e.g., as `optimization_barrier`, named for the mechanism,
-  or `prevent_common_subexpression_elimination`), and mention the external name only in documentation.
-- When a function-like call or macro invocation argument list spans multiple lines, include a trailing comma after the
-  final argument.
-- For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
-  `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
-- Name functions that enforce a precondition by returning an error (e.g., `Result<(), Error>`, or a validated input)
-  `validate_*`, not `check_*`. Reserve `check_*` for assertion-style macros and test oracles (e.g., `check_count!`,
-  `check_gradient!`, and `check_operation_*!`).
-- Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
-  shorthand.
-- When writing indentation into `std::fmt::Formatter`, prefer inline width-based formatting like
-  `write!(formatter, "{:indentation$}", "")` over per-space loops or one-off helper functions.
-- For user-requested renames or removals, always run a targeted search afterward to verify that no old identifier
-  references remain in the `ryft` codebase.
-- Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
-- Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
-- In derive lists that include both `Copy` and `Clone`, list `Copy` before `Clone` and keep those two traits before
-  any other derived traits.
-- When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
-  crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
-- Precede every non-trivial declarative-macro branch with a concise code comment explaining the accepted public form
-  or the internal generation role.
+Use the relevant skill for focused maintenance and reviews as well as new implementations. Skills own their detailed
+workflows; the shared references and scoped instructions still apply.
 
-### Error Handling
+- [`add-or-review-core-operation`](.agents/skills/add-or-review-core-operation/SKILL.md): core operations, value
+  capabilities/providers, transform rules or replay, reference validation, composite values, and backend integration,
+  including work outside `operations/`. Also consult its core input terminology when editing programs or instructions.
+- [`add-mlir-dialect`](.agents/skills/add-mlir-dialect/SKILL.md): MLIR dialect wrappers, registration, passes, and
+  custom dialect C API shims; owns dialect layout, typed APIs, documentation, coverage, and native shim conventions.
+- [`upgrade-xla`](.agents/skills/upgrade-xla/SKILL.md): OpenXLA dependency upgrades, native artifacts/build metadata,
+  generated bindings, Protobuf synchronization, distributed-runtime bridges, PJRT API/argument synchronization,
+  and release verification. Apply only the relevant maintenance workflow when a full upgrade is not requested.
 
-- For ordinary error enums with declarative variant messages, derive `thiserror::Error` instead of writing manual
-  `Display` and `std::error::Error` implementations. Keep manual formatting only when the message requires genuinely
-  procedural rendering.
-- Do not silently discard fallible operations (e.g., `let _ = ...` on `Result`-returning code is disallowed).
-- Use `?` for error propagation when the caller should decide what to do with the error.
-- Use explicit `match`/`if let` when mapping to domain-specific errors.
-- Use `Result<_, Error>` with the crate-specific `Error` type as the return type for functions that can return errors.
-  In the `ryft-pjrt` crate, return `Result<_, Error>` and map null/invalid handles to explicit error variants.
-- Colocate domain-specific error types with the module that owns the corresponding API and define those error enums
-  immediately after the imports in that file. Use crate-level umbrella error types only for aggregation/wrapping.
-- Error messages must start with lowercase text and must not end with trailing punctuation.
-- In diagnostics, surround operation names, identifiers, types, attributes, command-line flags, and other literal code
-  fragments with backticks, following Rust compiler conventions. Do not use single quotes for code references; reserve
-  them for syntax that actually contains single quotes, such as character literals, lifetimes, or serialized formats.
-- Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
-- `unwrap()`/`expect()` are allowed only:
-  - in tests, or
-  - when enforcing internal invariants that were already validated or are contractually guaranteed.
-- For invariants that can never fail by design (e.g., extraction right after a `check_count!`, a `NonZeroUsize` built
-  from a clamped value, or lookups guaranteed by construction), use bare `unwrap()`. Reserve `expect(...)` with a
-  message for conditions that are possible but unrecoverable (e.g., mutex poisoning).
-- `Drop` implementations may use `expect(...)` when a cleanup failure is unrecoverable.
+## Workspace Map and Scoped Rules
 
-### Ownership & Lifetimes
+| Crate(s)                           | Role and Additional Instructions                                                              |
+|------------------------------------|-----------------------------------------------------------------------------------------------|
+| `ryft`                             | Public umbrella crate                                                                         |
+| `ryft-core`                        | Values, programs, operations, transforms, and compilation contracts; use the core skill above |
+| `ryft-macros`, `ryft-macros-tests` | Derive/procedural macros and their integration tests                                          |
+| `ryft-xla`                         | Backend integration between core and XLA                                                      |
+| `ryft-mlir`                        | MLIR wrappers; read [MLIR rules](crates/ryft-mlir/AGENTS.md)                                  |
+| `ryft-pjrt`                        | Runtime/plugin wrappers; read [PJRT rules](crates/ryft-pjrt/AGENTS.md)                        |
+| `ryft-xla-sys`                     | Native sources, raw interfaces, artifacts; read [XLA rules](crates/ryft-xla-sys/AGENTS.md)    |
+| `ryft-triton`, `ryft-mosaic`       | Kernel compiler integration                                                                   |
+| `ryft-cuda`, `ryft-rocm`           | GPU runtime loading and integration                                                           |
 
-- Preserve established lifetime roles like:
-  - `'o`: owner/object lifetime,
-  - `'c`: context/client lifetime in `ryft-mlir` and `ryft-pjrt`,
-  - `'t`: thread pool lifetime in `ryft-mlir`, and
-  - `'s`: store lifetime in `ryft-pjrt`.
-- Name the lifetime of a borrow of an operation, object, or other owner `'o` (e.g., `ResidualProducer<'o, T>`, which
-  borrows its producing operation), including in the types and higher-ranked bounds that carry it along. Do not use a
-  generic `'a`.
-- Non-owning wrapper types in `ryft-mlir` are typically `Copy + Clone` and often end with `Ref`.
-- Owning wrapper types in `ryft-mlir` are not `Copy` and implement `Drop` to release C resources.
-- Owning wrapper types in `ryft-pjrt` are not `Copy` and implement `Drop` to release C resources.
-- Use `PhantomData` to encode ownership/lifetime relationships explicitly.
-
-### Concurrency & Caching
-
-- Use `Once`, `OnceLock`, `LazyLock`, and `Mutex` for one-time initialization and thread-safe caching.
-- Keep global registration operations idempotent and thread-safe.
-- In `ryft-mlir`, acquire context borrow guards (via `borrow()` and  `borrow_mut()`) around C API calls that can mutate
-  or that depend on mutable internal MLIR state.
-
-### FFI & Unsafe Patterns
-
-- Keep raw FFI details localized and expose safe wrappers by default.
-- Use explicit wrapper types around raw handles (e.g., `handle: *mut ...` / `Mlir...` along with `context`/`api`
-  fields). Refer to the `ryft-mlir` and `ryft-pjrt` crates for examples.
-- For C type wrappers use functions like the following similar to how we are doing in the
-  `ryft-mlir` and `ryft-pjrt` crates:
-  - `unsafe fn from_c_api(...) -> Option<Self>` or `unsafe fn from_c_api(...) -> Result<Self, Error>`, and
-  - `unsafe fn to_c_api(&self) -> ...`.
-- For opaque C type bindings, follow this exact pattern (including the comments but modifying the struct name):
-  ```
-  // We represent opaque C types as structs with a particular structure that is following the convention
-  // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
-  #[repr(C)]
-  pub struct PJRT_TopologyDescription {
-      _data: [u8; 0],
-      _marker: PhantomData<(*mut u8, PhantomPinned)>,
-  }
-  ```
-- For PJRT C API argument structs (i.e., `*_Args`) in `ryft-pjrt`, provide `new(...)` constructors that initialize
-  the struct fields following the pattern we are already using in that crate:
-  - `struct_size: size_of::<Self>()`
-  - `extension_start: std::ptr::null_mut()`
-  - sensible null/zero defaults for outputs
-- Whenever possible, use existing helper macros instead of duplicating FFI boilerplate like:
-  - `ryft-mlir`: `mlir_subtype_trait_impls!`, `mlir_op!`, `mlir_op_trait!`, `mlir_*_op!`, `mlir_pass!`, etc.
-  - `ryft-pjrt`: `invoke_pjrt_api_void_fn!`, `invoke_pjrt_api_error_fn!`, `invoke_distributed_api_error_fn!`, etc.
-
-## Documentation Style
-
-- Every struct, enum, trait, module, and function should have a documentation string. Enum variants should have 
-  documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
-  add documentation for all variants in that enum.
-- When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
-  unit variants or small enums.
-- Keep an empty line between adjacent documented struct fields, including fields of private implementation structs.
-- Do not attach rustdoc comments (i.e., `///`) to trait implementation blocks. Put reusable public contract
-  documentation on the trait or implementing type, and explain implementation mechanics and invariants with ordinary
-  code comments (i.e., `//`) at the beginning of the implementation or relevant method body.
-- Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
-- When simplifying existing documentation, preserve its architectural rationale, invariants, and relevant API links.
-  Improve wording without discarding useful information merely to shorten the text.
-- When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
-  "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
-- Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).
-- When linking external documentation, prefer the most precise relevant page/section instead of just using top-level
-  project pages.
-- On first mention of in-repo entities, use rustdoc links (e.g., ``[`Operation`]``), and use explicit paths (e.g.,
-  ``[`Operation`](crate::Operation)``) when not imported in the current scope.
-- For function/method argument documentation strings, use a dedicated `# Parameters` section with this exact bullet 
-  style: ``///   - `arg_name`: description...`` and indent wrapped lines under the bullet. You may skip this section
-  entirely in cases where the arguments do not need a description or where their role is clear from the main description
-  of the function itself.
-- Do not end function or method rustdoc blocks with an empty `///` line immediately before the item or its attributes.
-  Keep empty rustdoc lines only for internal paragraph, list, table, or code-block separation.
-- Do not add documentation strings to `From` implementations or their `from` functions. Document the conversion
-  semantics, including paired conversions that form a normalizing cycle between two types, in the documentation string
-  of the more domain-specific type (for example, a transform-owned error enum rather than the core `ProgramError`).
-- For public `unsafe` APIs, include:
-  - what handle/representation is being exposed,
-  - why it is unsafe, and
-  - why it is still exposed (e.g., extensibility/interoperability).
-- Public items that other workspace crates need (e.g., backend hooks that `ryft-xla` calls on `ryft-core` types) are
-  documented public API: explain why callers need them, the invariants callers must uphold, and any caveats (e.g.,
-  locking order or reentrancy), and include `# Errors` where applicable. Do not use `#[doc(hidden)]` to avoid
-  documenting them. Reserve `#[doc(hidden)]` for macro-expansion support and for items that are public only for
-  type-system reasons (e.g., the payload of an uninhabited variant). Make items that are only used within their own
-  crate `pub(crate)` or private instead of hiding them, and never make a type public solely to name it as a `Deref`
-  target or in another public signature when the owning type can expose the needed functions directly.
-- Do not mark in-repo types `#[non_exhaustive]`. Workspace crates evolve together, and the attribute forces wildcard
-  `_` arms in other crates, which hide newly added variants that those crates should handle (e.g., a backend lowering
-  that must cover every `ArrayReferenceTransform`). Match exhaustively instead, and use the attribute only for a
-  published-API compatibility reason that the user explicitly asks for.
-- For callback- and threading-heavy code, explain the lifetime/ownership invariants in comments. You can refer to
-  documentation strings in the core traits of the `ryft-pjrt` crate for examples of this.
-- When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
-  block content slightly so that the raw Rust file remains easy to scan.
-- When a `rustdoc` diagram would materially improve documentation clarity, prefer a rendered Mermaid diagram via
-  `aquamarine` over a large ASCII graph, while keeping any supporting tables aligned in the raw source.
-- When a large `rustdoc` table needs color or layout that Markdown cannot express cleanly, prefer theme-aware raw HTML
-  with colors derived from rustdoc CSS variables instead of hard-coded light-theme colors, and prefer a small local
-  `<style>` block with namespaced classes over repeating large inline styles on every cell.
-- Keep raw HTML and CSS in doc comments within the repo's 120-column limit by breaking declarations, tags, and table
-  cells across multiple lines instead of leaving oversized single-line blocks.
-- When revising one sentence inside a documentation paragraph, reread and polish the whole paragraph so the final
-  wording is coherent as a unit instead of sounding locally patched.
-- When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
-  allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
-  readability-driven sentence breaks.
-- In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
-  from free functions in prose.
-
-## Testing Guidelines
-
-All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
-Consult that file before writing or revising unit tests.
-
-## Crate-Specific Conventions
-
-### `ryft-core`
-
-- Use [add-or-review-core-operation](.agents/skills/add-or-review-core-operation/SKILL.md) when adding, changing,
-  or reviewing core operations, value capabilities and providers, transform rules or replay, core reference validation,
-  composite values, or their backend integration, including work outside `operations/`. The skill owns the detailed
-  operation layout, capability, transform, and core input terminology conventions. Consult it for terminology when
-  editing core programs or instructions as well. Keep operation-specific corrections in the skill and its references;
-  shared repository conventions and the testing guidelines remain authoritative for their respective concerns.
-
-### `ryft-mlir`
-
-- Use [add-mlir-dialect](.agents/skills/add-mlir-dialect/SKILL.md) when adding, updating, or reviewing MLIR dialect
-  wrappers, registration, passes, or custom dialect C API shims. It owns the dialect layout, typed APIs, documentation,
-  coverage, and native shim conventions. Apply it to existing-dialect maintenance as well as new dialects; keep future
-  dialect-specific corrections in that skill. General ownership, FFI, context borrowing, and testing rules still apply.
-- In `ryft-mlir`, do not use `filter_map` or `.ok()` to hide failed wrapper conversions while traversing counted MLIR
-  C API collections. Keep low-level collection APIs iterator-shaped with `impl Iterator<Item = Result<_, Error>>`
-  and make callers collect with `collect::<Result<Vec<_>, _>>()?` or handle each item explicitly.
-- Use this crate and `ryft-pjrt` as the reference style for macro-driven hierarchy modeling over third-party C APIs.
-
-### `ryft-pjrt`
-
-- For PJRT API upgrades and argument-struct synchronization, also use
-  [upgrade-xla](.agents/skills/upgrade-xla/SKILL.md); its binding guidance applies even without changing
-  the OpenXLA pin.
-- Prefer API-invocation macros for PJRT calls and keep handle conversion helpers centralized.
-- Keep `ffi` modules at the bottom of files with explicit C struct/function pointer definitions.
-- Continue using `OnceLock` to memoize expensive API queries (e.g., attributes, descriptions, etc.).
-- When a new PJRT option struct contains pointer fields to owned C API objects, expose a safe owned wrapper for the
-  pointee and model the option field as a borrow of that wrapper; do not silently pass null because the wrapper is
-  missing.
-- For public safe Rust APIs, prefer full-word count naming such as `device_count_per_slice` over abbreviated
-  `num_*` names. Only preserve upstream `num_*` names in FFI definitions and direct C API field mirrors.
-- See the **PJRT Extension Conventions** section below for conventions related to code in
-  `crates/ryft-pjrt/src/extensions`.
-
-#### PJRT Extension Conventions
-
-Each PJRT extension lives in its own module under `crates/ryft-pjrt/src/extensions/`. Use `layouts.rs`, `triton.rs`,
-and `ffi.rs` as authoritative references. All new extensions must follow these same patterns.
-
-##### Extension Struct
-
-- Derive `Copy, Clone`. Fields are `handle: *const ffi::PJRT_<Ext>_Extension` and `api: Api`, both private and each
-  with a `///` doc comment.
-- Provide three `pub(crate)` methods in the first `impl` block:
-  - `unsafe fn from_c_api(handle: *const crate::ffi::PJRT_Extension_Base, api: Api) -> Option<Self>`: Checks
-    `extension_type` against the expected `PJRT_Extension_Type_*` constant.
-  - `unsafe fn to_c_api(&self) -> *const ffi::PJRT_<Ext>_Extension`: Returns the raw handle.
-  - `fn api(&self) -> Api`: Returns the stored `Api`.
-- Add `unsafe impl Send` and `unsafe impl Sync` for the extension struct immediately after its main `impl` block.
-
-##### `impl` Block Ordering
-
-`impl` blocks for extension modules must appear in the following order:
-
-1. Extension struct definition and core methods (e.g., `from_c_api`, `to_c_api`, `api`).
-2. `unsafe impl Send` / `unsafe impl Sync` for the extension struct.
-3. Extension-specific domain methods (e.g., `register_handler`, `register_type`).
-4. Optional convenience delegation methods for core types like `Device`, etc.
-5. Convenience delegation methods for clients in an `impl Client<'_>` block.
-6. Convenience delegation methods for plugins in an `impl Plugin` block.
-7. `pub(crate)` functions in an `impl Api` block, including `pub(crate) fn <ext>_extension(&self)` that walks the
-   `PJRT_Extension_Base` chain and returns `Result<..., Error>`, using `Error::unimplemented` if the extension
-   is not present.
-8. Additional public wrapper types (e.g., enums, bitflags, borrowed views, etc.).
-9. `ffi` module (always appearing last, right before `#[cfg(test)] mod tests`).
-
-##### Convenience Delegation Methods
-
-- Both `Client<'_>` and `Plugin` must always provide `pub fn <ext>_extension(&self) -> Result<..., Error>`
-  that delegates to `self.api().<ext>_extension()`.
-- If the extension exposes high-level operations (e.g., `register_handler`, `register_type`), you must add
-  matching convenience methods on both `Client` and `Plugin` that call `self.<ext>_extension()?.<method>(...)`.
-- Convenience method documention strings should cross-reference the canonical method on the extension
-  struct (e.g., "Refer to the documentation of [`<Ext>Extension::<method>`] for more information.") to
-  avoid duplication.
-
-### `ryft-xla-sys`
-
-- Use [upgrade-xla](.agents/skills/upgrade-xla/SKILL.md) for dependency upgrades, native artifact/build metadata,
-  generated bindings, Protobuf synchronization, distributed-runtime bridge maintenance, and release verification.
-  Apply its relevant guidance to focused maintenance as well as full upgrades; keep future upgrade-specific corrections
-  in that skill. For custom MLIR dialect C API bindings, also use
-  [add-mlir-dialect](.agents/skills/add-mlir-dialect/SKILL.md).
-- In custom `ryft-xla-sys` C/C++ and Rust FFI identifiers, use regular UpperCamel acronym casing in function and enum
-  type names, such as `Gpu`, `Mlir`, and `Mma`; reserve all-uppercase acronym spelling for all-caps C constants and
-  upstream symbols that already use it.
-- Use `#pragma once` for source-owned C/C++ headers instead of include guards.
-- In custom C++ FFI shims, inline tiny nullable handle conversions at the getter call site instead of adding local
-  helpers when the helper only wraps a null check for one or two nearby functions.
-
-## Convention References / Examples
-
-The `ryft-pjrt`, `ryft-mlir`, and `ryft-xla-sys` crates should provide a good reference for our conventions if you want
-to look at real examples. For documentation of core concepts, you can refer to the documentation in
-`crates/ryft-core/src/parameters.rs` as a good example.
+For PJRT extensions and their convenience methods, also read
+[extension conventions](crates/ryft-pjrt/src/extensions/AGENTS.md), including when editing callers outside that
+directory. The MLIR and PJRT crates provide examples of macro-driven C API hierarchy modeling. For core documentation
+examples, see [parameters.rs](crates/ryft-core/src/parameters.rs); apply the written rules when older examples differ.
 
 ## Commands
 
-The following are some useful commands that you can use while working on the `ryft` project:
+Run from the repository root using the toolchain specified by `rust-toolchain.toml`. Apply the timeout policy above
+through the command runner or an available timeout utility. Prefer crate-scoped checks to reduce iteration cost.
 
-- Build all crates in the workspace: `cargo build`
-- Build one crate: `cargo build -p <crate>`
-- Type-check all crates in the workspace: `cargo check`
-- Type-check one crate: `cargo check -p <crate>`
-- Run tests for all crates in the workspace: `cargo test`
-- Run tests for one crate: `cargo test -p <crate>`
-- Run tests keeping their outputs in `stdout`: `cargo test -p <crate> -- --nocapture`
-- Format all crates in the workspace: `cargo fmt`
-- Format one crate: `cargo fmt -p <crate>`
+| Purpose                                                                | Command                                         |
+|------------------------------------------------------------------------|-------------------------------------------------|
+| Type-check a crate                                                     | `cargo check -p <crate>`                        |
+| Build a crate                                                          | `cargo build -p <crate>`                        |
+| Run a crate's tests, including its default integration/doctest targets | `cargo test -p <crate>`                         |
+| Run library unit tests                                                 | `cargo test -p <crate> --lib`                   |
+| Run matching tests with output                                         | `cargo test -p <crate> <filter> -- --nocapture` |
+| Check formatting without rewriting files                               | `cargo fmt -p <crate> --check`                  |
+| Format an affected crate                                               | `cargo fmt -p <crate>`                          |
 
-Generally, you should prefer running commands scoped to the crate that you are currently modifying to reduce iteration
-cost and avoid unnecessary cross-crate churn.
-
-## Generated And Special Files
-
-- Do not manually edit generated outputs unless explicitly regenerating them as part of a version upgrade:
-  - `crates/ryft-xla-sys/src/bindings.rs`
-- Avoid touching unrelated binary/editor artifacts (e.g., `.DS_Store`).
+Use workspace-wide `cargo check`, `cargo build`, or `cargo test` when the change requires workspace coverage. Inspect
+formatting diffs and avoid unrelated churn. For native prerequisites and rebuilds, consult the relevant skill and
+[native build documentation](crates/ryft-xla-sys/README.md) before invoking expensive builds.
