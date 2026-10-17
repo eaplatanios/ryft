@@ -10,8 +10,10 @@ description: >-
 
 Treat an OpenXLA upgrade as a cross-crate source and native-binary change. Follow the detailed
 [Contribution checklist](../../../crates/ryft-xla-sys/README.md#contribution) and the current build configuration.
-Read [AGENTS.md](../../../AGENTS.md) for shared planning, Git safeguards, FFI ownership, PJRT extension design,
-C/C++ style, documentation, and testing conventions. This skill owns the upgrade and artifact-specific requirements.
+Read [AGENTS.md](../../../AGENTS.md) for workflow, Git safeguards, and shared convention routing, and the
+[native rules](../../../crates/ryft-xla-sys/AGENTS.md) for C/C++ conventions. For affected bindings, also read the
+[FFI conventions](../../ffi-conventions.md) and the owning crate instructions linked from the root. This skill owns
+the upgrade and artifact-specific requirements.
 
 Apply only the requested mode: a full upgrade follows the workflow below; a binding repair or artifact rebuild applies
 its relevant steps at the existing pins without selecting a new revision, creating an upgrade branch, or starting

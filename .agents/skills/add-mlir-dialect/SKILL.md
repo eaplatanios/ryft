@@ -9,9 +9,10 @@ description: >-
 
 Implement the requested dialect surface under `crates/ryft-mlir/src/dialects/`, or review existing support against its
 pinned upstream contracts. This skill owns dialect-specific implementation, documentation, and coverage conventions.
-Read repository [AGENTS.md](../../../AGENTS.md) for shared planning, ownership/lifetimes, unsafe boundaries, context
-borrow guards, formatting, and generated-file rules. Read the [testing guidelines](../../unit-testing-guidelines.md)
-before changing tests.
+Read repository [AGENTS.md](../../../AGENTS.md) for workflow, safeguards, and shared convention routing. Read the
+[MLIR rules](../../../crates/ryft-mlir/AGENTS.md) for ownership, context borrow guards, and collection APIs, and the
+[FFI conventions](../../ffi-conventions.md) for native wrappers. Apply the shared Rust and documentation references
+linked by the root. Read the [testing guidelines](../../unit-testing-guidelines.md) before changing tests.
 
 ## Establish The Pinned Surface
 

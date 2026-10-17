@@ -41,7 +41,9 @@ When a change expands batch geometry, inventory every consumer of its metadata b
 
 - Exercise repeated occurrences of one dimension identity within one carrier, with different extent coordinates,
   capacities, and metadata order. Verify both output geometry and every relationship check; an identity-level provider
-  cannot substitute for a particular physical occurrence.
+  cannot substitute for a particular physical occurrence. When extent coordinates are themselves ragged, vary only
+  inactive coordinate entries and verify that relationship checks still depend solely on live coordinates. Cover both
+  static refinements and equality checks, plus a genuine live mismatch and an empty live domain.
 - Follow the metadata into region bodies, including rematerialization, custom derivatives, and linear calls. Output
   restoration cannot repair a body that already computed on padding or skipped a per-item assertion. Compare direct
   execution with execution through the region boundary using observable live values and failing checks.
@@ -50,6 +52,11 @@ When a change expands batch geometry, inventory every consumer of its metadata b
   supported, and require an explicit error where surviving geometry cannot be represented.
 - Test equivalent extent-array layouts with permuted coordinate storage. Distinguish coordinate identity from vector
   order, while retaining explicit layout requirements at boundaries that actually impose them.
+- Exercise replicated ragged carriers produced by ordinary operations, including collectives, through shared elementwise
+  rules and broadcasting. A replicated shortcut must preserve the same geometry as its mapped path. Check homogeneous
+  policies as well as composite policies: unsupported consumers must reject before executing on padding or unwrapping
+  logical dimensions, and policy validation must catch accidental metadata loss independently of the individual
+  consumer.
 
 After a finding exposes a shared invariant, audit all producers, consumers, and sibling implementations of that
 invariant in the same pass. Add regressions at the owning boundary, not only at the operation that revealed the failure.

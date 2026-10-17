@@ -9,12 +9,13 @@ version numbers, symbol lists, or historical assumptions from this skill.
 Compare `xla/pjrt/c/pjrt_c_api.h` and every relevant PJRT extension header between the old and new OpenXLA revisions.
 Audit extension declarations beyond the headers currently passed to bindgen so a newly added extension is not missed.
 Update handwritten definitions in `crates/ryft-pjrt/src` and `src/extensions`, adding new supported extension modules,
-documentation, and tests according to the [PJRT conventions](../../../../AGENTS.md#ryft-pjrt).
+documentation, and tests according to the [PJRT conventions](../../../../crates/ryft-pjrt/AGENTS.md) and
+[extension conventions](../../../../crates/ryft-pjrt/src/extensions/AGENTS.md).
 
 When upgrading PJRT or XLA FFI structs, update both the raw `ffi` argument structs and every corresponding safe Rust
 wrapper, convenience method, and test in the same change. Newly added nested option structs must be usable through
-the matching safe wrapper or safe method argument, not only through `ffi`. Follow the shared pointer-ownership and
-`*_Args::new(...)` initialization rules in `AGENTS.md`; do not silently substitute null for a missing safe API.
+the matching safe wrapper or safe method argument, not only through `ffi`. Follow the pointer-ownership and
+`*_Args::new(...)` initialization rules in the PJRT conventions; do not silently substitute null for a missing safe API.
 
 `crates/ryft-xla-sys/src/bindings.rs` is bindgen output with deliberate manual adjustments. Generate against the new
 artifact's headers using the `generate-bindings` feature; inspect `build.rs` and its `OUT_DIR/bindings.rs` output before

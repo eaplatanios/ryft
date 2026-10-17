@@ -1,8 +1,9 @@
 # Native Dialect Shims
 
 Read this reference when the requested dialect needs a native handle, attribute/type constructors or accessors, or
-other C API support that the pinned upstream API does not expose. Shared FFI, ownership, context-guard, C++ naming,
-and header rules remain in repository [AGENTS.md](../../../../AGENTS.md). Use the
+other C API support that the pinned upstream API does not expose. Read the shared
+[FFI conventions](../../../ffi-conventions.md), [MLIR ownership/context rules](../../../../crates/ryft-mlir/AGENTS.md),
+and [native naming/header rules](../../../../crates/ryft-xla-sys/AGENTS.md). Use the
 [upgrade-xla skill](../../upgrade-xla/SKILL.md) for generated-binding and native artifact requirements, applying only
 the binding repair or artifact rebuild mode needed by this task.
 

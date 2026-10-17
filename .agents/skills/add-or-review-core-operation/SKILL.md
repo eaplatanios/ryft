@@ -13,10 +13,12 @@ unsupported behavior or unverified parity explicitly rather than treating the go
 
 ## Start Here
 
-Read the repository [AGENTS.md](../../../AGENTS.md) for shared workflow, Rust, documentation, and import conventions,
-and the [unit-testing guidelines](../../unit-testing-guidelines.md) before writing or revising tests. This skill
-owns the additional core operation conventions; keep future operation-specific corrections here or in its references.
-Apply the shared conventions to module documentation, public APIs, implementation comments, and tests alike.
+Read repository [AGENTS.md](../../../AGENTS.md) for workflow and safeguards, the
+[Rust conventions](../../rust-conventions.md) for code and imports, and the
+[documentation guidelines](../../documentation-guidelines.md) for API documentation. Read the
+[unit-testing guidelines](../../unit-testing-guidelines.md) before writing or revising tests. This skill owns the
+additional core operation conventions; keep future operation-specific corrections here or in its references. Apply
+the shared conventions to module documentation, public APIs, implementation comments, and tests alike.
 
 Inspect the current source before choosing an implementation pattern. The useful starting points below are paths
 relative to the repository root, not a requirement to read every file for every task:
@@ -63,8 +65,9 @@ Group each operation in this order, omitting only implementations that do not ap
 
 Keep shared blanket implementations and substantial helper submodules shared; do not duplicate them to reproduce
 this ordering. Reuse existing production and testing macros from `crate::macros` where applicable, following their
-current contracts and importing them unqualified as required by `AGENTS.md`. For example, elementwise operations
-can use `define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared boilerplate.
+current contracts and importing them unqualified as required by the Rust conventions. For example, elementwise
+operations can use `define_elementwise_operation!` and `define_elementwise_capability!` rather than restating shared
+boilerplate.
 
 Prefer validated builders such as `ArrayType::with_sharding` over direct metadata field assignments when constructing
 or updating operation output types, and propagate validation errors through existing conversions.
