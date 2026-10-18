@@ -62,7 +62,7 @@ use std::fmt::{Debug, Display};
 use ryft_macros::Parameter;
 
 use crate::batching::{BatchingContext, BatchingPolicy};
-use crate::contexts::{Context, DomainProjection, EagerContext, ProjectedContext};
+use crate::contexts::{Context, ContextProjection, EagerContext, ProjectedContext};
 use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::PartialEvaluationContext;
@@ -226,7 +226,7 @@ pub trait CapturingContext: Context {
 
 impl<C: CapturingContext, T: Type> CapturingContext for ProjectedContext<C, T>
 where
-    C: DomainProjection<T>,
+    C: ContextProjection<T>,
     C::Capture: ValueProjection<T, Projected: Value<Type = T>>,
 {
     type Capture = <C::Capture as ValueProjection<T>>::Projected;
@@ -731,8 +731,8 @@ mod tests {
 
     #[test]
     fn test_projected_context_capture_delegates_to_parent_capture_table() {
-        /// Checks forwarding with only its public bounds, without assuming either operation family provides guards.
-        fn capture_projected<T: Type, C: CapturingContext + DomainProjection<T>>(
+        /// Checks forwarding with only its public bounds.
+        fn capture_projected<T: Type, C: CapturingContext + ContextProjection<T>>(
             context: &ProjectedContext<C, T>,
             value: <C::Capture as ValueProjection<T>>::Projected,
         ) -> Result<<C::Constant as ValueProjection<T>>::Projected, ProgramError>

@@ -336,7 +336,10 @@ where
     }
 }
 
-impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext<C, T> {
+impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext<C, T>
+where
+    Self: Context,
+{
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // Projection changes only the visible type/value/operation member. Named-axis scope belongs to the parent
