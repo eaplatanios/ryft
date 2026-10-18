@@ -50,14 +50,11 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::arrays::LogicalMesh;
-use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
+use crate::batching::{BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, DomainProjection, EagerContext, ProjectedContext};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
-};
-use crate::interpretation::InterpretableOperation;
+use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::parameters::Parameter;
-use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::partial::PartialEvaluationContext;
 use crate::programs::{Operation, Type, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
 
@@ -323,8 +320,9 @@ pub trait NamedAxes: Context {
     fn named_axes(&self) -> Vec<(String, NamedAxis)>;
 }
 
-impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContext<V, O>>> NamedAxes
-    for EagerContext<V, O>
+impl<V: Value, O: Operation<Type = V::Type>> NamedAxes for EagerContext<V, O>
+where
+    Self: Context,
 {
     #[inline]
     fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
@@ -352,7 +350,10 @@ impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type>, Capture> NamedAxes for TracingContext<V, O, Capture>
+where
+    Self: Context,
+{
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
@@ -376,7 +377,10 @@ impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, 
     }
 }
 
-impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
+impl<C: NamedAxes> NamedAxes for NestedTracingContext<C>
+where
+    Self: Context,
+{
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A lookup resolves against the axes this nested trace was seeded with first, and otherwise delegates to the
@@ -405,8 +409,7 @@ impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
 
 impl<C: NamedAxes> NamedAxes for PartialEvaluationContext<C>
 where
-    C::Operation:
-        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    Self: Context,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
@@ -421,8 +424,9 @@ where
     }
 }
 
-impl<C: NamedAxes<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> NamedAxes
-    for BatchingContext<C, P>
+impl<C: NamedAxes, P: RecursiveBatchingPolicy<C>> NamedAxes for BatchingContext<C, P>
+where
+    Self: Context,
 {
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
@@ -450,12 +454,7 @@ impl<C: NamedAxes<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPoli
 
 impl<C: NamedAxes, P: DifferentiationPolicy<C>> NamedAxes for DifferentiationContext<C, P>
 where
-    C::Type: DifferentiableType,
-    C::Operation: DifferentiableOperation<C>
-        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    Self: Context,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {

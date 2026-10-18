@@ -87,11 +87,12 @@ use std::rc::Rc;
 
 use crate::interpretation::{EagerInterpretationDriver, InterpretableOperation};
 use crate::macros::check_builders;
-use crate::operations::ConstantOperation;
+use crate::operations::{ConstantOperation, GuardOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
-    AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
-    Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
+    AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, OperationProvider, Program,
+    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value,
+    ValueDomainDispatch, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -292,6 +293,7 @@ pub trait Context: Domain + Clone {
     /// input values. Use this when a caller needs both the staged program and the corresponding concrete output for
     /// the same input. The runtime values flow through `self`, which supplies the concrete value type and the
     /// constant-lifting behavior.
+    #[allow(clippy::type_complexity)]
     fn interpret_and_trace<
         F: FnOnce(Input::To<Tracer<TracingContext<Self::Constant, Self::Operation>>>) -> Result<Output, ProgramError>,
         Input: Parameterized<
@@ -313,7 +315,11 @@ pub trait Context: Domain + Clone {
             Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
-    > {
+    >
+    where
+        TracingContext<Self::Constant, Self::Operation>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
@@ -607,9 +613,19 @@ impl<C: Context + DomainProjection<T>, T: Type> Context for ProjectedContext<C, 
 /// their own flowing value types and delegate rewritten operations to a parent staging context instead of implementing
 /// this trait themselves.
 ///
-/// The flowing value is pinned to [`Tracer<Self>`](Tracer). Every staging context records operation invocations
-/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results.
-pub trait StagingContext: Context<Value = Tracer<Self>> {
+/// The flowing value is pinned to [`Tracer<Self>`](Tracer), with this context as its [`Value::Domain`] and
+/// [`ValueDomainDispatch`] routing capabilities back through it. Every staging context records operation invocations
+/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results. Its operation family provides
+/// [`GuardOperation`] requests because staging can specialize attached regions and must preserve their input checks.
+/// A provider may reject checks that its family cannot represent. This requirement belongs to staging; the base
+/// [`Context`] protocol does not construct guards.
+pub trait StagingContext:
+    Context<
+        Value = Tracer<Self>,
+        Value: Value<Type = Self::Type, Domain = Self, Dispatch = ValueDomainDispatch>,
+        Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>,
+    >
+{
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;
 
@@ -1447,6 +1463,14 @@ mod tests {
             }
         }
 
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for StagingRegionOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
+            }
+        }
+
         #[derive(Clone)]
         struct IdentityInstantiatingRegionOperation {
             dependent_regions: bool,
@@ -1504,6 +1528,14 @@ mod tests {
                     )));
                 };
                 Ok(region_interface.output_types().to_vec())
+            }
+        }
+
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for IdentityInstantiatingRegionOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -1713,6 +1745,17 @@ mod tests {
                     },
                     Self::Call => Self::Call,
                 })
+            }
+        }
+
+        impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for NarrowingOperation {
+            type Operation = Self;
+
+            fn provide(
+                request: GuardOperation<DimensionType>,
+                _input_types: &[&DimensionType],
+            ) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
