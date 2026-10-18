@@ -146,6 +146,31 @@ impl<T: Type, D> DomainProjection<T> for D where
 {
 }
 
+/// Projection of an active [`Context`] onto a `T`-typed member context. In addition to the passive [`DomainProjection`]
+/// contract, the member operation family provides [`GuardOperation`] requests, as every [`Context`] requires. Keeping
+/// this requirement here lets passive operation and domain projections remain usable without guard provision.
+/// A provider may reject guards that its family cannot represent.
+pub trait ContextProjection<T: Type>:
+    DomainProjection<T>
+    + Context<
+        Operation: OperationProjection<
+            T,
+            Projected: OperationProvider<
+                T,
+                GuardOperation<T>,
+                Operation = <Self::Operation as OperationProjection<T>>::Projected,
+            >,
+        >,
+    >
+{
+}
+
+impl<T: Type, C: Context + DomainProjection<T>> ContextProjection<T> for C where
+    <C::Operation as OperationProjection<T>>::Projected:
+        OperationProvider<T, GuardOperation<T>, Operation = <C::Operation as OperationProjection<T>>::Projected>
+{
+}
+
 /// Active binding semantics layered on a passive [`Domain`]. A [`Context`] decides how stored constants become flowing
 /// values, what applying an operation means, what identity information can be recovered from a value, and whether the
 /// innermost binding semantics execute eagerly. Eager contexts interpret operations immediately, staging contexts
@@ -175,8 +200,21 @@ impl<T: Type, D> DomainProjection<T> for D where
 ///
 /// All contexts are cloneable handles. Stateful implementations must ensure that clones share one active builder or
 /// transform state rather than fork it.
+///
+/// # Guard Provision
+///
+/// Every context's operation family provides [`GuardOperation`] requests. Contextual replay (refer to
+/// [`Program::interpret_in_context`]) checks the type relationships of a region boundary before specializing its body
+/// and, under a symbolic context, must bind that check as an instruction of the family, so it constructs the check
+/// through [`OperationProvider`] and binds it like any other operation. Stating the requirement here, rather than at
+/// every replay caller, lets `C: Context` alone imply it. Families whose enum carries a guard variant receive the
+/// provider from the blanket `From` implementation; a family that cannot represent a guard implements a rejecting
+/// provider, which an eager context never invokes because concrete values establish their relationships at the
+/// boundary.
 #[cfg_attr(doc, aquamarine::aquamarine)]
-pub trait Context: Domain + Clone {
+pub trait Context:
+    Clone + Domain<Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>>
+{
     /// Lifts a staged [`Program`] constant into this [`Context`]'s runtime value representation. Most eager contexts
     /// use the same representation for [`Domain::Constant`] and [`Domain::Value`], and so this is just an identity
     /// function. Backends that use abstract, lifetime-free constants for compiled programs can either materialize
@@ -397,7 +435,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Domain for EagerContext<V, O> {
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Context for EagerContext<V, O> {
+impl<
+    V: Value,
+    O: Operation<Type = V::Type>
+        + InterpretableOperation<Self>
+        + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+> Context for EagerContext<V, O>
+{
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
@@ -506,7 +550,7 @@ impl<C: DomainProjection<T>, T: Type> Domain for ProjectedContext<C, T> {
     type Operation = <C::Operation as OperationProjection<T>>::Projected;
 }
 
-impl<C: Context + DomainProjection<T>, T: Type> Context for ProjectedContext<C, T> {
+impl<C: ContextProjection<T>, T: Type> Context for ProjectedContext<C, T> {
     #[inline]
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         self.parent
@@ -615,16 +659,12 @@ impl<C: Context + DomainProjection<T>, T: Type> Context for ProjectedContext<C, 
 ///
 /// The flowing value is pinned to [`Tracer<Self>`](Tracer), with this context as its [`Value::Domain`] and
 /// [`ValueDomainDispatch`] routing capabilities back through it. Every staging context records operation invocations
-/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results. Its operation family provides
-/// [`GuardOperation`] requests because staging can specialize attached regions and must preserve their input checks.
-/// A provider may reject checks that its family cannot represent. This requirement belongs to staging; the base
-/// [`Context`] protocol does not construct guards.
+/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results. Staging is where the
+/// [`GuardOperation`] provider that every [`Context`] family carries is actually exercised: replaying a region under
+/// a staging context specializes its body and must therefore record its input checks as instructions, which a family
+/// that cannot represent a guard rejects at that point.
 pub trait StagingContext:
-    Context<
-        Value = Tracer<Self>,
-        Value: Value<Type = Self::Type, Domain = Self, Dispatch = ValueDomainDispatch>,
-        Operation: OperationProvider<Self::Type, GuardOperation<Self::Type>, Operation = Self::Operation>,
-    >
+    Context<Value = Tracer<Self>, Value: Value<Type = Self::Type, Domain = Self, Dispatch = ValueDomainDispatch>>
 {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;

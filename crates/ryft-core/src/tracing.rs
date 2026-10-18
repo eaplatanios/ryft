@@ -836,18 +836,14 @@ impl<C: Context> Debug for NestedTracingContext<C> {
     }
 }
 
-impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>> Domain
-    for NestedTracingContext<C>
-{
+impl<C: Context> Domain for NestedTracingContext<C> {
     type Type = C::Type;
     type Value = Tracer<Self>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>> Context
-    for NestedTracingContext<C>
-{
+impl<C: Context> Context for NestedTracingContext<C> {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
         // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
@@ -915,9 +911,7 @@ impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, O
     }
 }
 
-impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>>
-    StagingContext for NestedTracingContext<C>
-{
+impl<C: Context> StagingContext for NestedTracingContext<C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
