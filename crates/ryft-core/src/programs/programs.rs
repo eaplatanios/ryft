@@ -2399,7 +2399,7 @@ struct BoundaryPruner<'o, V: Value, O: Operation<Type = V::Type>> {
     pruned_instructions: Vec<InstructionId>,
 }
 
-impl<'o, V: Value, O: Clone + Operation<Type = V::Type>> BoundaryPruner<'o, V, O> {
+impl<'o, V: Value, O: Operation<Type = V::Type>> BoundaryPruner<'o, V, O> {
     /// Creates a new [`BoundaryPruner`] for the program whose arena is `arena`.
     #[inline]
     fn new(arena: &'o RegionArena<V, O>) -> Self {

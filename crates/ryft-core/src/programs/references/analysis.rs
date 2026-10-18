@@ -1452,7 +1452,7 @@ impl ReferenceAnalysis {
 
 impl<
     V: Value,
-    O: Clone + Operation<Type = V::Type>,
+    O: Operation<Type = V::Type>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > Program<V, O, Input, Output>
