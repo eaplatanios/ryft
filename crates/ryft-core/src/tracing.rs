@@ -77,10 +77,11 @@ use ryft_macros::Parameter;
 use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
+use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
+    AtomId, BindingRegionDriver, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
     TypeRefinements, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
 
@@ -389,7 +390,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
     }
+}
 
+impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C>
+where
+    Self: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
     /// point. It creates a fresh [`TracingContext`] over the `(V, O)` type universe, executes `function` once on
     /// [`Tracer`] inputs standing in for `input_type`, and returns the output types plus the finalized program.
@@ -582,14 +588,18 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Default for TracingContext<V, O,
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, C> Domain for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    Domain for TracingContext<V, O, C>
+{
     type Type = V::Type;
     type Value = Tracer<Self>;
     type Constant = V;
     type Operation = O;
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    Context for TracingContext<V, O, C>
+{
     #[inline]
     fn lift(&self, constant: V) -> Result<Tracer<Self>, ProgramError> {
         // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
@@ -657,7 +667,9 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O,
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, C> StagingContext for TracingContext<V, O, C> {
+impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>, C>
+    StagingContext for TracingContext<V, O, C>
+{
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
@@ -731,6 +743,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// traced program is flat (i.e., [`Vec`]-parameterized) on both boundaries (the canonical shape for nested programs
     /// that are replayed positionally) with the closure's output [`Parameter`] structure returned alongside it so that
     /// callers can reassemble structured outputs from the program's flat outputs.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn trace<F, Output>(
         parent: C,
@@ -743,6 +756,7 @@ impl<C: Context> NestedTracingContext<C> {
     where
         F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
         Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         Self::trace_with_named_axes(parent, function, input_types, Vec::new())
     }
@@ -750,6 +764,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// Traces `function` against `input_types` like [`trace`](Self::trace), but seeds the nested trace's context with
     /// the provided named axes, which shadow same-named bindings of `parent`. This is the nested-tracing counterpart
     /// of [`TracingContext::trace_with_named_axes`].
+    #[allow(clippy::type_complexity)]
     pub fn trace_with_named_axes<F, Output>(
         parent: C,
         function: F,
@@ -762,6 +777,7 @@ impl<C: Context> NestedTracingContext<C> {
     where
         F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
         Output: Parameterized<Tracer<Self>>,
+        Self: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let input_count = input_types.len();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -820,14 +836,18 @@ impl<C: Context> Debug for NestedTracingContext<C> {
     }
 }
 
-impl<C: Context> Domain for NestedTracingContext<C> {
+impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>> Domain
+    for NestedTracingContext<C>
+{
     type Type = C::Type;
     type Value = Tracer<Self>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-impl<C: Context> Context for NestedTracingContext<C> {
+impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>> Context
+    for NestedTracingContext<C>
+{
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
         // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
@@ -895,7 +915,9 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 }
 
-impl<C: Context> StagingContext for NestedTracingContext<C> {
+impl<C: Context<Operation: OperationProvider<C::Type, GuardOperation<C::Type>, Operation = C::Operation>>>
+    StagingContext for NestedTracingContext<C>
+{
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
@@ -934,6 +956,7 @@ pub trait Trace: Domain {
     /// Traces `function` into a [`Program`] for the provided input types, in this [`Domain`]'s type, staged-constant,
     /// and operation universe. This is the explicitly named counterpart of the [`trace`] function, which recovers the
     /// tracing universe and signature from example values instead. Refer to its documentation for more information.
+    #[allow(clippy::type_complexity)]
     #[inline]
     fn trace<
         F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
@@ -954,7 +977,11 @@ pub trait Trace: Domain {
             Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
-    > {
+    >
+    where
+        DomainTracingContext<Self>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         DomainTracingContext::<Self>::trace(function, input_type)
     }
 
@@ -975,7 +1002,11 @@ pub trait Trace: Domain {
     >(
         function: F,
         input_type: Input,
-    ) -> Result<Output::To<Self::Type>, ProgramError> {
+    ) -> Result<Output::To<Self::Type>, ProgramError>
+    where
+        DomainTracingContext<Self>:
+            StagingContext<Type = Self::Type, Constant = Self::Constant, Operation = Self::Operation>,
+    {
         DomainTracingContext::<Self>::infer_output_type(function, input_type)
     }
 }
@@ -991,6 +1022,7 @@ impl<D: Domain> Trace for D {}
 /// [`DomainTracer`] inputs standing in for the input types through a fresh [`DomainTracingContext`], and returns the
 /// inferred output types together with the finalized program. [`Trace::trace`] exposes the same trace with the tracing
 /// universe named explicitly and the abstract input types supplied directly.
+#[allow(clippy::type_complexity)]
 #[inline]
 pub fn trace<
     V: Value,
@@ -1018,7 +1050,14 @@ pub fn trace<
         >,
     ),
     ProgramError,
-> {
+>
+where
+    DomainTracingContext<V::Domain>: StagingContext<
+            Type = V::Type,
+            Constant = <V::Domain as Domain>::Constant,
+            Operation = <V::Domain as Domain>::Operation,
+        >,
+{
     V::Domain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
@@ -1043,17 +1082,26 @@ pub fn infer_output_type<
 >(
     function: F,
     input: Input,
-) -> Result<Output::To<V::Type>, ProgramError> {
+) -> Result<Output::To<V::Type>, ProgramError>
+where
+    DomainTracingContext<V::Domain>: StagingContext<
+            Type = V::Type,
+            Constant = <V::Domain as Domain>::Constant,
+            Operation = <V::Domain as Domain>::Operation,
+        >,
+{
     V::Domain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
 impl<
     T: Type,
     V: Value<Type = T>,
-    O: Clone + Operation<Type = T>,
+    O: Operation<Type = T>,
     Input: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
 > Program<V, O, Input, Output>
+where
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
 {
     /// Specializes this [`Program`] to the provided refined input types by replaying every
     /// [`Instruction`](crate::Instruction) into a fresh trace, so that type inference propagates the refinements
@@ -1110,10 +1158,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// specialized at a sharded carry that returns that carry unsharded), leaving the regions to be used as declared.
     ///
     /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example, a
-    /// region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` has its extent
-    /// instantiated as an exact dynamic dimension, while eager array inputs carry the static extent 2. Primitive
-    /// operations infer their outputs from their inputs and so never observe this, but a differentiation rule that
-    /// linearizes such a region would construct tangents whose types disagree with those of the primal outputs.
+    /// region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` keeps its symbolic
+    /// extent `b` when only its identities are instantiated (a static type has no identity to rename `b` to), while
+    /// eager array inputs carry the static extent 2. Primitive operations infer their outputs from their inputs and so
+    /// never observe this, but a differentiation rule that linearizes such a region would construct tangents whose
+    /// types disagree with those of the primal outputs.
     ///
     /// Callers must validate the original region interfaces of the application first (refer to
     /// [`Operation::validate_region_interfaces`]), because specialization could otherwise make mismatched region
@@ -1131,6 +1180,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         V: 'r,
         O: 'r,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         let regions = regions.collect::<Vec<_>>();
         let mut interfaces = regions.iter().map(|region| region.interface()).collect::<Vec<_>>();
@@ -1211,7 +1261,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ) -> Result<Option<TypeIdentityRenaming<<V::Type as Type>::Identity>>, TypeError> {
         match V::Type::derive_identity_renaming(declared, requested) {
             Ok(renaming) => Ok(Some(renaming)),
-            Err(error) => match <V::Type as Type>::Refinements::establish(declared.iter(), requested.iter()) {
+            Err(error) => match <V::Type as Type>::Refinements::new(declared.iter(), requested.iter()) {
                 Ok(_) => Ok(None),
                 Err(_) => Err(error),
             },
@@ -1224,7 +1274,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// it. The body is replayed even when the instantiated signature already equals `input_types`, which is the case
     /// for inputs that only narrow bounds, whereas [`specialize`](Self::specialize) would return such a region
     /// unchanged.
-    pub(crate) fn specialize_to_region_input_types(self, input_types: &[V::Type]) -> Result<Self, ProgramError> {
+    pub(crate) fn specialize_to_region_input_types(self, input_types: &[V::Type]) -> Result<Self, ProgramError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
         let instantiated = self.with_instantiated_type_identities(input_types)?.into_owned();
         if instantiated.input_types() != input_types {
             return instantiated.specialize(input_types);
@@ -1544,6 +1597,14 @@ mod tests {
                 _inputs: &[Array],
             ) -> Result<Vec<Array>, ProgramError> {
                 Ok(Vec::new())
+            }
+        }
+
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for NoOutputOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -2122,7 +2183,8 @@ mod tests {
 
         // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
         // so a value captured through the nested context lands in the parent's shared capture table.
-        let capturing_parent = TracingContext::<CaptureReference<ArrayType>, NegOperation<ArrayType>, Array>::new();
+        let capturing_parent =
+            TracingContext::<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>::new();
         let nested = NestedTracingContext::new(capturing_parent.clone());
         let reference = nested
             .capture(Array::scalar(7.0).unwrap())
@@ -2419,13 +2481,14 @@ mod tests {
                 assert_eq!(body.input_types(), declared);
                 assert!(body.instructions().is_empty());
 
-                // An exact dimension of four conflicts with the array/reference extent of three. Structural
-                // derivation retains its precise error; optional preparation declines replay and mandatory primitive
+                // A static dimension of four conflicts with the array/reference extent of three. Structural derivation
+                // reports the conflicting bindings; optional preparation declines replay and mandatory primitive
                 // inference rejects the original application before either branch can run.
-                let error = TypeError::invalid(
-                    "dimension variable n is renamed to 4 by one signature member \
-                     and bound to static extent 3 by another",
-                );
+                let error = TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_string(),
+                    expected: if reversed { 3 } else { 4 },
+                    actual: if reversed { 4 } else { 3 },
+                });
                 assert_eq!(FlatIrProgram::region_input_identity_renaming(&declared, &invalid), Err(error.clone()));
                 assert_eq!(FlatIrProgram::region_requires_specialization(&declared, &invalid), Err(error.clone()));
                 input_types.truncate(1);
@@ -2477,7 +2540,7 @@ mod tests {
 
         // Input types that only narrow bounds are replayed too, although instantiating the type identities of the
         // region already makes its signature agree with them, in which case `specialize` would return the region
-        // unchanged. The replay infers that `d + 2` is exactly 5 for `d` that is exactly 3.
+        // unchanged. The replay infers that `d + 2` is exactly 5 for `d` that is exactly `3`.
         let extent = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
         let two = DimensionValue::constant(2).unwrap();
         let addition = DimensionAddOperation::new(&extent, two.r#type().as_ref()).unwrap();
@@ -2488,7 +2551,9 @@ mod tests {
         let region = builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let exact_extent = DimensionValue::constant(3).unwrap().r#type().into_owned();
+
+        // An exact symbolic type keeps an identity for instantiation to rename, unlike a static type.
+        let exact_extent = DimensionType::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
         let instantiated =
             region.with_instantiated_type_identities(std::slice::from_ref(&exact_extent)).unwrap().into_owned();
         let unchanged = instantiated.specialize(std::slice::from_ref(&exact_extent)).unwrap();
