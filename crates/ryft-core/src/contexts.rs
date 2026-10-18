@@ -258,6 +258,19 @@ pub trait Context:
     /// the answer reflects the innermost context that actually executes the bound operations.
     fn is_eager(&self) -> bool;
 
+    /// Returns whether replaying a [`Region`](crate::Region) over inputs of types `input_types` in this [`Context`]
+    /// must stage guards for type relationships that the types do not prove. A staging context always does, because
+    /// the body it stages is specialized to relationships that remain unproven until runtime. An eager context does
+    /// only when an input type is not fully static: concrete values carry exact types, so a type that still names an
+    /// identity marks a transform carrier riding over an eager parent (e.g., a bounded ragged batch or a mapped
+    /// dimension) whose per-item geometry lives outside the type and which a boundary refinement check alone cannot
+    /// validate. Only the guard's transform rule reaches those per-item checks. Exact static types keep guard planning
+    /// off the eager hot path.
+    #[inline]
+    fn needs_guards(&self, input_types: &[Self::Type]) -> bool {
+        !self.is_eager() || input_types.iter().any(|r#type| r#type.identities().next().is_some())
+    }
+
     /// Returns the currently composed non-semantic [`Provenance`] that [`Instruction`](crate::Instruction)s
     /// staged through this [`Context`] record. Staging boundaries (i.e., contexts that own the [`ProgramBuilder`]
     /// instructions are emitted into, such as tracing and partial evaluation contexts) answer from their shared
