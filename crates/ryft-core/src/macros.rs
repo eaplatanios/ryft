@@ -571,6 +571,11 @@ macro_rules! define_dimension_arithmetic_operation {
                 inputs: &[__C::Value],
             ) -> Result<Vec<__C::Value>, $crate::programs::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
+
+                // The value-level capability validates the observed extents first, so that eager diagnostics report
+                // them rather than a proof from the inputs' exact bounds.
+                let output = inputs[0].$method(&inputs[1])?;
+
                 $crate::programs::operations::Operation::infer_output_types(
                     self,
                     &[
@@ -579,7 +584,8 @@ macro_rules! define_dimension_arithmetic_operation {
                     ],
                     &[],
                 )?;
-                Ok(vec![inputs[0].$method(&inputs[1])?])
+
+                Ok(vec![output])
             }
         }
 
@@ -1968,6 +1974,11 @@ macro_rules! impl_differentiable_operation {
         where
             $operation: $crate::Operation<Type = <$value as $crate::Typed>::Type>,
             $($bounds)*
+            $crate::TracingContext<$value, $operations>: $crate::StagingContext<
+                Type = <$value as $crate::Typed>::Type,
+                Constant = $value,
+                Operation = $operations,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<$value, $operations>>(
                 &self,
@@ -2135,6 +2146,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = $type>,
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2189,6 +2205,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = $type>,
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2231,6 +2252,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         > $crate::TransposableOperation<__V, __O> for $operation<__R>
         where
             $operation<__R>: $crate::Operation<Type = __T>,
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2683,6 +2709,11 @@ macro_rules! impl_differentiable_elementwise_operation {
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -2801,8 +2832,13 @@ macro_rules! impl_differentiable_elementwise_operation {
                 + ::std::convert::From<$crate::AddOperation<__T>> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
-            $crate::Tracer<$crate::TracingContext<__V, __O>>: $crate::ElementwiseDerivativeAlignment<__T>,
             $operation: $crate::Operation<Type = __T>,
+            $crate::Tracer<$crate::TracingContext<__V, __O>>: $crate::ElementwiseDerivativeAlignment<__T>,
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -3401,6 +3437,12 @@ macro_rules! impl_non_transposable_operation {
             $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
+            // Stated before the caller's bounds, which need not end with a comma.
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
             $($bounds)*
         {
             #[inline]
@@ -3456,6 +3498,12 @@ macro_rules! impl_nullary_transposable_operation {
             $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
+            // Stated before the caller's bounds, which need not end with a comma.
+            $crate::TracingContext<__V, __O>: $crate::StagingContext<
+                Type = <__V as $crate::Typed>::Type,
+                Constant = __V,
+                Operation = __O,
+            >,
             $($bounds)*
         {
             #[inline]
@@ -5438,8 +5486,8 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
         Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
-        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation, Reduce,
-        ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
+        ElementwiseOperation, ExpOperation, GuardOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation,
+        Reduce, ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -5557,7 +5605,7 @@ mod tests {
         TestArithmeticDimension,
         test_arithmetic_dimension,
         output_name = |left: &DimensionType, right: &DimensionType| {
-            format!("{} + {}", left.variable(), right.variable())
+            format!("{} + {}", left.dimension(), right.dimension())
         },
         infer_bounds = |left: &DimensionType, right: &DimensionType| {
             let lower = left
@@ -5590,7 +5638,7 @@ mod tests {
         /// Dimension operation testing inline capability generation.
         TestGeneratedDimensionOperation, TEST_GENERATED_DIMENSION_OPERATION_NAME,
         TestGeneratedDimension, test_generated_dimension,
-        output_name = |left: &DimensionType, _right: &DimensionType| left.variable().to_string(),
+        output_name = |left: &DimensionType, _right: &DimensionType| left.dimension().to_string(),
         infer_bounds = |left: &DimensionType, _right: &DimensionType| -> Result<_, DimensionError> {
             Ok((left.bounds(), false))
         },
@@ -5680,6 +5728,83 @@ mod tests {
     impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestUnaryOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestBinaryOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestDifferentiableOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestReversedSubOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestNegatedAddOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for TestArithmeticDimensionOperation {
+        type Operation = Self;
+
+        fn provide(
+            request: GuardOperation<DimensionType>,
+            _input_types: &[&DimensionType],
+        ) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
+    impl OperationProvider<DimensionType, GuardOperation<DimensionType>> for TestGeneratedDimensionOperation {
+        type Operation = Self;
+
+        fn provide(
+            request: GuardOperation<DimensionType>,
+            _input_types: &[&DimensionType],
+        ) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
 
     impl From<ZeroOperation<ArrayType>> for TestUnaryOperation<ArrayType> {
         fn from(_operation: ZeroOperation<ArrayType>) -> Self {
@@ -5894,6 +6019,17 @@ mod tests {
     impl_nullary_transposable_operation!(<T> TestNullaryOperation<T> where T: Type);
     impl_nullary_batchable_operation!(@replicated <T> TestNullaryOperation<T> where T: Type);
 
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestNullaryOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
     /// Generic nullary operation used to instantiate generic macro forms.
     struct TestGenericNullaryOperation<T>(PhantomData<fn() -> T>);
 
@@ -5948,6 +6084,17 @@ mod tests {
     impl_nullary_transposable_operation!(<T> TestGenericNullaryOperation<T>);
     impl_nullary_batchable_operation!(@replicated <D> TestGenericNullaryOperation<D>);
 
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestGenericNullaryOperation<T>
+    where
+        Self: Operation<Type = T>,
+    {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
+
     /// Generic nullary operation used to instantiate generic-plus-`where` macro forms.
     struct TestBoundedNullaryOperation<T>(PhantomData<fn() -> T>);
 
@@ -6001,6 +6148,13 @@ mod tests {
     impl_non_differentiable_operation!(<V> TestBoundedNullaryOperation<V> where V: Clone);
     impl_nullary_transposable_operation!(<O> TestBoundedNullaryOperation<O> where O: Clone);
     impl_nullary_batchable_operation!(@replicated <C> TestBoundedNullaryOperation<C> where C: Clone);
+
+    impl<T: Type> OperationProvider<T, GuardOperation<T>> for TestBoundedNullaryOperation<T> {
+        type Operation = Self;
+        fn provide(request: GuardOperation<T>, _input_types: &[&T]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
+        }
+    }
 
     #[test]
     fn test_check_count() {
@@ -6256,8 +6410,12 @@ mod tests {
         let renamed_left = DimensionType::new("renamed_left", left_type.bounds());
         let renamed_right = DimensionType::new("renamed_right", right_type.bounds());
         let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(left_type.variable().clone(), renamed_left.variable().clone()).unwrap();
-        renaming.insert(right_type.variable().clone(), renamed_right.variable().clone()).unwrap();
+        renaming
+            .insert(left_type.variable().unwrap().clone(), renamed_left.variable().unwrap().clone())
+            .unwrap();
+        renaming
+            .insert(right_type.variable().unwrap().clone(), renamed_right.variable().unwrap().clone())
+            .unwrap();
         let renamed = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
@@ -7079,7 +7237,8 @@ mod tests {
         where
             O: Operation<Type = ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
-                + DifferentiableOperation<EagerContext<Array, O>>,
+                + DifferentiableOperation<EagerContext<Array, O>>
+                + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
         {
         }
 
@@ -7149,7 +7308,12 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 0 })),
         ));
 
-        fn assert_transposable<O: Operation<Type = ArrayType> + TransposableOperation<Array, O>>() {}
+        fn assert_transposable<
+            O: Operation<Type = ArrayType>
+                + TransposableOperation<Array, O>
+                + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
+        >() {
+        }
 
         assert_transposable::<TestGenericNullaryOperation<ArrayType>>();
         assert_transposable::<TestBoundedNullaryOperation<ArrayType>>();
@@ -7185,7 +7349,8 @@ mod tests {
         where
             O: Operation<Type = ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
-                + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>,
+                + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>
+                + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>,
         {
         }
 

@@ -61,13 +61,11 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
+use crate::batching::{BatchingContext, BatchingPolicy};
 use crate::contexts::{Context, DomainProjection, EagerContext, ProjectedContext};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
-};
+use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
-use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::partial::PartialEvaluationContext;
 use crate::programs::{
     Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena, Type,
     TypeError, TypeIdentityRenaming, Typed, Value, ValueDirectDispatch, ValueProjection,
@@ -245,13 +243,15 @@ where
 // Any traced constant family that can embed a `CaptureReference` registers captures the same way: the runtime value
 // is appended to the trace's capture table and the staged payload is the reference to its slot. Constant families that
 // also carry immediate payloads therefore inherit capture registration unchanged.
-impl<T: Type, V: Value<Type = T> + From<CaptureReference<T>>, O: Operation<Type = T>, C: Value<Type = T>>
-    CapturingContext for TracingContext<V, O, C>
+impl<T: Type, V: Value<Type = T> + From<CaptureReference<T>>, O: Operation<Type = T>, Capture: Value<Type = T>>
+    CapturingContext for TracingContext<V, O, Capture>
+where
+    Self: Context<Type = T, Constant = V>,
 {
-    type Capture = C;
+    type Capture = Capture;
 
     #[inline]
-    fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
+    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
         let mut captures = self.captures().borrow_mut();
         let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
         captures.push(value);
@@ -259,7 +259,10 @@ impl<T: Type, V: Value<Type = T> + From<CaptureReference<T>>, O: Operation<Type 
     }
 }
 
-impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
+impl<C: CapturingContext> CapturingContext for NestedTracingContext<C>
+where
+    Self: Context<Type = C::Type, Constant = C::Constant>,
+{
     type Capture = C::Capture;
 
     #[inline]
@@ -270,8 +273,7 @@ impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
 
 impl<C: CapturingContext> CapturingContext for PartialEvaluationContext<C>
 where
-    C::Operation:
-        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    Self: Context<Type = C::Type, Constant = C::Constant>,
 {
     type Capture = C::Capture;
 
@@ -281,8 +283,9 @@ where
     }
 }
 
-impl<C: CapturingContext<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> CapturingContext
-    for BatchingContext<C, P>
+impl<C: CapturingContext, P: BatchingPolicy<C>> CapturingContext for BatchingContext<C, P>
+where
+    Self: Context<Type = C::Type, Constant = C::Constant>,
 {
     type Capture = C::Capture;
 
@@ -294,12 +297,7 @@ impl<C: CapturingContext<Operation: BatchableOperation<C, P>>, P: RecursiveBatch
 
 impl<C: CapturingContext, P: DifferentiationPolicy<C>> CapturingContext for DifferentiationContext<C, P>
 where
-    C::Type: DifferentiableType,
-    C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<C>
-        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    Self: Context<Type = C::Type, Constant = C::Constant>,
 {
     type Capture = C::Capture;
 
@@ -733,16 +731,27 @@ mod tests {
 
     #[test]
     fn test_projected_context_capture_delegates_to_parent_capture_table() {
+        /// Checks forwarding with only its public bounds, without assuming either operation family provides guards.
+        fn capture_projected<T: Type, C: CapturingContext + DomainProjection<T>>(
+            context: &ProjectedContext<C, T>,
+            value: <C::Capture as ValueProjection<T>>::Projected,
+        ) -> Result<<C::Constant as ValueProjection<T>>::Projected, ProgramError>
+        where
+            C::Capture: ValueProjection<T, Projected: Value<Type = T>>,
+        {
+            context.capture(value)
+        }
+
         let parent =
             TracingContext::<CaptureReference<ArrayIrType>, ArrayIrOperation<Array>, ArrayIrValue<Array>>::new();
         let array_context = ProjectedContext::<_, ArrayType>::new(parent.clone());
-        let array = Array::scalar(3.0_f32).unwrap();
-        let array_reference = array_context.capture(array.clone()).unwrap();
+        let array = Array::scalar(3f32).unwrap();
+        let array_reference = capture_projected(&array_context, array.clone()).unwrap();
         assert_eq!(array_reference.index(), 0);
         assert_eq!(array_reference.r#type(), array.r#type());
         let dimension_context = ProjectedContext::<_, DimensionType>::new(parent.clone());
         let dimension = DimensionValue::constant(7).unwrap();
-        let dimension_reference = dimension_context.capture(dimension.clone()).unwrap();
+        let dimension_reference = capture_projected(&dimension_context, dimension.clone()).unwrap();
         assert_eq!(dimension_reference.index(), 1);
         assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type().as_ref());
         assert_eq!(
