@@ -212,7 +212,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 ///
 /// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
 /// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
-/// batch carrier and become ragged geometry only when a shape-consuming batching rule accepts them.
+/// batch carrier and become ragged extents only when a shape-consuming batching rule accepts them.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and

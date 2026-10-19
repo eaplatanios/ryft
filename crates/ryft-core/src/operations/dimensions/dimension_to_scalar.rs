@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
-    DimensionValue,
+    DimensionValue, Memory,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -14,6 +15,8 @@ use crate::macros::{
     impl_reference_dischargeable_operation,
 };
 use crate::operations::Capability;
+use crate::operations::manipulation::conversions::ConvertElementType;
+use crate::operations::manipulation::memory::TransferToMemory;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
@@ -89,8 +92,13 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 {
 }
 
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>>
-    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionToScalarOperation
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Value: ConvertElementType + TransferToMemory,
+            Operation: From<DimensionToScalarOperation>,
+        >,
+> BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionToScalarOperation
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -100,11 +108,22 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         // Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension
         // already stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes
-        // that same value as a mapped scalar array without staging another operation.
+        // that same value as a mapped scalar array, converted to the `i64` elements in device memory that the operation
+        // promises when the extents use another integer type or live in another memory space. Mapped extents are rank
+        // one (indexed by the batch axis alone), so each batch item has exactly one scalar.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
-        if input.mapped_dimension_extents().is_some() {
-            return Ok(vec![ArrayIrBatch::new(input.value().clone(), input.batch_axis())?].into());
+        if let Some(extents) = input.mapped_dimension_extents() {
+            let extents_type = extents.r#type();
+            let extents_type = <&ArrayType>::try_from(extents_type.as_ref())?;
+            let mut value = Cow::Borrowed(extents);
+            if extents_type.data_type() != DIMENSION_DATA_TYPE {
+                value = Cow::Owned(value.convert_element_type(DIMENSION_DATA_TYPE)?);
+            }
+            if extents_type.memory() != Memory::Device {
+                value = Cow::Owned(value.transfer_to_memory(Memory::Device)?);
+            }
+            return Ok(vec![ArrayIrBatch::new(value.into_owned(), input.batch_axis())?].into());
         }
         input.validate_replicated_dimension()?;
         Ok(context
@@ -197,7 +216,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, MAX_DIMENSION_EXTENT};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
+        MAX_DIMENSION_EXTENT, Shape,
+    };
+    use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
@@ -374,6 +397,68 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_dimension_to_scalar_batching() -> Result<(), ProgramError> {
+        let length = DimensionType::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+
+        // A replicated dimension converts through the parent context into one replicated scalar.
+        let replicated =
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::new(length.clone(), 3).unwrap()));
+        assert_eq!(
+            DimensionToScalarOperation.batch(&context, &EmptyRegionDriver, &[replicated])?.into_parts().0,
+            vec![ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(3i64).unwrap()))],
+        );
+
+        // Mapped extents are exposed directly when they already are `i64` data in device memory. Extents of another
+        // integer type or in another memory space are converted and transferred, so that every item has exactly the
+        // scalar type that type inference promises.
+        let host_extents = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [2]).with_memory(Memory::Host { pinned: false }),
+            &[1i32, 2],
+        )
+        .unwrap();
+        let expected =
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![1i64, 2]).unwrap()), BatchAxis::new(0))?;
+        for extents in [Array::vector(vec![1i64, 2]).unwrap(), Array::vector(vec![1i32, 2]).unwrap(), host_extents] {
+            let mapped =
+                ArrayIrBatch::mapped_dimension(ArrayIrValue::Array(extents), BatchAxis::new(0), length.clone())?;
+            assert_eq!(
+                DimensionToScalarOperation.batch(&context, &EmptyRegionDriver, &[mapped])?.into_parts().0,
+                vec![expected.clone()],
+            );
+        }
+
+        // Staging records the conversion and the transfer as two operations on the packed extents.
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(extent, extents)| {
+                let batching = BatchingContext::<_, ArrayIrBatchingPolicy>::new(extent.domain(), extent);
+                let mapped = ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), length.clone())?;
+                Ok(BatchingTracer::new(batching, mapped).to_scalar()?.into_batch().into_value())
+            },
+            (
+                ArrayIrType::Dimension(DimensionType::from(items.clone())),
+                ArrayIrType::Array(
+                    ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)]))
+                        .with_memory(Memory::Host { pinned: true }),
+                ),
+            ),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:i32[items]@Host[Pinned] .
+                let %2:i64[items]@Host[Pinned] = convert_element_type [data_type=i64] %1
+                    %3:i64[items] = transfer_to_memory [destination=Device] %2
+                in (%3)"},
+        );
+        Ok(())
     }
 
     #[test]

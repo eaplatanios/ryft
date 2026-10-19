@@ -222,6 +222,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
         // rather than exposing its packed storage bound.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
+        self.validate_input_type(&input.unbatched_type())?;
         let input_type = input.value().r#type();
         let batched_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let packed_axis = match input.batch_axis().axis() {
@@ -246,6 +247,17 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
                     ),
                 });
             };
+
+            // A mapped dimension carries one extent per batch item. Extents that also vary over other axes (e.g., an
+            // outer batch axis that is an ordinary axis at this level) would need coordinates that it cannot record.
+            if ragged_axis.extent_axes().len() != 1 {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{DIMENSION_SIZE_OPERATION_NAME}` cannot extract a mapped dimension whose per-item extents \
+                         vary over axes other than the batch axis",
+                    ),
+                });
+            }
 
             return Ok(vec![ArrayIrBatch::mapped_dimension(
                 ragged_axis.extents().clone(),
@@ -287,6 +299,9 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
+///
+/// During batching, a bounded ragged axis produces a mapped dimension carrying its per-item extents. Reading a ragged
+/// axis whose per-item extents vary over axes other than the batch axis is not supported.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values (including the projected array members of composite values) implement this capability for [`ArrayType`] and
@@ -396,15 +411,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_batch;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue,
+        RaggedAxis, Shape,
     };
+    use crate::batching::BatchingTracer;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        EffectClasses, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming, ValueProjection,
+        EffectClasses, EmptyRegionDriver, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming,
+        ValueProjection,
     };
     use crate::tracing::TracingContext;
 
@@ -743,5 +762,72 @@ mod tests {
             panic!("expected one residual dimension output");
         };
         assert_eq!(output.extent(), 5);
+    }
+
+    #[test]
+    fn test_dimension_size_batching() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let extents = ArrayIrValue::Array(Array::vector(vec![1i64, 3])?);
+        let input =
+            ragged_batch(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), extents.clone(), &length, 1)?;
+
+        // A bounded ragged axis produces a mapped dimension that carries its per-item extents.
+        let output = BatchingTracer::new(context.clone(), input).dimension_size(0)?.into_batch();
+        assert_eq!(output, ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), length.into())?);
+
+        // An ordinary axis produces a replicated dimension.
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), BatchAxis::new(0))?;
+        let output = BatchingTracer::new(context, input).dimension_size(0)?.into_batch();
+        assert_eq!(output, ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3)?)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dimension_size_batching_validates_selected_axis() -> Result<(), ProgramError> {
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32; 6])?), BatchAxis::new(0))?;
+        let operation = DimensionSizeOperation::new(&ArrayType::new_static(DataType::F32, [3, 4]), 1)?;
+        assert_eq!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1").into()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dimension_size_batching_rejects_nested_extents() -> Result<(), ProgramError> {
+        // Extents that also vary over an outer axis cannot be carried by a mapped dimension.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let input = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2, 3]), &[1f32; 12])?),
+            BatchAxis::new(0),
+        )?
+        .with_ragged_axes(vec![RaggedAxis::new(
+            2,
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1i64, 2, 3, 1])?),
+            length,
+            vec![0, 1],
+        )])?;
+        let operation = DimensionSizeOperation::new(<&ArrayType>::try_from(&input.unbatched_type())?, 1)?;
+        assert_eq!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]).map(|_| ()),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`dimension_size` cannot extract a mapped dimension whose per-item extents vary over axes \
+                          other than the batch axis"
+                    .to_string(),
+            }),
+        );
+        Ok(())
     }
 }
