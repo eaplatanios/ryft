@@ -1410,13 +1410,13 @@ pub fn interpret_projected_operation<
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType,
-        DimensionValue, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue,
+        DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
@@ -1424,7 +1424,7 @@ mod tests {
         NegOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
+    use crate::programs::regions::tests::{StructuralIdentity, StructuralOperation, StructuralType};
     use crate::programs::{
         AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, RegionId, RegionInterface,
         RegionSlot, TypeError,
@@ -1947,268 +1947,6 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_type_identities_preserves_local_reifications() {
-        // Reifying the same boundary axis twice can produce different first-class definitions. Each constructor
-        // follows its own input definition without changing the shared mapping for the array's boundary identity.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(vector.clone().into());
-        let mut outputs = Vec::new();
-        for _ in 0..2 {
-            let size = builder
-                .add_instruction(DimensionSizeOperation::new(&vector, 0).unwrap(), vec![], vec![input], None)
-                .unwrap()[0];
-            outputs.push(
-                builder.add_instruction(ZeroOperation::new(vector.clone()), vec![], vec![size], None).unwrap()[0],
-            );
-        }
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                outputs,
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let region = program.entry_region_ref();
-        let input_types = region.input_types();
-        let refinements = ArrayIrTypeRefinements::new(&input_types, &input_types).unwrap();
-        let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
-        let first = DimensionType::new("first", n.bounds());
-        let second = DimensionType::new("second", n.bounds());
-        for (index, actual) in [(0, &first), (2, &second)] {
-            replay
-                .record_outputs(region, &region.instructions()[index], &[actual.clone().into()], None)
-                .unwrap();
-            let local = replay
-                .instruction_renaming(region, &region.instructions()[index + 1], &[actual.clone().into()])
-                .unwrap();
-            assert_eq!(local.rename(n.variable().unwrap()), actual.variable().unwrap().clone());
-        }
-        assert!(replay.identity_renaming.borrow().is_identity());
-        let local = replay.instruction_renaming(region, &region.instructions()[1], &[first.clone().into()]).unwrap();
-        assert_eq!(local.rename(n.variable().unwrap()), first.variable().unwrap().clone());
-    }
-
-    #[test]
-    fn test_replay_type_identities_records_internal_definitions() {
-        // Each replay records the fresh result of dimension arithmetic, and every later shape references that result.
-        // Separate replay states must not share a substitution merely because they replay the same source region.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let addition = DimensionAddOperation::new(&n, &n).unwrap();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(n.clone().into());
-        let result = builder.add_instruction(addition, vec![], vec![input, input], None).unwrap()[0];
-        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
-            panic!("expected a dimension result");
-        };
-        let vector = ArrayType::new(DataType::F32, Shape::new(vec![result_type.dimension().clone()]));
-        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![result], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![result, output],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let region = program.entry_region_ref();
-        let actual_input = DimensionType::new("input", n.bounds());
-        let input_types = vec![actual_input.clone().into()];
-        let mut actual_results = Vec::new();
-        for _ in 0..2 {
-            let refinements = ArrayIrTypeRefinements::new(region.input_types(), &input_types).unwrap();
-            let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
-            let actual = DimensionType::new("result", result_type.bounds());
-            replay.record_outputs(region, &region.instructions()[0], &[actual.clone().into()], None).unwrap();
-            let mapping =
-                replay.instruction_renaming(region, &region.instructions()[1], &[actual.clone().into()]).unwrap();
-            assert_eq!(mapping.rename(n.variable().unwrap()), actual_input.variable().unwrap().clone());
-            assert_eq!(mapping.rename(result_type.variable().unwrap()), actual.variable().unwrap().clone());
-            let outputs = vec![
-                actual.clone().into(),
-                ArrayType::new(DataType::F32, Shape::new(vec![actual.dimension().clone()])).into(),
-            ];
-            let renamed_declared = region
-                .output_types()
-                .iter()
-                .map(|r#type| r#type.rename_identities(&replay.identity_renaming.borrow()))
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(renamed_declared, outputs);
-            actual_results.push(actual);
-        }
-        assert_ne!(actual_results[0].variable(), actual_results[1].variable());
-    }
-
-    #[test]
-    fn test_partial_replay_preserves_forwarded_definition_bounds() {
-        let value = DimensionType::new("value", DimensionBounds::unbounded());
-        let offset = DimensionType::new("offset", DimensionBounds::new(0, Some(2)).unwrap());
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(value.clone().into());
-        let offset_input = builder.add_input(offset.clone().into());
-        let result = builder
-            .add_instruction(
-                DimensionAddOperation::new(&value, &offset).unwrap(),
-                vec![],
-                vec![input, offset_input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![result],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let partial_inputs = [
-            PartialValue::Unknown(value.clone().into()),
-            PartialValue::Unknown(DimensionValue::constant(0).unwrap().r#type().into_owned().into()),
-        ];
-        let evaluation = program.partially_evaluate(&partial_inputs).unwrap();
-        assert_eq!(evaluation.program().output_types(), vec![value.clone().into()]);
-        assert!(evaluation.program().instructions().is_empty());
-
-        // Ordinary replay remains strict. Partial replay alone knows that folding validated the producer and
-        // forwarded an existing input definition, rather than introducing the source's capped output definition.
-        let region = program.entry_region_ref();
-        let input_types = partial_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let refinements = ArrayIrTypeRefinements::new(region.input_types(), &input_types).unwrap();
-        let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
-        assert!(replay.record_outputs(region, &region.instructions()[0], &[value.clone().into()], None).is_err());
-        replay
-            .record_outputs(region, &region.instructions()[0], &[value.clone().into()], Some(&input_types))
-            .unwrap();
-        assert!(replay.identity_renaming.borrow().is_identity());
-
-        // A subsequent shape payload still has to admit the forwarded value's bounds. This application was already
-        // rejected before shared identity bookkeeping, so forwarding must not silently widen its declared shape.
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(value.clone().into());
-        let offset_input = builder.add_input(offset.clone().into());
-        let result = builder
-            .add_instruction(
-                DimensionAddOperation::new(&value, &offset).unwrap(),
-                vec![],
-                vec![input, offset_input],
-                None,
-            )
-            .unwrap()[0];
-        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
-            panic!("expected a dimension result");
-        };
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![result_type.dimension().clone()]));
-        let output = builder.add_instruction(ZeroOperation::new(vector_type), vec![], vec![result], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.partially_evaluate(&partial_inputs).unwrap_err(),
-            ProgramError::Type(TypeError::invalid(format!(
-                "`zero` input 0 has type {value} but the output shape requires {result_type}",
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_partial_replay_preserves_exact_definitions_with_retained_references() {
-        // A singleton actual matrix joins two formal identities. The reference retains its wider identity, but that
-        // name cannot replace the narrower formal axis: preparation must keep a source-admissible representation.
-        let narrow = DimensionType::new("narrow", DimensionBounds::new(1, Some(4)).unwrap());
-        let wide = DimensionType::new("wide", DimensionBounds::new(1, Some(8)).unwrap());
-        let exact = DimensionType::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
-        let vector =
-            |dimension: &DimensionType| ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
-        let reference_type: ArrayIrType = ReferenceType::new(vector(&wide)).into();
-        let matrix_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![narrow.dimension().clone(), wide.dimension().clone()]));
-        let actual_matrix_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![exact.dimension().clone(), exact.dimension().clone()]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        builder.add_input(reference_type.clone());
-        let dimension = builder.add_input(narrow.clone().into());
-        builder.add_input(matrix_type.into());
-        let output =
-            builder.add_instruction(ZeroOperation::new(vector(&narrow)), vec![], vec![dimension], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let reference =
-            |extent| ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; extent]).unwrap()));
-        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let matrix = ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap());
-        let expected = program.interpret(vec![reference(3), dimension.clone(), matrix.clone()]).unwrap();
-        let context =
-            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
-        let inputs = vec![
-            context.unknown_input(reference_type, 0),
-            PartialEvaluationValue::known(dimension.clone()),
-            context.unknown_input(actual_matrix_type.into(), 2),
-        ];
-        let outputs = context.inline_program(&program, inputs).unwrap();
-        let evaluation = context.into_evaluation(outputs).unwrap();
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(3), matrix.clone()]), Ok(expected));
-        let direct_error = program.interpret(vec![reference(4), dimension, matrix.clone()]);
-        assert!(direct_error.is_err());
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(4), matrix]), direct_error);
-    }
-
-    #[test]
-    fn test_partial_replay_preserves_unfixed_bounds_with_retained_references() {
-        // One supplied dimension links two formal classes without fixing an extent. A reference keeps the wider
-        // identity, while the narrower constructor and vector must agree on a compatible name within their bounds.
-        let narrow = DimensionType::new("narrow", DimensionBounds::new(1, Some(4)).unwrap());
-        let wide = DimensionType::new("wide", DimensionBounds::new(1, Some(8)).unwrap());
-        let supplied = DimensionType::new("supplied", narrow.bounds());
-        let vector = ArrayType::new(DataType::F32, Shape::new(vec![narrow.dimension().clone()]));
-        let reference_type: ArrayIrType =
-            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![wide.dimension().clone()]))).into();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        builder.add_input(reference_type.clone());
-        let dimension = builder.add_input(narrow.into());
-        builder.add_input(wide.into());
-        let input = builder.add_input(vector.clone().into());
-        let zero =
-            builder.add_instruction(ZeroOperation::new(vector.clone()), vec![], vec![dimension], None).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), vec![], vec![input, zero], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder; 4],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let reference =
-            |extent| ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; extent]).unwrap()));
-        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let input = ArrayIrValue::Array(Array::vector(vec![2f32; 3]).unwrap());
-        let arguments = vec![reference(3), dimension.clone(), dimension.clone(), input.clone()];
-        let expected = program.interpret(arguments.clone()).unwrap();
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Unknown(reference_type),
-                PartialValue::Unknown(supplied.clone().into()),
-                PartialValue::Unknown(supplied.into()),
-                PartialValue::Unknown(vector.into()),
-            ])
-            .unwrap();
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &arguments), Ok(expected));
-        let invalid = vec![reference(4), dimension.clone(), dimension, input];
-        let direct_error = program.interpret(invalid.clone());
-        assert!(direct_error.is_err());
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &invalid), direct_error);
-    }
-
-    #[test]
     fn test_program_interpret_replayed_internal_identities() {
         // The two internal dimensions have equal printed names and bounds, but different definition sites. Replay
         // must retain that distinction while consistently renaming each subsequent constructor's shape payload.
@@ -2506,6 +2244,350 @@ mod tests {
     }
 
     #[test]
+    fn test_region_ref_interpret_in_context_guards_mixed_dimension_array_entries() {
+        // A staged replay whose inputs leave a declared relationship unproven (a symbolic dimension next to a static
+        // array that both declare `n`) stages an entry guard over those inputs, so the replayed program checks the
+        // runtime extents exactly like direct interpretation and the body consumes the guard's outputs.
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionType::new("n", bounds);
+        let m = DimensionType::new("m", bounds);
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let dimension = builder.add_input(n.clone().into());
+        builder.add_input(vector.clone().into());
+        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![dimension], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        for supplied in [n, m] {
+            let name = supplied.variable().unwrap().name().to_owned();
+            let context = TracingContext::<TestValue, TestOperation>::new();
+            let inputs =
+                vec![context.input(supplied.into()), context.input(ArrayType::new_static(DataType::F32, [2]).into())];
+            let outputs = source.entry_region_ref().interpret_in_context(&context, inputs).unwrap();
+            let atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+            let replayed = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(atoms, vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                replayed.to_string(),
+                formatdoc! {
+                    r#"
+                        lambda %0:dimension<{name} ∈ [1, 8)>, %1:f32[2] .
+                        let %2:dimension<2>, %3:f32[2] = guard [boundary="region", types=[dimension<n ∈ [1, 8)>, f32[n]]] %0 %1
+                            %4:f32[2] = zero [type=f32[n]] %2
+                        in (%4)"#,
+                    name = name,
+                },
+            );
+            let dimension = |extent| TestValue::Dimension(DimensionValue::constant(extent).unwrap());
+            let vector = TestValue::Array(Array::vector(vec![1f32; 2]).unwrap());
+            let valid = source.interpret(vec![dimension(2), vector.clone()]);
+            assert_eq!(valid, Ok(vec![TestValue::Array(Array::vector(vec![0f32; 2]).unwrap())]));
+            assert_eq!(replayed.interpret(vec![dimension(2), vector.clone()]), valid);
+            let invalid = source.interpret(vec![dimension(3), vector.clone()]);
+            assert_eq!(
+                invalid,
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 3,
+                    actual: 2,
+                }))),
+            );
+            assert_eq!(replayed.interpret(vec![dimension(3), vector]), invalid);
+        }
+    }
+    #[test]
+    fn test_replay_type_identities_new() {
+        // Eager replay keeps the source identities: exact values carry their geometry in their types. Staged replay
+        // maps a dimension input's definition to the identity of the supplied value, so staged payloads refer to the
+        // value they received, and leaves identities the inputs keep unchanged.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let n2 = DimensionType::new("n2", n.bounds());
+        let vector = |dimension: &DimensionType| -> ArrayIrType {
+            ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()])).into()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = builder.add_input(n.clone().into());
+        builder.add_input(vector(&n));
+        let output = builder
+            .add_instruction(
+                ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]))),
+                vec![],
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let supplied = vec![n2.clone().into(), vector(&n)];
+        let refinements = ArrayIrTypeRefinements::new(region.input_types(), &supplied).unwrap();
+        let eager = ReplayTypeIdentities::new(region, &supplied, refinements.clone(), false).unwrap();
+        assert!(eager.identity_renaming.borrow().is_identity());
+        let staged = ReplayTypeIdentities::new(region, &supplied, refinements, true).unwrap();
+        assert_eq!(staged.identity_renaming.borrow().rename(n.variable().unwrap()), n2.variable().unwrap().clone());
+        let unchanged = region.input_types();
+        let refinements = ArrayIrTypeRefinements::new(&unchanged, &unchanged).unwrap();
+        let staged = ReplayTypeIdentities::new(region, &unchanged, refinements, true).unwrap();
+        assert!(staged.identity_renaming.borrow().is_identity());
+        assert_eq!(
+            ReplayTypeIdentities::new(region, &supplied[..1], ArrayIrTypeRefinements::default(), true).map(|_| ()),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+        );
+    }
+
+    #[test]
+    fn test_replay_type_identities_instruction_guard() {
+        // Operands whose declared types share a dimension identity with a reference input are guarded: the guard
+        // declares their source types and retains the reference's identity, so a related operand that arrives with a
+        // static extent adopts the reference's name instead of the reference adopting the extent. Operands unrelated
+        // to any reference, or arriving at exactly their declared types, need no guard.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let [n, a] = ["n", "a"].map(|name| DimensionType::new(name, bounds));
+        let vector_type =
+            |dimension: &DimensionType| ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        let vector = |dimension: &DimensionType| -> ArrayIrType { vector_type(dimension).into() };
+        let reference =
+            |dimension: &DimensionType| -> ArrayIrType { ReferenceType::new(vector_type(dimension)).into() };
+        let program = |with_reference: bool| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            if with_reference {
+                builder.add_input(reference(&n));
+            }
+            let first = builder.add_input(vector(&n));
+            let second = builder.add_input(vector(&n));
+            let output = builder.add_instruction(AddOperation::new(), vec![], vec![first, second], None).unwrap()[0];
+            let input_count = if with_reference { 3 } else { 2 };
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; input_count],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let static_vector: ArrayIrType = ArrayType::new_static(DataType::F32, [4]).into();
+
+        // A related operand with a static extent is guarded together with the symbolic one, and both outputs carry
+        // the reference's identity.
+        let program_with_reference = program(true);
+        let region = program_with_reference.entry_region_ref();
+        let supplied = vec![reference(&a), vector(&a), static_vector.clone()];
+        let refinements =
+            ArrayIrTypeRefinements::from_local_declarations(region.input_types().iter(), supplied.iter()).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &supplied, refinements, true).unwrap();
+        let (guard, members) = replay
+            .instruction_guard(region, &region.instructions()[0], &supplied[1..])
+            .unwrap()
+            .expect("operands related to a reference input are guarded");
+        assert_eq!(members, vec![0, 1]);
+        assert_eq!(guard.boundary(), "add");
+        assert_eq!(guard.declared_types(), &[vector(&n), vector(&n)]);
+        assert_eq!(guard.retained(), &[a.to_variable()]);
+        assert_eq!(guard.infer_output_types(&supplied[1..], &[]), Ok(vec![vector(&a), vector(&a)]));
+
+        // Operands arriving at exactly their declared types need no guard.
+        let declared = region.input_types();
+        let refinements = ArrayIrTypeRefinements::new(&declared, &declared).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &declared, refinements, true).unwrap();
+        assert_eq!(replay.instruction_guard(region, &region.instructions()[0], &declared[1..]), Ok(None));
+
+        // Without a reference input, no operand is related to one.
+        let program_without_reference = program(false);
+        let region = program_without_reference.entry_region_ref();
+        let supplied = vec![vector(&a), static_vector];
+        let refinements =
+            ArrayIrTypeRefinements::from_local_declarations(region.input_types().iter(), supplied.iter()).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &supplied, refinements, true).unwrap();
+        assert_eq!(replay.instruction_guard(region, &region.instructions()[0], &supplied), Ok(None));
+    }
+
+    #[test]
+    fn test_replay_type_identities_instruction_renaming() {
+        // Reifying the same boundary axis twice can produce different first-class definitions. Each constructor's
+        // renaming follows its own input definition, while the shared mapping for the array's boundary identity
+        // stays unchanged.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(vector.clone().into());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let size = builder
+                .add_instruction(DimensionSizeOperation::new(&vector, 0).unwrap(), vec![], vec![input], None)
+                .unwrap()[0];
+            outputs.push(
+                builder.add_instruction(ZeroOperation::new(vector.clone()), vec![], vec![size], None).unwrap()[0],
+            );
+        }
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let input_types = region.input_types();
+        let refinements = ArrayIrTypeRefinements::new(&input_types, &input_types).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
+        let first = DimensionType::new("first", n.bounds());
+        let second = DimensionType::new("second", n.bounds());
+        for (index, actual) in [(0, &first), (2, &second)] {
+            replay
+                .record_outputs(region, &region.instructions()[index], &[actual.clone().into()], None)
+                .unwrap();
+            let local = replay
+                .instruction_renaming(region, &region.instructions()[index + 1], &[actual.clone().into()])
+                .unwrap();
+            assert_eq!(local.rename(n.variable().unwrap()), actual.variable().unwrap().clone());
+        }
+        assert!(replay.identity_renaming.borrow().is_identity());
+        let local = replay.instruction_renaming(region, &region.instructions()[1], &[first.clone().into()]).unwrap();
+        assert_eq!(local.rename(n.variable().unwrap()), first.variable().unwrap().clone());
+    }
+
+    #[test]
+    fn test_replay_type_identities_record_outputs() {
+        // Each replay records the fresh result of dimension arithmetic, and every later shape references that result.
+        // Separate replay states must not share a substitution merely because they replay the same source region.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let addition = DimensionAddOperation::new(&n, &n).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(n.clone().into());
+        let result = builder.add_instruction(addition, vec![], vec![input, input], None).unwrap()[0];
+        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
+            panic!("expected a dimension result");
+        };
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![result_type.dimension().clone()]));
+        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![result], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![result, output],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let actual_input = DimensionType::new("input", n.bounds());
+        let input_types = vec![actual_input.clone().into()];
+        let mut actual_results = Vec::new();
+        for _ in 0..2 {
+            let refinements = ArrayIrTypeRefinements::new(region.input_types(), &input_types).unwrap();
+            let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
+            let actual = DimensionType::new("result", result_type.bounds());
+            replay.record_outputs(region, &region.instructions()[0], &[actual.clone().into()], None).unwrap();
+            let mapping =
+                replay.instruction_renaming(region, &region.instructions()[1], &[actual.clone().into()]).unwrap();
+            assert_eq!(mapping.rename(n.variable().unwrap()), actual_input.variable().unwrap().clone());
+            assert_eq!(mapping.rename(result_type.variable().unwrap()), actual.variable().unwrap().clone());
+            let outputs = vec![
+                actual.clone().into(),
+                ArrayType::new(DataType::F32, Shape::new(vec![actual.dimension().clone()])).into(),
+            ];
+            let renamed_declared = region
+                .output_types()
+                .iter()
+                .map(|r#type| r#type.rename_identities(&replay.identity_renaming.borrow()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(renamed_declared, outputs);
+            actual_results.push(actual);
+        }
+        assert_ne!(actual_results[0].variable(), actual_results[1].variable());
+
+        // Ordinary replay must rename a definition to the replayed output's identity and rejects an output whose type
+        // does not refine the declared result. Partial replay reports its input types, so an input that a proven fold
+        // forwards unchanged (here `value`, wider than the source's capped `value + offset` result) introduces no
+        // definition and keeps its own identity.
+        let forwarded = DimensionType::new("value", DimensionBounds::unbounded());
+        let offset = DimensionType::new("offset", DimensionBounds::new(0, Some(2)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(forwarded.clone().into());
+        let offset_input = builder.add_input(offset.clone().into());
+        let result = builder
+            .add_instruction(
+                DimensionAddOperation::new(&forwarded, &offset).unwrap(),
+                vec![],
+                vec![input, offset_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![result],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let forwarded_input_types =
+            vec![forwarded.clone().into(), DimensionValue::constant(0).unwrap().r#type().into_owned().into()];
+        let refinements = ArrayIrTypeRefinements::new(region.input_types(), &forwarded_input_types).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &forwarded_input_types, refinements, true).unwrap();
+        assert_eq!(
+            replay.record_outputs(region, &region.instructions()[0], &[forwarded.clone().into()], None),
+            Err(ProgramError::Type(TypeError::invalid(
+                "dimension type dimension<value ∈ [0, ∞)> cannot instantiate declared type \
+                 dimension<value + offset ∈ [0, 9223372036854775808)>",
+            ))),
+        );
+        replay
+            .record_outputs(region, &region.instructions()[0], &[forwarded.into()], Some(&forwarded_input_types))
+            .unwrap();
+        assert!(replay.identity_renaming.borrow().is_identity());
+    }
+
+    #[test]
+    fn test_replay_type_identities_rename_constant() {
+        // Array IR literals are static and own no identities, so constant freshening is observable only on a type
+        // whose constants define identities. A reference to such a constant follows the same substitution, while a
+        // separate replay of the region gets a fresh owner.
+        let identity = StructuralIdentity::new("constant");
+        let definition = StructuralType::definition(identity.clone());
+        let reference = StructuralType::reference(identity.clone());
+        let mut builder = ProgramBuilder::<StructuralType, StructuralOperation>::new();
+        let defined = builder.add_constant(definition.clone());
+        let referenced = builder.add_constant(reference.clone());
+        let program = builder
+            .build::<Vec<StructuralType>, Vec<StructuralType>>(
+                vec![defined, referenced],
+                Vec::new(),
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        assert_eq!(region.type_identity_signature().internal_identities(), std::slice::from_ref(&identity));
+        let first = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
+        let second = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
+        let first_definition = first.rename_constant(&definition).unwrap();
+        let second_definition = second.rename_constant(&definition).unwrap();
+        assert_ne!(first_definition.definitions, definition.definitions);
+        assert_ne!(second_definition.definitions, definition.definitions);
+        assert_ne!(first_definition.definitions, second_definition.definitions);
+        let first_reference = first.rename_constant(&reference).unwrap();
+        let second_reference = second.rename_constant(&reference).unwrap();
+        assert_eq!(first_reference.references, first_definition.definitions);
+        assert_eq!(second_reference.references, second_definition.definitions);
+
+        // Reusing a replay's constant does not allocate a second identity or mutate the original payload.
+        assert_eq!(first.rename_constant(&definition), Ok(first_definition.clone()));
+        assert_eq!(definition.definitions, vec![identity]);
+    }
+
+    #[test]
     fn test_region_interpreter_new() {
         let program = stepping_program();
         let state = RegionInterpreter::new(
@@ -2695,63 +2777,5 @@ mod tests {
             interpret_projected_operation(&context, &operation, &EmptyRegionDriver, &inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())]),
         );
-    }
-
-    #[test]
-    fn test_staged_replay_prepares_mixed_dimension_array_entries() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-
-        let bounds = DimensionBounds::positive(Some(8)).unwrap();
-        let n = DimensionType::new("n", bounds);
-        let m = DimensionType::new("m", bounds);
-        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let dimension = builder.add_input(n.clone().into());
-        builder.add_input(vector.clone().into());
-        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![dimension], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        for supplied in [n, m] {
-            let name = supplied.variable().unwrap().name().to_owned();
-            let context = TracingContext::<TestValue, TestOperation>::new();
-            let inputs =
-                vec![context.input(supplied.into()), context.input(ArrayType::new_static(DataType::F32, [2]).into())];
-            let outputs = source.entry_region_ref().interpret_in_context(&context, inputs).unwrap();
-            let atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
-            let replayed = context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<TestValue>, Vec<TestValue>>(atoms, vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            assert_eq!(
-                replayed.to_string(),
-                format!(
-                    indoc! {r#"
-                        lambda %0:dimension<{name} ∈ [1, 8)>, %1:f32[2] .
-                        let %2:dimension<2>, %3:f32[2] = guard [boundary="region", types=[dimension<n ∈ [1, 8)>, f32[n]]] %0 %1
-                            %4:f32[2] = zero [type=f32[n]] %2
-                        in (%4)"#},
-                    name = name,
-                ),
-            );
-            let dimension = |extent| TestValue::Dimension(DimensionValue::constant(extent).unwrap());
-            let vector = TestValue::Array(Array::vector(vec![1f32; 2]).unwrap());
-            let valid = source.interpret(vec![dimension(2), vector.clone()]);
-            assert_eq!(valid, Ok(vec![TestValue::Array(Array::vector(vec![0f32; 2]).unwrap())]));
-            assert_eq!(replayed.interpret(vec![dimension(2), vector.clone()]), valid);
-            let invalid = source.interpret(vec![dimension(3), vector.clone()]);
-            assert_eq!(
-                invalid,
-                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
-                    dimension: "n".to_owned(),
-                    expected: 3,
-                    actual: 2,
-                }))),
-            );
-            assert_eq!(replayed.interpret(vec![dimension(3), vector]), invalid);
-        }
     }
 }
