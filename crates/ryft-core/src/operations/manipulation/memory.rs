@@ -332,9 +332,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayBatch, ArrayElement, ArrayIrOperation, ArrayOperation, DataType, DimensionBounds,
-        DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Sharding, TiledLayout,
+        DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding, TiledLayout,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -527,7 +528,7 @@ mod tests {
             type Type = ArrayType;
             type Value = DispatchArray;
             type Constant = Array;
-            type Operation = TransferToMemoryOperation;
+            type Operation = ArrayOperation<Array>;
         }
 
         impl Context for InvalidOutputContext {
@@ -611,19 +612,14 @@ mod tests {
         assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0; 6]);
 
-        // Memory placement changes neither logical geometry nor the values carrying per-item extents.
+        // Memory placement changes neither the logical shape nor the values carrying per-item extents.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_input = ArrayBatch::new(
+        let ragged_input = ragged_array_batch(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0f64; 6]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(
-            1,
             Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap(),
-            variable,
-            vec![0],
-        )])
+            &variable,
+            1,
+        )
         .unwrap();
         let ragged_outputs = operation
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&ragged_input))
@@ -670,7 +666,7 @@ mod tests {
         assert_eq!(tangent.r#type().memory(), PINNED_HOST);
 
         // Symbolic tangents retain the destination type without staging a redundant allocation or transfer.
-        let context = TracingContext::<Array, TransferToMemoryOperation>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(ArrayType::new_static(DataType::F64, [2]));
         let duals = TransferToMemoryOperation::new(PINNED_HOST)
             .jvp(

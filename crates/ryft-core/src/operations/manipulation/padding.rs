@@ -16,7 +16,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
     ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
@@ -71,7 +71,7 @@ pub const PAD_OPERATION_NAME: &str = "pad";
 ///
 /// Live reverse-mode differentiation of symbolic input shapes uses the mixed form and linearization, which retains the
 /// runtime extents needed to restore cropped input positions and build the padding-position mask. Homogeneous direct
-/// transposition supports static geometry as symbolic-zero cotangents do not require runtime extents.
+/// transposition supports static shapes as symbolic-zero cotangents do not require runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PadOperation<T: Type> {
     /// Refer to the documentation of [`Self::edge_padding_low`] for more information.
@@ -186,7 +186,7 @@ impl PadOperation<ArrayIrType> {
 
     /// Returns whether execution must check that each explicit output-extent input equals the size computed from
     /// the corresponding input axis and this operation's edge and interior padding amounts. A mismatch is an error;
-    /// the supplied extent cannot override the padding geometry or request additional cropping.
+    /// the supplied extent cannot override the padding amounts or request additional cropping.
     ///
     /// When `true`, the operation carries [`EffectClass::OrderedAssertion`], making the check an observable effect
     /// even when the padded output is unused. This is the conservative initial state, not a claim that the extents
@@ -502,10 +502,10 @@ where
         // over the padded result, and select those values at padding positions).
         check_count!("input", inputs, 2, ProgramError);
 
-        // Validate the padding contract first so that the ragged-axis check indexes the amounts with a known arity,
-        // and reject unsupported ragged geometry before ordinary shape inference, which cannot express a changed
-        // ragged extent. The amounts are indexed physically after inserting the mapped batch axis, and the lifted
-        // vectors are reused by every branch below.
+        // Validate the padding contract first so that the ragged-axis check indexes the amounts with a known arity, and
+        // reject unsupported ragged axes before ordinary shape inference, which cannot express a changed ragged extent.
+        // The amounts are indexed physically after inserting the mapped batch axis, and the lifted vectors are reused
+        // by every branch below.
         validate_pad_inputs(
             &inputs[0].unbatched_type(),
             &inputs[1].unbatched_type(),
@@ -578,7 +578,8 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for PadOperation<ArrayIrType>
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
+    for PadOperation<ArrayIrType>
 where
     C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
@@ -702,7 +703,7 @@ where
         padded_inputs.push(placeholder_padding);
         padded_inputs.extend(lifted_output_extents.iter().cloned());
 
-        // Both pads of the decomposition share the lifted geometry, so one proof recomputation covers them.
+        // Both pads of the decomposition share the lifted padding and shapes, so one proof recomputation covers them.
         let operation = operation
             .with_input_types(&padded_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
         let mut padded = context.parent().bind(operation.clone(), Vec::new(), padded_inputs.as_slice())?;
@@ -988,9 +989,7 @@ impl_differentiable_operation! {
     PadOperation<ArrayIrType>,
     jvp<C>
     where
-        C: Context<Type = ArrayIrType> + Zero<C::Value>,
-        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C: ContextProjection<ArrayType, Type = ArrayIrType> + Zero<C::Value>,
         C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
             + From<DimensionSizeOperation>
             + From<DynamicSliceOperation<ArrayIrType>>
@@ -1007,10 +1006,15 @@ impl_differentiable_operation! {
                                + From<ZeroOperation<ArrayType>>,
             > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
-    {
+        TracingContext<C::Constant, C::Operation>: StagingContext<
+            Type = ArrayIrType,
+            Constant = C::Constant,
+            Operation = C::Operation,
+        >,
+{
         |operation, context, _driver, inputs| {
-            // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays
-            // the mixed pad directly; dynamic geometry retains the exact input shape and output extents so the linear
+            // The explicit output extents are ordinary non-differentiated shape values. Exact input shapes replay
+            // the mixed pad directly; dynamic shapes retain the exact input shape and output extents so the linear
             // transpose can reconstruct both the input and padding value cotangents.
             let destinations = context;
             if inputs.len() < 2 {
@@ -1125,7 +1129,7 @@ impl_differentiable_operation! {
                                 zeros.remove(0)
                             } else {
                                 // Inverse edge padding first recovers the dilated input. Its exact result extents are
-                                // `n + max(n - 1, 0) * interior`, derived from the retained input geometry.
+                                // `n + max(n - 1, 0) * interior`, derived from the retained input extents.
                                 let mut dilated_extents = Vec::with_capacity(transpose_input_type.rank());
                                 for (axis, input_extent) in input_extents.iter().enumerate() {
                                     let interior = transpose_operation.interior_padding()[axis];
@@ -1362,10 +1366,17 @@ impl_differentiable_operation! {
                 <V as ValueProjection<ArrayType>>::Projected,
                 <O as OperationProjection<ArrayType>>::Projected,
             >,
+        TracingContext<
+            <V as ValueProjection<ArrayType>>::Projected, <O as OperationProjection<ArrayType>>::Projected,
+        >: StagingContext<
+            Type = ArrayType,
+            Constant = <V as ValueProjection<ArrayType>>::Projected,
+            Operation = <O as OperationProjection<ArrayType>>::Projected,
+        >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Static input and output geometry delegate to the homogeneous array pullback, while every explicit
-            // output extent receives a structural-zero cotangent. Dynamic geometry requires linearization so
+            // Static input and output shapes delegate to the homogeneous array pullback, while every explicit
+            // output extent receives a structural-zero cotangent. Dynamic shapes require linearization so
             // `DifferentiableOperation::jvp` can retain the exact primal extents as residuals.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -1392,7 +1403,7 @@ impl_differentiable_operation! {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
                         "direct `{PAD_OPERATION_NAME}` transposition with dynamic extents requires linearization so \
-                         that the primal geometry can be retained as residuals",
+                         that the primal extents can be retained as residuals",
                     ),
                 }
                 .into());
@@ -1662,7 +1673,7 @@ where
 /// Represents padding with explicit output dimensions and static padding configuration. The array and scalar inputs
 /// follow [`Pad`]'s semantics. Each output axis additionally has a dimension input whose value must equal the padded
 /// extent computed from the corresponding input axis. All output axes are supplied, including static and unchanged
-/// axes, so the staged operation retains a complete description of its runtime geometry.
+/// axes, so the staged operation retains a complete description of its runtime shape.
 ///
 /// Exact dimension types yield static output axes. Other dimension types preserve their identities and bounds; bounds
 /// constrain possible runtime extents rather than determining the actual result size. Runtime checks reject negative
@@ -1699,7 +1710,7 @@ where
 #[capability]
 pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Pads `self` and validates the supplied result dimensions before returning the array value. Invalid input kinds,
-    /// ranks, element data types, configuration lengths, and incompatible geometry return an error.
+    /// ranks, element data types, configuration lengths, and incompatible shapes return an error.
     ///
     /// # Parameters
     ///
@@ -1736,7 +1747,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reverse-mode differentiation uses scatter's dual gather. Currently, every non-padded axis must have a static
     /// extent, and a dynamic target `extent` must have a positive lower bound. For example, padding `[2, size]` along
     /// axis `1` supports a pullback when the target is bounded below by `1`, whereas `[rows, size]` with dynamic `rows`
-    /// or a target bounded below by `0` does not. Forward evaluation supports those geometries independently of these
+    /// or a target bounded below by `0` does not. Forward evaluation supports those shapes independently of these
     /// reverse-mode restrictions.
     ///
     /// # Parameters
@@ -1802,7 +1813,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
             &[("end", ValueProjection::<DimensionType>::from_projected(end)), ("extent", extent.clone())],
         )?;
 
-        // For the output geometry, the padded axis takes the target extent and every other axis
+        // For the output shape, the padded axis takes the target extent and every other axis
         // keeps its runtime extent.
         let mut output_dimensions = input_dimensions.clone();
         output_dimensions[axis] = extent.clone();
@@ -2141,7 +2152,7 @@ fn validate_padding_value_sharding(input: &ArrayType, padding_value: &ArrayType)
     Ok(())
 }
 
-/// Returns whether the provided padding geometry leaves every possible element and its position unchanged
+/// Returns whether the provided padding amounts leave every possible element and its position unchanged
 /// for the provided input [`ArrayType`].
 fn is_effective_identity(
     input_type: &ArrayType,
@@ -2164,7 +2175,7 @@ fn is_effective_identity(
 /// Validates that padding can preserve the existing [`RaggedAxis`] metadata without updating its extent values or
 /// their indexing. Each ragged data axis and every axis indexing its extents must have zero low, high, and interior
 /// padding; other axes may be padded normally. The function rejects axes outside the padding vectors and unsupported
-/// changes to ragged geometry, otherwise returning a clone of the unchanged metadata for the batching rule to retain.
+/// changes to ragged axes, otherwise returning a clone of the unchanged metadata for the batching rule to retain.
 fn validate_padding_ragged_axes<V: Value>(
     ragged_axes: &[RaggedAxis<V>],
     edge_padding_low: &[i64],
@@ -2225,8 +2236,8 @@ mod tests {
 
     use super::*;
 
-    /// Builds a rank-1 mixed pad of an `f32[size]` input with the provided padding amounts whose explicit output
-    /// extent is the `output_size` program input, so the padded geometry is only known at runtime.
+    /// Builds a rank-1 mixed pad of an `f32[size]` input with the provided padding amounts whose explicit output extent
+    /// is the `output_size` program input, so the padded shape is only known at runtime.
     fn dynamic_pad_program(
         input_bounds: DimensionBounds,
         output_bounds: DimensionBounds,
@@ -2322,9 +2333,9 @@ mod tests {
 
     #[test]
     fn test_pad_type_inference() {
-        // Type inference validates the padding geometry and returns the padded type: interior padding dilates the
-        // input before the edges are added, an empty axis holds only its edge padding, and dynamic axes whose extent
-        // changes need the explicit result-extent input of the mixed operation.
+        // Type inference validates the padding amounts and returns the padded type: interior padding dilates the input
+        // before the edges are added, an empty axis holds only its edge padding, and dynamic axes whose extent changes
+        // need the explicit result-extent input of the mixed operation.
         let input_type = ArrayType::new_static(DataType::F64, [3]);
         let padding_value_type = ArrayType::scalar(DataType::F64);
         check_operation_type_inference!(
@@ -2847,7 +2858,7 @@ mod tests {
 
     #[test]
     fn test_pad_batching_preserves_ragged_dimensions() {
-        // Ragged geometry survives padding of an unrelated axis, while padding the ragged axis or an axis indexing its
+        // Ragged axes survive padding of an unrelated axis, while padding the ragged axis or an axis indexing its
         // extents is rejected before shape inference.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
@@ -3396,9 +3407,9 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_transposition_rejects_unrepresentable_geometry() {
-        // The homogeneous pullback slices static geometry only. A dynamic axis whose extent the padding leaves
-        // unchanged passes type inference but has no static input extent to slice.
+    fn test_pad_transposition_rejects_unrepresentable_shape() {
+        // The homogeneous pullback slices static shapes only. A dynamic axis whose extent the padding leaves unchanged
+        // passes type inference but has no static input extent to slice.
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![size.into()])));
@@ -4112,8 +4123,8 @@ mod tests {
             }],
         );
 
-        // Intersecting result bounds admit valid runtime geometries, and a possibly empty input crops to a possibly
-        // empty output. A proven operation rejects signatures whose extents it cannot prove statically.
+        // Intersecting result bounds admit valid runtime extents, and a possibly empty input crops to a possibly empty
+        // output. A proven operation rejects signatures whose extents it cannot prove statically.
         let input_variable = DimensionVariable::new("input", DimensionBounds::new(1, Some(5)).unwrap());
         let output_variable = DimensionVariable::new("output", DimensionBounds::new(3, Some(7)).unwrap());
         let narrow_variable = DimensionVariable::new("narrow", DimensionBounds::new(3, Some(6)).unwrap());
@@ -4209,8 +4220,8 @@ mod tests {
         let padding_value =
             ArrayIrValue::Array(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap());
 
-        // A concrete mixed value validates the explicit extent against the padded input geometry before padding its
-        // array member.
+        // A concrete mixed value validates the explicit extent against the padded input shape before padding its array
+        // member.
         assert_eq!(
             operation.interpret(
                 &context,
@@ -4613,8 +4624,8 @@ mod tests {
         assert_eq!(program.instructions()[0].operation().effects().classes(), EffectClasses::NONE);
         assert!(program.into_simplified().unwrap().instructions().is_empty());
 
-        // The mapped padding-value decomposition stages a placeholder pad and a mask pad with the same lifted
-        // geometry; both keep the proof, so the whole unused decomposition is eliminated.
+        // The mapped padding-value decomposition stages a placeholder pad and a mask pad with the same lifted shape;
+        // both keep the proof, so the whole unused decomposition is eliminated.
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = parent.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
         let padding_value = parent.input(ArrayType::new_static(DataType::F64, [2]).into());
@@ -4819,7 +4830,7 @@ mod tests {
             )
             .unwrap();
 
-        // Static geometry replays the mixed pad directly on the tangents under the same constant extent, which is a
+        // A static shape replays the mixed pad directly on the tangents under the same constant extent, which is a
         // non-differentiated shape value. `check_operation_differentiation!` perturbs every program input numerically,
         // which the dimension input does not support, so the transform is checked explicitly here.
         let jvp = program.jvp().unwrap();
@@ -4875,8 +4886,8 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_pad_differentiation_dynamic_geometry() {
-        // Dynamic input geometry retains the exact input extent and the explicit output extent as residuals, so the
+    fn test_array_ir_pad_differentiation_dynamic_shape() {
+        // A dynamic input shape retains the exact input extent and the explicit output extent as residuals, so the
         // linear tangent map can be transposed: the pullback undoes the edge padding, slices the dilated input with
         // stride `interior + 1`, and sums the cotangent at the padding positions selected through a padded mask.
         let source = DimensionVariable::new("source", DimensionBounds::new(0, Some(5)).unwrap());
@@ -5039,8 +5050,8 @@ mod tests {
 
     #[test]
     fn test_array_ir_pad_differentiation_dynamic_axis_after_static_axis() {
-        // Explicit pad geometry retains one output extent per physical axis, including statically typed axes. Keep a
-        // static leading axis to verify that the pullback selects dynamic constructor inputs from the right axis.
+        // An explicit pad retains one output extent per physical axis, including statically typed axes. Keep a static
+        // leading axis to verify that the pullback selects dynamic constructor inputs from the right axis.
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let padded_columns = DimensionVariable::new("padded_columns", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type =
@@ -5112,7 +5123,7 @@ mod tests {
     #[test]
     fn test_array_ir_pad_differentiation_disconnected_input_tangent() {
         // A structural-zero tangent has no runtime dimensions of its own. Read the input primal's extent so
-        // materializing that tangent uses the same geometry rather than an input-free dynamic constructor.
+        // materializing that tangent uses the same extent rather than an input-free dynamic constructor.
         let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(5)).unwrap());
         let result = DimensionVariable::new("result", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source.clone())]));
@@ -5684,7 +5695,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_pad_transposition() {
-        // Static geometry delegates to the homogeneous pullback, so the pullback is the same strided slice, zero pad,
+        // A static shape delegates to the homogeneous pullback, so the pullback is the same strided slice, zero pad,
         // and masked sum. The explicit extent is a shape input with no cotangent contribution.
         let eight = ArrayIrValue::Dimension(DimensionValue::constant(8).unwrap());
         let input_types = [
@@ -5809,9 +5820,8 @@ mod tests {
 
     #[test]
     fn test_array_ir_pad_transposition_rejects_dynamic_extents() {
-        // The direct rule delegates to the homogeneous pullback, which slices static geometry only. Dynamic geometry
-        // is rejected by name; linearization is the supported route, because it retains the primal extents as
-        // residuals.
+        // The direct rule delegates to the homogeneous pullback, which slices static shapes only. Dynamic extents are
+        // rejected by name; linearization is the supported route, because it retains the primal extents as residuals.
         let program = dynamic_pad_program(
             DimensionBounds::new(0, Some(5)).unwrap(),
             DimensionBounds::new(3, Some(11)).unwrap(),
@@ -5824,7 +5834,7 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == format!(
                     "direct `{PAD_OPERATION_NAME}` transposition with dynamic extents requires linearization so that \
-                     the primal geometry can be retained as residuals",
+                     the primal extents can be retained as residuals",
                 ),
         ));
         assert_eq!(
@@ -6038,7 +6048,7 @@ mod tests {
         );
 
         // The pullback gathers the input cotangent back out of the written positions and sums the padding positions
-        // into the padding value's cotangent; the indices and broadcast geometry are ordinary residuals.
+        // into the padding value's cotangent; the indices and broadcast extents are ordinary residuals.
         let linearization = program.linearize_with_respect_to(&[0, 1]).unwrap();
         let pullback = linearization.pullback().unwrap();
         assert_eq!(
@@ -6114,7 +6124,7 @@ mod tests {
             &[255, 127, 128, 255]
         );
 
-        // Empty targets and empty inputs remain valid forward geometries.
+        // Empty targets and empty inputs remain valid forward shapes.
         let input = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
         let fill = ArrayIrValue::Array(Array::scalar(-0.0_f32).unwrap());
         assert_eq!(interpret_pad_to_extent(&input, &fill, 0, &zero, &zero), Ok(input.clone()));

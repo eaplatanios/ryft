@@ -15,7 +15,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
@@ -41,6 +41,7 @@ use crate::programs::{
     LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
     TypeError, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
+use crate::tracing::TracingContext;
 
 /// Determines how [`Gather`] handles windows extending outside its input. Negative indices are out of bounds and they
 /// do not count backward from an axis end. Refer to the documentation of [`Gather`] for examples of each policy.
@@ -202,9 +203,10 @@ impl GatherDimensionNumbers {
     }
 }
 
-/// Optional behavior and output placement for [`Gather`]. Geometry is supplied separately as [`GatherDimensionNumbers`]
-/// and slice sizes. The default promises in-bounds indices, makes no sortedness or non-overlap promise, and infers
-/// output [`Sharding`]. Explicit fill values remain constant attributes and do not receive gradients.
+/// Optional behavior and output placement for [`Gather`]. Window dimensions are supplied separately as
+/// [`GatherDimensionNumbers`] and slice sizes. The default promises in-bounds indices, makes no sortedness or
+/// non-overlap promise, and infers output [`Sharding`]. Explicit fill values remain constant attributes and do
+/// not receive gradients.
 #[derive(Clone, Debug)]
 pub struct GatherOptions<V: Value<Type = ArrayType> = Array> {
     /// Refer to the documentation of [`mode`](Self::mode) for more information.
@@ -259,7 +261,7 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
     }
 
     /// Returns this [`GatherOptions`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
-    /// [`None`] restores inferred placement. A request specifies result placement when the window geometry does not
+    /// [`None`] restores inferred placement. A request specifies result placement when the window dimensions do not
     /// determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
     /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
@@ -465,10 +467,10 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     }
 
     /// Returns this [`GatherOperation`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
-    /// `None` restores inferred placement. A request specifies result placement when the window geometry does not
+    /// `None` restores inferred placement. A request specifies result placement when the window dimensions do not
     /// determine one unambiguously: complete window axes inherit input placement and query axes inherit index
-    /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
-    /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
+    /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements on
+    /// paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
     /// and manual-axis variation. It must have the output rank and cannot reference automatic mesh axes. Validation
     /// takes place when inferring the result type.
     #[inline]
@@ -856,10 +858,10 @@ impl_differentiable_operation! {
             // The integer index input (i.e., input 1) has no tangent space, so in a valid pushforward it is the known
             // input and the gathered input (i.e., input 0) is the linear one. The forward map `t ↦ gather(t, indices)`
             // has, as its adjoint, the dual scatter-add that writes the output cotangent back into a zero input at the
-            // gathered windows: the scatter geometry mirrors  the gather axis-for-axis. The transpose reads the known
-            // indices from the pullback boundary and stages an ordinary additive `ScatterOperation`, so linearization
-            // retains the indices as regular Single Static Assignment (SSA) residuals. The indices receive a structural
-            // zero, and a zero output cotangent stays a structural zero.
+            // gathered windows: the scatter's dimension numbers mirror the gather's axis-for-axis. The transpose reads
+            // the known indices from the pullback boundary and stages an ordinary additive `ScatterOperation`, so
+            // linearization retains the indices as regular Single Static Assignment (SSA) residuals. The indices
+            // receive a structural zero, and a zero output cotangent stays a structural zero.
             //
             // **Contract:** This homogeneous rule requires a statically shaped input. The scatter target is a zero
             // of the input's cotangent type, and the homogeneous `ArrayType` operation family owns no first-class
@@ -921,11 +923,9 @@ impl_differentiable_operation! {
     },
 }
 
-impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C>
-    for GatherOperation<Stored>
+impl<Stored: Value<Type = ArrayType>, C: ContextProjection<ArrayType, Type = ArrayIrType>>
+    MemberDifferentiableOperation<C> for GatherOperation<Stored>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + OperationProjection<
@@ -937,6 +937,8 @@ where
                            + From<ZeroOperation<ArrayType>>,
         >,
     EagerContext<Stored>: Zero<Stored>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2083,11 +2085,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, i1, i4,
-        u4,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, i1, i4, u4,
     };
     use crate::axes::NamedAxis;
     use crate::batching::batch;
@@ -2096,6 +2098,7 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::operations::assertions::GuardOperation;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
@@ -2391,7 +2394,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Combining the builders preserves the gather geometry and renders each non-default option.
+        // Combining the builders preserves the gather's dimension numbers and renders each non-default option.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let configured = operation
             .clone()
@@ -3349,6 +3352,14 @@ mod tests {
             Gather(GatherOperation<ArrayType>),
         }
 
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for AbstractGatherOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
+            }
+        }
+
         impl OperationProvider<ArrayType, ParallelVaryOperation> for AbstractGatherOperation {
             type Operation = Self;
 
@@ -3742,10 +3753,13 @@ mod tests {
 
         // Ragged input extents must never be replaced with packed storage extents while selecting windows.
         let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let ragged = ArrayBatch::new(Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
-            .unwrap();
+        let ragged = ragged_array_batch(
+            Array::matrix(2, 3, vec![1_f64, 2., 3., 4., 5., 6.]).unwrap(),
+            Array::vector(vec![1_i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[ragged, indices]).unwrap_err(),
             BatchingError::UnsupportedOperation {

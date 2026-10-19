@@ -16,7 +16,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
     ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
@@ -583,9 +583,7 @@ impl_differentiable_operation! {
     ConcatenateOperation<ArrayIrType>,
     jvp<C>
     where
-        C: Context<Type = ArrayIrType> + Zero<C::Value>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C: ContextProjection<ArrayType, Type = ArrayIrType> + Zero<C::Value>,
         C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
             + From<ConcatenateOperation<ArrayIrType>>
             + From<DimensionSizeOperation>
@@ -597,7 +595,12 @@ impl_differentiable_operation! {
                 Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>,
             > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
-    {
+        TracingContext<C::Constant, C::Operation>: StagingContext<
+            Type = ArrayIrType,
+            Constant = C::Constant,
+            Operation = C::Operation,
+        >,
+{
         |operation, context, _driver, inputs| {
             // The trailing result-extent input is an ordinary non-differentiated shape value. Static input cotangent
             // shapes replay the mixed concatenate directly; dynamic input shapes are retained as explicit residuals so
@@ -760,16 +763,23 @@ impl_differentiable_operation! {
                         <O as OperationProjection<ArrayType>>::Projected,
                     >>,
         ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>: ElementwiseDerivativeAlignment<ArrayType>,
+        TracingContext<
+            <V as ValueProjection<ArrayType>>::Projected, <O as OperationProjection<ArrayType>>::Projected,
+        >: StagingContext<
+            Type = ArrayType,
+            Constant = <V as ValueProjection<ArrayType>>::Projected,
+            Operation = <O as OperationProjection<ArrayType>>::Projected,
+        >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // The explicit result extent receives a structural zero cotangent and each array cotangent is sliced out of
             // the output cotangent at its cumulative offset along the concatenated axis. Fully static inputs delegate
             // that slicing to the homogeneous array pullback. Inputs with a dynamic extent on a _non-concatenated_ axis
             // are sliced directly in the composite universe instead, reading each such extent off the live output
-            // cotangent, which repeats the input's dimension identity on every preserved axis. A dynamic extent on
-            // the _concatenated_ axis is the one geometry this boundary does not already hold, because the per-input
-            // offsets are then runtime sums, so that case requires linearization instead, which retains those input
-            // extents as explicit residuals through `DifferentiableOperation::jvp`.
+            // cotangent, which repeats the input's dimension identity on every preserved axis. A dynamic extent on the
+            // _concatenated_ axis is the one extent this boundary does not already hold, because the per-input offsets
+            // are then runtime sums, so that case requires linearization instead, which retains those input extents as
+            // explicit residuals through `DifferentiableOperation::jvp`.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
@@ -841,10 +851,10 @@ impl_differentiable_operation! {
                 );
             }
 
-            // A dynamic extent on a non-concatenated axis needs no residual, because the exact geometry the pullback
+            // A dynamic extent on a non-concatenated axis needs no residual, because the exact extents the pullback
             // requires is already live at this boundary. Concatenation preserves every non-concatenated axis, so the
             // output cotangent repeats each input's dimension identity there, and a repeated identity denotes one
-            // runtime quantity. Reading those extents off the cotangent therefore recovers the input geometry exactly
+            // runtime quantity. Reading those extents off the cotangent therefore recovers the input shape exactly
             // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
             // express this because its `SliceOperation` bounds are static payload values, so the composite slice is
             // staged here directly.
@@ -856,9 +866,9 @@ impl_differentiable_operation! {
             let cotangent_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
             let rank = cotangent_type.rank();
 
-            // Stage the geometry shared by every input slice once (a zero start, and one extent per non-concatenated
-            // axis, which is an exact constant for a static axis and a single `dimension_size` read of the live
-            // cotangent for a dynamic one). The concatenated axis is filled in per input below.
+            // Stage the indices and extents shared by every input slice once (a zero start, and one extent per
+            // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
+            // read of the live cotangent for a dynamic one). The concatenated axis is filled in per input below.
             let mut staged = context.stage_nullary_operation(ConstantOperation::new(
                 DimensionValue::constant(0).map_err(ProgramError::from)?,
             ))?;
@@ -1475,7 +1485,7 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         })
 }
 
-/// Preserves shared ragged geometry whose values and extent arrays are unaffected by concatenating `axis`.
+/// Preserves shared ragged axes whose values and extent arrays are unaffected by concatenating `axis`.
 /// Callers must provide at least one input and validate its concatenated axis before invoking this function.
 fn validate_concatenation_ragged_axes<V: Value>(
     inputs: &[&[RaggedAxis<V>]],
@@ -3780,10 +3790,10 @@ mod tests {
 
     #[test]
     fn test_array_ir_concatenate_transposition_rejects_a_dynamic_concatenated_extent() {
-        // A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold: the
-        // per-input slice offsets are runtime sums that the output cotangent alone cannot recover. Direct
-        // transposition therefore rejects the case by name instead of guessing, and linearization is the supported
-        // route, because it retains those input extents as explicit residuals.
+        // A dynamic extent on the *concatenated* axis is the one extent this boundary does not already hold: the
+        // per-input slice offsets are runtime sums that the output cotangent alone cannot recover. Direct transposition
+        // therefore rejects the case by name instead of guessing, and linearization is the supported route, because it
+        // retains those input extents as explicit residuals.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let total = DimensionVariable::new("total", DimensionBounds::new(2, Some(10)).unwrap());
         let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)]));
@@ -4058,7 +4068,7 @@ mod tests {
                      axis indexing its extents",
                 ),
         ));
-        // Missing metadata cannot be interpreted as ordinary dense geometry for the other input.
+        // Missing metadata cannot be interpreted as an ordinary dense shape for the other input.
         assert!(matches!(
             validate_concatenation_ragged_axes(&[&first, &second[..1]], 3),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))

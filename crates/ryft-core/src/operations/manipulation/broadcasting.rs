@@ -13,7 +13,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::elementwise::reduce_broadcast_cotangent;
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableType, DifferentiationDual, TransposableOperation,
@@ -41,18 +41,18 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
     Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
-use crate::tracing::{NestedTracingContext, Tracer};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 /// Canonical operation name shared by [`BroadcastOperation`] and [`DynamicBroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
 
 /// [`Operation`] that performs general N-dimensional broadcasting over the homogeneous array language.
 ///
-/// This is the member-family broadcast primitive: complete output geometry is carried by the [`ArrayType`] metadata
+/// This is the member-family broadcast primitive: the complete output shape is carried by the [`ArrayType`] metadata
 /// stored in the operation payload, so the operation has exactly one input and no explicit extent edges. It and
 /// [`ReshapeOperation`] form the homogeneous baseline that [`ProjectedContext`](crate::ProjectedContext) serves,
-/// which is why transform rules for mixed operations can delegate to them once input geometry is resolved.
-/// Refer to the documentation of [`Broadcast`] for the underlying resolved-geometry contract.
+/// which is why transform rules for mixed operations can delegate to them once input shapes are resolved.
+/// Refer to the documentation of [`Broadcast`] for the underlying resolved-shape contract.
 ///
 /// Programs that need first-class dynamic extents stage [`DynamicBroadcastOperation`] instead, which takes one explicit
 /// first-class dimension input per output axis.
@@ -242,7 +242,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                     .with_sharding(output_sharding)
                     .map_err(|error| TypeError::invalid(error.to_string()))?;
 
-                // Broadcast packed storage using its physical extents, then remap the logical ragged geometry.
+                // Broadcast packed storage using its physical extents, then remap the logical ragged axes.
                 let mut dimensions = output_type.shape().dimensions().to_vec();
                 let ragged_axes = inputs[0]
                     .ragged_axes()
@@ -363,8 +363,8 @@ impl<O: Operation<Type = ArrayType> + From<BroadcastOperation>> OperationProvide
 /// the input through unchanged.
 ///
 /// [`Broadcast`] fills the same role for [`BroadcastOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
-/// their corresponding arithmetic [`Operation`]s. It also operates on [`ArrayType`] to validate output geometry without
-/// computing array values. The geometry is stored in the operation rather than supplied through dimension inputs,
+/// their corresponding arithmetic [`Operation`]s. It also operates on [`ArrayType`] to validate output shapes without
+/// computing array values. The output shape is stored in the operation rather than supplied through dimension inputs,
 /// allowing mixed-operation transform rules to use this capability once their input extents have been resolved.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
@@ -733,7 +733,7 @@ impl DynamicBroadcastOperation {
     }
 
     /// Returns this operation with the provided requested output [`Layout`]`. Layout rank and structure are validated
-    /// during type inference. Storage geometry depending on dynamic extents is validated once their runtime values are
+    /// during type inference. Storage metadata depending on dynamic extents is validated once their runtime values are
     /// available. Without an explicit layout, shape-changing broadcasts use the default layout; identity broadcasts
     /// preserve the input layout. Mapped batching supports tiled layouts by placing the batch axis outside each item's
     /// storage. Explicit strided layouts currently support replicated batching only because a leading batch stride can
@@ -903,7 +903,7 @@ where
         validate_broadcast_output_axes(input_rank, output_rank, self.output_axes())?;
 
         // Eager replay can concretize ordinary array dimensions while their dimension inputs retain declared dynamic
-        // types. Parent binding validates that runtime geometry; only ragged identities must be checked here, before
+        // types. Parent binding validates those runtime extents; only ragged identities must be checked here, before
         // replacing their logical dimensions with physical packed extents.
         for ragged_axis in input.ragged_axes() {
             let input_axis = ragged_axis.axis()
@@ -928,7 +928,7 @@ where
             }
         }
 
-        // Mapped extents become physical upper bounds below, so validate their logical geometry first. The parent
+        // Mapped extents become physical upper bounds below, so validate their logical extents first. The parent
         // binding cannot recover it afterward: a dense non-singleton axis matching the packed bound must not silently
         // shrink to smaller per-item extents. Replicated dimensions retain their runtime values and are checked by
         // parent binding, which also permits eager replay with concretized ordinary input dimensions.
@@ -1067,7 +1067,7 @@ where
                 .iter()
                 .find(|ragged_axis| self.output_axes()[ragged_axis.axis() - 1] == axis)
             {
-                // Existing ragged geometry also uses packed extents when the output dimension is replicated.
+                // Existing ragged axes also use packed extents when the output dimension is replicated.
                 let packed_type = moved_input.value().r#type();
                 let packed_type = <&ArrayType>::try_from(packed_type.as_ref())?;
                 let Dimension::Static(physical_extent) = packed_type.dimension(ragged_axis.axis()) else {
@@ -1124,9 +1124,7 @@ impl_differentiable_operation! {
     DynamicBroadcastOperation,
     jvp<C>
     where
-        C: Context<Type = ArrayIrType>,
-        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C: ContextProjection<ArrayType, Type = ArrayIrType>,
         C::Operation: From<DynamicBroadcastOperation>
             + From<DimensionSizeOperation>
             + From<LinearCallOperation<ArrayIrType>>
@@ -1137,11 +1135,16 @@ impl_differentiable_operation! {
                 ArrayType,
                 Projected: From<BroadcastOperation> + From<ReduceOperation> + From<TransposeOperation>,
             >,
-    {
+        TracingContext<C::Constant, C::Operation>: StagingContext<
+            Type = ArrayIrType,
+            Constant = C::Constant,
+            Operation = C::Operation,
+        >,
+{
         |operation, context, _driver, inputs| {
-            // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays
-            // the mixed broadcast directly while dynamic input geometry retains its exact extents so the linear
-            // transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
+            // The explicit output extents are ordinary non-differentiated shape values. Exact input shapes replay the
+            // mixed broadcast directly while dynamic input shapes retain their exact extents so the linear transpose
+            // can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
             let destinations = context;
             if inputs.is_empty() {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -1243,7 +1246,7 @@ impl_differentiable_operation! {
                                 exact_inputs.push(contribution);
                                 exact_inputs.extend(input_shape.dimensions(&transpose_context, residuals)?);
 
-                                // Keep runtime geometry on explicit input edges, including when the shape is unchanged.
+                                // Keep runtime extents on explicit input edges, including when the shape is unchanged.
                                 let mut outputs = if contribution_type.shape() == transpose_target_type.shape() {
                                     transpose_context.bind(
                                         DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
@@ -1267,7 +1270,8 @@ impl_differentiable_operation! {
                                     )?;
 
                                 // Optional dynamic-operation metadata means inference, so it cannot clear a layout or
-                                // sharding. Once geometry is explicit, pin the complete target type with a broadcast.
+                                // sharding. Once the extents are explicit, pin the complete target type with a
+                                // broadcast.
                                 if contribution.r#type().as_ref() != &transpose_target_type {
                                     let output_axes = (0..transpose_target_type.rank()).collect::<Vec<_>>();
                                     contribution =
@@ -1298,10 +1302,17 @@ impl_differentiable_operation! {
                         <O as OperationProjection<ArrayType>>::Projected,
                     >,
             >,
+        TracingContext<
+            <V as ValueProjection<ArrayType>>::Projected, <O as OperationProjection<ArrayType>>::Projected,
+        >: StagingContext<
+            Type = ArrayType,
+            Constant = <V as ValueProjection<ArrayType>>::Projected,
+            Operation = <O as OperationProjection<ArrayType>>::Projected,
+        >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Static input geometry delegates to the homogeneous array pullback, while every explicit output
-            // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so that
+            // Static input shapes delegate to the homogeneous array pullback, while every explicit output
+            // extent receives a structural-zero cotangent. Dynamic input shapes require linearization so that
             // `DifferentiableOperation::jvp` can retain its exact extents as residuals.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -1364,8 +1375,8 @@ impl_differentiable_operation! {
 /// Exact dimension types describe static axes, while non-exact dimension types identify dynamic axes and their bounds.
 /// Both forms bind [`DynamicBroadcastOperation`]. Backend lowering chooses a static, bounded, or dynamic representation
 /// from the inferred result type. Broadcasting preserves element type and memory space. By default, sharding follows
-/// the input-to-output axis mapping and new axes are replicated; callers may request output sharding explicitly.
-/// Changed geometry clears the physical layout. An identity broadcast with unchanged metadata passes through its input.
+/// the input-to-output axis mapping and new axes are replicated; callers may request output sharding explicitly. A
+/// changed shape clears the physical layout. An identity broadcast with unchanged metadata passes through its input.
 ///
 /// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and
 /// [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
@@ -1507,8 +1518,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     /// Replicates `self` along new leading axes while preserving the extents of its existing axes. Existing dynamic
     /// extents are obtained from the input with [`DimensionSize::dimension_size`], so callers only supply the new axes.
     /// For example, prepending dimensions `[2, 4]` to a vector of size three produces shape `[2, 4, 3]`. Existing
-    /// sharding follows the shifted axes and new axes are replicated. An empty leading shape preserves the input
-    /// geometry.
+    /// sharding follows the shifted axes and new axes are replicated. An empty leading shape preserves the input shape.
     ///
     /// # Parameters
     ///
@@ -1544,9 +1554,9 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
             return Ok(self.clone());
         }
 
-        // Validate the leading dimension kinds and the explicit output sharding before staging any geometry reads,
-        // so that a rejected request leaves no dead instructions behind and a request that provably changes nothing
-        // stages nothing at all.
+        // Validate the leading dimension kinds and the explicit output sharding before staging any dimension reads, so
+        // that a rejected request leaves no dead instructions behind and a request that provably changes nothing stages
+        // nothing at all.
         let mut output_shape = Vec::with_capacity(leading_dimensions.len() + input_type.rank());
         for dimension in leading_dimensions {
             output_shape.push(dimension.r#type().as_dimension_type()?.simplified_dimension());
@@ -1599,7 +1609,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
 
     /// Replicates `self` along new leading axes whose sizes are known on the host. This creates exact dimension
     /// constants and delegates to [`DynamicBroadcast::dynamic_broadcast_leading`], preserving existing dynamic extents
-    /// through dimension-size inputs. Passing an empty slice preserves the input geometry.
+    /// through dimension-size inputs. Passing an empty slice preserves the input shape.
     ///
     /// # Parameters
     ///
@@ -1891,7 +1901,7 @@ fn validate_broadcast_output_axes(
 }
 
 /// Validates broadcast storage metadata using known lower bounds for dynamic extents. Runtime extents can expose
-/// additional stride aliasing or storage overflow, which interpretation validates against the resolved geometry.
+/// additional stride aliasing or storage overflow, which interpretation validates against the resolved extents.
 fn validate_broadcast_output_layout(output_type: &ArrayType) -> Result<(), TypeError> {
     if output_type.layout().is_some() {
         let dimensions = output_type
@@ -1968,6 +1978,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
         DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
@@ -1980,6 +1991,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::assertions::GuardOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
@@ -2034,7 +2046,10 @@ mod tests {
         type Operation = O;
     }
 
-    impl<V: Value, O: Debug + Operation<Type = V::Type>> Context for InvalidOutputContext<V, O> {
+    impl<V: Value, O: Debug + Operation<Type = V::Type>> Context for InvalidOutputContext<V, O>
+    where
+        O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+    {
         fn lift(&self, value: V) -> Result<Self::Value, ProgramError> {
             Ok(DispatchValue { value, output_count: self.0, operation: PhantomData })
         }
@@ -2543,12 +2558,12 @@ mod tests {
             BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1i64, 3]).unwrap();
-        let input = ArrayBatch::new(
+        let input = ragged_array_batch(
             Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 0., 0., 2., 3., 4.]).unwrap(),
-            BatchAxis::new(0),
+            extents.clone(),
+            &size,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), size.clone().into()]));
         let (outputs, _) = BroadcastOperation::new(output_type.clone(), vec![1])
@@ -2558,16 +2573,16 @@ mod tests {
         assert_eq!(
             outputs,
             vec![
-                ArrayBatch::new(
+                ragged_array_batch(
                     Array::from_elements(
                         ArrayType::new_static(DataType::F32, [2, 2, 3]),
                         &[1f32, 0., 0., 1., 0., 0., 2., 3., 4., 2., 3., 4.],
                     )
                     .unwrap(),
-                    BatchAxis::new(0),
+                    extents.clone(),
+                    &size,
+                    2
                 )
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), size.clone(), vec![0])])
                 .unwrap()
             ],
         );
@@ -3022,9 +3037,10 @@ mod tests {
     #[test]
     fn test_broadcast_broadcast_invalid_output_count() {
         let array = Array::from_elements(ArrayType::scalar(DataType::I32), &[7_i32]).unwrap();
-        // Exercise both missing and extra results without involving larger operation families.
+
+        // Exercise both missing and extra results. The context never runs the bound operation.
         for output_count in [0, 2] {
-            let context = InvalidOutputContext::<Array, BroadcastOperation>(output_count, PhantomData);
+            let context = InvalidOutputContext::<Array, ArrayOperation<Array>>(output_count, PhantomData);
             let input = context.lift(array.clone()).unwrap();
             assert!(matches!(
                 input.broadcast(ArrayType::new_static(DataType::I32, [2]), &[]),
@@ -3889,15 +3905,15 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
         let extents =
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1i64, 3]).unwrap());
-        let input = ArrayIrBatch::new(
+        let input = ragged_batch(
             ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 0., 0., 2., 3., 4.])
                     .unwrap(),
             ),
-            BatchAxis::new(0),
+            extents.clone(),
+            &size,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let dimension =
             ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(size.clone()))
@@ -3928,14 +3944,14 @@ mod tests {
         // output dimension is rejected instead of being silently repacked.
         let narrow_extents =
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1i64, 2]).unwrap());
-        let narrow_input = ArrayIrBatch::new(
+        let narrow_input = ragged_batch(
             ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[1f32, 0., 2., 3.]).unwrap(),
             ),
-            BatchAxis::new(0),
+            narrow_extents.clone(),
+            &size,
+            1,
         )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, narrow_extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let narrow_dimension =
             ArrayIrBatch::mapped_dimension(narrow_extents, BatchAxis::new(0), DimensionType::from(size.clone()))
@@ -3965,15 +3981,15 @@ mod tests {
         assert_eq!(
             outputs,
             vec![
-                ArrayIrBatch::new(
+                ragged_batch(
                     ArrayIrValue::Array(
                         Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 1., 1., 2., 2., 2.])
                             .unwrap(),
                     ),
-                    BatchAxis::new(0),
+                    extents.clone(),
+                    &size,
+                    1
                 )
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), size.clone(), vec![0])])
                 .unwrap()
             ],
         );
@@ -3987,7 +4003,7 @@ mod tests {
         assert_eq!(
             outputs,
             vec![
-                ArrayIrBatch::new(
+                ragged_batch(
                     ArrayIrValue::Array(
                         Array::from_elements(
                             ArrayType::new_static(DataType::F32, [2, 2, 3]),
@@ -3995,10 +4011,10 @@ mod tests {
                         )
                         .unwrap(),
                     ),
-                    BatchAxis::new(0),
+                    extents,
+                    &size,
+                    2
                 )
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(2, extents, size.clone(), vec![0])])
                 .unwrap()
             ],
         );
@@ -4020,7 +4036,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_broadcast_batching_replicated_ragged() {
-        // Replicated ragged geometry may index another ordinary axis rather than the mapped batch axis. Only staged
+        // A replicated ragged axis may index another ordinary axis rather than the mapped batch axis. Only staged
         // dimensions can name a ragged dimension (eager dimensions carry exact types), so the parent is a trace.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
@@ -4182,8 +4198,8 @@ mod tests {
     fn test_dynamic_broadcast_batching_preserves_declared_dynamic_extent() {
         // A mapped array input canonicalizes to a leading batch axis, and the declared output extents cross the
         // batching rule untouched: the lifted broadcast consumes the transform's own batch extent followed by exactly
-        // the original extent inputs. A declared *dynamic* extent makes that forwarding observable, because a rule
-        // that reconstructed output geometry from the input type would have to stage its own `dimension_size` read.
+        // the original extent inputs. A declared *dynamic* extent makes that forwarding observable, because a rule that
+        // reconstructed output extents from the input type would have to stage its own `dimension_size` read.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_extent = trace.input(DimensionType::from(columns.clone()).into());
@@ -4374,7 +4390,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        // Dynamic input geometry retains the exact extent as a residual of a linear call, so that the transpose can
+        // A dynamic input shape retains the exact extent as a residual of a linear call, so that the transpose can
         // rebind the input cotangent to its runtime shape.
         let linearization = dynamic_program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
@@ -4650,7 +4666,7 @@ mod tests {
             )
         );
 
-        // Empty dynamic extents preserve the input geometry without introducing any cotangent elements.
+        // Empty dynamic extents preserve the input shape without introducing any cotangent elements.
         let empty_input = ArrayIrValue::Array(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 1]), &[]).unwrap(),
         );
@@ -4670,7 +4686,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_broadcast_transposition() {
-        // Static input geometry delegates to the homogeneous pullback, which sums the cotangent over the replicated
+        // A static input shape delegates to the homogeneous pullback, which sums the cotangent over the replicated
         // axis, while the known extent inputs receive no cotangent.
         check_operation_transposition!(
             @exact,
@@ -4697,7 +4713,7 @@ mod tests {
             }],
         );
 
-        // A zero cotangent needs no dynamic geometry residual and leaves every input accumulator structural.
+        // A zero cotangent needs no dynamic extent residual and leaves every input accumulator structural.
         let size = DimensionVariable::new("size", DimensionBounds::positive(Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
         let input_types = vec![ArrayIrType::Array(input_type), DimensionType::from(size).into()];
@@ -4728,7 +4744,7 @@ mod tests {
     #[test]
     fn test_dynamic_broadcast_transposition_rejects_a_dynamic_input_extent() {
         // The direct rule reduces and rebinds the cotangent from the input type alone, which cannot recover a runtime
-        // input extent. It therefore rejects dynamic input geometry by name; linearization is the supported route,
+        // input extent. It therefore rejects dynamic input extents by name; linearization is the supported route,
         // because it retains those extents as residuals.
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
@@ -4807,10 +4823,10 @@ mod tests {
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_invalid_output_count() {
         let array = Array::from_elements(ArrayType::scalar(DataType::I32), &[7_i32]).unwrap();
-        // Exercise both missing and extra results without involving larger operation families.
+        // Exercise both missing and extra results. The context never runs the bound operation.
         for output_count in [0, 2] {
             let context =
-                InvalidOutputContext::<ArrayIrValue<Array>, DynamicBroadcastOperation>(output_count, PhantomData);
+                InvalidOutputContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>(output_count, PhantomData);
             let input = context.lift(ArrayIrValue::Array(array.clone())).unwrap();
             let extent = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
             assert!(matches!(
@@ -4923,7 +4939,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
         let value = context.input(ArrayType::scalar(DataType::F32).into());
         let exemplar = context.input(ArrayType::new(DataType::F32, Shape::new(vec![size.into(), 2.into()])).into());
-        // Filling an exemplar's geometry is an ordinary broadcast with sizes read from that exemplar.
+        // Filling an exemplar's shape is an ordinary broadcast with sizes read from that exemplar.
         let dimensions = [exemplar.dimension_size(0).unwrap(), exemplar.dimension_size(1).unwrap()];
         let output = value.dynamic_broadcast_to(&dimensions).unwrap();
         let program = context
@@ -5068,7 +5084,7 @@ mod tests {
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
 
-        // Leading dimension kinds and the explicit sharding are validated before any geometry read is staged for a
+        // Leading dimension kinds and the explicit sharding are validated before any dimension read is staged for a
         // dynamically shaped receiver, so a rejected request leaves no dead `dimension_size` behind.
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

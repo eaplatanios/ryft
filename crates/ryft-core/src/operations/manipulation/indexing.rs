@@ -384,8 +384,8 @@ pub trait Indexing: Value {
     /// function reads the selection while `set`, `add`, `mul`, `min`, and `max` return a new array, leaving the
     /// input unchanged. For reference values, `view` derives a reference to the selected region and `read`, `write`,
     /// `add_update`, and `swap` access the reference's state through that view in place. Validation occurs in those
-    /// terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported geometry and
-    /// the shared bounds and index-promise contracts.
+    /// terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported shapes and the
+    /// shared bounds and index-promise contracts.
     ///
     /// # Parameters
     ///
@@ -406,7 +406,7 @@ impl<V: Value> Indexing for V {}
 /// a reference view of the selected region and access the reference's state through it in place, exactly like
 /// `ref.at[...]` in JAX.
 ///
-/// # Supported Geometry
+/// # Supported Shapes
 ///
 /// Concrete shapes support host integer indices, positive and negative strides, inserted axes, ellipses, broadcast
 /// integer-array indices, and explicit host-known [`IndexMask`]s. Eager arrays and staged arrays use the same selection
@@ -468,10 +468,10 @@ impl<
         + ManualVariationAlignment<ArrayType>,
 > Indexed<'_, '_, '_, V, ArrayType>
 {
-    /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
-    /// Slices clip their endpoints independently. Floating-point fill literals preserve their original encodings.
-    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts. A host integer
-    /// that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
+    /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization. Slices
+    /// clip their endpoints independently. Floating-point fill literals preserve their original encodings. Refer to
+    /// [`Indexed`] for supported shapes and the shared bounds and index-promise contracts. A host integer that remains
+    /// out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
     ///
     /// # Parameters
     ///
@@ -1163,7 +1163,7 @@ impl<
     /// value family. A selection with a symbolic shape instead keeps its extents as dimension values and supports one
     /// indexed axis, full forward or reverse slices on the other axes, and inserted axes. When starting from an array
     /// tracer projected out of an [`ArrayIrType`] value, read the selection through that value instead. Refer to
-    /// [`Indexed`] for the complete supported-geometry contract.
+    /// [`Indexed`] for the complete supported-shape contract.
     ///
     /// Symbolic reads inherit [`DynamicGather`]'s one-element window requirement on the indexed axis. Specifically,
     /// its minimum extent must be positive unless the query is statically empty. Untouched axes and query axes may have
@@ -1171,8 +1171,8 @@ impl<
     ///
     /// # Parameters
     ///
-    ///   - `options`: Bounds handling and optional fill. Symbolic geometry rejects explicit output sharding and
-    ///     index promises. Concrete geometry also supports placement and uniqueness as described on [`Indexed`].
+    ///   - `options`: Bounds handling and optional fill. Symbolic shapes reject explicit output sharding and index
+    ///     promises. Concrete shapes also support placement and uniqueness as described on [`Indexed`].
     pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
         if !self.has_symbolic_shape()? {
             return self.with_projected_selection(|selection| selection.get(options)).map(V::from_projected);
@@ -1237,9 +1237,9 @@ impl<
     /// # Parameters
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
-    ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
-    ///     bounds and index-promise contracts.
+    ///   - `options`: Scatter bounds policy and placement/promises for concrete shapes. Symbolic shapes reject explicit
+    ///     output sharding and index promises. Refer to [`Indexed`] for supported shapes and the shared bounds and
+    ///     index-promise contracts.
     #[inline]
     pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Overwrite, options)
@@ -1283,7 +1283,7 @@ impl<
     /// family. A selection with a symbolic shape is instead resolved by [`dynamic_plan`](Self::dynamic_plan), which
     /// keeps the dimension values available, and then scattered along its single queried axis with dynamic operations.
     /// The reversed input is updated in selection order and reversed back, so the returned value has the original
-    /// geometry.
+    /// shape.
     ///
     /// # Parameters
     ///
@@ -1679,10 +1679,10 @@ impl<
         Ok(V::from_projected(value.clone().into_projected()?.reverse(axes.to_vec())?))
     }
 
-    /// Resolves the supported symbolic selection geometry without reading traced array data on the host. One host-side
-    /// pass over the selectors validates every one of them and records the reversed axes, the inserted axes, and the
-    /// single queried axis; only then is that query staged, so that a bad later selector never leaves a partly staged
-    /// indexing expression in the caller's context.
+    /// Resolves a supported symbolic selection without reading traced array data on the host. One host-side pass over
+    /// the selectors validates every one of them and records the reversed axes, the inserted axes, and the single
+    /// queried axis; only then is that query staged, so that a bad later selector never leaves a partly staged indexing
+    /// expression in the caller's context.
     ///
     /// # Parameters
     ///
@@ -2026,7 +2026,7 @@ struct IndexPlan<V> {
     new_axes: Vec<usize>,
 }
 
-/// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
+/// Runtime indexing plan for a selection with at most one array or scalar index. Full slices preserve their dimension
 /// identities; inserted axes are recorded separately so gather/scatter continue to operate on the original rank.
 struct DynamicIndexPlan<V> {
     /// Optional input axis and normalized signed query array.
@@ -2089,7 +2089,7 @@ mod tests {
 
     use super::*;
 
-    /// Tracer over [`ArrayIrValue`]s used by the symbolic-geometry tests.
+    /// Tracer over [`ArrayIrValue`]s used by the symbolic-shape tests.
     type ArrayIrTracer = Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
 
     /// Allocates the 2x3 `f32` reference used by the reference-view tests.
@@ -3115,7 +3115,7 @@ mod tests {
             Err(TypeError::invalid("host integer index is out of bounds under `PromiseInBounds`").into()),
         );
 
-        // Query arrays must be signed integers placed with the input, and masks need concrete geometry.
+        // Query arrays must be signed integers placed with the input, and masks need concrete shapes.
         assert_eq!(
             trace(
                 |input, indices| input.at(&index![.., indices]).get(&GatherOptions::new()),
@@ -3179,7 +3179,7 @@ mod tests {
         let indices = ArrayIrValue::Array(Array::vector(vec![-1_i32, 0]).unwrap());
 
         // A reversed axis is reversed before the scatter and reversed back afterwards, so the result keeps the input
-        // geometry while the updates land in selection order.
+        // shape while the updates land in selection order.
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(input, indices, updates)| input.at(&index![..by - 1, &indices]).set(&updates, &ScatterOptions::new()),
             (

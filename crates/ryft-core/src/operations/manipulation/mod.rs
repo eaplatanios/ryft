@@ -1,4 +1,4 @@
-//! Operations that rearrange, select, and relocate array data without changing element values. Each operation is
+//! Operations that rearrange, select, and relocate array data or change a value's representation. Each operation is
 //! defined by an [`Operation`](crate::Operation) type (e.g., [`SliceOperation`]) together with a value capability
 //! trait (e.g., [`Slice`]) whose functions apply it to eager [`Array`]s and traced values alike, so the same code
 //! executes immediately or records into a program depending on the value it runs on.
@@ -19,7 +19,8 @@
 //!     values it derives a view that is read and written in place.
 //!   - **Changing Representation and Placement:** [`ConvertElementType`] changes the element data type,
 //!     [`ReducePrecision`] rounds floating-point elements to a narrower simulated format within their data type,
-//!     and [`TransferToMemory`] moves an array between memory spaces.
+//!     [`Cast`] returns a value at a related type representation (e.g., an `f32[n]` value as `f32[2]`), checking
+//!     the relationship at runtime or assuming it, and [`TransferToMemory`] moves an array between memory spaces.
 //!
 //! Negative host integers and negative runtime start indices count from the end of their axis once before clamping.
 //! The `Dynamic*` variants take first-class dimension values in the mixed [`ArrayIrValue`](crate::ArrayIrValue)
@@ -89,8 +90,9 @@ pub use broadcasting::{
 };
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, DynamicConcatenate};
 pub use conversions::{
-    CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
-    REDUCE_PRECISION_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation,
+    CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, ConvertElementType,
+    ConvertElementTypeOperation, ElementType, REDUCE_PRECISION_OPERATION_NAME, ReducePrecision,
+    ReducePrecisionOperation,
 };
 pub use gathering::{
     DynamicGather, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,
@@ -160,8 +162,8 @@ impl<
 {
 }
 
-/// Group of the array IR manipulation capabilities, whose dynamic result geometry consumes explicit first-class
-/// dimension values (i.e., [`DynamicReshape`], [`DynamicBroadcast`], [`DynamicPad`], [`DynamicConcatenate`], and
+/// Group of the array IR manipulation capabilities, whose dynamic result shapes consume explicit first-class dimension
+/// values (i.e., [`DynamicReshape`], [`DynamicBroadcast`], [`DynamicPad`], [`DynamicConcatenate`], and
 /// [`DynamicSliceWithDimensions`]). It is implemented automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
