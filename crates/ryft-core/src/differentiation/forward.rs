@@ -811,8 +811,15 @@ impl<
 /// and value transfer. Projection therefore changes the value family visible to the rule while retaining the choice
 /// of fused or partitioned computation.
 pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
-    /// Whether the primal computation completes before the tangent program can execute. Such policies need no tangent
-    /// value dependency solely to order a conversion after a primal check; extent dependencies still apply.
+    /// Whether the whole primal computation finishes before any tangent work executes. This holds for
+    /// [`PartitionedDifferentiationPolicy`], whose tangent program runs only after the primal program has produced
+    /// its results, but not for [`FusedDifferentiationPolicy`], which interleaves both computations in one program.
+    ///
+    /// Rules whose tangent is sound only after a primal check has run (e.g., the unchecked tangent cast behind a
+    /// checked `cast` or a `guard` operation) consult this flag. When it is `false`, the tangent must take a data
+    /// dependency on the primal result so that the fused program orders it after the check. When it is `true`, that
+    /// ordering is implied, so such rules transfer only the primal values whose extents the tangent still needs, which
+    /// keeps those values out of the tangent program's residuals.
     const PRIMAL_COMPLETES_BEFORE_TANGENT: bool = false;
 
     /// Creates a separate context for tangent work, if the policy needs one. [`DifferentiationContext::new`]

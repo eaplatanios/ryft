@@ -290,6 +290,7 @@ where
             ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
             Operation = O,
         >,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns this [`CotangentReferenceAccumulator`]'s cotangent reference, allocating it with a zero initial value
     /// first if it has not been allocated yet. The zero referent is materialized through the operation family's
@@ -392,7 +393,10 @@ impl CotangentAccumulator {
     pub fn reference<V: Value, O: Operation<Type = V::Type>>(
         &self,
         context: &TranspositionContext<V, O>,
-    ) -> Result<Option<Tracer<TracingContext<V, O>>>, DifferentiationError> {
+    ) -> Result<Option<Tracer<TracingContext<V, O>>>, DifferentiationError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
         Ok(match context.cotangent_storage(self)? {
             CotangentStorage::Value { .. } => None,
             CotangentStorage::Buffer { reference, .. } => Some(reference.clone()),
@@ -409,7 +413,10 @@ impl CotangentAccumulator {
         &self,
         context: &mut TranspositionContext<V, O>,
         contribution: MaybeZero<Tracer<TracingContext<V, O>>>,
-    ) -> Result<(), DifferentiationError> {
+    ) -> Result<(), DifferentiationError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
         // Validate the handle's context identity and the contribution's type before changing any storage,
         // even when this input does not need a cotangent.
         let storage = context.cotangent_storage(self)?;
@@ -481,7 +488,10 @@ impl CotangentAccumulator {
 /// [`Typed`] implementation describes the expected contribution type, including when no contributions have arrived; it
 /// does not describe the reference used to store those contributions. Both variants accept only additive updates,
 /// unlike reference-state accumulators, whose contents may also be taken or replaced by reference transpose rules.
-enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
+enum CotangentStorage<V: Value, O: Operation<Type = V::Type>>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Contributions are summed as they arrive, allowing earlier values to be released during execution.
     Value {
         /// Expected cotangent type, also retained for disconnected and ignored inputs.
@@ -506,7 +516,10 @@ enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
     },
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     type Type = V::Type;
 
     #[inline]
@@ -561,7 +574,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// output. A root whose state cotangent does not need to cross the region boundary can use
 /// [`CotangentDestinationKind::Ignore`], allowing the nested region to allocate and discard its own accumulator
 /// if needed. State cotangents needed by the enclosing computation must instead use its accumulators.
-pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
+pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// [`TracingContext`] that the transposed [`Program`] is staged into.
     parent: TracingContext<V, O>,
 
@@ -586,7 +602,10 @@ pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
     dimension_sources: Vec<Tracer<TracingContext<V, O>>>,
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Creates a new [`TranspositionContext`] over `parent` with empty cotangent storage and no reference analysis.
     /// Rules staged through it can use every [`TracingContext`] capability and cotangent accumulators for non-reference
     /// inputs. Reference-state queries require the analysis installed by the program transposition engine.
@@ -708,10 +727,11 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         self.reference_analysis.as_ref()
     }
 
-    /// Returns retained values from which the runtime dimensions needed to construct reference state zeros can be
-    /// obtained. A source can be an array whose dimensions can be queried or an explicit dimension value; these are
-    /// candidate sources and not a list of already extracted dimensions. They include known primal values and
-    /// cotangents encountered during transposition, and remain available after value cotangent storage is drained.
+    /// Returns retained values that supply runtime dimensions to transpose rules, for example to construct a reference
+    /// state zero or witness a cast's input identities. A source can be an array or an explicit dimension. These are
+    /// candidate sources, rather than dimensions already extracted for a particular operation. They include known
+    /// primal values and cotangents encountered during transposition, and remain available after value cotangent
+    /// storage is drained.
     ///
     /// For example, constructing a zero buffer of type `f32[n]` requires the runtime value of `n`, which the type alone
     /// does not supply. An available array of type `f64[n]` can supply that dimension even though its element type is
@@ -1089,7 +1109,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Deref for TranspositionContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> Deref for TranspositionContext<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     type Target = TracingContext<V, O>;
 
     #[inline]
@@ -1098,7 +1121,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Deref for TranspositionContext<V, O
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> DerefMut for TranspositionContext<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> DerefMut for TranspositionContext<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     #[inline]
     fn deref_mut(&mut self) -> &mut TracingContext<V, O> {
         &mut self.parent
@@ -1271,6 +1297,8 @@ impl<
                 >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.linear_program
             .transpose_with_trailing_residuals_shared(self.residuals.len(), destination_kinds)
@@ -1332,6 +1360,8 @@ impl<
                 >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.validate_reference_boundary()?;
         let program = self.transposed_program(&[])?;
@@ -1368,6 +1398,8 @@ impl<
                 >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.validate_reference_boundary()?;
         let seeds = cotangents.into_parameters().map(CotangentSeed::Value).collect::<Vec<_>>();
@@ -1449,6 +1481,8 @@ impl<
             > + From<AddOperation<C::Type>>,
         Input::Family: ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<C::Value>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let seeds = seeds.into_parameters().collect::<Vec<_>>();
         let destinations = destinations.into_parameters().collect::<Vec<_>>();
@@ -1487,6 +1521,8 @@ impl<
                 >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let cotangents = self.apply_impl(seeds, &destinations)?;
         let gradients = destinations
@@ -1548,6 +1584,8 @@ impl<
                 >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         // Validate the seeds against the complete primal output boundary, including the leaves whose differential
         // spaces contain only zero. Only information-carrying values become program inputs because the compact program
@@ -1858,6 +1896,8 @@ impl<
             Operation = O,
         > + From<AddOperation<V::Type>>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn transpose_program(
@@ -1967,8 +2007,7 @@ impl<
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::arrays::ArrayType;
-/// # use ryft_core::{ConstantOperation, Value, ZeroOperation};
+/// # use ryft_core::{ArrayType, ConstantOperation, GuardOperation, Value, ZeroOperation};
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -1976,9 +2015,13 @@ impl<
 /// enum LinearOperation<V: Value<Type = ArrayType>> {
 ///     Zero(ZeroOperation<ArrayType>),
 ///     Constant(ConstantOperation<V>),
+///     Guard(GuardOperation<ArrayType>),
 /// }
 /// ```
-pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
+pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     /// Applies this operation's transpose rule to symbolic output cotangents, accumulating `x̄ = Lᵀ(ȳ)` for the linear
     /// map `y = L(x)`. Each input has an opaque [`CotangentAccumulator`], and the implementor must check
     /// [`is_needed`](CotangentAccumulator::is_needed) before computing an expensive contribution, and then submit it
@@ -2047,6 +2090,8 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
 /// requirements of [`TransposableOperation::transpose`] apply unchanged, including when a rule delegates to projection.
 pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
     Operation<Type: DifferentiableType>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Applies this member's transpose rule using the enclosing family's values and cotangent accumulators.
     ///
@@ -2109,6 +2154,8 @@ impl<
             Operation = O,
         > + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_ with respect to
     /// `input_indices`, using `destination_kinds` to select how their cotangents cross the pullback boundary. Refer
@@ -2208,9 +2255,9 @@ impl<
             /// Materializes the known source atom with the provided [`AtomId`]. An atom that is already materialized
             /// needs nothing and a constant is copied directly, while any other atom schedules its producing
             /// instruction (i.e., a [`Replay`](Self::Replay) step preceded by one [`Visit`](Self::Visit) step per
-            /// input). The first visit of a value produced by a known local reference lifecycle instead schedules the
-            /// complete lifecycle slice, in program order, through [`Self::VisitLifecycleInstruction`] steps, and then
-            /// visits the value again, which finds it materialized.
+            /// input). A value produced by a known local reference lifecycle instead schedules the lifecycle slice
+            /// through its source position, in program order, through [`Self::VisitLifecycleInstruction`] steps, and
+            /// then visits the value again, which finds it materialized.
             Visit(AtomId),
 
             /// Schedules the replay of the instruction at the provided position of the source region's instruction list
@@ -2233,13 +2280,12 @@ impl<
             lifecycles: Option<LocalReferenceLifecycles>,
 
             /// Positions, in the transposed region's instruction list, of the lifecycle instructions that transpose
-            /// rules may need, in program order. They are replayed together, the first time any lifecycle value is
-            /// materialized, so that every replayed access observes its primal state regardless of the order in which
-            /// the reverse walk demands their values.
+            /// rules and known assertions may need, in program order. Replay advances only through the requested
+            /// observation, so later writes and their input checks cannot run ahead of an earlier assertion.
             slice: Vec<usize>,
 
-            /// Whether [`slice`](Self::slice) has already been replayed.
-            replayed: bool,
+            /// First position of [`slice`](Self::slice) that has not been scheduled for replay.
+            next: usize,
         }
 
         impl KnownLifecycleReplay {
@@ -2256,8 +2302,8 @@ impl<
         /// only once. `materialization_state` distinguishes scheduled producers from completed ones, both detecting a
         /// malformed cycle and keeping the traversal independent of the native call stack. Producers must be pure,
         /// except for ordered assertions and the instructions of known local reference lifecycles. The first
-        /// materialized lifecycle value replays the complete lifecycle slice of `known_lifecycles` in program order,
-        /// each instruction together with its data dependencies, so that later demands find their values memoized.
+        /// materialized lifecycle value advances `known_lifecycles` through that observation in program order,
+        /// each instruction together with its data dependencies, so that earlier observations remain memoized.
         ///
         /// # Parameters
         ///
@@ -2313,20 +2359,21 @@ impl<
                             .get(instruction_index)
                             .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
 
-                        // A value of a known local reference lifecycle is produced by replaying the complete lifecycle
-                        // slice in program order and then resuming this visit, which finds the value memoized.
+                        // Replay only through this observation. Replaying future mutations could materialize their
+                        // input assertions ahead of the assertion whose input is currently being requested.
                         if known_lifecycles.contains(instruction_index) {
-                            if known_lifecycles.replayed {
+                            let end = known_lifecycles.slice.partition_point(|index| *index <= instruction_index);
+                            let start = known_lifecycles.next;
+                            if start >= end {
                                 return Err(ProgramError::MalformedProgram(
                                     "known local reference lifecycle value is outside the replayed lifecycle slice"
                                         .into(),
                                 ));
                             }
-                            known_lifecycles.replayed = true;
+                            known_lifecycles.next = end;
                             steps.push(MaterializationStep::Visit(current));
                             steps.extend(
-                                known_lifecycles
-                                    .slice
+                                known_lifecycles.slice[start..end]
                                     .iter()
                                     .rev()
                                     .copied()
@@ -2335,9 +2382,8 @@ impl<
                             continue;
                         }
 
-                        // Replaying an ordered assertion is safe. It validates the same saved primal value and cannot
-                        // introduce a failure that successful primal execution did not already admit. Other effects
-                        // could be duplicated or reordered and therefore require prior residualization.
+                        // Ordered assertions validate the same known values. The forward assertion sweep below
+                        // preserves their source order; other effects require prior residualization.
                         let effects = program.instruction_effects(instruction_index)?.classes();
                         if effects.into_iter().any(|effect| effect != EffectClass::OrderedAssertion) {
                             return Err(ProgramError::UnsupportedOperation {
@@ -2504,19 +2550,20 @@ impl<
         // The lifecycle of a known local reference root is primal computation. A linear instruction that accesses such
         // a root through its handle would observe the root's state when the pullback runs rather than at its primal
         // position, so it is rejected. Otherwise, the lifecycle instructions that transpose rules may need are replayed
-        // into the pullback as one slice, in program order, the first time any of their values is materialized. Rules
-        // may need the known inputs of every instruction that the reverse walk may visit.
+        // into the pullback in source order, only through each requested observation. Both known assertions and rules
+        // that the reverse walk may visit contribute their known input dependencies.
         let instruction_by_output = self.region().instruction_by_output();
         let lifecycles = analysis
             .as_deref()
             .map(|analysis| analysis.local_lifecycles(*self, |root| !linear_roots.contains(&root)))
             .transpose()?;
-        let mut known_lifecycles = KnownLifecycleReplay { lifecycles: None, slice: Vec::new(), replayed: false };
+        let mut known_lifecycles = KnownLifecycleReplay { lifecycles: None, slice: Vec::new(), next: 0 };
         if let Some(lifecycles) = lifecycles {
             let may_visit = |index: usize| -> Result<bool, ProgramError> {
                 let instruction = &self.instructions()[index];
                 Ok(instruction.inputs().iter().chain(instruction.outputs()).any(|atom| linear[atom.index()])
                     || self.instruction_effects(index)?.has_deferred_work()
+                    || self.instruction_effects(index)?.classes().contains(EffectClass::OrderedAssertion)
                     || instruction
                         .regions()
                         .iter()
@@ -2681,14 +2728,12 @@ impl<
             },
         )?;
 
-        // Retain known primal values that can supply runtime dimensions for reference-state zeros. Static types
-        // need no dimension source, and reference values cannot supply dimensions through this protocol.
-        if context.reference_analysis.is_some() {
-            for atom in known_map.iter().flatten() {
-                let source = context.tracer(*atom, None);
-                if !source.r#type().is_reference() && source.r#type().identities().next().is_some() {
-                    context.dimension_sources.push(source);
-                }
+        // Retain known primal extents for transpose rules, including cast witnesses and reference-state zeros.
+        // Static types need no source, and references cannot supply dimensions through this protocol.
+        for atom in known_map.iter().flatten() {
+            let source = context.tracer(*atom, None);
+            if !source.r#type().is_reference() && source.r#type().identities().next().is_some() {
+                context.dimension_sources.push(source);
             }
         }
 
@@ -2728,12 +2773,79 @@ impl<
         let region_mappings = RegionReplayMappings::new();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
+        // A raw transpose has not executed the forward program. Replay known assertions in their original order,
+        // including checks whose results have no adjoints. Linear checks stay live below so their owning rule can
+        // preserve them or reject unavailable primal extents.
+        for (instruction_index, instruction) in self.instructions().iter().enumerate() {
+            let effects = self.instruction_effects(instruction_index)?.classes();
+            if !effects.contains(EffectClass::OrderedAssertion) {
+                continue;
+            }
+
+            // The operation's rule owns checks over linear inputs, which must remain live even with zero adjoints.
+            if instruction.inputs().iter().chain(instruction.outputs()).any(|atom| linear[atom.index()]) {
+                continue;
+            }
+
+            if materialization_state[instruction_index] == MaterializationState::Complete {
+                continue;
+            }
+
+            if effects.into_iter().any(|effect| effect != EffectClass::OrderedAssertion) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "partition-aware transpose cannot replay effectful known assertion `{}`; \
+                         partial-evaluate it into a residual input first",
+                        instruction.operation().name(),
+                    ),
+                }
+                .into());
+            }
+
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|&input| {
+                    materialize_known(
+                        *self,
+                        instruction_by_output.as_slice(),
+                        linear.as_slice(),
+                        &region_mappings,
+                        &builder,
+                        known_map.as_mut_slice(),
+                        materialization_state.as_mut_slice(),
+                        &mut known_lifecycles,
+                        input,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
+            let regions = driver.import_into(&builder, &vec![None; instruction.regions().len()])?;
+            let outputs = builder
+                .borrow_mut()
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+
+            for (&source, mapped) in instruction.outputs().iter().zip(outputs) {
+                known_map[source.index()] = Some(mapped);
+            }
+
+            materialization_state[instruction_index] = MaterializationState::Complete;
+        }
+
         // Walk the primal program backward. Value output cotangents and live reference-state accumulators
         // determine which rules must run; known factors are materialized only when a rule needs them.
         for (instruction_index, instruction) in self.instructions().iter().enumerate().rev() {
             // Validate effects before omitting dead reverse work. Instructions with linear outputs, and sinks that
             // access reference state, may carry only state effects or primal assertions. Reference rules transpose
-            // state through its accumulators; assertions remain preconditions executed by the forward program.
+            // state through its accumulators; assertions over known inputs were handled before this reverse walk.
             // Other sinks have no cotangent result and are omitted. Known-only producers are checked separately
             // when their values are materialized for a transpose rule.
             let has_linear_output = instruction.outputs().iter().copied().try_fold(false, |any, output| {
@@ -2744,10 +2856,21 @@ impl<
                 let is_linear = *linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                 Ok::<_, ProgramError>(any || is_linear)
             })?;
+
+            // Known assertion-bearing regions were replayed in forward order. Their primal checks must not run
+            // a second time through an empty reverse call. Deferred backward obligations still run below.
+            if !has_linear_input
+                && !has_linear_output
+                && materialization_state[instruction_index] == MaterializationState::Complete
+                && self.instruction_effects(instruction_index)?.classes().contains(EffectClass::OrderedAssertion)
+                && !self.instruction_effects(instruction_index)?.has_deferred_work()
+            {
+                continue;
+            }
+
             if has_linear_output || has_linear_input {
-                // Ordered assertions are primal preconditions. The primal/forward program executes them before its
-                // pullback is applied, so transposition must not replay them in reverse order. Other observable effects
-                // cannot be omitted from or replayed by the transposed linear program.
+                // Assertions over linear inputs belong to their owning operation or region's transpose rule.
+                // Other observable effects cannot be omitted or replayed in reverse order.
                 let effects = self.instruction_effects(instruction_index)?.classes();
                 let takes_reference_path = has_linear_output || effects.contains(EffectClass::OrderedState);
                 if takes_reference_path
@@ -2819,6 +2942,7 @@ impl<
                 // Deferred work in the instruction or its executable computation regions must also run, because its
                 // transformation obligation materializes only here (dormant rule regions contribute none).
                 let must_transpose = self.instruction_effects(instruction_index)?.has_deferred_work()
+                    || instruction.operation().effects().classes().contains(EffectClass::OrderedAssertion)
                     || instruction
                         .regions()
                         .iter()
@@ -2872,25 +2996,31 @@ impl<
                             &mut known_lifecycles,
                             input,
                         )?;
-                        Ok(PartialValue::Known(context.tracer(atom, Some(r#type))))
+                        let known = context.tracer(atom, Some(r#type));
+
+                        // A known intermediate supplies runtime extents like a known program input does (e.g.,
+                        // a dimension that only its producer defines), so later rules can witness its identities.
+                        if !known.r#type().is_reference()
+                            && known.r#type().identities().next().is_some()
+                            && !context.dimension_sources.contains(&known)
+                        {
+                            context.dimension_sources.push(known.clone());
+                        }
+                        Ok(PartialValue::Known(known))
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let transposition_driver = RecursiveTranspositionDriver::new(*self, instruction_index)?;
 
-            // Retain concrete cotangents with runtime dimensions before the rule consumes them. Later reference rules
-            // may need these dimensions to construct zeros after value cotangent storage has been drained.
-            if context.reference_analysis.is_some() {
-                context.dimension_sources.extend(
-                    instruction_output_cotangents
-                        .iter()
-                        .filter_map(MaybeZero::as_value)
-                        .filter(|source| {
-                            !source.r#type().is_reference() && source.r#type().identities().next().is_some()
-                        })
-                        .cloned(),
-                );
-            }
+            // Retain runtime extents before the rule consumes these cotangents. Later rules may need them for cast
+            // witnesses or reference-state zeros after value cotangent storage has been drained.
+            context.dimension_sources.extend(
+                instruction_output_cotangents
+                    .iter()
+                    .filter_map(MaybeZero::as_value)
+                    .filter(|source| !source.r#type().is_reference() && source.r#type().identities().next().is_some())
+                    .cloned(),
+            );
 
             let input_accumulators = instruction
                 .inputs()
@@ -3133,6 +3263,7 @@ where
         > + From<AddOperation<T>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Transposes this linear [`Program`] with respect to every input while preserving its structured boundary.
     /// Refer to [`Program::transpose_with_respect_to`] for more information.
@@ -3205,11 +3336,12 @@ where
     /// Callers that want predictable pullback cost should partially evaluate and carry such values as residual inputs.
     /// Known producers with observable effects are rejected with [`ProgramError::UnsupportedOperation`] (callers must
     /// partially evaluate their values into residual inputs to avoid duplicating or reordering primal effects). Ordered
-    /// assertions are the exception because replay validates the same saved primal values. On the linear side,
-    /// reference-state effects transpose through cotangent accumulators, and ordered assertions remain primal
-    /// preconditions rather than running in reverse order. Other effects on instructions with linear outputs are
-    /// rejected before dead edge elimination. Known program inputs are always exposed as pullback inputs, while
-    /// literal constants are copied lazily under the same demand-driven policy.
+    /// assertions over known values are replayed in forward order even when their results are discarded. Assertions
+    /// depending on selected linear values stay live even without output adjoints; their operation's rule must preserve
+    /// the check or reject unavailable primal values. Checked casts require linearization first. On the linear side,
+    /// reference-state effects transpose through cotangent accumulators. Other effects on instructions with linear
+    /// outputs are rejected before dead-edge elimination. Known program inputs are always exposed as pullback inputs,
+    /// while literal constants are copied lazily under the same demand-driven policy.
     ///
     /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input per
     /// non-reference program output, walks this program in reverse instruction order applying each [`Operation`]'s
@@ -3257,12 +3389,12 @@ where
     /// A reference allocated inside the source is linear state (e.g., a tangent reference) only when a linear value
     /// flows into it, either as its initial value or through a later store. Otherwise, its complete lifecycle is known
     /// primal computation (e.g., the recomputation of a primal local reference inside a linear program). The pullback
-    /// replays the lifecycle instructions that its transpose rules need, once and in program order, so that every
-    /// replayed read observes the state it observed in the source, and it removes replayed lifecycles whose values no
-    /// rule ends up using. A linear instruction that accesses such a known reference is rejected, because its transpose
-    /// would observe the reference's state out of program order. A reference with a known nonzero initial value that
-    /// later receives a linear store is affine rather than linear state, so it is transposed as linear state only when
-    /// its initial value is zero.
+    /// replays the lifecycle instructions that its transpose rules and known assertions need, once and in program order
+    /// through each requested observation, so every read observes its original state without pulling later checks ahead
+    /// of earlier assertions. It removes replayed lifecycles whose values no rule ends up using. A linear instruction
+    /// that accesses such a known reference is rejected, because its transpose would observe the reference's state out
+    /// of program order. A reference with a known nonzero initial value that later receives a linear store is affine
+    /// rather than linear state, so it is transposed as linear state only when its initial value is zero.
     ///
     /// This raw program transformation sees types rather than runtime reference identities. When executing its result,
     /// callers must supply mutually independent cotangent references that do not alias primal references or captured
@@ -3468,7 +3600,8 @@ pub trait ReverseModeDifferentiate:
     }
 }
 
-impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseModeDifferentiate for C where
+impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseModeDifferentiate for C
+where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
@@ -3487,7 +3620,9 @@ impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseMo
                 <C::Operation as ReferenceAccessOperation>::Transform,
             >,
             Operation = C::Operation,
-        > + From<AddOperation<C::Type>>
+        > + From<AddOperation<C::Type>>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
 }
 
@@ -3516,6 +3651,8 @@ where
             ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
             Operation = C::Operation,
         > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     let destinations = gradient_destinations(context, &primals)?;
     let (output, pullback) = context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
@@ -3555,6 +3692,8 @@ where
             ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
             Operation = C::Operation,
         > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>): Parameterized<
             LinearizationTracer<C>,
             To<C::Value> = (C::Value, AuxiliaryOutput),
@@ -3629,6 +3768,9 @@ pub fn transpose_projected_operation<
 ) -> Result<(), DifferentiationError>
 where
     for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    TracingContext<<V as ValueProjection<T>>::Projected, P>:
+        StagingContext<Type = T, Constant = <V as ValueProjection<T>>::Projected, Operation = P>,
 {
     if !operation.region_slots().is_empty() {
         return Err(ProgramError::UnsupportedOperation {
@@ -3648,7 +3790,7 @@ where
     // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
     // The trace is detached from any region, so the member rule cannot reach reference accumulators, which is what this
     // helper's region-free, reference-free contract requires.
-    let mut rule_context = TranspositionContext::new(TracingContext::<<V as ValueProjection<T>>::Projected, P>::new());
+    let mut rule_context = TranspositionContext::<<V as ValueProjection<T>>::Projected, P>::new(TracingContext::new());
 
     // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only their
     // projected types. Known primals become leading member-program inputs and their composite atoms become the leading
@@ -3772,6 +3914,12 @@ where
     <O as OperationProjection<T>>::Projected:
         From<P> + TransposableOperation<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>,
     for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    TracingContext<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>: StagingContext<
+            Type = T,
+            Constant = <V as ValueProjection<T>>::Projected,
+            Operation = <O as OperationProjection<T>>::Projected,
+        >,
 {
     check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
     accumulators.iter().try_for_each(|accumulator| context.cotangent_storage(accumulator).map(|_| ()))?;
@@ -3984,8 +4132,8 @@ pub(crate) mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -3993,10 +4141,10 @@ pub(crate) mod tests {
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types};
     use crate::operations::{
-        AddOperation, ConditionOperation, Constant, MulOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-        ReferenceWriteOperation, Sin, ZeroOperation,
+        AddOperation, CastOperation, ConditionOperation, Constant, GuardOperation, MulOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
+        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -4177,6 +4325,14 @@ pub(crate) mod tests {
             _transforms: Vec<Self::Transform>,
         ) -> Result<Self, ProgramError> {
             Err(ProgramError::MalformedProgram("test linear operations have no reference inputs".to_owned()))
+        }
+    }
+
+    impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for TestLinearOperation {
+        type Operation = Self;
+
+        fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            Err(request.unsupported_family_error())
         }
     }
 
@@ -4559,7 +4715,7 @@ pub(crate) mod tests {
             accumulator.allocate_in(&context, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot materialize a zero of type f32[extent] because no value in scope supplies the \
-                    runtime geometry dimension<extent ∈ [2, 8)> that its residual 0 names",
+                    runtime extent dimension<extent ∈ [2, 8)> that its residual 0 names",
         ));
         assert!(!accumulator.is_allocated());
         assert!(context.builder().borrow().instructions().is_empty());
@@ -7149,6 +7305,151 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_program_transpose_with_respect_to_known_reference_assertions() {
+        // A discarded check still demands the known frozen value, even when no transpose rule needs it.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.into()])));
+        let exact = ArrayIrType::from(ArrayType::new_static(DataType::F32, [2]));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let linear = builder.add_input(exact.clone());
+        let known = builder.add_input(symbolic.clone());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(CastOperation::checked(exact, vec![symbolic]), Vec::new(), vec![frozen], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![linear],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        let expected = indoc! {"
+            lambda %0:f32[2], %1:f32[n] .
+            let %2:ref<f32[n]> = reference_new %1
+                %3:f32[n] = reference_freeze %2
+                %4:f32[2] = cast [type=f32[2], inputs=[f32[n]], checked=true] %3
+            in (%0)"};
+        assert_eq!(program.to_string(), expected);
+        assert_eq!(pullback.to_string(), expected);
+        let value = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
+        assert_eq!(pullback.interpret(vec![value.clone(), value.clone()]), Ok(vec![value.clone()]));
+        let wrong = ArrayIrValue::Array(Array::vector(vec![1f32; 3]).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![value, wrong]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f32[3]` to unrelated type `f32[2]`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_known_reference_assertion_order() {
+        // The later write consumes a checked value. Demanding the earlier read for the first assertion must not
+        // replay that write or its input check yet. Both reference observations also supply live linear coefficients.
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionVariable::new("n", bounds);
+        let m = DimensionVariable::new("m", bounds);
+        let first_type = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![n.into()])));
+        let second_type = ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![m.into()])));
+        let exact = ArrayIrType::from(ArrayType::new_static(DataType::F32, [2]));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let linear = builder.add_input(exact.clone());
+        let first_known = builder.add_input(first_type.clone());
+        let second_known = builder.add_input(second_type.clone());
+        let initial = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![1f32; 2]).unwrap()));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let first_product = reference_test_mul(&mut builder, linear, read);
+        builder
+            .add_instruction(
+                CastOperation::checked(first_type.clone(), vec![exact.clone(), first_type]),
+                Vec::new(),
+                vec![read, first_known],
+                None,
+            )
+            .unwrap();
+        let later = builder
+            .add_instruction(CastOperation::checked(exact, vec![second_type]), Vec::new(), vec![second_known], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, later], None)
+            .unwrap();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let second_product = reference_test_mul(&mut builder, linear, frozen);
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![first_product, second_product],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2], %2:f32[n], %3:f32[m] .
+                let %4:f32[2] = const [1.0, 1.0]
+                    %5:ref<f32[2]> = reference_new %4
+                    %6:f32[2] = reference_read %5
+                    %7:f32[n] = cast [type=f32[n], inputs=[f32[2], f32[n]], checked=true] %6 %2
+                    %8:f32[2] = cast [type=f32[2], inputs=[f32[m]], checked=true] %3
+                    () = reference_write %5 %8
+                    %9:f32[2] = reference_freeze %5
+                    %10:f32[2] = mul %9 %1
+                    %11:f32[2] = mul %6 %0
+                    %12:f32[2] = add %10 %11
+                in (%12)"},
+        );
+        let vector = |values| ArrayIrValue::Array(Array::vector::<f32>(values).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![
+                vector(vec![1.0, 2.0]),
+                vector(vec![4.0, 5.0]),
+                vector(vec![1.0; 2]),
+                vector(vec![3.0, 4.0])
+            ]),
+            Ok(vec![vector(vec![13.0, 22.0])]),
+        );
+        let first_error = ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_owned(),
+            expected: 3,
+            actual: 2,
+        }));
+        assert_eq!(
+            program.interpret(vec![vector(vec![1.0; 2]), vector(vec![1.0; 3]), vector(vec![1.0; 4])]),
+            Err(first_error.clone()),
+        );
+        assert_eq!(
+            pullback.interpret(vec![
+                vector(vec![1.0; 2]),
+                vector(vec![1.0; 2]),
+                vector(vec![1.0; 3]),
+                vector(vec![1.0; 4])
+            ]),
+            Err(first_error),
+        );
+        assert_eq!(
+            pullback.interpret(vec![
+                vector(vec![1.0; 2]),
+                vector(vec![1.0; 2]),
+                vector(vec![1.0; 2]),
+                vector(vec![1.0; 4])
+            ]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cast` cannot convert type `f32[4]` to unrelated type `f32[2]`",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_program_transpose_with_respect_to_mixed_known_and_tangent_references() {
         // A known local reference `a = new(r)` and a tangent reference `b = new(t)` interleave: `b` accumulates
         // `read(a) · t` before and after `a += r²`. `b` receives linear values and is transposed as tangent state
@@ -8470,6 +8771,8 @@ pub(crate) mod tests {
 
         impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>>>
             TransposableOperation<V, O> for ScopedMemberOperation
+        where
+            O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
         {
             fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
@@ -8497,6 +8800,14 @@ pub(crate) mod tests {
                 (*context).clone().invoke_with_provenance_scope(ProvenanceScope::new("second"), || {
                     accumulators[0].accumulate(context, outputs[0].clone())
                 })
+            }
+        }
+
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ScopedMemberOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -8528,6 +8839,17 @@ pub(crate) mod tests {
                     .collect::<Result<Vec<_>, _>>()?;
                 check_count!("region", region_interfaces, 0, TypeError);
                 Ok(self.0.infer_output_types(&input_types, &[])?.into_iter().map(ArrayIrType::from).collect())
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, GuardOperation<ArrayIrType>> for ScopedProgramOperation {
+            type Operation = Self;
+
+            fn provide(
+                request: GuardOperation<ArrayIrType>,
+                _input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -8657,6 +8979,8 @@ pub(crate) mod tests {
             V: Value<Type = ProjectedMemberType<2>>,
             O: Operation<Type = ProjectedMemberType<2>> + From<AddOperation<ProjectedMemberType<2>>>,
         > TransposableOperation<V, O> for InterleavedMemberOperation
+        where
+            O: OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
         {
             fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
@@ -8675,6 +8999,16 @@ pub(crate) mod tests {
                     }
                 }
                 Ok(())
+            }
+        }
+
+        impl OperationProvider<ProjectedMemberType<2>, GuardOperation<ProjectedMemberType<2>>> for InterleavedMemberOperation {
+            type Operation = Self;
+            fn provide(
+                request: GuardOperation<ProjectedMemberType<2>>,
+                _input_types: &[&ProjectedMemberType<2>],
+            ) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -8707,6 +9041,17 @@ pub(crate) mod tests {
                     return Ok(vec![input_types[0].clone()]);
                 }
                 Ok(vec![ProjectedProgramType::Third(ProjectedMemberType)])
+            }
+        }
+
+        impl OperationProvider<ProjectedProgramType, GuardOperation<ProjectedProgramType>> for InterleavedProgramOperation {
+            type Operation = Self;
+
+            fn provide(
+                request: GuardOperation<ProjectedProgramType>,
+                _input_types: &[&ProjectedProgramType],
+            ) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
