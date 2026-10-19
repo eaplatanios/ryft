@@ -263,7 +263,7 @@ pub trait Context:
     /// the body it stages is specialized to relationships that remain unproven until runtime. An eager context does
     /// only when an input type is not fully static: concrete values carry exact types, so a type that still names an
     /// identity marks a transform carrier riding over an eager parent (e.g., a bounded ragged batch or a mapped
-    /// dimension) whose per-item geometry lives outside the type and which a boundary refinement check alone cannot
+    /// dimension) whose per-item extents live outside the type and which a boundary refinement check alone cannot
     /// validate. Only the guard's transform rule reaches those per-item checks. Exact static types keep guard planning
     /// off the eager hot path.
     #[inline]

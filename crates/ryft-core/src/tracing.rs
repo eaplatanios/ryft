@@ -1107,8 +1107,8 @@ where
     ///
     /// Replay tracks the correspondence between source and replayed type-identity definitions, updating downstream
     /// operation payloads and nested region metadata consistently. Inference can therefore propagate concrete bounds
-    /// through first-class dimension arithmetic and into operations that receive their geometry as explicit inputs.
-    /// This does not replace arbitrary stored geometry with runtime values. Instead, each operation remains responsible
+    /// through first-class dimension arithmetic and into operations that receive their extents as explicit inputs.
+    /// This does not replace arbitrary stored shapes with runtime values. Instead, each operation remains responsible
     /// for validating its payload against the refined inputs, and unsupported refinements retain their diagnostics.
     pub fn specialize(self, input_types: &[T]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, self.input_count(), ProgramError);

@@ -301,7 +301,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     may occur only once per boundary because [`OperationProjection<U>`] names one canonical projected family.
 ///   - A **mixed** boundary means the instruction crosses member kinds: the payload keeps its native `Operation<Type =
 ///     U>` contract while its parent instruction also consumes inputs belonging to other members of `T` (e.g., the
-///     first-class dimensions that supply a dynamic result geometry) and may produce results in those members too. The
+///     first-class dimensions that supply a dynamic result shape) and may produce results in those members too. The
 ///     mixed machinery classifies each input and each result by the member universe it belongs to rather than by its
 ///     position, so the two input kinds may be arranged in any order. The payload supplies that boundary through
 ///     [`MemberOperation`] and, for interpretation, through
@@ -322,7 +322,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     structural projected member reaches that behavior through its member family's rules and its projected batching
 ///     policy, and its generated forward-mode and transposition arms stage a zero tangent and contribute no cotangents
 ///     respectively. A structural mixed member instead has its forward-mode rule generated as the payload's primal plus
-///     one zero tangent per declared parent output, staged over the same inputs so that the runtime geometry those
+///     one zero tangent per declared parent output, staged over the same inputs so that the runtime extents those
 ///     inputs carry stays available to both. Each output's tangent is constructed in the computational member universe
 ///     that output belongs to, discovered by projecting the declared output type across the family's computational
 ///     members (see [Member Universes](#member-universes)). An output outside all of them, such as a structural member

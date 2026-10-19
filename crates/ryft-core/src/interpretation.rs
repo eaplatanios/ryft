@@ -956,7 +956,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
 
         // A symbolic entry must be checked before strict structural renaming, and its prepared values must enter the
         // body. Reference handles retain their types; ordinary operands can adopt the checked representation. Exact
-        // eager values carry their concrete geometry, so the refinement check above already established their
+        // eager values carry their concrete extents, so the refinement check above already established their
         // relationships and no guard is constructed (refer to [`Context::needs_guards`]).
         if context.needs_guards(&input_types)
             && let Some((guard, members)) = GuardOperation::for_entry("region", &region.input_types(), &input_types)?
@@ -2305,9 +2305,9 @@ mod tests {
     }
     #[test]
     fn test_replay_type_identities_new() {
-        // Eager replay keeps the source identities: exact values carry their geometry in their types. Staged replay
-        // maps a dimension input's definition to the identity of the supplied value, so staged payloads refer to the
-        // value they received, and leaves identities the inputs keep unchanged.
+        // Eager replay keeps the source identities: exact values carry their extents in their types. Staged replay maps
+        // a dimension input's definition to the identity of the supplied value, so staged payloads refer to the value
+        // they received, and leaves identities the inputs keep unchanged.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let n2 = DimensionType::new("n2", n.bounds());
         let vector = |dimension: &DimensionType| -> ArrayIrType {

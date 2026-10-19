@@ -665,9 +665,9 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// that part uses its declared identity if an actual member carries it, otherwise the first compatible actual
     /// member. This keeps the body's representation within the declared identity's bounds; exact classes instead apply
     /// their exact fact. Classes without an exact extent can also select preferred identities. Consumers use this to
-    /// give related values compatible representations while respecting immutable reference geometry. A changed known
-    /// representation may require a residual checked value. The result is a representation justified by checking the
-    /// complete input signature, rather than a runtime check performed by this type-level function.
+    /// give related values compatible representations while respecting the immutable shapes of references. A changed
+    /// known representation may require a residual checked value. The result is a representation justified by checking
+    /// the complete input signature, rather than a runtime check performed by this type-level function.
     ///
     /// Refer to the [examples on `TypeRefinements`](TypeRefinements#examples) for more information.
     ///

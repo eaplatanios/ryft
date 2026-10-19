@@ -1735,7 +1735,7 @@ mod tests {
             Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
         );
 
-        // Array types describe geometry rather than contents, so no array output is the singleton of its type.
+        // Array types describe shapes rather than contents, so no array output is the singleton of its type.
         assert_eq!(
             builder.add_instruction_or_fold(
                 FoldOperation { output_types: vec![scalar], replacements: vec![OperationFoldOutput::Singleton] },

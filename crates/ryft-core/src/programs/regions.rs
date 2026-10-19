@@ -1422,8 +1422,8 @@ pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
     /// [`Some`] instantiates their nominal identities from the supplied input types. Importing is _structural_. It
     /// renames stored type metadata without re-inferring instruction outputs or replaying bodies. The staging context
-    /// specializes bodies when input bounds or geometry become more precise, and reconciles signatures that depend
-    /// on other attached regions before recording the operation.
+    /// specializes bodies when input bounds or shapes become more precise, and reconciles signatures that depend on
+    /// other attached regions before recording the operation.
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -2505,7 +2505,7 @@ pub(crate) fn reachable_region_mask<'r, V: Typed + Parameter + 'r, O: 'r>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::Display;
     use std::sync::Arc;
@@ -2518,7 +2518,6 @@ mod tests {
         Shape,
     };
     use crate::contexts::EagerContext;
-    use crate::interpretation::ReplayTypeIdentities;
     use crate::operations::{ReferenceNewOperation, ReferenceReadOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -2677,7 +2676,7 @@ mod tests {
 
     /// Nominal identity used by the structural closure prototype.
     #[derive(Clone, Debug, Parameter)]
-    struct StructuralIdentity {
+    pub(crate) struct StructuralIdentity {
         /// Diagnostic name.
         name: &'static str,
 
@@ -2687,7 +2686,7 @@ mod tests {
 
     impl StructuralIdentity {
         /// Creates a structural test identity.
-        fn new(name: &'static str) -> Self {
+        pub(crate) fn new(name: &'static str) -> Self {
             Self { name, token: Arc::new(()) }
         }
     }
@@ -2714,12 +2713,12 @@ mod tests {
 
     /// Test type that exposes definition and reference occurrences independently.
     #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-    struct StructuralType {
+    pub(crate) struct StructuralType {
         /// Identity definitions in positional order.
-        definitions: Vec<StructuralIdentity>,
+        pub(crate) definitions: Vec<StructuralIdentity>,
 
         /// Identity references in positional order.
-        references: Vec<StructuralIdentity>,
+        pub(crate) references: Vec<StructuralIdentity>,
     }
 
     impl StructuralType {
@@ -2729,12 +2728,12 @@ mod tests {
         }
 
         /// Creates a type that defines one identity.
-        fn definition(identity: StructuralIdentity) -> Self {
+        pub(crate) fn definition(identity: StructuralIdentity) -> Self {
             Self::new(vec![identity], Vec::new())
         }
 
         /// Creates a type that references one identity.
-        fn reference(identity: StructuralIdentity) -> Self {
+        pub(crate) fn reference(identity: StructuralIdentity) -> Self {
             Self::new(Vec::new(), vec![identity])
         }
     }
@@ -2811,7 +2810,7 @@ mod tests {
 
     /// Minimal operation used by manually assembled structural closure fixtures.
     #[derive(Clone)]
-    struct StructuralOperation;
+    pub(crate) struct StructuralOperation;
 
     impl Operation for StructuralOperation {
         type Type = StructuralType;
@@ -3064,42 +3063,6 @@ mod tests {
         let signature = constant_reference.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
         assert_eq!(signature.internal_identities(), &[constant_identity]);
-    }
-
-    #[test]
-    fn test_replay_type_identities_freshens_constant_definitions() {
-        // Unlike eager dimensions, this existing structural value retains an identity that its constant owns.
-        // A reference to that constant follows the same substitution, while a separate replay gets a fresh owner.
-        let identity = StructuralIdentity::new("constant");
-        let definition = StructuralType::definition(identity.clone());
-        let reference = StructuralType::reference(identity.clone());
-        let mut builder = ProgramBuilder::<StructuralType, StructuralOperation>::new();
-        let defined = builder.add_constant(definition.clone());
-        let referenced = builder.add_constant(reference.clone());
-        let program = builder
-            .build::<Vec<StructuralType>, Vec<StructuralType>>(
-                vec![defined, referenced],
-                Vec::new(),
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let region = program.entry_region_ref();
-        assert_eq!(region.type_identity_signature().internal_identities(), std::slice::from_ref(&identity));
-        let first = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
-        let second = ReplayTypeIdentities::new(region, &[], (), true).unwrap();
-        let first_definition = first.rename_constant(&definition).unwrap();
-        let second_definition = second.rename_constant(&definition).unwrap();
-        assert_ne!(first_definition.definitions, definition.definitions);
-        assert_ne!(second_definition.definitions, definition.definitions);
-        assert_ne!(first_definition.definitions, second_definition.definitions);
-        let first_reference = first.rename_constant(&reference).unwrap();
-        let second_reference = second.rename_constant(&reference).unwrap();
-        assert_eq!(first_reference.references, first_definition.definitions);
-        assert_eq!(second_reference.references, second_definition.definitions);
-
-        // Reusing a replay's constant does not allocate a second identity or mutate the original payload.
-        assert_eq!(first.rename_constant(&definition), Ok(first_definition.clone()));
-        assert_eq!(definition.definitions, vec![identity]);
     }
 
     #[test]
