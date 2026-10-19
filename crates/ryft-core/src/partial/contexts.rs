@@ -704,7 +704,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
         let input_atoms =
-            inputs.iter().map(|input| self.residual_atom(input)).collect::<Result<Vec<_>, ProgramError>>()?;
+            inputs.iter().map(|input| self.residual_atom_id(input)).collect::<Result<Vec<_>, ProgramError>>()?;
 
         // Propagate the materialized inputs' refinements through attached regions, just as replay into a trace does.
         // Release the builder borrow before specialization replays any body into its own fresh trace. Keep the original
@@ -1184,7 +1184,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 if input.is_known() && !retained[index] {
                     let r#type = input.r#type();
                     if r#type.identities().any(|(_, identity)| identities.contains(identity)) {
-                        self.residual_atom(input)?;
+                        self.residual_atom_id(input)?;
                         identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
                         retained[index] = true;
                         changed = true;
@@ -1277,7 +1277,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let indices = (0..known.len()).filter(|&index| known[index]).collect::<Vec<_>>();
         let known_declared = indices.iter().map(|&index| declared[index].clone()).collect::<Vec<_>>();
         let known_types = indices.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
-        if let Some((guard, members)) = GuardOperation::for_entry("partial_evaluation", &known_declared, &known_types)?
+        if let Some((guard, members)) = GuardOperation::for_entry("partial evaluation", &known_declared, &known_types)?
         {
             let member_types = members.iter().map(|&member| known_types[member].clone()).collect::<Vec<_>>();
             let pinned_identities = Self::pinned_identities(member_types.iter().map(|r#type| (false, r#type)));
@@ -1342,20 +1342,27 @@ impl<C: Context> PartialEvaluationContext<C> {
         Ok(inputs)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Plans the guard over the complete entry of `region`, which is declared as `declared`, for `inputs` whose known
-    /// members have already been narrowed (with [`None`] marking unallocated root unknowns) and their `input_types`, in
-    /// input order. Returns the positions of the guarded members, in increasing order, together with the guard
-    /// operation that this context's operation family provides for them, or [`None`] when no relationship needs a
-    /// check. Unallocated root unknowns outside the guard are narrowed in `input_types` only by the singleton bounds of
-    /// their own actual identities. Refer to [`Self::guard_region_inputs`] for the role of `separate_invocation`.
+    /// Determines the guard over the complete entry of `region` without applying it. This function stages, folds, and
+    /// allocates nothing, so that [`Self::prepare_entry_inputs`] can request every entry guard from the operation
+    /// family before it applies any of them, and a rejected guard leaves the context unchanged. Returns the positions
+    /// of the guarded members, in increasing order, together with the guard operation that this context's operation
+    /// family provides for them, or [`None`] when the input types leave no relationship of the entry unproven.
     ///
     /// The guard re-checks the known members of every class that an unknown input joins, even though the known-input
     /// guard of [`Self::prepare_entry_inputs`] has already established their relationships among themselves. Dropping
     /// such members is not safe in general: a known member can be the only one that ties a formal identity to the
     /// class (e.g., two known `f32[b]` entering `f32[n]` and `f32[m]`, next to unknowns entering both), and reference
     /// precedence can change the representation of every known member of the class, which only guard outputs carry.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Region whose entry is guarded.
+    ///   - `declared`: Declared input types of `region`.
+    ///   - `inputs`: Current entry values in input order, with known members already narrowed among themselves and
+    ///     [`None`] marking root unknowns that are not allocated yet.
+    ///   - `input_types`: Actual types of `inputs`, in input order. Unallocated root unknowns outside the guard are
+    ///     narrowed in place, by the singleton bounds of their own identities only.
+    ///   - `separate_invocation`: Refer to [`Self::guard_region_inputs`] for information on this argument.
     fn plan_entry_guard(
         region: RegionRef<'_, C::Constant, C::Operation>,
         declared: &[C::Type],
@@ -1363,7 +1370,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         input_types: &mut [C::Type],
         separate_invocation: bool,
     ) -> Result<(Vec<usize>, Option<C::Operation>), ProgramError> {
-        let mut members = GuardOperation::for_entry("partial_evaluation", declared, input_types)?
+        let mut members = GuardOperation::for_entry("partial evaluation", declared, input_types)?
             .map(|(_, members)| members)
             .unwrap_or_default();
         let pinned = Self::pinned_identities(
@@ -1372,6 +1379,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 .zip(input_types.iter())
                 .map(|(input, r#type)| (input.as_ref().is_some_and(PartialEvaluationValue::is_known), r#type)),
         );
+
         if inputs.iter().any(Option::is_none) {
             // Outside guarded members, only an actual identity's own singleton bounds can narrow an unknown.
             // Guarded representations always stay inside the body, so checked unknown headers remain unchanged.
@@ -1382,6 +1390,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 }
             }
         }
+
         if separate_invocation && !region.effects().classes().is_empty() {
             let identities_of = |known: bool| {
                 inputs
@@ -1405,27 +1414,28 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
             members.sort_unstable();
         }
+
         if members.is_empty() {
             return Ok((members, None));
         }
+
         let member_types = members.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
-        let guard =
-            GuardOperation::new("partial_evaluation", members.iter().map(|&index| declared[index].clone()).collect())
-                .retaining(&member_types, &pinned)?;
+        let declared_types = members.iter().map(|&index| declared[index].clone()).collect();
+        let guard = GuardOperation::new("partial evaluation", declared_types).retaining(&member_types, &pinned)?;
         let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
         Ok((members, Some(guard)))
     }
 
-    /// Returns the identities whose representations an entry guard keeps, in priority order: those of reference inputs,
-    /// known or unknown, because a reference cannot be cast, then those of the inputs that `inputs` marks as pinned.
-    /// The known-input guard pins nothing beyond references, so that exact facts narrow the known inputs among
-    /// themselves. The complete-entry guard pins the known inputs, because a guard that stays residual turns every
-    /// member whose type it changes into an unknown value, and pinning keeps such known inputs known.
+    /// Returns the identities whose representations an entry guard keeps, in priority order (i.e., those of reference
+    /// inputs, known or unknown, because a reference cannot be cast, followed by those of the inputs that `inputs`
+    /// marks as pinned). The known-input guard pins nothing beyond references, so that exact facts narrow the known
+    /// inputs among themselves. The complete-entry guard pins the known inputs, because a guard that stays residual
+    /// turns every member whose type it changes into an unknown value, and pinning keeps such known inputs known.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: Whether each input's identities are pinned, paired with its type, in input order.
-    fn pinned_identities<'o>(inputs: impl IntoIterator<Item = (bool, &'o C::Type)>) -> Vec<<C::Type as Type>::Identity>
+    fn pinned_identities<'o, I: IntoIterator<Item = (bool, &'o C::Type)>>(inputs: I) -> Vec<<C::Type as Type>::Identity>
     where
         C::Type: 'o,
     {
@@ -1445,17 +1455,17 @@ impl<C: Context> PartialEvaluationContext<C> {
         identities
     }
 
-    /// Returns the residual atom that carries `value`, materializing it on first use according to its
+    /// Returns the [`AtomId`] of the residual atom that carries `value`, materializing it on first use according to its
     /// [`PartialValueMaterialization`]: an unknown is already a residual variable, a known value becomes an inline
-    /// residual constant or a residual input (an [`Undecided`](PartialValueMaterialization::Undecided) value becomes an
-    /// input), and the assignment is recorded in the value's shared slot so that every clone reuses it. Known values
+    /// residual constant or a residual input (an [`Undecided`](PartialValueMaterialization::Undecided) value becomes
+    /// an input), and the assignment is recorded in the value's shared slot so that every clone reuses it. Known values
     /// that resolve to the same staged atom of the parent share one residual input.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when an unknown value carries a known materialization, or when a
-    /// value placed as a constant does not resolve to a constant in the parent context.
-    fn residual_atom(&self, value: &PartialEvaluationValue<C::Value>) -> Result<AtomId, ProgramError> {
+    /// Returns [`ProgramError::MalformedProgram`] when an unknown value carries a known materialization,
+    /// or when a value placed as a constant does not resolve to a constant in the parent context.
+    fn residual_atom_id(&self, value: &PartialEvaluationValue<C::Value>) -> Result<AtomId, ProgramError> {
         // A residual variable is already a residual atom, and an already-materialized known value's shared
         // slot carries the residual atom assigned on first materialization. Every other known value differs
         // only in whether it materializes as an inline constant.
@@ -1514,6 +1524,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
             false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
         });
+
         Ok(atom)
     }
 }
@@ -3048,7 +3059,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {r#"
                 lambda %0:f32[n], %1:f32[2] .
-                let %2:f32[2], %3:f32[2] = guard [boundary="partial_evaluation", types=[f32[n], f32[n]]] %1 %0
+                let %2:f32[2], %3:f32[2] = guard [boundary="partial evaluation", types=[f32[n], f32[n]]] %1 %0
                 in ()"#},
         );
         let eager = EagerContext::<TestValue, TestOperation>::new();
@@ -3102,7 +3113,7 @@ mod tests {
             indoc! {r#"
                 lambda %0:ref<f32[wide]>, %1:f32[exact, exact] .
                 let %2:f32[3, wide] = guard [
-                    boundary="partial_evaluation",
+                    boundary="partial evaluation",
                     types=[ref<f32[wide]>, f32[narrow, wide]],
                     retained=[wide],
                 ] %0 %1
@@ -3145,7 +3156,7 @@ mod tests {
                 )
                 .map(|_| ()),
             Err(ProgramError::UnsupportedOperation {
-                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                message: "the input types of `partial evaluation` leave identity relationships unproven, but the \
                           operation family cannot represent the guard required to preserve these input checks"
                     .to_string(),
             }),
@@ -3509,7 +3520,7 @@ mod tests {
                 )
                 .map(|_| ()),
             Err(ProgramError::UnsupportedOperation {
-                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                message: "the input types of `partial evaluation` leave identity relationships unproven, but the \
                           operation family cannot represent the guard required to preserve these input checks"
                     .to_string(),
             }),
@@ -3552,7 +3563,7 @@ mod tests {
             indoc! {r#"
                 lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)> .
                 let %2:dimension<a ∈ [1, 8)>, %3:dimension<a ∈ [1, 8)> = guard [
-                    boundary="partial_evaluation",
+                    boundary="partial evaluation",
                     types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                     retained=[a],
                 ] %0 %1
@@ -3592,7 +3603,7 @@ mod tests {
                     retained=[a],
                 ] %0 %1
                     %5:dimension<a ∈ [1, 8)>, %6:dimension<a ∈ [1, 8)> = guard [
-                        boundary="partial_evaluation",
+                        boundary="partial evaluation",
                         types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                         retained=[a],
                     ] %2 %1
@@ -3631,12 +3642,12 @@ mod tests {
             indoc! {r#"
                 lambda %0:dimension<a ∈ [1, 8)>, %1:dimension<b ∈ [1, 8)>, %2:dimension<c ∈ [1, 8)> .
                 let %3:dimension<b ∈ [1, 8)>, %4:dimension<b ∈ [1, 8)> = guard [
-                    boundary="partial_evaluation",
+                    boundary="partial evaluation",
                     types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                     retained=[b],
                 ] %1 %2
                     %5:dimension<b ∈ [1, 8)>, %6:dimension<b ∈ [1, 8)>, %7:dimension<b ∈ [1, 8)> = guard [
-                        boundary="partial_evaluation",
+                        boundary="partial evaluation",
                         types=[dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>, dimension<n ∈ [1, 8)>],
                         retained=[b],
                     ] %1 %4 %0
@@ -3711,7 +3722,7 @@ mod tests {
         assert_eq!(
             context.guard_region_inputs(program.entry_region_ref(), inputs, false).map(|_| ()),
             Err(ProgramError::UnsupportedOperation {
-                message: "the input types of `partial_evaluation` leave identity relationships unproven, but the \
+                message: "the input types of `partial evaluation` leave identity relationships unproven, but the \
                           operation family cannot represent the guard required to preserve these input checks"
                     .to_string(),
             }),
