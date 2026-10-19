@@ -86,11 +86,12 @@ use std::fmt::Debug;
 
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
+use crate::operations::GuardOperation;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver,
-    RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeRefinements, Typed, Value, ValueProjection,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, Instruction, Operation, OperationProvider, Program,
+    ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value, ValueProjection,
 };
 
 /// Provides instruction-scoped access to the attached [`Region`](crate::Region)s of one interpreted [`Operation`]
@@ -225,8 +226,13 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContext<V, O>>, D: RegionDriver<V, O>>
-    InterpretationDriver<EagerContext<V, O>> for EagerInterpretationDriver<'_, D>
+impl<
+    V: Value,
+    O: Operation<Type = V::Type>
+        + InterpretableOperation<EagerContext<V, O>>
+        + OperationProvider<V::Type, GuardOperation<V::Type>, Operation = O>,
+    D: RegionDriver<V, O>,
+> InterpretationDriver<EagerContext<V, O>> for EagerInterpretationDriver<'_, D>
 {
     #[inline]
     fn interpret_region(
@@ -338,7 +344,7 @@ impl<
     #[inline]
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<EagerContext<V, O>>,
+        O: InterpretableOperation<EagerContext<V, O>> + OperationProvider<T, GuardOperation<T>, Operation = O>,
         Input: Parameterized<V, To<V> = Input>,
         Output: Parameterized<V, To<V> = Output>,
     {
@@ -367,7 +373,6 @@ impl<
         input: Input::To<C::Value>,
     ) -> Result<Output::To<C::Value>, ProgramError>
     where
-        O: Clone,
         Input::Family: ParameterizedFamily<C::Value>,
         Output::Family: ParameterizedFamily<C::Value>,
     {
@@ -448,6 +453,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         context: &C,
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Eager and symbolic replay share one traversal. Eager values establish their relationships at the boundary,
+        // while symbolic replay binds the family's guard to preserve relationships that still need runtime checks.
         let mut interpretation = RegionInterpreter::new(context.clone(), self, inputs)?;
         while !interpretation.is_complete() {
             interpretation = interpretation.step()?;
@@ -479,6 +486,366 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     }
 }
 
+/// [`TypeIdentity`](crate::TypeIdentity) bookkeeping shared by context interpretation and partial-evaluation replay.
+/// Source input facts validate instruction-local reifications; the shared mapping follows replayed definitions and
+/// freshens staged constants. Callers choose staging explicitly, because partial evaluation emits residual values
+/// even with an eager known-side parent. Entry validation and guard emission remain the calling interpreter's
+/// responsibility.
+pub(crate) struct ReplayTypeIdentities<T: Type> {
+    /// Original source input facts, used to validate reified boundary dimensions before local substitutions.
+    input_refinements: T::Refinements,
+
+    /// Declared identities of the source region whose extents are fixed by its reference inputs: the identities in
+    /// the declared types of the reference inputs, plus every declared identity that the entry facts place in the
+    /// same class as one of them. For example, a region declaring inputs `ref<f32[n]>` and `dimension<k>` that is
+    /// entered with `ref<f32[a]>` and `dimension<a>` records `n` and `k`, since both are tied to the referent's
+    /// dimension `a`. A reference's referent type can never be retyped, so an instruction operand whose declared
+    /// type names one of these identities is checked against the reference's dimensions, not the other way
+    /// around (refer to [`Self::instruction_guard`]).
+    reference_declared_identities: Vec<T::Identity>,
+
+    /// Actual identities carried by the supplied reference inputs (i.e., the identities of their referent types; `a`
+    /// in the example above). The guards that [`Self::instruction_guard`] builds keep these identities on their
+    /// outputs, so a checked ordinary operand adopts the reference's name for a shared dimension instead of a static
+    /// extent or another identity. The reference's type is fixed, and later reads of it must still agree with that
+    /// operand (refer to [`GuardOperation::retaining`]).
+    reference_actual_identities: Vec<T::Identity>,
+
+    /// Source-to-replayed identity substitutions shared by constants, operations, attached regions, and outputs.
+    identity_renaming: RefCell<TypeIdentityRenaming<T::Identity>>,
+}
+
+impl<T: Type> ReplayTypeIdentities<T> {
+    /// Creates the bookkeeping for one replay of `region` whose inputs have already been validated against the declared
+    /// input types (`refinements` are the facts that validation established). The bookkeeping starts with an empty
+    /// identity renaming when the replay executes eagerly, because eager values carry exact types and the boundary
+    /// facts describe them completely. When the replay stages a program instead (i.e., when `staging` is `true`), the
+    /// renaming starts with two kinds of substitutions, so that the staged program names the identities of the values
+    /// it receives rather than the source region's own:
+    ///
+    ///   - A dimension input that defines an identity is mapped to the identity of the value supplied for it. For
+    ///     example, a pullback declared to return `f32[n, 4]` may receive its dimension residual as `dimension<n2>`,
+    ///     and the mapping `n -> n2` makes the staged output refer to that residual. Only inputs with a definition
+    ///     position take part; an array such as `f32[n]` cannot establish such a mapping.
+    ///   - Every identity that a constant of the region defines is mapped to a fresh identity that no input and no
+    ///     other identity of the region uses. Two replays of the same region into one destination (e.g., a primal
+    ///     and its pullback) would otherwise both define the source's literal dimension `2`, and each definition
+    ///     must be unique in the destination while staying shared by all uses within its own replay.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Source region being replayed.
+    ///   - `input_types`: Types of the values that enter the region, after any entry guard prepared them.
+    ///   - `refinements`: Facts established by validating `input_types` against the region's declared input types,
+    ///     kept to validate reified boundary dimensions at individual instructions.
+    ///   - `staging`: Whether the replay stages a program rather than executing eagerly. Partial evaluation passes
+    ///     `true` even with an eager known-side parent, because it stages residual values.
+    pub(crate) fn new<V: Value<Type = T>, O: Operation<Type = T>>(
+        region: RegionRef<'_, V, O>,
+        input_types: &[T],
+        refinements: T::Refinements,
+        staging: bool,
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, region.input_ids().len(), ProgramError);
+        let identity_renaming = RefCell::new({
+            // Eager kernels materialize concrete shapes and keep the original boundary refinement facts.
+            // Only staging substitutes validated formal definitions and freshens constant-owned identities.
+            let mut renaming = TypeIdentityRenaming::new();
+            if staging {
+                let signature = region.type_identity_signature();
+                let mut input_definitions = Vec::new();
+                for input in region.input_ids() {
+                    input_definitions.extend(
+                        region.atoms()[input.index()]
+                            .r#type()
+                            .identities()
+                            .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
+                            .map(|(_, identity)| identity.clone()),
+                    );
+                }
+
+                if !input_definitions.is_empty() {
+                    // Complete boundary refinement has already succeeded. Dimension-valued inputs can carry a more
+                    // precise nominal definition, which subsequent staged array payloads must reference consistently
+                    // with those inputs. For example, a pullback declared to return `Array[n, 4]` may receive its
+                    // dimension residual as `n2`. Mapping the validated dimension input `n -> n2` makes the output
+                    // payload refer to that residual. Array shape references alone cannot establish such a mapping;
+                    // only definition positions participate.
+                    let (declared, actual): (Vec<_>, Vec<_>) = region
+                        .input_types()
+                        .into_iter()
+                        .zip(input_types)
+                        .filter(|(declared, _)| {
+                            declared.identities().any(|(position, _)| position == TypeIdentityPosition::Definition)
+                        })
+                        .map(|(declared, actual)| (declared, actual.clone()))
+                        .unzip();
+                    for (source, target) in T::derive_identity_renaming(&declared, &actual)?.replacements() {
+                        if source != target && input_definitions.contains(source) {
+                            renaming.insert(source.clone(), target.clone())?;
+                        }
+                    }
+                }
+
+                if !signature.internal_identities().is_empty() {
+                    // Two retained programs can lift the same literal into one destination. Its local definition must
+                    // be fresh for each replay, while identities belonging to input bindings retain their established
+                    // type-identity renaming. For example, replaying a primal and its pullback must not define the same
+                    // source dimension constant `2` twice in the destination. Each replay gets its own definition,
+                    // shared consistently by all its local uses.
+                    let mut unavailable = None;
+                    for atom in region.atoms() {
+                        if let Some(constant) = atom.as_constant() {
+                            for (position, identity) in constant.r#type().identities() {
+                                if position == TypeIdentityPosition::Definition
+                                    && signature.internal_identities().contains(identity)
+                                    && !renaming.replacements().iter().any(|(source, _)| source == identity)
+                                {
+                                    let unavailable = unavailable.get_or_insert_with(|| {
+                                        let mut identities = signature.identities().to_vec();
+                                        for input_type in input_types {
+                                            identities
+                                                .extend(input_type.identities().map(|(_, identity)| identity.clone()));
+                                        }
+                                        identities
+                                    });
+                                    let target = renaming.insert_fresh(identity.clone(), unavailable)?;
+                                    unavailable.push(target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            renaming
+        });
+
+        let mut reference_declared_identities = region
+            .input_types()
+            .iter()
+            .filter(|r#type| r#type.is_reference())
+            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        for class in refinements.identity_classes() {
+            if class.declared().iter().any(|identity| reference_declared_identities.contains(identity)) {
+                reference_declared_identities.extend(class.declared().iter().cloned());
+            }
+        }
+
+        let reference_actual_identities = input_types
+            .iter()
+            .filter(|r#type| r#type.is_reference())
+            .flat_map(|r#type| r#type.identities().map(|(_, identity)| identity.clone()).collect::<Vec<_>>())
+            .collect();
+
+        Ok(Self {
+            input_refinements: refinements,
+            reference_declared_identities,
+            reference_actual_identities,
+            identity_renaming,
+        })
+    }
+
+    /// Returns the guard that `instruction`'s operands must pass through before the instruction is replayed, together
+    /// with the positions (in increasing order) of the operands it takes, or [`None`] when no guard is needed. The
+    /// guard takes every operand whose declared type shares a dimension identity with a reference input (refer to
+    /// [`Self::reference_declared_identities`]) and declares those operands' source types, retaining the identities
+    /// of the supplied references (refer to [`GuardOperation::retaining`]). No guard is needed when no operand is
+    /// related to a reference input, when the related operands already have exactly their declared types, or when
+    /// the guard would leave every non-reference operand's type unchanged. The caller binds the returned guard over
+    /// the operands at the returned positions and replaces each non-reference one of them with the corresponding
+    /// guard output before binding the instruction.
+    ///
+    /// The checked values, rather than captured handles, witness the relationship, so a preceding freeze or discharge
+    /// cannot invalidate the guard. Ordinary broadcasting outside those relationships remains the consuming operation's
+    /// responsibility. Entry exact facts are not applied here: each guard establishes only its own current operand
+    /// relationship.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Source region whose instruction is being replayed.
+    ///   - `instruction`: Source instruction about to be replayed.
+    ///   - `input_types`: Types of the replayed values supplied as the instruction's operands, in operand order.
+    pub(crate) fn instruction_guard<V: Value<Type = T>, O: Operation<Type = T>>(
+        &self,
+        region: RegionRef<'_, V, O>,
+        instruction: &Instruction<O>,
+        input_types: &[T],
+    ) -> Result<Option<(GuardOperation<T>, Vec<usize>)>, TypeError> {
+        if self.reference_declared_identities.is_empty() {
+            return Ok(None);
+        }
+
+        let members = instruction
+            .inputs()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                region.atoms()[id.index()]
+                    .r#type()
+                    .identities()
+                    .any(|(_, identity)| self.reference_declared_identities.contains(identity))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Ok(None);
+        }
+
+        let declared = members
+            .iter()
+            .map(|&index| region.atoms()[instruction.inputs()[index].index()].r#type().into_owned())
+            .collect::<Vec<_>>();
+        let actual = members.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+        if declared == actual {
+            return Ok(None);
+        }
+
+        let guard = GuardOperation::new(instruction.operation().name(), declared)
+            .retaining(&actual, &self.reference_actual_identities)?;
+        let outputs = guard.infer_output_types(&actual, &[])?;
+        let changed = actual
+            .iter()
+            .filter(|r#type| !r#type.is_reference())
+            .zip(outputs)
+            .any(|(actual, output)| *actual != output);
+        Ok(changed.then_some((guard, members)))
+    }
+
+    /// Returns `constant`, a constant of the source region, with the shared identity renaming applied, so that the
+    /// caller lifts a constant whose type names the replay's identities (e.g., the fresh identity of a literal
+    /// dimension) rather than the source region's.
+    #[inline]
+    pub(crate) fn rename_constant<V: Value<Type = T>>(&self, constant: &V) -> Result<V, TypeError> {
+        constant.rename_type_identities(&self.identity_renaming.borrow())
+    }
+
+    /// Returns the [`TypeIdentityRenaming`] to apply to `instruction`'s operation and attached regions when it is
+    /// replayed over operands of types `input_types`: the shared renaming, overridden for this instruction alone
+    /// wherever an operand reifies a boundary dimension under a new identity (e.g., `dimension_size` of an input
+    /// `f32[q]` replayed at `f32[2]` defines a fresh exact dimension). The override stays local because another
+    /// instruction may reify the same dimension under yet another identity; every reification is still validated
+    /// against the original boundary facts, so all of them must have the same extent.
+    pub(crate) fn instruction_renaming<V: Value<Type = T>, O: Operation<Type = T>>(
+        &self,
+        region: RegionRef<'_, V, O>,
+        instruction: &Instruction<O>,
+        input_types: &[T],
+    ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
+        let mut renaming = self.identity_renaming.borrow().clone();
+        let reified_inputs = instruction
+            .inputs()
+            .iter()
+            .zip(input_types)
+            .filter_map(|(id, actual)| {
+                let declared = region.atoms()[id.index()].r#type().into_owned();
+                let reified = declared.identities().any(|(position, identity)| {
+                    position == TypeIdentityPosition::Definition
+                        && !region.type_identity_signature().internal_identities().contains(identity)
+                });
+                reified.then(|| (declared, actual.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        if !reified_inputs.is_empty() {
+            // An input array can establish q without carrying its first-class dimension value. Replaying
+            // `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh exact dimension.
+            // Use that explicit input's identity for this constructor and its regions. Keep this local as a second
+            // `dimension_size` may reify the same `q` under another fresh identity, and so globally renaming `q` would
+            // incorrectly make those two instructions define one identity. Original boundary facts still require every
+            // reification of `q` to have the same extent.
+            self.input_refinements.validate_refinement(
+                reified_inputs.iter().map(|(declared, _)| declared),
+                reified_inputs.iter().map(|(_, actual)| actual),
+                region.type_identity_signature().identities(),
+            )?;
+            let local = T::derive_identity_renaming(
+                &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
+                &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
+            )?;
+            let mut combined = TypeIdentityRenaming::new();
+            for (source, target) in renaming.replacements() {
+                if !local.replacements().iter().any(|(local_source, _)| local_source == source) {
+                    combined.insert(source.clone(), target.clone())?;
+                }
+            }
+            for (source, target) in local.replacements() {
+                combined.insert(source.clone(), target.clone())?;
+            }
+            renaming = combined;
+        }
+
+        Ok(renaming)
+    }
+
+    /// Extends the shared identity renaming with the identities that `instruction` defines, mapping each one to the
+    /// identity its replayed output of type `output_types` carries, so that later instructions, attached regions, and
+    /// the output validation refer to the replayed definitions. Only identities defined inside the source region are
+    /// recorded; input identities were mapped at entry and output references introduce no replacements.
+    ///
+    /// `replayed_input_types` is supplied by partial-evaluation replay only. An output that is one of those inputs
+    /// forwarded unchanged (a proven fold) and whose declared type the forwarded type does not refine introduces no
+    /// new definition and is skipped: it must keep its own identity rather than be renamed to the source's result
+    /// descriptor, which may be narrower (e.g., an arithmetic result capped at the backend width).
+    pub(crate) fn record_outputs<V: Value<Type = T>, O: Operation<Type = T>>(
+        &self,
+        region: RegionRef<'_, V, O>,
+        instruction: &Instruction<O>,
+        output_types: &[T],
+        replayed_input_types: Option<&[T]>,
+    ) -> Result<(), ProgramError> {
+        check_count!("output", output_types, instruction.outputs().len(), ProgramError);
+
+        let internal_identities = region.type_identity_signature().internal_identities();
+        if internal_identities.is_empty() {
+            return Ok(());
+        }
+
+        let (declared, actual): (Vec<_>, Vec<_>) = instruction
+            .outputs()
+            .iter()
+            .map(|id| region.atoms()[id.index()].r#type().into_owned())
+            .zip(output_types)
+            .filter(|(declared, actual)| {
+                // A proven fold can forward an unbounded dimension while the source arithmetic result carries a
+                // finite backend-width cap. Its input identity already exists, so partial replay must not impose
+                // the old result descriptor on that forwarded value or rename metadata to an inadmissible alias.
+                !(replayed_input_types.is_some_and(|inputs| inputs.contains(actual))
+                    && declared.identities().any(|(position, identity)| {
+                        position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
+                    })
+                    && !declared.is_refined_by(actual))
+            })
+            .map(|(declared, actual)| (declared, actual.clone()))
+            .unzip();
+
+        let definitions = declared
+            .iter()
+            .flat_map(Type::identities)
+            .filter(|(position, identity)| {
+                *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
+            })
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        if definitions.is_empty() {
+            return Ok(());
+        }
+
+        let output_renaming = T::derive_identity_renaming(&declared, &actual)?;
+        let mut renaming = self.identity_renaming.borrow_mut();
+        for (source, target) in output_renaming.replacements() {
+            if source != target && definitions.contains(source) {
+                // An unchanged definition adds no type-identity replacement. A later read of that same source
+                // dimension may refine its bounds and establish the first nontrivial replacement.
+                renaming.insert(source.clone(), target.clone())?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Resumable context-driven interpreter with the same boundary refinements, provenance, identity renaming, and
 /// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps [`RegionInterpreterState`] to retain
 /// context-specific validation and binding between steps. Each step completes one outer instruction; an attached
@@ -497,32 +864,22 @@ pub(crate) struct RegionInterpreter<'r, C: Context> {
     /// interpreter so ordinary replay and scheduler-selected steps share the same traversal and value-transfer rules.
     state: RegionInterpreterState<'r, C::Constant, C::Operation, C::Value>,
 
-    /// Facts established by comparing the complete declared input signature with the supplied values, expressed
-    /// under the input identities selected for this replay. For example, an actual static extent can refine a
-    /// declared symbolic dimension. [`Self::finish`] uses these facts to validate the output signature after applying
-    /// [`Self::identity_renaming`]. When input identities change during construction, these facts are re-established
-    /// under the renamed signature; [`Self::input_refinements`] retains their original source interpretation.
+    /// Facts established at entry by validating the supplied input types against the declared input types, expressed
+    /// under the entry identity renaming (e.g., an actual static extent refining a declared symbolic dimension).
+    /// [`Self::finish`] validates the declared output types, renamed the same way, against the actual outputs with
+    /// these facts, so an extent learned from an input also constrains every output that refers to that dimension.
     refinements: <C::Type as Type>::Refinements,
 
-    /// Input refinement facts retained under the source signature's original identities. An instruction can receive
-    /// a concrete dimension value reified from an input array without that value having been a region input itself.
-    /// [`Self::step`] checks such inputs against these original facts before choosing an instruction-local identity
-    /// substitution. Separate reifications may have different identities, but must satisfy the same boundary facts;
-    /// these local substitutions do not replace the shared mappings in [`Self::identity_renaming`].
-    input_refinements: <C::Type as Type>::Refinements,
-
-    /// Shared mapping from source type identities to the identities used by replayed values. Construction records
-    /// applicable input substitutions and freshens constant-owned definitions when staging; [`Self::step`] extends
-    /// the mapping when an instruction produces a fresh region-owned definition. Later operation payloads, attached
-    /// regions, and final output checks use those substitutions consistently. Identity equality is nominal meaning that
-    /// equal dimension extents alone do not justify merging identities. Reified input-owned dimensions use temporary
-    /// instruction-local substitutions instead, validated through [`Self::input_refinements`].
-    identity_renaming: RefCell<TypeIdentityRenaming<<C::Type as Type>::Identity>>,
+    /// Identity bookkeeping of this [`RegionInterpreter`] which contains the original entry facts that validate reified
+    /// boundary dimensions, the identities tied to reference inputs whose operands [`Self::step`] guards, and the
+    /// shared renaming from source identities to the identities of replayed values, which constants, operations
+    /// attached regions, and the final output validation all apply.
+    type_identities: ReplayTypeIdentities<C::Type>,
 
     /// Replay-scoped import mappings and renamed-source caches shared by the [`ReplayRegionDriver`]s created in
     /// [`Self::step`]. Repeated attached roots and shared descendants retain their identity when imported into the
     /// same destination builder; mappings for different builders remain separate. These [`RegionId`](crate::RegionId)
-    /// mappings describe where regions were imported, while [`Self::identity_renaming`] describes substitutions inside
+    /// mappings describe where regions were imported, while [`Self::type_identities`] describes substitutions inside
     /// types and operation payloads. The mappings belong to this source-arena replay and must not be reused for another
     /// arena.
     region_mappings: RegionReplayMappings<C::Constant, C::Operation>,
@@ -547,7 +904,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     pub(crate) fn new(
         context: C,
         region: RegionRef<'r, C::Constant, C::Operation>,
-        inputs: Vec<C::Value>,
+        mut inputs: Vec<C::Value>,
     ) -> Result<Self, ProgramError> {
         // Both direct region calls and structured Program calls arrive here with flat values.
         // Check their count before validating types or binding instructions.
@@ -573,7 +930,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         {
             <C::Type as Type>::Refinements::default()
         } else {
-            <C::Type as Type>::Refinements::establish(
+            <C::Type as Type>::Refinements::new(
                 input_ids.iter().map(|id| region.atoms()[id.index()].r#type()),
                 inputs.iter().map(Typed::r#type),
             )
@@ -595,90 +952,60 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         // renaming applies to declared output types during validation; it does not equate unrelated dimensions
         // with equal names.
         let region_mappings = RegionReplayMappings::new();
-        let identity_renaming = RefCell::new({
-            // Eager kernels materialize concrete shapes and keep the original boundary refinement facts. Only staging
-            // substitutes validated formal definitions and freshens constant-owned identities.
-            let mut renaming = TypeIdentityRenaming::new();
-            if !context.is_eager() {
-                let signature = region.type_identity_signature();
-                let mut input_definitions = Vec::new();
-                for input in region.input_ids() {
-                    input_definitions.extend(
-                        region.atoms()[input.index()]
-                            .r#type()
-                            .identities()
-                            .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
-                            .map(|(_, identity)| identity.clone()),
-                    );
-                }
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
 
-                if !input_definitions.is_empty() {
-                    // Complete boundary refinement has already succeeded. Dimension-valued inputs can carry a more
-                    // precise nominal definition, which subsequent staged array payloads must reference consistently
-                    // with those inputs. For example, a pullback declared to return `Array[n, 4]` may receive its
-                    // dimension residual as `n2`. Mapping the validated dimension input `n -> n2` makes the output
-                    // payload refer to that residual. Array shape references alone cannot establish such a mapping;
-                    // only definition positions participate.
-                    let declared = region.input_types();
-                    let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    for (source, target) in C::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
-                        if source != target && input_definitions.contains(source) {
-                            renaming.insert(source.clone(), target.clone())?;
-                        }
-                    }
-                }
-
-                if !signature.internal_identities().is_empty() {
-                    // Two retained programs can lift the same literal into one destination. Its local definition must
-                    // be fresh for each replay, while identities belonging to input bindings retain their established
-                    // type-identity renaming. For example, replaying a primal and its pullback must not define the same
-                    // source dimension constant `2` twice in the destination. Each replay gets its own definition,
-                    // shared consistently by all its local uses.
-                    let mut unavailable = None;
-                    for atom in region.atoms() {
-                        if let Some(constant) = atom.as_constant() {
-                            for (position, identity) in constant.r#type().identities() {
-                                if position == TypeIdentityPosition::Definition
-                                    && signature.internal_identities().contains(identity)
-                                    && !renaming.replacements().iter().any(|(source, _)| source == identity)
-                                {
-                                    let unavailable = unavailable.get_or_insert_with(|| {
-                                        let mut identities = signature.identities().to_vec();
-                                        for input in &inputs {
-                                            identities.extend(
-                                                input.r#type().identities().map(|(_, identity)| identity.clone()),
-                                            );
-                                        }
-                                        identities
-                                    });
-                                    let target = renaming.insert_fresh(identity.clone(), unavailable)?;
-                                    unavailable.push(target);
-                                }
-                            }
-                        }
-                    }
+        // A symbolic entry must be checked before strict structural renaming, and its prepared values must enter the
+        // body. Reference handles retain their types; ordinary operands can adopt the checked representation. Exact
+        // eager values carry their concrete geometry, so the refinement check above already established their
+        // relationships and no guard is constructed (refer to [`Context::needs_guards`]).
+        if context.needs_guards(&input_types)
+            && let Some((guard, members)) = GuardOperation::for_entry("region", &region.input_types(), &input_types)?
+        {
+            let actual = members.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+            let guard = guard.retaining(&actual, &[])?;
+            let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+            let outputs = context.bind(
+                C::Operation::provide(guard, &members.iter().map(|&index| &input_types[index]).collect::<Vec<_>>())?,
+                Vec::new(),
+                &guarded,
+            )?;
+            check_count!(
+                "output",
+                outputs,
+                members.iter().filter(|&&index| !input_types[index].is_reference()).count(),
+                ProgramError,
+            );
+            let mut outputs = outputs.into_iter();
+            for index in members {
+                if !input_types[index].is_reference() {
+                    inputs[index] = outputs.next().unwrap();
                 }
             }
-            renaming
-        });
+        }
 
-        // A staged pullback can receive a dimension residual under a new identity. After validating the original
-        // input signature, express its refinement facts under that type-identity renaming too: an exact extent of 8
-        // must still constrain every output shape referring to the residual's replayed identity.
-        let input_refinements = refinements.clone();
-        let refinements = if identity_renaming.borrow().is_identity() {
+        let type_identities = ReplayTypeIdentities::new(
+            region,
+            &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+            refinements.clone(),
+            !context.is_eager(),
+        )?;
+
+        let refinements = if type_identities.identity_renaming.borrow().is_identity() {
             refinements
         } else {
-            let declared = input_ids
+            let declared = region
+                .input_types()
                 .iter()
-                .map(|id| region.atoms()[id.index()].r#type().rename_identities(&identity_renaming.borrow()))
+                .map(|r#type| r#type.rename_identities(&type_identities.identity_renaming.borrow()))
                 .collect::<Result<Vec<_>, _>>()?;
-            <C::Type as Type>::Refinements::establish(declared.iter(), inputs.iter().map(Typed::r#type))?
+            <C::Type as Type>::Refinements::new(declared.iter(), input_types.iter())?
         };
+
         let state = RegionInterpreterState::new(region, inputs, |_, constant| {
-            context.lift(constant.rename_type_identities(&identity_renaming.borrow())?)
+            context.lift(type_identities.rename_constant(constant)?)
         })?;
-        Ok(Self { context, state, refinements, input_refinements, identity_renaming, region_mappings })
+
+        Ok(Self { context, state, refinements, type_identities, region_mappings })
     }
 
     /// Returns the context used by this interpreter's constant lifting and instruction binding. Schedulers can
@@ -699,7 +1026,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// Dispatches the next outer instruction and returns the interpreter positioned after it. [`Self::state`]
     /// supplies the inputs; this interpreter validates reified boundary dimensions, applies the appropriate type
     /// identity substitutions, and binds through [`Self::context`] with the source instruction's provenance and a
-    /// [`ReplayRegionDriver`]. Fresh region-owned definitions extend [`Self::identity_renaming`] before later steps
+    /// [`ReplayRegionDriver`]. Fresh region-owned definitions extend [`Self::type_identities`] before later steps
     /// can use them, while [`Self::region_mappings`] preserves attached-region sharing across bindings.
     ///
     /// A step handles one complete outer binding, including any attached-region work performed by its operation
@@ -707,60 +1034,51 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// or validation cannot resume from inputs already transferred or repeat effects through the same state. This
     /// interpreter does not roll back effects already performed by the context.
     pub(crate) fn step(self) -> Result<Self, ProgramError> {
-        let Self { context, state, refinements, input_refinements, identity_renaming, region_mappings } = self;
+        let Self { context, state, refinements, type_identities, region_mappings } = self;
         let region = state.region;
         let state = state.step::<ProgramError, _>(|instruction, inputs| {
             // Constant lifting and instruction replay share this type-identity renaming. The operation and driver
             // own their renamed metadata, so release the read borrow before binding and recording fresh output
             // identities. Retaining its guard would make the later mutable borrow fail.
-            let (operation, driver) = {
-                let mut renaming = identity_renaming.borrow().clone();
-                let reified_inputs = instruction
-                    .inputs()
-                    .iter()
-                    .zip(inputs)
-                    .filter_map(|(id, actual)| {
-                        let declared = region.atoms()[id.index()].r#type().into_owned();
-                        let reified = declared.identities().any(|(position, identity)| {
-                            position == TypeIdentityPosition::Definition
-                                && !region.type_identity_signature().internal_identities().contains(&identity)
-                        });
-                        reified.then(|| (declared, actual.r#type().into_owned()))
-                    })
-                    .collect::<Vec<_>>();
-                if !reified_inputs.is_empty() {
-                    // An input array can establish q without carrying its first-class dimension value.
-                    // Replaying `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh
-                    // exact dimension. Use that explicit input's identity for this constructor and its regions.
-                    // Keep this local as a second `dimension_size` may reify the same `q` under another fresh
-                    // identity, and so globally renaming `q` would incorrectly make those two instructions define
-                    // one identity. Original boundary facts still require every reification of `q` to have the
-                    // same extent.
-                    input_refinements.validate(
-                        reified_inputs.iter().map(|(declared, _)| declared),
-                        reified_inputs.iter().map(|(_, actual)| actual),
-                        region.type_identity_signature().identities(),
-                    )?;
-                    let local = C::Type::derive_identity_renaming(
-                        &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
-                        &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
-                    )?;
-                    let mut combined = TypeIdentityRenaming::new();
-                    for (source, target) in renaming.replacements() {
-                        if !local.replacements().iter().any(|(local_source, _)| local_source == source) {
-                            combined.insert(source.clone(), target.clone())?;
-                        }
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let prepared = if context.needs_guards(&input_types)
+                && let Some((guard, members)) = type_identities.instruction_guard(region, instruction, &input_types)?
+            {
+                let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+                let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    context.bind(
+                        C::Operation::provide(
+                            guard,
+                            &members.iter().map(|&index| &input_types[index]).collect::<Vec<_>>(),
+                        )?,
+                        Vec::new(),
+                        &guarded,
+                    )
+                })?;
+                check_count!(
+                    "output",
+                    outputs,
+                    members.iter().filter(|&&index| !input_types[index].is_reference()).count(),
+                    ProgramError,
+                );
+                let mut prepared = inputs.to_vec();
+                let mut outputs = outputs.into_iter();
+                for index in members {
+                    if !input_types[index].is_reference() {
+                        prepared[index] = outputs.next().unwrap();
                     }
-                    for (source, target) in local.replacements() {
-                        combined.insert(source.clone(), target.clone())?;
-                    }
-                    renaming = combined;
                 }
-                let operation = instruction.operation().rename_type_identities(&renaming)?;
-                let driver = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
-                    .with_type_identity_renaming(&renaming)?;
-                (operation, driver)
+                Some(prepared)
+            } else {
+                None
             };
+
+            let inputs = prepared.as_deref().unwrap_or(inputs);
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let renaming = type_identities.instruction_renaming(region, instruction, &input_types)?;
+            let operation = instruction.operation().rename_type_identities(&renaming)?;
+            let driver = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
+                .with_type_identity_renaming(&renaming)?;
 
             // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
             // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
@@ -770,50 +1088,18 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 context.bind(operation, driver, inputs)
             })?;
 
-            // Record fresh internal definitions before the next instruction uses their identities. Only definition
-            // positions owned by this region may extend the shared type-identity renaming; output references cannot
-            // introduce replacements. Formal input renaming was handled at entry, and reified input-owned
-            // dimensions use the instruction-local renaming above.
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            let internal_identities = region.type_identity_signature().internal_identities();
-            if internal_identities.is_empty() {
-                return Ok(outputs);
-            }
-            let declared = instruction
-                .outputs()
-                .iter()
-                .map(|id| region.atoms()[id.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            let definitions = declared
-                .iter()
-                .flat_map(Type::identities)
-                .filter(|(position, identity)| {
-                    *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
-                })
-                .map(|(_, identity)| identity.clone())
-                .collect::<Vec<_>>();
-            if definitions.is_empty() {
-                return Ok(outputs);
-            }
-            let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-            let output_renaming = C::Type::derive_identity_renaming(&declared, &actual)?;
-            let mut renaming = identity_renaming.borrow_mut();
-            for (source, target) in output_renaming.replacements() {
-                if source != target && definitions.contains(source) {
-                    // An unchanged definition adds no type-identity replacement. A later read of that same source
-                    // dimension may refine its bounds and establish the first nontrivial replacement.
-                    renaming.insert(source.clone(), target.clone())?;
-                }
-            }
+            let output_types = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+            type_identities.record_outputs(region, instruction, &output_types, None)?;
             Ok(outputs)
         })?;
-        Ok(Self { context, state, refinements, input_refinements, identity_renaming, region_mappings })
+
+        Ok(Self { context, state, refinements, type_identities, region_mappings })
     }
 
     /// Consumes a completed interpreter and returns values in the source region's output order. [`Self::state`]
     /// gathers those values using its remaining-use counts; this function then checks the declared output contract
-    /// using [`Self::refinements`] and [`Self::identity_renaming`]. Type identities allowed by the source signature are
-    /// renamed consistently, so output validation accepts replayed definitions without admitting unrelated identities.
+    /// using [`Self::type_identities`]. Type identities allowed by the source signature are renamed consistently,
+    /// so output validation accepts replayed definitions without admitting unrelated identities.
     ///
     /// This does not dispatch remaining instructions: an incomplete state is rejected. Output refinement failures
     /// are reported with the same boundary diagnostics as input failures in [`Self::new`]. Both success and failure
@@ -823,10 +1109,9 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         // precise output type requires validation. That validation reuses facts established from the inputs and permits
         // a previously unbound output identity only when it belongs to this program's closed identity signature
         // (established by the formal inputs or defined by an instruction inside it).
-        let Self { context: _context, state, refinements, identity_renaming, .. } = self;
+        let Self { context: _context, state, refinements, type_identities, .. } = self;
         let region = state.region;
         let outputs = state.finish()?;
-        let identity_renaming = identity_renaming.into_inner();
         let output_ids = region.output_ids();
         if output_ids.len() != outputs.len()
             || output_ids
@@ -834,33 +1119,22 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 .zip(&outputs)
                 .any(|(id, actual)| region.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
         {
-            if identity_renaming.is_identity() {
-                refinements
-                    .validate(
-                        output_ids.iter().map(|id| region.atoms()[id.index()].r#type()),
-                        outputs.iter().map(Typed::r#type),
-                        region.type_identity_signature().identities(),
-                    )
-                    .map_err(|error| {
-                        Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output")
-                    })?;
-            } else {
-                let output_types = output_ids
-                    .iter()
-                    .map(|id| region.atoms()[id.index()].r#type().rename_identities(&identity_renaming))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let closed_identities = region
-                    .type_identity_signature()
-                    .identities()
-                    .iter()
-                    .map(|identity| identity_renaming.rename(identity))
-                    .collect::<Vec<_>>();
-                refinements
-                    .validate(output_types.iter(), outputs.iter().map(Typed::r#type), &closed_identities)
-                    .map_err(|error| {
-                        Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output")
-                    })?;
-            }
+            // The declared output types and the closed identity set are renamed the same way as the replayed values,
+            // so validation accepts replayed definitions without admitting unrelated identities.
+            let renaming = type_identities.identity_renaming.borrow();
+            let declared = output_ids
+                .iter()
+                .map(|id| region.atoms()[id.index()].r#type().rename_identities(&renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+            let closed_identities = region
+                .type_identity_signature()
+                .identities()
+                .iter()
+                .map(|identity| renaming.rename(identity))
+                .collect::<Vec<_>>();
+            refinements
+                .validate_refinement(declared.iter(), outputs.iter().map(Typed::r#type), &closed_identities)
+                .map_err(|error| Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output"))?;
         }
         Ok(outputs)
     }
@@ -1140,17 +1414,20 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        AddOperation, BroadcastOperation, DimensionAddOperation, DimensionSizeOperation, NegOperation, ZeroOperation,
+        AddOperation, BroadcastOperation, ConditionOperation, DimensionAddOperation, DimensionSizeOperation,
+        NegOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{
-        AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, RegionId, RegionInterface, RegionSlot,
-        TypeError,
+        AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceType, RegionId, RegionInterface,
+        RegionSlot, TypeError,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
     use crate::tracing::TracingContext;
@@ -1391,7 +1668,7 @@ mod tests {
     #[test]
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -1404,7 +1681,7 @@ mod tests {
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
@@ -1423,7 +1700,7 @@ mod tests {
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -1444,6 +1721,102 @@ mod tests {
                         bounds: DimensionBounds::non_negative(Some(3)).unwrap(),
                     }),
         ));
+    }
+
+    #[test]
+    fn test_program_interpret_with_rejecting_guard_provider() {
+        // Eager replay never requests guards, so a family whose provider rejects every guard request still replays a
+        // region-carrying operation over a symbolic extent, and the branch entries still check the runtime extents.
+        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.simplified_dimension()]));
+        let branches = [0, 1].map(|output_index| {
+            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+            let inputs = [builder.add_input(vector_type.clone()), builder.add_input(vector_type.clone())];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![inputs[output_index]], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        });
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let first = builder.add_input(vector_type.clone());
+        let second = builder.add_input(vector_type);
+        let branches = branches.into_iter().map(|branch| builder.import_program(branch)).collect();
+        let outputs = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, first, second], None)
+            .unwrap()
+            .to_vec();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder]).unwrap();
+        let first = Array::vector(vec![1f32, 2.0]).unwrap();
+        let second = Array::vector(vec![3f32, 4.0]).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::scalar(true).unwrap(), first.clone(), second.clone()]),
+            Ok(vec![first.clone()])
+        );
+        assert_eq!(
+            program.interpret(vec![Array::scalar(false).unwrap(), first.clone(), second]),
+            Ok(vec![Array::vector(vec![3f32, 4.0]).unwrap()])
+        );
+        assert_eq!(
+            program.interpret(vec![Array::scalar(true).unwrap(), first, Array::vector(vec![1f32, 2.0, 3.0]).unwrap()]),
+            Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                dimension: "extent".to_owned(),
+                expected: 2,
+                actual: 3,
+            }))),
+        );
+    }
+
+    #[test]
+    fn test_program_interpret_in_context_guards_unproven_entry_relationships() {
+        // Replaying `[f32[n], f32[n]]` at a lifted `f32[4]` and a symbolic `f32[n]` checks only types at trace time,
+        // which admit the mixed refinement. The replay stages an entry guard ahead of the body, so the traced program
+        // rejects a mismatching runtime extent exactly like direct interpretation.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first = builder.add_input(vector_type.clone());
+        builder.add_input(vector_type.clone());
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![first],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let four = ArrayIrValue::Array(Array::vector(vec![2f32; 4]).unwrap());
+        let three = ArrayIrValue::Array(Array::vector(vec![1f32; 3]).unwrap());
+        let mismatch = Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+            dimension: "n".to_string(),
+            expected: 4,
+            actual: 3,
+        })));
+        assert_eq!(program.interpret(vec![four.clone(), three.clone()]), mismatch);
+
+        let outer = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = vec![outer.lift(four.clone()).unwrap(), outer.input(vector_type)];
+        let outputs = program.interpret_in_context(&outer, inputs).unwrap();
+        let output_atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+        let traced = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                output_atoms,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            traced.to_string(),
+            indoc! {r#"
+                lambda %1:f32[n] .
+                let %0:f32[4] = const [2.0, 2.0, 2.0, 2.0]
+                    %2:f32[4], %3:f32[4] = guard [boundary="region", types=[f32[n], f32[n]]] %0 %1
+                in (%2)"#},
+        );
+        assert_eq!(traced.interpret(vec![four.clone()]), Ok(vec![four]));
+        assert_eq!(traced.interpret(vec![three]), mismatch);
     }
 
     #[test]
@@ -1472,6 +1845,13 @@ mod tests {
                     )));
                 };
                 Ok(vec![input_type.clone()])
+            }
+        }
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for WrongShapeOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
             }
         }
 
@@ -1567,6 +1947,268 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_type_identities_preserves_local_reifications() {
+        // Reifying the same boundary axis twice can produce different first-class definitions. Each constructor
+        // follows its own input definition without changing the shared mapping for the array's boundary identity.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(vector.clone().into());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let size = builder
+                .add_instruction(DimensionSizeOperation::new(&vector, 0).unwrap(), vec![], vec![input], None)
+                .unwrap()[0];
+            outputs.push(
+                builder.add_instruction(ZeroOperation::new(vector.clone()), vec![], vec![size], None).unwrap()[0],
+            );
+        }
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let input_types = region.input_types();
+        let refinements = ArrayIrTypeRefinements::new(&input_types, &input_types).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
+        let first = DimensionType::new("first", n.bounds());
+        let second = DimensionType::new("second", n.bounds());
+        for (index, actual) in [(0, &first), (2, &second)] {
+            replay
+                .record_outputs(region, &region.instructions()[index], &[actual.clone().into()], None)
+                .unwrap();
+            let local = replay
+                .instruction_renaming(region, &region.instructions()[index + 1], &[actual.clone().into()])
+                .unwrap();
+            assert_eq!(local.rename(n.variable().unwrap()), actual.variable().unwrap().clone());
+        }
+        assert!(replay.identity_renaming.borrow().is_identity());
+        let local = replay.instruction_renaming(region, &region.instructions()[1], &[first.clone().into()]).unwrap();
+        assert_eq!(local.rename(n.variable().unwrap()), first.variable().unwrap().clone());
+    }
+
+    #[test]
+    fn test_replay_type_identities_records_internal_definitions() {
+        // Each replay records the fresh result of dimension arithmetic, and every later shape references that result.
+        // Separate replay states must not share a substitution merely because they replay the same source region.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let addition = DimensionAddOperation::new(&n, &n).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(n.clone().into());
+        let result = builder.add_instruction(addition, vec![], vec![input, input], None).unwrap()[0];
+        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
+            panic!("expected a dimension result");
+        };
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![result_type.dimension().clone()]));
+        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![result], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![result, output],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        let actual_input = DimensionType::new("input", n.bounds());
+        let input_types = vec![actual_input.clone().into()];
+        let mut actual_results = Vec::new();
+        for _ in 0..2 {
+            let refinements = ArrayIrTypeRefinements::new(region.input_types(), &input_types).unwrap();
+            let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
+            let actual = DimensionType::new("result", result_type.bounds());
+            replay.record_outputs(region, &region.instructions()[0], &[actual.clone().into()], None).unwrap();
+            let mapping =
+                replay.instruction_renaming(region, &region.instructions()[1], &[actual.clone().into()]).unwrap();
+            assert_eq!(mapping.rename(n.variable().unwrap()), actual_input.variable().unwrap().clone());
+            assert_eq!(mapping.rename(result_type.variable().unwrap()), actual.variable().unwrap().clone());
+            let outputs = vec![
+                actual.clone().into(),
+                ArrayType::new(DataType::F32, Shape::new(vec![actual.dimension().clone()])).into(),
+            ];
+            let renamed_declared = region
+                .output_types()
+                .iter()
+                .map(|r#type| r#type.rename_identities(&replay.identity_renaming.borrow()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(renamed_declared, outputs);
+            actual_results.push(actual);
+        }
+        assert_ne!(actual_results[0].variable(), actual_results[1].variable());
+    }
+
+    #[test]
+    fn test_partial_replay_preserves_forwarded_definition_bounds() {
+        let value = DimensionType::new("value", DimensionBounds::unbounded());
+        let offset = DimensionType::new("offset", DimensionBounds::new(0, Some(2)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(value.clone().into());
+        let offset_input = builder.add_input(offset.clone().into());
+        let result = builder
+            .add_instruction(
+                DimensionAddOperation::new(&value, &offset).unwrap(),
+                vec![],
+                vec![input, offset_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![result],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let partial_inputs = [
+            PartialValue::Unknown(value.clone().into()),
+            PartialValue::Unknown(DimensionValue::constant(0).unwrap().r#type().into_owned().into()),
+        ];
+        let evaluation = program.partially_evaluate(&partial_inputs).unwrap();
+        assert_eq!(evaluation.program().output_types(), vec![value.clone().into()]);
+        assert!(evaluation.program().instructions().is_empty());
+
+        // Ordinary replay remains strict. Partial replay alone knows that folding validated the producer and
+        // forwarded an existing input definition, rather than introducing the source's capped output definition.
+        let region = program.entry_region_ref();
+        let input_types = partial_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let refinements = ArrayIrTypeRefinements::new(region.input_types(), &input_types).unwrap();
+        let replay = ReplayTypeIdentities::new(region, &input_types, refinements, true).unwrap();
+        assert!(replay.record_outputs(region, &region.instructions()[0], &[value.clone().into()], None).is_err());
+        replay
+            .record_outputs(region, &region.instructions()[0], &[value.clone().into()], Some(&input_types))
+            .unwrap();
+        assert!(replay.identity_renaming.borrow().is_identity());
+
+        // A subsequent shape payload still has to admit the forwarded value's bounds. This application was already
+        // rejected before shared identity bookkeeping, so forwarding must not silently widen its declared shape.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(value.clone().into());
+        let offset_input = builder.add_input(offset.clone().into());
+        let result = builder
+            .add_instruction(
+                DimensionAddOperation::new(&value, &offset).unwrap(),
+                vec![],
+                vec![input, offset_input],
+                None,
+            )
+            .unwrap()[0];
+        let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
+            panic!("expected a dimension result");
+        };
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![result_type.dimension().clone()]));
+        let output = builder.add_instruction(ZeroOperation::new(vector_type), vec![], vec![result], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.partially_evaluate(&partial_inputs).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(format!(
+                "`zero` input 0 has type {value} but the output shape requires {result_type}",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_partial_replay_preserves_exact_definitions_with_retained_references() {
+        // A singleton actual matrix joins two formal identities. The reference retains its wider identity, but that
+        // name cannot replace the narrower formal axis: preparation must keep a source-admissible representation.
+        let narrow = DimensionType::new("narrow", DimensionBounds::new(1, Some(4)).unwrap());
+        let wide = DimensionType::new("wide", DimensionBounds::new(1, Some(8)).unwrap());
+        let exact = DimensionType::new("exact", DimensionBounds::new(3, Some(4)).unwrap());
+        let vector =
+            |dimension: &DimensionType| ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        let reference_type: ArrayIrType = ReferenceType::new(vector(&wide)).into();
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![narrow.dimension().clone(), wide.dimension().clone()]));
+        let actual_matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![exact.dimension().clone(), exact.dimension().clone()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(reference_type.clone());
+        let dimension = builder.add_input(narrow.clone().into());
+        builder.add_input(matrix_type.into());
+        let output =
+            builder.add_instruction(ZeroOperation::new(vector(&narrow)), vec![], vec![dimension], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference =
+            |extent| ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; extent]).unwrap()));
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let matrix = ArrayIrValue::Array(Array::matrix(3, 3, vec![1f32; 9]).unwrap());
+        let expected = program.interpret(vec![reference(3), dimension.clone(), matrix.clone()]).unwrap();
+        let context =
+            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let inputs = vec![
+            context.unknown_input(reference_type, 0),
+            PartialEvaluationValue::known(dimension.clone()),
+            context.unknown_input(actual_matrix_type.into(), 2),
+        ];
+        let outputs = context.inline_program(&program, inputs).unwrap();
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(3), matrix.clone()]), Ok(expected));
+        let direct_error = program.interpret(vec![reference(4), dimension, matrix.clone()]);
+        assert!(direct_error.is_err());
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[reference(4), matrix]), direct_error);
+    }
+
+    #[test]
+    fn test_partial_replay_preserves_unfixed_bounds_with_retained_references() {
+        // One supplied dimension links two formal classes without fixing an extent. A reference keeps the wider
+        // identity, while the narrower constructor and vector must agree on a compatible name within their bounds.
+        let narrow = DimensionType::new("narrow", DimensionBounds::new(1, Some(4)).unwrap());
+        let wide = DimensionType::new("wide", DimensionBounds::new(1, Some(8)).unwrap());
+        let supplied = DimensionType::new("supplied", narrow.bounds());
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![narrow.dimension().clone()]));
+        let reference_type: ArrayIrType =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![wide.dimension().clone()]))).into();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        builder.add_input(reference_type.clone());
+        let dimension = builder.add_input(narrow.into());
+        builder.add_input(wide.into());
+        let input = builder.add_input(vector.clone().into());
+        let zero =
+            builder.add_instruction(ZeroOperation::new(vector.clone()), vec![], vec![dimension], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), vec![], vec![input, zero], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference =
+            |extent| ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1f32; extent]).unwrap()));
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let input = ArrayIrValue::Array(Array::vector(vec![2f32; 3]).unwrap());
+        let arguments = vec![reference(3), dimension.clone(), dimension.clone(), input.clone()];
+        let expected = program.interpret(arguments.clone()).unwrap();
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(reference_type),
+                PartialValue::Unknown(supplied.clone().into()),
+                PartialValue::Unknown(supplied.into()),
+                PartialValue::Unknown(vector.into()),
+            ])
+            .unwrap();
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &arguments), Ok(expected));
+        let invalid = vec![reference(4), dimension.clone(), dimension, input];
+        let direct_error = program.interpret(invalid.clone());
+        assert!(direct_error.is_err());
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &invalid), direct_error);
+    }
+
+    #[test]
     fn test_program_interpret_replayed_internal_identities() {
         // The two internal dimensions have equal printed names and bounds, but different definition sites. Replay
         // must retain that distinction while consistently renaming each subsequent constructor's shape payload.
@@ -1588,8 +2230,7 @@ mod tests {
             let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
                 panic!("expected a dimension result");
             };
-            let output_type =
-                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(result_type.variable().clone())]));
+            let output_type = ArrayType::new(DataType::F64, Shape::new(vec![result_type.dimension().clone()]));
             outputs.push(
                 builder
                     .add_instruction(
@@ -1617,22 +2258,15 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [3]).into(),
             ])
             .unwrap();
-        let output_types = specialized.output_types();
-        let variables = output_types
-            .iter()
-            .map(|r#type| {
-                let ArrayIrType::Array(r#type) = r#type else { panic!("expected array type") };
-                let [Dimension::Dynamic(variable)] = r#type.shape().dimensions() else {
-                    panic!("expected one retained dimension input");
-                };
-                assert_eq!(r#type.data_type(), DataType::F64);
-                variable.clone()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(variables[0].bounds(), DimensionBounds::new(3, Some(4)).unwrap());
-        assert_eq!(variables[1].bounds(), DimensionBounds::new(4, Some(5)).unwrap());
-        assert_ne!(variables[0], variables[1]);
-        assert_eq!(variables[0], variables[2]);
+        // Static inputs make every replayed dimension static, so each output takes the extent of its own definition.
+        assert_eq!(
+            specialized.output_types(),
+            vec![
+                ArrayType::new_static(DataType::F64, [3]).into(),
+                ArrayType::new_static(DataType::F64, [4]).into(),
+                ArrayType::new_static(DataType::F64, [3]).into(),
+            ],
+        );
         assert_eq!(
             specialized.interpret(vec![
                 ArrayIrValue::Array(
@@ -1656,8 +2290,8 @@ mod tests {
         );
         assert_eq!(program.to_string(), original);
 
-        // Replaying two retained graphs into the same destination must also give their literal dimension
-        // definitions separate identities. Each replay still shares its own literal across all uses.
+        // Replaying two retained graphs into the same destination copies each literal dimension once per replay. The
+        // literals are static, so they define no identities that the two replays would need to keep apart.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = vec![
             context.input(ArrayType::new_static(DataType::F64, [2]).into()),
@@ -1677,7 +2311,10 @@ mod tests {
             .unwrap();
         let constants = destination.atoms().iter().filter_map(Atom::as_constant).collect::<Vec<_>>();
         assert_eq!(constants.len(), 2);
-        assert_ne!(constants[0].r#type(), constants[1].r#type());
+        assert!(
+            constants.iter().all(|constant| constant.r#type().as_ref()
+                == &DimensionValue::constant(1).unwrap().r#type().into_owned().into())
+        );
 
         // A more precise dimension input carries its own nominal definition. Array outputs referring to that
         // dimension must respect its validated refinement, including during eager replay.
@@ -1755,7 +2392,7 @@ mod tests {
         let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
-        let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
@@ -1782,7 +2419,7 @@ mod tests {
         assert_eq!(program.to_string(), original_program);
 
         // A statically typed payload establishes no boundary facts, so ordinary replay is untouched.
-        let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let output = builder
             .add_instruction(
@@ -2058,5 +2695,63 @@ mod tests {
             interpret_projected_operation(&context, &operation, &EmptyRegionDriver, &inputs),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())]),
         );
+    }
+
+    #[test]
+    fn test_staged_replay_prepares_mixed_dimension_array_entries() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let n = DimensionType::new("n", bounds);
+        let m = DimensionType::new("m", bounds);
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let dimension = builder.add_input(n.clone().into());
+        builder.add_input(vector.clone().into());
+        let output = builder.add_instruction(ZeroOperation::new(vector), vec![], vec![dimension], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        for supplied in [n, m] {
+            let name = supplied.variable().unwrap().name().to_owned();
+            let context = TracingContext::<TestValue, TestOperation>::new();
+            let inputs =
+                vec![context.input(supplied.into()), context.input(ArrayType::new_static(DataType::F32, [2]).into())];
+            let outputs = source.entry_region_ref().interpret_in_context(&context, inputs).unwrap();
+            let atoms = outputs.iter().map(|output| output.atom_id().unwrap()).collect();
+            let replayed = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(atoms, vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                replayed.to_string(),
+                format!(
+                    indoc! {r#"
+                        lambda %0:dimension<{name} ∈ [1, 8)>, %1:f32[2] .
+                        let %2:dimension<2>, %3:f32[2] = guard [boundary="region", types=[dimension<n ∈ [1, 8)>, f32[n]]] %0 %1
+                            %4:f32[2] = zero [type=f32[n]] %2
+                        in (%4)"#},
+                    name = name,
+                ),
+            );
+            let dimension = |extent| TestValue::Dimension(DimensionValue::constant(extent).unwrap());
+            let vector = TestValue::Array(Array::vector(vec![1f32; 2]).unwrap());
+            let valid = source.interpret(vec![dimension(2), vector.clone()]);
+            assert_eq!(valid, Ok(vec![TestValue::Array(Array::vector(vec![0f32; 2]).unwrap())]));
+            assert_eq!(replayed.interpret(vec![dimension(2), vector.clone()]), valid);
+            let invalid = source.interpret(vec![dimension(3), vector.clone()]);
+            assert_eq!(
+                invalid,
+                Err(ProgramError::Type(TypeError::custom(DimensionError::InputDimensionMismatch {
+                    dimension: "n".to_owned(),
+                    expected: 3,
+                    actual: 2,
+                }))),
+            );
+            assert_eq!(replayed.interpret(vec![dimension(3), vector]), invalid);
+        }
     }
 }
