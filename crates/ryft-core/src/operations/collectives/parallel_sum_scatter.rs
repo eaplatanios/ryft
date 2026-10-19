@@ -12,7 +12,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
@@ -107,7 +107,7 @@ pub struct ParallelSumScatterOperation {
 
 impl ParallelSumScatterOperation {
     /// Creates a new [`ParallelSumScatterOperation`] over the axis with the provided name and resolved axis size.
-    /// Construction preserves the supplied axis and options, while type inference validates the geometry, groups, and
+    /// Construction preserves the supplied axis and options, while type inference validates the shapes, groups, and
     /// mesh state. Unlike the [`ParallelSumScatter`] functions, which accept negative axes, this constructor takes a
     /// non-negative axis position.
     ///
@@ -308,7 +308,7 @@ impl Operation for ParallelSumScatterOperation {
         let input_type = self.validate_input(input_types, region_interfaces)?;
 
         // Result-shape arithmetic in the homogeneous array family requires static extents.
-        // Dynamic geometry uses explicit result extents in the composite array/dimension family.
+        // Dynamic shapes use explicit result extents in the composite array/dimension family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_SUM_SCATTER_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -494,7 +494,7 @@ impl ShapeChangingCollectiveOperation for ParallelSumScatterOperation {
 
         let mut output_type = <&ArrayType>::try_from(&output_types.remove(0))?.clone();
 
-        // Check the actual result geometry: the placeholder zero above cannot establish explicit-sharding divisibility.
+        // Check the actual result shape: the placeholder zero above cannot establish explicit-sharding divisibility.
         let sharding =
             input_type.resized_sharding(output_type.shape().dimensions(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
         output_type = output_type.with_sharding(sharding)?;
@@ -631,6 +631,8 @@ impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllGatherOperation>,
 > TransposableOperation<V, O> for ParallelSumScatterOperation
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -695,7 +697,8 @@ impl<
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: Assert
                        + DimensionSize
@@ -737,6 +740,9 @@ impl<
                            + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         >,
 > MemberDifferentiableOperation<C> for ParallelSumScatterOperation
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     #[inline]
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -967,8 +973,8 @@ impl<
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let rank = input_type.rank();
 
-        // Untiled scatter consumes its selected axis. Only a dynamic extent needs to be observed and checked;
-        // operation type inference checks the static input geometry when the collective is bound below.
+        // Untiled scatter consumes its selected axis. Only a dynamic extent needs to be observed and checked; operation
+        // type inference checks the static input shape when the collective is bound below.
         if options.mode == CollectiveMode::Untiled
             && matches!(input_type.shape().dimensions()[scatter_axis], Dimension::Dynamic(_))
         {
@@ -1035,9 +1041,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, RaggedAxis,
-        ShardingDimension, StridedLayout,
+        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension,
+        StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1809,10 +1816,13 @@ mod tests {
         // A matching level rejects bounded ragged inputs in both families, and the composite family does so before it
         // reads the mapped extents.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged = ArrayBatch::new(Array::matrix(2, 4, vec![1.0; 8]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2i32, 4]).unwrap(), length.clone(), vec![0])])
-            .unwrap();
+        let ragged = ragged_array_batch(
+            Array::matrix(2, 4, vec![1.0; 8]).unwrap(),
+            Array::vector(vec![2i32, 4]).unwrap(),
+            &length,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             batch_collective(&tiled, "x", 2, ragged),
             Err(BatchingError::UnsupportedOperation {
@@ -1821,11 +1831,13 @@ mod tests {
             }),
         );
         let extents = ArrayIrValue::Array(Array::vector(vec![2i32, 4]).unwrap());
-        let input =
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), length.clone(), vec![0])])
-                .unwrap();
+        let input = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()),
+            extents.clone(),
+            &length,
+            1,
+        )
+        .unwrap();
         let output_extent =
             ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(length)).unwrap();
         let context = BatchingContext::new(

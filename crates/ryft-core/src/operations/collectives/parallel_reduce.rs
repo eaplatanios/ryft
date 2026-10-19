@@ -777,6 +777,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, MeshAxis, MeshAxisType,
@@ -822,9 +823,7 @@ mod tests {
     /// whose extents are one and two, so that the last two elements of the first item and the last element of the
     /// second item are padding.
     fn ragged_batch<T: ArrayElement>(values: Vec<T>, length: &DimensionVariable) -> ArrayBatch<Array> {
-        ArrayBatch::new(Array::matrix(2, 3, values).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
+        ragged_array_batch(Array::matrix(2, 3, values).unwrap(), Array::vector(vec![1i32, 2]).unwrap(), length, 1)
             .unwrap()
     }
 
@@ -1573,10 +1572,7 @@ mod tests {
         );
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(packed, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(packed, extents, &length, 1).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2).with_axis_name("i".to_string());
         let outputs =
             operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
@@ -1777,9 +1773,7 @@ mod tests {
             batch_extent,
         )
         .with_axis_name("i".to_string());
-        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length.clone(), vec![0])])
+        let input = ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &length, 1)
             .unwrap();
         let output = sum.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
@@ -1830,9 +1824,7 @@ mod tests {
             batch_extent,
         )
         .with_axis_name("i".to_string());
-        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length.clone(), vec![0])])
+        let input = ragged_array_batch(packed.into_projected().unwrap(), extents.into_projected().unwrap(), &length, 1)
             .unwrap();
         let output = max.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::replicated());

@@ -12,7 +12,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation, batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, ValueResolution};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
@@ -376,7 +376,10 @@ impl ParallelRaggedAllToAllOperation {
         &self,
         context: &mut TracingContext<V, O>,
         offsets: &Tracer<TracingContext<V, O>>,
-    ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError> {
+    ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+    where
+        TracingContext<V, O>: StagingContext<Type = ArrayType, Constant = V, Operation = O>,
+    {
         if self.is_physical() {
             // Physical batching has already materialized every participant, so no named-axis binder remains in
             // which a dense collective could run. Row `p` of the result instead concatenates, for every sender in the
@@ -1435,8 +1438,8 @@ impl_differentiable_operation! {
                                 let received = markers.not_equal(&marker_zero)?;
 
                                 // The receive mask varies with its offset metadata. Expanding it over payload
-                                // dimensions changes only geometry; retain those variation facts instead of
-                                // replacing them with an unsharded Boolean type.
+                                // dimensions changes only its shape; retain those variation facts instead of replacing
+                                // them with an unsharded Boolean type.
                                 let mut condition_type = received.r#type().into_owned();
                                 for (axis, dimension) in
                                     output_type.shape().dimensions().iter().enumerate().skip(leading_axis + 1)
@@ -1504,7 +1507,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ValueProjection<ArrayType, Projected =
     }
 }
 
-impl<C: Context<Type = ArrayIrType> + DomainProjection<ArrayType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
+impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy>
     for ParallelRaggedAllToAllOperation
 where
     ParallelRaggedAllToAllOperation:
@@ -1522,7 +1525,8 @@ where
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,

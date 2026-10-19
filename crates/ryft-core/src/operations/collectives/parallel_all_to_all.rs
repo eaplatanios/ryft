@@ -11,7 +11,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
@@ -106,8 +106,8 @@ pub struct ParallelAllToAllOperation {
 
 impl ParallelAllToAllOperation {
     /// Creates a new [`ParallelAllToAllOperation`] over the axis with the provided name and resolved axis size.
-    /// Construction preserves the supplied axes and options, while type inference validates the geometry, groups,
-    /// and mesh state. Unlike the [`ParallelAllToAll`] functions, which accept negative axes, this constructor takes
+    /// Construction preserves the supplied axes and options, while type inference validates the shapes, groups, and
+    /// mesh state. Unlike the [`ParallelAllToAll`] functions, which accept negative axes, this constructor takes
     /// non-negative axis positions.
     ///
     /// # Parameters
@@ -242,7 +242,7 @@ impl Operation for ParallelAllToAllOperation {
         let input_type = self.validate_input(input_types, region_interfaces)?;
 
         // Result shape arithmetic in the homogeneous array family requires static extents.
-        // Dynamic geometry uses explicit result extents in the composite array/dimension family.
+        // Dynamic shapes use explicit result extents in the composite array/dimension family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_ALL_TO_ALL_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -740,6 +740,8 @@ impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllToAllOperation>,
 > TransposableOperation<V, O> for ParallelAllToAllOperation
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -803,7 +805,8 @@ impl<
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: Assert
                        + DimensionSize
@@ -844,6 +847,9 @@ impl<
                            + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         >,
 > MemberDifferentiableOperation<C> for ParallelAllToAllOperation
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     #[inline]
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -966,7 +972,7 @@ pub trait ParallelAllToAll<T = <Self as Capability>::Universe>: Capability + Siz
     ///
     /// Returns a [`ProgramError::Axis`] wrapping [`AxisError::UnboundAxisName`] when no binder binds `axis_name` or
     /// [`AxisError::OutOfBounds`] when an axis is out of bounds, and a [`ProgramError`] for invalid groups or split
-    /// geometry, pending cross-device sums, or an overflowing concatenation extent. A batch level that binds the
+    /// dimensions, pending cross-device sums, or an overflowing concatenation extent. A batch level that binds the
     /// collective axis rejects participant groups and bounded ragged inputs.
     fn parallel_all_to_all_with_options<SplitAxis: Into<Axis>, ConcatenationAxis: Into<Axis>>(
         &self,
@@ -1122,8 +1128,8 @@ where
         let input_type = input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
 
-        // Untiled exchange replaces the split axis. Its static extent needs no instruction. A dynamic one still
-        // needs an equality assertion before it is discarded. Operation type inference checks static geometry.
+        // Untiled exchange replaces the split axis. Its static extent needs no instruction. A dynamic one still needs
+        // an equality assertion before it is discarded. Operation type inference checks static shapes.
         if options.mode == CollectiveMode::Untiled
             && matches!(input_type.shape().dimensions()[split_axis], Dimension::Dynamic(_))
         {
@@ -1252,9 +1258,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, DataType, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType,
-        RaggedAxis, ShardingDimension, StridedLayout,
+        ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1771,7 +1778,7 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [2, 4, 3]).into()]),
         );
 
-        // Untiled geometry retains unaffected dynamic dimensions.
+        // Untiled exchange retains unaffected dynamic dimensions.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         assert_eq!(
             ParallelAllToAllOperation::new("x".to_string(), 2, 1, 0, CollectiveOptions::default())
@@ -2149,15 +2156,13 @@ mod tests {
         // A matching level rejects bounded ragged inputs in both array families, because one extent per item does not
         // determine how each sender partitions its live prefix among the receivers.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(
-                1,
-                Array::vector(vec![2i32, 4]).unwrap(),
-                variable.clone(),
-                vec![0],
-            )])
-            .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 4, vec![1.0f32; 8]).unwrap(),
+            Array::vector(vec![2i32, 4]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             batch_collective(
                 &ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
@@ -2173,11 +2178,13 @@ mod tests {
         );
 
         let extents = ArrayIrValue::Array(Array::vector(vec![2i32, 4]).unwrap());
-        let input =
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-                .unwrap();
+        let input = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0f32; 8]).unwrap()),
+            extents.clone(),
+            &variable,
+            1,
+        )
+        .unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -3262,7 +3269,7 @@ mod tests {
 
     #[test]
     fn test_parallel_all_to_all_parallel_all_to_all_with_options() {
-        // The staged exchange records the ordered participant groups of `options`, and its geometry uses their common
+        // The staged exchange records the ordered participant groups of `options`, and its shape uses their common
         // group size.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);

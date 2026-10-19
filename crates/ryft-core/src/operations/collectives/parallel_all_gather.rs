@@ -12,7 +12,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
@@ -138,7 +138,7 @@ pub struct ParallelAllGatherOperation {
 
 impl ParallelAllGatherOperation {
     /// Creates a new [`ParallelAllGatherOperation`] over the axis with the provided name and resolved axis size.
-    /// Construction preserves the supplied options while type inference validates the geometry, groups, and mesh state.
+    /// Construction preserves the supplied options while type inference validates the shapes, groups, and mesh state.
     /// Unlike the [`ParallelAllGather`] functions, which accept negative axes, this constructor takes a non-negative
     /// axis position.
     ///
@@ -380,8 +380,8 @@ impl Operation for ParallelAllGatherOperation {
         let input_type = self.validate_input(input_types, region_interfaces)?;
         let effective_axis_size = self.effective_axis_size()?;
 
-        // Result-shape arithmetic in the homogeneous array family requires static extents. Dynamic geometry uses
-        // explicit result extents in the composite array/dimension family.
+        // Result-shape arithmetic in the homogeneous array family requires static extents. Dynamic shapes use explicit
+        // result extents in the composite array/dimension family.
         let Some(shape) = input_type.static_shape() else {
             return Err(TypeError::invalid(format!(
                 "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` does not support dynamically shaped inputs",
@@ -694,7 +694,7 @@ impl<
             });
         }
 
-        // The gather moves the packed per-item array, so its geometry comes from the packed type rather than from the
+        // The gather moves the packed per-item array, so its shape comes from the packed type rather than from the
         // logical type, which restores the dynamic dimension of every bounded ragged axis that the static-shape type
         // inference cannot consume.
         let input_type = input.value().r#type().unbatched(input.batch_axis())?;
@@ -737,6 +737,8 @@ impl<
         + From<ParallelVaryOperation>
         + From<ParallelSumScatterOperation>,
 > TransposableOperation<V, O> for ParallelAllGatherOperation
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -921,7 +923,8 @@ impl<
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: Assert
                        + DimensionSize
@@ -1151,6 +1154,9 @@ impl<
             > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         >,
 > MemberDifferentiableOperation<C> for ParallelAllGatherOperation
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1656,10 +1662,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::{ragged_array_batch, ragged_batch};
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension, StridedLayout,
     };
-    use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{
@@ -2246,7 +2253,7 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
             .with_memory(Memory::Host { pinned: true });
 
-        // Check the final extent, even when the input dimension is symbolic and cannot establish exact geometry.
+        // Check the final extent, even when the input dimension is symbolic and cannot establish an exact shape.
         assert_eq!(
             operation.infer_array_ir_output_types(&[
                 input.clone().into(),
@@ -2735,16 +2742,13 @@ mod tests {
         // Untiled gathering co-moves bounded ragged metadata with the gathered value. The per-item extents of a mapped
         // input follow its batch axis onto the inserted participant axis, which becomes their extent axis.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1i32, 3]).unwrap(),
-                    variable.clone(),
-                    vec![0],
-                )])
-                .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             batch_collective(
                 &ParallelAllGatherOperation::new(
@@ -2840,10 +2844,13 @@ mod tests {
             ParallelAllGatherOutputVariance::Varying,
         );
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])])
-            .unwrap();
+        let ragged = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &variable,
+            1,
+        )
+        .unwrap();
 
         // Tiled gathering fuses the participant and concatenation axes, which can make live chunks non-prefix-shaped,
         // so a level that binds the axis rejects bounded ragged inputs.
@@ -3116,12 +3123,12 @@ mod tests {
                     &context,
                     &EmptyRegionDriver,
                     &[
-                        ArrayIrBatch::new(
+                        ragged_batch(
                             ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
-                            BatchAxis::new(0),
+                            extents.clone(),
+                            &variable,
+                            1
                         )
-                        .unwrap()
-                        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
                         .unwrap(),
                         extent(2),
                         ArrayIrBatch::mapped_dimension(
@@ -3196,16 +3203,13 @@ mod tests {
         );
 
         // A mapped ragged input must supply its per-item extents through a mapped result extent.
-        let mapped_input =
-            ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into()), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    trace.input(ArrayType::new_static(DataType::I32, [2]).into()),
-                    variable,
-                    vec![0],
-                )])
-                .unwrap();
+        let mapped_input = ragged_batch(
+            trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into()),
+            trace.input(ArrayType::new_static(DataType::I32, [2]).into()),
+            &variable,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             operation.batch_in_parent(&context, &EmptyRegionDriver, &[mapped_input, two, length]).map(|_| ()),
             Err(BatchingError::InvalidBatchMetadata {
@@ -3220,11 +3224,13 @@ mod tests {
     fn test_parallel_all_gather_batching_array_ir_rejects_unsupported_inputs() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap());
-        let ragged =
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap()), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-                .unwrap();
+        let ragged = ragged_batch(
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap()),
+            extents.clone(),
+            &variable,
+            1,
+        )
+        .unwrap();
         let mapped_extent =
             ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(variable.clone())).unwrap();
         let extent =

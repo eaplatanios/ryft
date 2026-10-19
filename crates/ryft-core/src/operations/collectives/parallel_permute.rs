@@ -9,7 +9,7 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
@@ -406,6 +406,8 @@ impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelPermuteOperation>,
 > TransposableOperation<V, O> for ParallelPermuteOperation
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -679,6 +681,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionValue,
         DimensionVariable, DynamicArrayExtentBatchingPolicy, Layout, Memory, MeshAxis, Shape, Sharding, StridedLayout,
@@ -1216,38 +1219,36 @@ mod tests {
         assert_eq!(
             send.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0,
             vec![
-                ArrayBatch::new(Array::matrix(2, 3, vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                    .unwrap()
-                    .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![0i32, 1]).unwrap(), length, vec![0])])
-                    .unwrap(),
+                ragged_array_batch(
+                    Array::matrix(2, 3, vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(),
+                    Array::vector(vec![0i32, 1]).unwrap(),
+                    &length,
+                    1
+                )
+                .unwrap(),
             ],
         );
 
         // A zero extent is not representable for a dimension whose lower bound is positive, which only a partial
         // permutation can require, and a level that binds another axis cannot route the extents of its own items.
         let positive_length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let input =
-            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1i32, 3]).unwrap(),
-                    positive_length.clone(),
-                    vec![0],
-                )])
-                .unwrap();
+        let input = ragged_array_batch(
+            Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![1i32, 3]).unwrap(),
+            &positive_length,
+            1,
+        )
+        .unwrap();
         assert_eq!(
             batch_collective(&swap, "x", 2, input.clone()),
             Ok(vec![
-                ArrayBatch::new(Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                    .unwrap()
-                    .with_ragged_axes(vec![RaggedAxis::new(
-                        1,
-                        Array::vector(vec![3i32, 1]).unwrap(),
-                        positive_length,
-                        vec![0],
-                    )])
-                    .unwrap()
+                ragged_array_batch(
+                    Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0]).unwrap(),
+                    Array::vector(vec![3i32, 1]).unwrap(),
+                    &positive_length,
+                    1
+                )
+                .unwrap()
             ]),
         );
         assert_eq!(
@@ -1278,15 +1279,13 @@ mod tests {
         let extent_sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["devices"])]).unwrap();
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let ragged = |values: Vec<f64>, extents: Vec<i32>| {
-            ArrayBatch::new(Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(extents).unwrap().reshard(&extent_sharding).unwrap(),
-                    length.clone(),
-                    vec![0],
-                )])
-                .unwrap()
+            ragged_array_batch(
+                Array::matrix(2, 3, values).unwrap().reshard(&sharding).unwrap(),
+                Array::vector(extents).unwrap().reshard(&extent_sharding).unwrap(),
+                &length,
+                1,
+            )
+            .unwrap()
         };
         let input = ragged(vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0], vec![1, 3]);
         let swap = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]);

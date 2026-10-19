@@ -151,7 +151,7 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
-use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
     DifferentiationPolicy, DifferentiationTracer, TranspositionContext,
@@ -391,9 +391,9 @@ impl<C: Context, P: DifferentiationPolicy<C>> ShapeChangingCollectiveValue for D
 ///
 /// The hooks named after a public accessor of the operation (e.g., [`axis_name`](Self::axis_name)) return the same
 /// values. They are repeated here because this trait is private, while the accessors are part of the public API.
-trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
+trait LinearCollectiveOperation: Operation<Type = ArrayType> {
     /// Collective operation type that transposition stages on the output cotangent.
-    type Adjoint: Clone + Operation<Type = ArrayType>;
+    type Adjoint: Operation<Type = ArrayType>;
 
     /// Returns the name of the axis that this collective exchanges values over.
     fn axis_name(&self) -> &str;
@@ -534,7 +534,10 @@ trait LinearCollectiveOperation: Clone + Operation<Type = ArrayType> {
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
+    ) -> Result<(), DifferentiationError>
+    where
+        TracingContext<V, O>: StagingContext<Type = ArrayType, Constant = V, Operation = O>,
+    {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -614,7 +617,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
 
         // Resolve symbolic input dimensions from the actual array, then reuse homogeneous type inference to validate
-        // the collective's geometry and compute the concrete result shape while retaining the input metadata.
+        // the collective and compute the concrete result shape while retaining the input metadata.
         let concrete_input_type = input.r#type().as_ref().clone().with_shape(Shape::new(
             (0..input.r#type().rank())
                 .map(|axis| input.dimension_size(axis).map(Dimension::Static))
@@ -679,7 +682,11 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         &self,
         context: &DifferentiationContext<C, P>,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
+    {
         let Some((array, _)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -763,13 +770,14 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
     /// Implements [`batch_in_parent`](crate::MemberBatchableOperation::batch_in_parent) for this collective in the
     /// composite array/dimension family, whose explicit result extents remain the only source of dynamic reshape
-    /// geometry. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
+    /// extents. Bounded ragged inputs are rejected, and the result extents, which describe the shape shared by every
     /// batch item, must be replicated. A `batch` level that does not bind the collective's axis forwards it to its
     /// parent, while a level that binds the axis consumes it through
     /// [`batch_matching_axis`](ShapeChangingCollectiveBatching::batch_matching_axis)
     /// over the array projection of its parent.
     fn shape_changing_collective_batch_in_parent<
-        C: Context<
+        C: ContextProjection<
+                ArrayType,
                 Type = ArrayIrType,
                 Value: Assert
                            + DimensionSize
@@ -824,7 +832,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         self.reject_mesh_form()?;
 
         // Project the composite values onto their array and dimension domains, so that the homogeneous kernel
-        // can use the explicit dimension values directly for dynamic reshape geometry.
+        // can use the explicit dimension values directly for dynamic reshape extents.
         let array = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
@@ -850,7 +858,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
 /// Context-specific batching capability of a [`ShapeChangingCollectiveOperation`] for `batch` levels whose parent is
 /// `C`. Its function consumes a level that binds the collective's named axis; the shared batching rules use it after
-/// validating the inputs and determining the output geometry.
+/// validating the inputs and determining the output shape.
 ///
 /// The context parameter belongs to this trait so that each collective's implementation can require exactly the value
 /// capabilities it uses: all-gather and all-to-all require [`Transpose`], while sum-scatter also requires [`Reduce`].
@@ -877,7 +885,7 @@ trait ShapeChangingCollectiveBatching<C: Context<Type = ArrayType>>: ShapeChangi
 }
 
 /// Representation boundary used only by shape-changing collective batching rules. The collective kernels determine the
-/// exchange geometry. This trait exposes the extent representation, exact division, and the alignment and reshape
+/// exchange shapes. This trait exposes the extent representation, exact division, and the alignment and reshape
 /// encodings that differ between homogeneous arrays and composite array/dimension programs.
 trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayExtentBatchingPolicy<C> {
     /// Extent representation consumed by the shared collective kernels.
@@ -993,7 +1001,8 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>> Colle
 }
 
 impl<
-    C: Context<
+    C: ContextProjection<
+            ArrayType,
             Type = ArrayIrType,
             Value: Assert
                        + DimensionSize
@@ -1465,12 +1474,12 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
     /// Returns this `batch` level re-expressed over the array projection of its parent with the dynamic extent batching
     /// policy, keeping its axis name, extent, and sharding, so that the matching-axis kernels of the shape-changing
     /// collectives, which operate on homogeneous arrays, can consume this level's mapped axis while reading their
-    /// reshape geometry from the explicit dimension values of composite programs.
+    /// reshape extents from the explicit dimension values of composite programs.
     fn array_projection(
         &self,
     ) -> BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
     where
-        C: DomainProjection<ArrayType>,
+        C: ContextProjection<ArrayType>,
     {
         BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(self.parent().clone()),

@@ -646,9 +646,10 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::testing::ragged_array_batch;
     use crate::arrays::{
         ArrayIrValue, Dimension, DimensionBounds, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy,
-        MeshAxis, RaggedAxis, Shape,
+        MeshAxis, Shape,
     };
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -907,10 +908,7 @@ mod tests {
         let packed = trace.input(packed_type);
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(packed, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
-            .unwrap();
+        let input = ragged_array_batch(packed, extents, &length, 1).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
         let outputs = ParallelVaryOperation::new("m".to_string())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
