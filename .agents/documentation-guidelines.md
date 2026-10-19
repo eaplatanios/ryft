@@ -64,3 +64,6 @@ code comments. Preserve the documented contract, technical rationale, and links 
   readability-driven sentence breaks.
 - In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
   from free functions in prose.
+- For arrays and types, use "shape" for an array's shape, "extent" for the size of a dimension (static or runtime), and
+  "dimension" for the dimension itself. Do not introduce "geometry" or other new umbrella nouns for these concepts.
+  GPU backend crates keep "geometry" only in its standard CUDA meaning (e.g., launch/grid or descriptor geometry).

@@ -25,10 +25,10 @@ mechanically testing every combination.
 
 For region-carrying operations, include known, symbolic, and unknown inputs; eager and staged execution; selected and
 unselected regions; observable effects and deferred work; zero outputs and structural zeros; static, dynamic, and
-bounded ragged geometry; references and identity-bearing values; placement and manual variation; and nested transform
+bounded ragged extents; references and identity-bearing values; placement and manual variation; and nested transform
 composition where supported.
 
-Trace information across every transform boundary: values and types, region signatures, runtime geometry, reference
+Trace information across every transform boundary: values and types, region signatures, runtime extents, reference
 identities, effects, derivative activity, and validation evidence. Verify both their producers and consumers; a locally
 correct rule can still lose information at a boundary. Check direct context binding as well as validated program replay:
 rewriting an operation must not bypass its original primitive contract. Matching primal signatures do not guarantee
@@ -37,10 +37,10 @@ Inspect supported and rejected cases, including empty, singleton, and disconnect
 Evaluate documented limitations and optimizations against their semantic consequences and the requested JAX parity;
 their presence in comments is not justification for accepting them.
 
-When a change expands batch geometry, inventory every consumer of its metadata before fixing individual failures:
+When a change extends how batches carry extents, inventory every metadata consumer before fixing individual failures:
 
 - Exercise repeated occurrences of one dimension identity within one carrier, with different extent coordinates,
-  capacities, and metadata order. Verify both output geometry and every relationship check; an identity-level provider
+  capacities, and metadata order. Verify both output extents and every relationship check; an identity-level provider
   cannot substitute for a particular physical occurrence. When extent coordinates are themselves ragged, vary only
   inactive coordinate entries and verify that relationship checks still depend solely on live coordinates. Cover both
   static refinements and equality checks, plus a genuine live mismatch and an empty live domain.
@@ -49,14 +49,35 @@ When a change expands batch geometry, inventory every consumer of its metadata b
   execution with execution through the region boundary using observable live values and failing checks.
 - Inspect every axis-remapping consumer for removed extent coordinates, and distinguish consuming a ragged axis from
   preserving it after removing one of its coordinates. Compare sequential reductions with a joint reduction where
-  supported, and require an explicit error where surviving geometry cannot be represented.
+  supported, and require an explicit error where surviving extents cannot be represented. When aggregating extents, mask
+  the extent arrays' own live coordinate domains and cover empty participant domains; a numeric reduction identity need
+  not be a valid dimension extent.
 - Test equivalent extent-array layouts with permuted coordinate storage. Distinguish coordinate identity from vector
-  order, while retaining explicit layout requirements at boundaries that actually impose them.
+  order, while retaining explicit layout requirements at boundaries that actually impose them. Also compare full and
+  singleton-broadcast extent storage over the same coordinate domain, including nested ragged coordinates and empty
+  domains. Include literal and symbolically proved singleton axes on either side of equality checks and in
+  outer-coordinate masks, not only scalar refinements. Audit the shared masking path used by reductions and contractions
+  as well as relationship checks. Storage shape is not the semantic coordinate domain: checks must range over live
+  coordinates, and metadata transport must preserve valid compact storage without using a cast as a broadcast. Follow
+  transported metadata into dimension reads, participant routing, and extent aggregation too. Before a consumer treats
+  metadata as rectangular coordinate data, materialize every coordinate it indexes, including omitted participant
+  coordinates and empty domains; normalize proved symbolic singleton storage at that materialization boundary. Cover
+  both mapped and replicated carriers, and routing that inserts a participant axis as well as routing one already
+  recorded in the metadata. Execute symbolic-to-static normalization through the backend followed by singleton
+  expansion: a static result annotation alone may leave dynamic storage flags that invalidate that expansion.
 - Exercise replicated ragged carriers produced by ordinary operations, including collectives, through shared elementwise
-  rules and broadcasting. A replicated shortcut must preserve the same geometry as its mapped path. Check homogeneous
+  rules and broadcasting. A replicated shortcut must preserve the same extents as its mapped path. Check homogeneous
   policies as well as composite policies: unsupported consumers must reject before executing on padding or unwrapping
   logical dimensions, and policy validation must catch accidental metadata loss independently of the individual
-  consumer.
+  consumer. Compare both input orders of commutative operations, including singleton coordinate broadcasts. Validate
+  semantic coordinate domains before broadcasting erases their differences, not only the final axis positions. Compose
+  an explicit or dense elementwise broadcast with a later ragged operation: a check local to one merge cannot recover
+  coordinate distinctions an earlier producer discarded. If the representation cannot preserve those distinctions,
+  reject that transformation at the producer instead of silently changing the identity's meaning.
+
+For ordered validation dependencies, exercise both batching-before-differentiation and differentiation-before-batching,
+then partially evaluate with unknown extents and known payloads or tangents. A guard whose own relationships are proven
+can still transport earlier assertions; proof of its local types does not make that ordering dependency redundant.
 
 After a finding exposes a shared invariant, audit all producers, consumers, and sibling implementations of that
 invariant in the same pass. Add regressions at the owning boundary, not only at the operation that revealed the failure.

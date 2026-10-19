@@ -28,7 +28,7 @@ relative to the repository root, not a requirement to read every file for every 
 | Operation, provider, member, and projection contracts   | `crates/ryft-core/src/programs/operations.rs`                                |
 | Interpretation and reference discharge                  | `crates/ryft-core/src/interpretation.rs`, `src/programs/references/`         |
 | Capability universes and value dispatch                 | `crates/ryft-core/src/operations/mod.rs`, `src/programs/values.rs`           |
-| Families, bundles, composite values, and batch geometry | `crates/ryft-core/src/arrays/{operations,ir,batching}.rs`                    |
+| Families, bundles, composite values, and batch extents  | `crates/ryft-core/src/arrays/{operations,ir,batching}.rs`                    |
 | Simple operations and tests                             | `crates/ryft-core/src/operations/arithmetic.rs`, especially `AddOperation`   |
 | Construction and shape changes                          | `crates/ryft-core/src/operations/constants/`, `src/operations/manipulation/` |
 | Shared production and testing macros                    | `crates/ryft-core/src/macros.rs`, `src/arrays/macros.rs`                     |
@@ -45,7 +45,7 @@ Load the references that apply before editing:
   composite projections, dispatch, generic transform-policy bounds, or backend value integration, including work
   outside operation modules.
 - [Transform Invariants](references/transforms.md): Used for operation replay, reference validation, partial evaluation,
-  batching, differentiation, transposition, sharding/manual variation, or dynamic/ragged geometry.
+  batching, differentiation, transposition, sharding/manual variation, or dynamic/ragged extents.
 - [Coverage and Final Review](references/review.md): Used for every operation addition or review, and for the affected
   behaviors of a scoped follow-up. Full operation reviews require the complete inventory, not just the reported bug.
 

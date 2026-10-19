@@ -17,7 +17,7 @@ or backend value integration. The canonical architectural explanations are `Capa
 These universe requirements apply to value-level capabilities. Context constructor capabilities such as `Zero<V>` have a
 different role; inspect their existing contract instead of mechanically giving them a value-level receiver.
 
-- Every value-level capability trait, including dynamic-geometry, dimension, reference, and alignment capabilities, is
+- Every value-level capability trait, including dynamic-shape, dimension, reference, and alignment capabilities, is
   universe-parameterized (`X<T = <Self as Capability>::Universe>: Capability + Sized`, where the universe is a coherence
   marker that need not be a `Type`, and host types are their own universe), with any other parameters (e.g.,
   `Transform`, `Binding`, or `Output`) before the universe, and every capability bundle has the same universe parameter
