@@ -704,7 +704,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
         let input_atoms =
-            inputs.iter().map(|input| self.materialize_input(input)).collect::<Result<Vec<_>, ProgramError>>()?;
+            inputs.iter().map(|input| self.residual_atom(input)).collect::<Result<Vec<_>, ProgramError>>()?;
 
         // Propagate the materialized inputs' refinements through attached regions, just as replay into a trace does.
         // Release the builder borrow before specialization replays any body into its own fresh trace. Keep the original
@@ -816,7 +816,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// source instruction indices, including recursive calls into shared regions.
     ///
     /// The caller must have prepared `inputs` for the region's entry through
-    /// [`guard_region_inputs`](Self::guard_region_inputs) or [`prepare_region_inputs`](Self::prepare_region_inputs),
+    /// [`guard_region_inputs`](Self::guard_region_inputs) or [`prepare_root_inputs`](Self::prepare_root_inputs),
     /// which check the supplied signature against the entry and guard every relationship that it leaves unproven, so
     /// replay performs no entry check of its own. The prepared types can still differ from the declared ones (e.g.,
     /// they can rename array axes or carry the exact facts that the entry proves), so replay relates them to the
@@ -1135,90 +1135,28 @@ impl<C: Context> PartialEvaluationContext<C> {
         Ok(PartialEvaluation { program, inputs, outputs: evaluation_outputs })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Materializes a known live reference at a validated declared allocation boundary, whose runtime referent is
-    /// still validated on region entry. The residual program treats distinct reference inputs as independent roots,
-    /// so a handle that it already receives is reused when its residual input has the declared type. A residual input
-    /// of another type (e.g., the exact type of an earlier use) cannot be widened to the declared allocation contract
-    /// inside the residual program, and a second input for the same handle would alias it, so that case is rejected.
-    /// Otherwise, the residual input is recorded in the shared materialization slot of `input`, so that every later
-    /// materialization of that value (e.g., by an instruction that uses the handle after the retained region) reuses
-    /// it instead of adding a second, aliasing input at the handle's exact type. The returned value shares that slot.
+    /// Prepares the inputs of `region` for replay at the root of a fresh residual program (refer to
+    /// [`Self::guard_region_inputs`] for the shared entry contract; the residual program's unknown inputs are supplied
+    /// by a separate invocation). Returns one seed value per region input (known values narrowed by the facts that the
+    /// entry proves, and unknowns allocated as residual inputs of their supplied types). Known values whose identities
+    /// connect, directly or through other known values, to an identity of an unknown input are also retained as
+    /// residual inputs, even when replay never consumes them, because they witness the extents that the unknown's
+    /// symbolic dimensions take at runtime.
     ///
     /// # Parameters
     ///
-    ///   - `input`: Known eager reference value whose actual referent refines the declared allocation type.
-    ///   - `declared`: Reference input contract of the retained region.
-    pub(crate) fn preserve_reference_input(
-        &self,
-        input: &PartialEvaluationValue<C::Value>,
-        declared: &C::Type,
-    ) -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
-        let known = input
-            .as_known()
-            .ok_or_else(|| ProgramError::MalformedProgram("reference entry witness must be known".to_string()))?;
-        if !self.parent.is_eager() || !declared.is_reference() || !known.r#type().is_reference() {
-            return Err(ProgramError::MalformedProgram(
-                "reference entry witness must have a known eager reference type".to_string(),
-            ));
-        }
-        <C::Type as Type>::Refinements::new([declared], [known.r#type()])?;
-        if let Some(identity) = self.parent.reference_identity(known)? {
-            let builder = self.builder.borrow();
-            for (input_index, existing) in self.inputs.borrow().iter().enumerate() {
-                let PartialEvaluationInput::Known(existing) = existing else {
-                    continue;
-                };
-                if !existing.r#type().is_reference() || self.parent.reference_identity(existing)? != Some(identity) {
-                    continue;
-                }
-                let atom = builder.input_ids()[input_index];
-                let existing_type = builder.atoms()[atom.index()].r#type();
-                if *existing_type != *declared {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "a known reference that the residual program already receives as `{existing_type}` cannot \
-                             also enter a retained region at its declared type `{declared}`",
-                        ),
-                    });
-                }
-                input.materialization.set(PartialValueMaterialization::Input { residual_atom: Some(atom) });
-                return Ok(input.clone());
-            }
-        }
-        let atom = self.builder.borrow_mut().add_input(declared.clone());
-        self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
-        input.materialization.set(PartialValueMaterialization::Input { residual_atom: Some(atom) });
-        Ok(input.clone())
-    }
-
-    /// Seeds a fresh residual boundary from the complete source entry, preserving exact facts and shared symbolic
-    /// identities supplied by known members even when replay never consumes those members.
-    ///
-    /// # Parameters
-    ///
-    ///   - `region`: Source boundary whose input contracts constrain the complete invocation.
-    ///   - `inputs`: Known values and actual unknown types in source input order.
-    pub(super) fn prepare_region_inputs(
+    ///   - `region`: Region whose body the caller replays in place of its entry.
+    ///   - `inputs`: Known values and the actual types of unknown inputs, in input order.
+    pub(super) fn prepare_root_inputs(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: &[PartialValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // Replaying the body removes this boundary's entry check, and the body is specialized at the exact facts that
+        // Replaying the body removes the entry check of `region`, so the body is specialized at the exact facts that
         // the entry proves about the actual inputs (e.g., an unknown `f32[n]` next to a known `f32[2]`, both entering
-        // `f32[n]`, is replayed as `f32[2]`). Known inputs are narrowed first, by the relationships among them alone
-        // (refer to `Self::narrow_known_inputs`). Residual entries keep the supplied unknown types, so that the
-        // residual program accepts every value that the source program accepts: an entry guard, staged before anything
-        // that the body stages so that no known-side effect folds before it, checks the entry's remaining relationships
-        // and returns the narrowed values that seed the body. A guard with an unknown input stays in the residual
-        // program together with its known witnesses, and its ordered effect defers later ordered known effects. A
-        // reference cannot be cast, so it keeps its supplied type and the guard only checks it. Related values use
-        // compatible protected representatives, with reference geometry taking precedence over known representations
-        // (refer to `Self::pinned_identities` and `GuardOperation::retaining`). A narrowing without a guard (i.e., by
-        // an actual identity whose own bounds admit a single extent, which needs no check) narrows the residual entry
-        // type instead. An operation family without a guard cannot preserve an unproven relationship at all, so such
-        // an entry is rejected (refer to `Self::guard_region_inputs`).
+        // `f32[n]`, is replayed as `f32[2]`), while the residual entry keeps the supplied unknown types, so that the
+        // residual program accepts every value that the source program accepts. The unknown inputs are the residual
+        // program's own inputs, supplied by a separate invocation.
         let seed = self.prepare_entry_inputs(
             region,
             inputs
@@ -1229,8 +1167,11 @@ impl<C: Context> PartialEvaluationContext<C> {
             true,
         )?;
 
-        // A symbolic known value can constrain an unknown's runtime geometry without providing an exact extent.
-        // Keep such values as ordinary residual inputs, including transitive links through multi-identity members.
+        // A symbolic known value can constrain the extent of an unknown's dimension without fixing it (e.g., a known
+        // `ref<f32[n]>` next to an unknown `f32[n]` needs no guard, yet witnesses `n`). Keep such values as ordinary
+        // residual inputs, following transitive links through members that carry several identities. Consumers tolerate
+        // such unconsumed inputs, including known references under a staging parent, whose partitions drop them from
+        // their residual programs.
         let mut identities = seed
             .iter()
             .filter(|input| input.is_unknown())
@@ -1243,7 +1184,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 if input.is_known() && !retained[index] {
                     let r#type = input.r#type();
                     if r#type.identities().any(|(_, identity)| identities.contains(identity)) {
-                        self.materialize_input(input)?;
+                        self.residual_atom(input)?;
                         identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
                         retained[index] = true;
                         changed = true;
@@ -1254,6 +1195,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 break;
             }
         }
+
         Ok(seed)
     }
 
@@ -1263,7 +1205,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// entry unproven (refer to [`GuardOperation::for_entry`]), entry guards are staged before anything that the
     /// body stages, so that no known-side effect folds before them. The relationships among known inputs alone are
     /// checked first, by a guard that folds into the known side and whose narrowed outputs replace the known inputs
-    /// (refer to [`Self::narrow_known_inputs`]). The remaining relationships are checked by a guard whose narrowed
+    /// (refer to [`Self::prepare_entry_inputs`]). The remaining relationships are checked by a guard whose narrowed
     /// outputs replace unknown inputs and known inputs whose required representation changes. Reference identities
     /// take precedence over known representations (refer to [`Self::pinned_identities`]). An unknown input can connect
     /// otherwise independent known classes, so changing a known representation can require the residual check even
@@ -1289,6 +1231,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Returns an error when the inputs do not refine the entry, or when the entry needs a guard but this context's
     /// operation family cannot provide one (refer to [`OperationProvider`]): removing the entry would then
     /// drop the check of its unproven relationships.
+    #[inline]
     pub(super) fn guard_region_inputs(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -1299,75 +1242,11 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.prepare_entry_inputs(region, inputs.into_iter().map(Some).collect(), input_types, separate_invocation)
     }
 
-    /// Gives `input` a residual atom using its existing materialization policy, preserving shared assignments and
-    /// deduplicating known-side staged feeders. Entry witnesses use the same protocol as consumed residual inputs.
-    fn materialize_input(&self, input: &PartialEvaluationValue<C::Value>) -> Result<AtomId, ProgramError> {
-        // A residual variable is already a residual atom, and an already-materialized known value's shared
-        // slot carries the residual atom assigned on first materialization. Every other known value differs
-        // only in whether it materializes as an inline constant.
-        let constant = match input.materialization() {
-            PartialValueMaterialization::Undecided => false,
-            PartialValueMaterialization::Input { residual_atom: None } => false,
-            PartialValueMaterialization::Input { residual_atom: Some(atom) } => return Ok(atom),
-            PartialValueMaterialization::Constant { residual_atom: None } => true,
-            PartialValueMaterialization::Constant { residual_atom: Some(atom) } => return Ok(atom),
-            PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
-        };
-
-        let known = input.as_known().ok_or_else(|| {
-            ProgramError::MalformedProgram(
-                "residual materialization marked an unknown value as a known residual".to_string(),
-            )
-        })?;
-
-        let atom = if constant {
-            let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
-                ProgramError::MalformedProgram(
-                    "residual materialization required a constant payload for a known value that is \
-                     not resolvable to a constant in the active known-side context"
-                        .to_string(),
-                )
-            })?;
-            let reference_identity =
-                known.r#type().is_reference().then(|| self.parent.reference_identity(known)).transpose()?;
-            let atom = self.builder.borrow_mut().add_constant(constant);
-            if let Some(key) = reference_identity {
-                self.constant_reference_identities.borrow_mut().insert(atom, key);
-            }
-            atom
-        } else {
-            // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
-            let staged_atom = match self.parent.resolve(known) {
-                ValueResolution::Staged(atom) => Some(atom),
-                _ => None,
-            };
-            let existing = staged_atom.and_then(|staged| self.staged_feeders.borrow().get(&staged).copied());
-            if let Some(atom) = existing {
-                atom
-            } else {
-                let atom = self.builder.borrow_mut().add_input(known.r#type().into_owned());
-                self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
-                if let Some(staged_atom) = staged_atom {
-                    self.staged_feeders.borrow_mut().insert(staged_atom, atom);
-                }
-                atom
-            }
-        };
-
-        // Record the assignment in the value's shared slot so that every clone of this value reuses the same
-        // residual atom instead of materializing the value again.
-        input.materialization.set(match constant {
-            true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
-            false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
-        });
-        Ok(atom)
-    }
-
-    /// Prepares one complete entry before replay. Existing values keep their shared materialization state; `None`
+    /// Prepares one complete entry before replay. Existing values keep their shared materialization state. [`None`]
     /// marks an unallocated root unknown whose supplied type belongs to the residual header. Both entry guards (i.e.,
-    /// the one over the known inputs that [`Self::narrow_known_inputs`] plans and the one over the complete entry that
-    /// [`Self::plan_entry_guard`] plans) are requested from the operation family before anything is folded,
-    /// residualized, or allocated, so that a rejection leaves this context unchanged.
+    /// the one over the known inputs alone and the one over the complete entry that [`Self::plan_entry_guard`] plans)
+    /// are requested from the operation family before anything is folded, residualized, or allocated, so that a
+    /// rejection leaves this context unchanged.
     fn prepare_entry_inputs(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -1378,24 +1257,54 @@ impl<C: Context> PartialEvaluationContext<C> {
         check_count!("input", inputs, region.input_ids().len(), ProgramError);
         check_count!("input", input_types, inputs.len(), ProgramError);
         let declared = region.input_types();
+
+        // Plan the narrowing of the known members of the entry by the relationships among the known inputs alone.
+        // Known values keep their types in the body that partial evaluation replays, so a known symbolic value that
+        // such a relationship fixes (e.g., a known `f32[n, m]` next to a known `dimension<2>` entering
+        // `[f32[n, m], dimension<m>]`) would otherwise disagree with the values that the body computes from the exact
+        // one (e.g., a `zero[m]` of type `f32[2]`). An entry guard over the known members checks those relationships
+        // before anything that the body stages. Its outputs replace only members whose type changes, so a deferred
+        // guard does not make unchanged known values residual. The guard retains the identities of known references,
+        // which cannot be cast. Relationships that involve unknown inputs are left to the complete entry's guard below.
+        // No guard is needed when the known types prove every such relationship. Staging or residualizing the guard
+        // produces outputs of exactly the types that its operation infers for its non-reference members, while an
+        // eager known side supplies exact types, which leave no relationship among known inputs unproven. Planning
+        // mutates no state, so that every entry guard is requested before any of them is applied.
         let known = inputs
             .iter()
             .map(|input| input.as_ref().is_some_and(PartialEvaluationValue::is_known))
             .collect::<Vec<_>>();
-        let known_guard = Self::narrow_known_inputs(&declared, &known, &input_types)?;
-        if let Some((_, _, outputs)) = &known_guard {
+        let indices = (0..known.len()).filter(|&index| known[index]).collect::<Vec<_>>();
+        let known_declared = indices.iter().map(|&index| declared[index].clone()).collect::<Vec<_>>();
+        let known_types = indices.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+        if let Some((guard, members)) = GuardOperation::for_entry("partial_evaluation", &known_declared, &known_types)?
+        {
+            let member_types = members.iter().map(|&member| known_types[member].clone()).collect::<Vec<_>>();
+            let pinned_identities = Self::pinned_identities(member_types.iter().map(|r#type| (false, r#type)));
+            let guard = guard.retaining(&member_types, &pinned_identities)?;
+            let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
+            let output_types = guard.infer_output_types(&member_types, &[])?;
+            let output_indices = members
+                .iter()
+                .filter(|&&member| !known_declared[member].is_reference())
+                .map(|&member| indices[member])
+                .collect::<Vec<_>>();
+            check_count!("output", output_types, output_indices.len(), ProgramError);
+            let members = members.into_iter().map(|member| indices[member]).collect::<Vec<_>>();
+            let outputs = output_indices.into_iter().zip(output_types).collect::<Vec<_>>();
+
             // Request the complete entry's guard before the known guard folds or residualizes, so that a family that
             // rejects either guard leaves this context unchanged. The known guard's outputs carry the types that its
             // operation infers, which stand in for the narrowed known inputs in this request. The applied guard is
             // planned again below from the actual narrowed values, because a known guard that remains residual turns
             // the members whose types it changes into unknown values.
             let mut narrowed_types = input_types.clone();
-            for (index, r#type) in outputs {
+            for (index, r#type) in &outputs {
                 narrowed_types[*index] = r#type.clone();
             }
             Self::plan_entry_guard(region, &declared, &inputs, &mut narrowed_types, separate_invocation)?;
-        }
-        if let Some((guard, members, outputs)) = known_guard {
+
+            // Apply the known guard, replacing only the known members whose types it changes.
             let guarded = members.iter().map(|&index| inputs[index].clone().unwrap()).collect::<Vec<_>>();
             let narrowed = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
             check_count!("output", narrowed, outputs.len(), ProgramError);
@@ -1406,6 +1315,8 @@ impl<C: Context> PartialEvaluationContext<C> {
                 }
             }
         }
+
+        // Plan and apply the guard over the complete entry, whose known members are now narrowed.
         let (members, guard) =
             Self::plan_entry_guard(region, &declared, &inputs, &mut input_types, separate_invocation)?;
         let mut inputs = inputs
@@ -1427,62 +1338,21 @@ impl<C: Context> PartialEvaluationContext<C> {
                 inputs[index] = output;
             }
         }
+
         Ok(inputs)
     }
 
-    /// Plans the narrowing of the known members of an entry declared as `declared` by the relationships among the known
-    /// inputs alone, where `known` marks those members and `input_types` holds the types of all inputs, in input order.
-    /// Known values keep their types in the body that partial evaluation replays, so a known symbolic value that such a
-    /// relationship fixes (e.g., a known `f32[n, m]` next to a known `dimension<2>` entering
-    /// `[f32[n, m], dimension<m>]`) would otherwise disagree with the values that the body computes from the exact one
-    /// (e.g., a `zero[m]` of type `f32[2]`). An entry guard over the known members checks those relationships before
-    /// anything that the body stages. Its outputs replace only members whose type changes, so a deferred guard does not
-    /// make unchanged known values residual. The guard retains the identities of known references, which cannot be
-    /// cast. Relationships that involve unknown inputs are left to [`Self::guard_region_inputs`].
-    ///
-    /// Returns [`None`] when the known types prove every such relationship. Otherwise, returns the guard operation that
-    /// this context's operation family provides, the positions of its members among the inputs, and the position and
-    /// inferred type of each of its outputs (i.e., of each non-reference member), in input order. Staging or
-    /// residualizing the guard produces outputs of exactly those types, while an eager known side supplies exact types,
-    /// which leave no relationship among known inputs unproven. Planning mutates no state, so that the caller can
-    /// request every entry guard before applying any of them.
-    #[allow(clippy::type_complexity)]
-    fn narrow_known_inputs(
-        declared: &[C::Type],
-        known: &[bool],
-        input_types: &[C::Type],
-    ) -> Result<Option<(C::Operation, Vec<usize>, Vec<(usize, C::Type)>)>, ProgramError> {
-        let indices = (0..known.len()).filter(|&index| known[index]).collect::<Vec<_>>();
-        let known_declared = indices.iter().map(|&index| declared[index].clone()).collect::<Vec<_>>();
-        let known_types = indices.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
-        let Some((guard, members)) = GuardOperation::for_entry("partial_evaluation", &known_declared, &known_types)?
-        else {
-            return Ok(None);
-        };
-        let member_types = members.iter().map(|&member| known_types[member].clone()).collect::<Vec<_>>();
-        let pinned_identities = Self::pinned_identities(member_types.iter().map(|r#type| (false, r#type)));
-        let guard = guard.retaining(&member_types, &pinned_identities)?;
-        let guard = C::Operation::provide(guard, &member_types.iter().collect::<Vec<_>>())?;
-        let output_types = guard.infer_output_types(&member_types, &[])?;
-        let output_indices = members
-            .iter()
-            .filter(|&&member| !known_declared[member].is_reference())
-            .map(|&member| indices[member])
-            .collect::<Vec<_>>();
-        check_count!("output", output_types, output_indices.len(), ProgramError);
-        let members = members.into_iter().map(|member| indices[member]).collect();
-        Ok(Some((guard, members, output_indices.into_iter().zip(output_types).collect())))
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Plans the guard over the complete entry of `region`, which is declared as `declared`, for `inputs` whose known
     /// members have already been narrowed (with [`None`] marking unallocated root unknowns) and their `input_types`, in
     /// input order. Returns the positions of the guarded members, in increasing order, together with the guard
     /// operation that this context's operation family provides for them, or [`None`] when no relationship needs a
-    /// check. Unallocated root unknowns outside the guard are narrowed in `input_types` only by their actual identities'
-    /// own singleton bounds. Refer to [`Self::guard_region_inputs`] for the role of `separate_invocation`.
+    /// check. Unallocated root unknowns outside the guard are narrowed in `input_types` only by the singleton bounds of
+    /// their own actual identities. Refer to [`Self::guard_region_inputs`] for the role of `separate_invocation`.
     ///
-    /// The guard re-checks the known members of every class that an unknown input joins, even though the guard that
-    /// [`Self::narrow_known_inputs`] plans has already established their relationships among themselves. Dropping
+    /// The guard re-checks the known members of every class that an unknown input joins, even though the known-input
+    /// guard of [`Self::prepare_entry_inputs`] has already established their relationships among themselves. Dropping
     /// such members is not safe in general: a known member can be the only one that ties a formal identity to the
     /// class (e.g., two known `f32[b]` entering `f32[n]` and `f32[m]`, next to unknowns entering both), and reference
     /// precedence can change the representation of every known member of the class, which only guard outputs carry.
@@ -1546,13 +1416,15 @@ impl<C: Context> PartialEvaluationContext<C> {
         Ok((members, Some(guard)))
     }
 
-    /// Returns candidate symbolic representatives in priority order: immutable reference identities, then identities
-    /// still carried by known inputs after known-side narrowing. A known representation can change behind a residual
-    /// entry check, while reference handles always keep their referent types.
+    /// Returns the identities whose representations an entry guard keeps, in priority order: those of reference inputs,
+    /// known or unknown, because a reference cannot be cast, then those of the inputs that `inputs` marks as pinned.
+    /// The known-input guard pins nothing beyond references, so that exact facts narrow the known inputs among
+    /// themselves. The complete-entry guard pins the known inputs, because a guard that stays residual turns every
+    /// member whose type it changes into an unknown value, and pinning keeps such known inputs known.
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Whether each input is known, paired with its type, in input order.
+    ///   - `inputs`: Whether each input's identities are pinned, paired with its type, in input order.
     fn pinned_identities<'o>(inputs: impl IntoIterator<Item = (bool, &'o C::Type)>) -> Vec<<C::Type as Type>::Identity>
     where
         C::Type: 'o,
@@ -1571,6 +1443,78 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
         }
         identities
+    }
+
+    /// Returns the residual atom that carries `value`, materializing it on first use according to its
+    /// [`PartialValueMaterialization`]: an unknown is already a residual variable, a known value becomes an inline
+    /// residual constant or a residual input (an [`Undecided`](PartialValueMaterialization::Undecided) value becomes an
+    /// input), and the assignment is recorded in the value's shared slot so that every clone reuses it. Known values
+    /// that resolve to the same staged atom of the parent share one residual input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when an unknown value carries a known materialization, or when a
+    /// value placed as a constant does not resolve to a constant in the parent context.
+    fn residual_atom(&self, value: &PartialEvaluationValue<C::Value>) -> Result<AtomId, ProgramError> {
+        // A residual variable is already a residual atom, and an already-materialized known value's shared
+        // slot carries the residual atom assigned on first materialization. Every other known value differs
+        // only in whether it materializes as an inline constant.
+        let constant = match value.materialization() {
+            PartialValueMaterialization::Undecided => false,
+            PartialValueMaterialization::Input { residual_atom: None } => false,
+            PartialValueMaterialization::Input { residual_atom: Some(atom) } => return Ok(atom),
+            PartialValueMaterialization::Constant { residual_atom: None } => true,
+            PartialValueMaterialization::Constant { residual_atom: Some(atom) } => return Ok(atom),
+            PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
+        };
+
+        let known = value.as_known().ok_or_else(|| {
+            ProgramError::MalformedProgram(
+                "residual materialization marked an unknown value as a known residual".to_string(),
+            )
+        })?;
+
+        let atom = if constant {
+            let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
+                ProgramError::MalformedProgram(
+                    "residual materialization required a constant payload for a known value that is \
+                     not resolvable to a constant in the active known-side context"
+                        .to_string(),
+                )
+            })?;
+            let reference_identity =
+                known.r#type().is_reference().then(|| self.parent.reference_identity(known)).transpose()?;
+            let atom = self.builder.borrow_mut().add_constant(constant);
+            if let Some(key) = reference_identity {
+                self.constant_reference_identities.borrow_mut().insert(atom, key);
+            }
+            atom
+        } else {
+            // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
+            let staged_atom = match self.parent.resolve(known) {
+                ValueResolution::Staged(atom) => Some(atom),
+                _ => None,
+            };
+            let existing = staged_atom.and_then(|staged| self.staged_feeders.borrow().get(&staged).copied());
+            if let Some(atom) = existing {
+                atom
+            } else {
+                let atom = self.builder.borrow_mut().add_input(known.r#type().into_owned());
+                self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
+                if let Some(staged_atom) = staged_atom {
+                    self.staged_feeders.borrow_mut().insert(staged_atom, atom);
+                }
+                atom
+            }
+        };
+
+        // Record the assignment in the value's shared slot so that every clone of this value reuses the same
+        // residual atom instead of materializing the value again.
+        value.materialization.set(match constant {
+            true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
+            false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
+        });
+        Ok(atom)
     }
 }
 
@@ -3545,72 +3489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_preserve_reference_input() {
-        let extent = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let declared: ArrayIrType =
-            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![extent.dimension().clone()]))).into();
-        let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
-        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
-            .with_reference_placement(ReferencePlacement::Stage);
-
-        // A handle that the residual program does not receive yet becomes a new residual input of the declared type,
-        // which the shared materialization slot of the supplied value records.
-        let first = context.known_value(TestValue::Reference(reference.clone()));
-        let prepared = context.preserve_reference_input(&first, &declared).unwrap();
-        let input = PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(0)) };
-        assert_eq!(first.materialization(), input);
-        assert!(Rc::ptr_eq(&prepared.materialization, &first.materialization));
-
-        // A distinct value of the same handle reuses that residual input, and so does a later use of that value.
-        let second = context.known_value(TestValue::Reference(reference.clone()));
-        let reused = context.preserve_reference_input(&second, &declared).unwrap();
-        assert_eq!(second.materialization(), input);
-        assert!(Rc::ptr_eq(&reused.materialization, &second.materialization));
-        let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
-        let outputs = context.residualize(read.clone(), Vec::new(), &[second]).unwrap();
-        let evaluation = context.into_evaluation(outputs).unwrap();
-        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Known(TestValue::Reference(reference.clone()))]);
-        assert_eq!(
-            evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:ref<f32[extent]> .
-                let %1:f32[extent] = reference_read %0
-                in (%1)"},
-        );
-
-        // A handle that the residual program already receives at another type (e.g., the exact type of an earlier
-        // use) cannot also enter at the declared type without a second, aliasing input.
-        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
-            .with_reference_placement(ReferencePlacement::Stage);
-        let known = context.known_value(TestValue::Reference(reference.clone()));
-        context.residualize(read, Vec::new(), std::slice::from_ref(&known)).unwrap();
-        assert_eq!(
-            context.preserve_reference_input(&known, &declared).map(|_| ()),
-            Err(ProgramError::UnsupportedOperation {
-                message: "a known reference that the residual program already receives as `ref<f32[2]>` cannot also \
-                          enter a retained region at its declared type `ref<f32[extent]>`"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(context.inputs.borrow().len(), 1);
-
-        // Only known references of an eager known side can enter at their declared types.
-        let unknown = context.unknown_input(declared.clone(), 0);
-        assert_eq!(
-            context.preserve_reference_input(&unknown, &declared).map(|_| ()),
-            Err(ProgramError::MalformedProgram("reference entry witness must be known".to_string())),
-        );
-        let array = context.known_value(TestValue::Array(Array::vector(vec![1f32; 2]).unwrap()));
-        assert_eq!(
-            context.preserve_reference_input(&array, &declared).map(|_| ()),
-            Err(ProgramError::MalformedProgram(
-                "reference entry witness must have a known eager reference type".to_string(),
-            )),
-        );
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_prepare_region_inputs_rejects_unguardable_entries() {
+    fn test_partial_evaluation_context_prepare_root_inputs_rejects_unguardable_entries() {
         // An operation family without an entry guard cannot preserve an unproven entry relationship, so preparing a
         // mixed signature is rejected instead of dropping its entry check.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
@@ -3624,7 +3503,7 @@ mod tests {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(
             context
-                .prepare_region_inputs(
+                .prepare_root_inputs(
                     program.entry_region_ref(),
                     &[PartialValue::Known(Array::vector(vec![1f32; 2]).unwrap()), PartialValue::Unknown(vector_type)],
                 )

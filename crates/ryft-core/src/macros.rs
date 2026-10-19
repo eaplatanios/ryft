@@ -3130,7 +3130,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         let $transpose_right = if $crate::DifferentiableType::is_zero_space(&coefficient_type) {
                             coefficient.clone()
                         } else {
-                            // Widen low-precision coefficients in their own geometry and reduction state.
+                            // Widen low-precision coefficients in their own shape and reduction state.
                             $crate::ElementwiseDerivativeAlignment::align_tangent(
                                 coefficient,
                                 &coefficient_type,
