@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameterized;
 
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
 use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation};
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
@@ -193,6 +193,7 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
 ///   - `primal`: Structured input value specifying the linearization point.
 ///   - `capture`: Structured runtime value held fixed while differentiating the input.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
+#[allow(clippy::type_complexity)]
 pub(crate) fn jacobian_forward_in_context<
     C: Context,
     I: Parameterized<
@@ -222,6 +223,8 @@ where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
     // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
@@ -436,6 +439,8 @@ where
             >,
             Operation = C::Operation,
         > + From<AddOperation<C::Type>>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
     // inputs in the ordinary case, but still requires each input parameter to have a nonzero cotangent space.
@@ -684,7 +689,11 @@ fn extract_auxiliary_primals<
     A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
 >(
     auxiliary: A,
-) -> Result<A::To<C::Value>, DifferentiationError> {
+) -> Result<A::To<C::Value>, DifferentiationError>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
     let structure = auxiliary.parameter_structure();
     let values = auxiliary
         .into_parameters()

@@ -109,10 +109,10 @@
 //!
 //! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
 //! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
-//! cotangent references: the final primal state contributes no seed, and completed cotangent references are frozen
-//! into ordinary values before returning. Runtime geometry is captured before primal execution, including when the
-//! function consumes an input reference. Duplicate references, views, and aliases at the differentiation boundary
-//! remain subject to the usual boundary validation. Auxiliary gradient outputs must be ordinary values.
+//! cotangent references: the final primal state contributes no seed, and completed cotangent references are frozen into
+//! ordinary values before returning. Runtime extents are captured before primal execution, including when the function
+//! consumes an input reference. Duplicate references, views, and aliases at the differentiation boundary remain subject
+//! to the usual boundary validation. Auxiliary gradient outputs must be ordinary values.
 //!
 //! Use [`Pullback::apply_with_destinations`] for explicit cotangent storage or nonzero final-state cotangent seeds.
 //! For reference inputs, those destinations hold final-state cotangents before replay and initial-state cotangents
@@ -158,7 +158,7 @@ use std::fmt::{Debug, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::contexts::{Context, DomainProjection, ProjectedContext};
+use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
 use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
@@ -456,7 +456,7 @@ impl DifferentiationRule {
     pub(crate) fn apply_projected<
         T: DifferentiableType,
         O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-        C: Context<Type: DifferentiableType> + DomainProjection<T>,
+        C: ContextProjection<T, Type: DifferentiableType>,
         P: DifferentiationPolicy<C>,
     >(
         self,
@@ -900,7 +900,7 @@ impl<Input, ContextState>
     /// control flow may inspect concrete primal. A staging context records primal and tangent operations in one fused
     /// trace, and data-dependent Rust control flow on a traced primal is unavailable. Structural-zero tangents remain
     /// symbolic between operations and are materialized at the output boundary through [`ResidualZeroProvider`],
-    /// preserving runtime geometry for dynamically shaped values. Nested transforms differentiate through these duals
+    /// preserving runtime extents for dynamically shaped values. Nested transforms differentiate through these duals
     /// and therefore compose forward, reverse-over-forward, and higher-order differentiation.
     ///
     /// # Parameters
@@ -929,6 +929,8 @@ impl<Input, ContextState>
         Output: Parameterized<DifferentiationTracer<C>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<DifferentiationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -975,6 +977,8 @@ impl<Input, ContextState>
         Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1013,6 +1017,8 @@ impl<Input, ContextState>
         Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1066,6 +1072,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1107,6 +1115,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1157,6 +1167,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1227,6 +1239,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output::Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1316,6 +1330,9 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<C>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<LinearizationContext<C>>>) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1374,6 +1391,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1425,6 +1444,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -1467,6 +1488,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         AuxiliaryOutput::Family: ParameterizedFamily<V>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1531,6 +1554,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         AuxiliaryOutput::Family: ParameterizedFamily<V>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1614,6 +1639,9 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(
             Input::To<LinearizationTracer<LinearizationContext<C>>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1664,6 +1692,8 @@ impl<Input, Capture, ContextState>
             Input::To<DifferentiationTracer<C>>,
             Capture::To<DifferentiationTracer<C>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.context.resolve(&self.primal)?.jvp(function, self.primal, tangent, self.capture.0)
     }
@@ -1704,6 +1734,8 @@ impl<Input, Capture, ContextState>
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let context = self.context.resolve(&self.primal)?;
         context.linearize(function, self.primal, self.capture.0)
@@ -1737,6 +1769,8 @@ impl<Input, Capture, ContextState>
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let context = self.context.resolve(&self.primal)?;
         context.vjp(function, self.primal, self.capture.0)
@@ -1777,6 +1811,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         value_and_gradient_in_context(
             &self.context.resolve(&self.primal)?,
@@ -1817,6 +1853,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1862,6 +1900,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let context = self.context.resolve(&self.primal)?;
         let (jacobian, ()) = jacobian_forward_in_context(
@@ -1929,6 +1969,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let context = self.context.resolve(&self.primal)?;
         let (jacobian, ()) = jacobian_reverse_in_context(
@@ -2019,6 +2061,9 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<LinearizationContext<C>>>,
             Capture::To<LinearizationTracer<LinearizationContext<C>>>,
         ) -> Result<Output, ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let context = self.context.resolve(&self.primal)?;
         let (hessian, ()) = hessian_in_context(
@@ -2078,6 +2123,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         value_and_gradient_auxiliary_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2130,6 +2177,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Parameterized<LinearizationTracer<C>, To<V> = (V, AuxiliaryOutput), Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -2178,6 +2227,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         jacobian_forward_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2246,6 +2297,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<C>>,
             Capture::To<LinearizationTracer<C>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         jacobian_reverse_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2340,6 +2393,9 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<LinearizationContext<C>>>,
             Capture::To<LinearizationTracer<LinearizationContext<C>>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+        PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         hessian_in_context(
             &self.context.resolve(&self.primal)?,

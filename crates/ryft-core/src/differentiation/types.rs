@@ -2,7 +2,7 @@ use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::operations::{
     Add, Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, Mul, One, Reshape, Select, Slice,
@@ -378,12 +378,14 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
-    C: One<C::Value> + Zero<C::Value> + Iota<C::Value> + Fill<u64, C::Value>,
+    C: Zero<C::Value> + One<C::Value> + Iota<C::Value> + Fill<u64, C::Value>,
     C::Value: Add + Mul + Compare<C::Value> + Select + Broadcast + Reshape + Slice + Transpose,
     C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayType, Constant = C::Constant, Operation = C::Operation>,
 {
     type PackedValue = ArrayBatch<C::Value>;
 

@@ -221,7 +221,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
             let residual = captured.ok_or_else(|| ProgramError::UnsupportedOperation {
                 message: format!(
                     "cannot materialize a zero of type {type} because no value in scope supplies the runtime \
-                     geometry {residual_type} that its residual {index} names",
+                     extent {residual_type} that its residual {index} names",
                 ),
             })?;
             if residual.r#type().as_ref() != residual_type {
@@ -634,10 +634,10 @@ mod tests {
 
     #[test]
     fn test_residual_zero_provider_materializes_zero_from_residual_sources() {
-        // The boundary form of the residual protocol assembles a zero's runtime geometry from the values in scope,
+        // The boundary form of the residual protocol assembles a zero's runtime extents from the values in scope,
         // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
-        // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
-        // geometry is split across a first-class dimension input and a per-iteration peer.
+        // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent has
+        // its extents split across a first-class dimension input and a per-iteration peer.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
         let context = TestContext::new();
@@ -659,8 +659,8 @@ mod tests {
         )
         .unwrap();
 
-        // A widened differential representation: the `f32` tangent of an `f8e8m0fnu[k]` primal has no live value of
-        // its own type, yet the primal names the extent `k` and therefore supplies its geometry.
+        // A widened differential representation: the `f32` tangent of an `f8e8m0fnu[k]` primal has no live value of its
+        // own type, yet the primal names the extent `k` and therefore supplies it.
         let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(k.clone())]));
         let narrow_primal = context.input(narrow_type.clone().into());
         let widened_tangent_type = narrow_type.tangent().unwrap();
@@ -673,8 +673,8 @@ mod tests {
         .unwrap();
         assert_eq!(widened.r#type().as_ref(), &ArrayIrType::Array(widened_tangent_type));
 
-        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length input is a
-        // first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
+        // The shape of a scan's stacked output: no peer has the `f64[length, k]` type, but the runtime length input is
+        // a first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
         let stacked_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k.clone())]),
@@ -723,7 +723,7 @@ mod tests {
             error,
             ProgramError::UnsupportedOperation {
                 message: "cannot materialize a zero of type f64[length, k] because no value in scope supplies the \
-                          runtime geometry dimension<length \u{2208} [1, 8)> that its residual 0 names"
+                          runtime extent dimension<length \u{2208} [1, 8)> that its residual 0 names"
                     .to_string(),
             },
         );

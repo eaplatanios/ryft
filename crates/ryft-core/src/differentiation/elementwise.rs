@@ -101,8 +101,8 @@ impl<
 
         // Replicating into a target axis whose extent is only known at run time is not a metadata-only broadcast.
         // That operation stores its output type in its payload, and program replay refines boundary types rather than
-        // payload types, so the replication count would never become known. Such an alignment therefore takes its
-        // geometry from `exemplar` through an input edge instead, which is what makes the runtime extent available.
+        // payload types, so the replication count would never become known. Such an alignment therefore takes its shape
+        // from `exemplar` through an input edge instead, which is what makes the runtime extent available.
         let value_type = value.r#type().into_owned();
         let requires_runtime_shape = target.shape().dimensions().iter().enumerate().any(|(axis, target_dimension)| {
             matches!(target_dimension, Dimension::Dynamic(_))
@@ -139,7 +139,7 @@ impl<
             value.broadcast(output_type, output_axes.as_slice())?
         };
 
-        // Geometry preserves input placement. Explicit redistribution is a separate operation as manual variation
+        // Broadcasting preserves input placement. Explicit redistribution is a separate operation as manual variation
         // has already been made explicit by forward input binding and is never repaired here.
         if requires_reshard && let Some(sharding) = target.sharding() {
             value = value.reshard(&sharding.without_manual_reduction_axes())?;
@@ -259,9 +259,10 @@ where
 }
 
 /// Reduces broadcast copies and restores surviving axes to input order. Stretched singleton axes remain omitted;
-/// callers restore those axes and exact type metadata using their static or retained runtime geometry. The mapping
-/// must name one distinct output axis per target axis. A mapped dimension must either match its target dimension
-/// (including equivalent static and exact-bound representations) or expand a statically singleton target dimension.
+/// callers restore those axes and exact type metadata using their static shapes or retained runtime extents. The
+/// mapping must name one distinct output axis per target axis. A mapped dimension must either match its target
+/// dimension (including equivalent static and exact-bound representations) or expand a statically singleton target
+/// dimension.
 pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + Transpose>(
     cotangent: &V,
     target: &ArrayType,

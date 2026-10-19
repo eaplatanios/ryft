@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameterized;
 
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, LinearizationContext, LinearizationTracer};
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
@@ -324,6 +324,9 @@ where
         Input::To<LinearizationTracer<LinearizationContext<C>>>,
         Capture::To<LinearizationTracer<LinearizationContext<C>>>,
     ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    PartialEvaluationContext<C>: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     let (outer, auxiliary) = jacobian_forward_in_context(
         context,

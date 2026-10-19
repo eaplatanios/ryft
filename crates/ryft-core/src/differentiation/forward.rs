@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
@@ -481,6 +481,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 >,
                 Operation = O,
             > + From<AddOperation<V::Type>>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
@@ -739,6 +740,8 @@ impl<
     pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
     where
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         // Flatten the caller's structured tangent tree and first validate it against the complete primal boundary,
         // including the leaves whose differential spaces contain only zero.
@@ -808,6 +811,10 @@ impl<
 /// and value transfer. Projection therefore changes the value family visible to the rule while retaining the choice
 /// of fused or partitioned computation.
 pub trait DifferentiationPolicy<C: Context>: Copy + Clone + Debug {
+    /// Whether the primal computation completes before the tangent program can execute. Such policies need no tangent
+    /// value dependency solely to order a conversion after a primal check; extent dependencies still apply.
+    const PRIMAL_COMPLETES_BEFORE_TANGENT: bool = false;
+
     /// Creates a separate context for tangent work, if the policy needs one. [`DifferentiationContext::new`]
     /// calls this function once during construction. Returning `None` makes [`DifferentiationContext::tangent`] return
     /// the exact same context instance as [`DifferentiationContext::primal`]. Returning `Some(context)` makes it return
@@ -888,7 +895,11 @@ impl<C: Context> DifferentiationPolicy<PartialEvaluationContext<C>> for Partitio
 where
     C::Operation:
         PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
+    const PRIMAL_COMPLETES_BEFORE_TANGENT: bool = true;
+
     #[inline]
     fn tangent_context(primal: &PartialEvaluationContext<C>) -> Option<PartialEvaluationContext<C>> {
         Some(primal.deferred_sibling())
@@ -916,9 +927,11 @@ where
 #[derive(Copy, Clone, Debug)]
 pub struct ProjectedDifferentiationPolicy<P>(PhantomData<P>);
 
-impl<T: Type, C: Context + DomainProjection<T>, P: DifferentiationPolicy<C>>
-    DifferentiationPolicy<ProjectedContext<C, T>> for ProjectedDifferentiationPolicy<P>
+impl<T: Type, C: ContextProjection<T>, P: DifferentiationPolicy<C>> DifferentiationPolicy<ProjectedContext<C, T>>
+    for ProjectedDifferentiationPolicy<P>
 {
+    const PRIMAL_COMPLETES_BEFORE_TANGENT: bool = P::PRIMAL_COMPLETES_BEFORE_TANGENT;
+
     #[inline]
     fn tangent_context(primal: &ProjectedContext<C, T>) -> Option<ProjectedContext<C, T>> {
         P::tangent_context(primal.parent()).map(ProjectedContext::new)
@@ -1093,6 +1106,8 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
         C::Type: 'static,
         C::Operation:
             OperationPayloadProjection + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let residual_placement: Rc<dyn ResidualPlacement<C::Constant, C::Operation>> = Rc::new(policy.clone());
         let (partition, _) = region.partition_with_configuration(
@@ -1114,8 +1129,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// The driver supplies the enclosing operation family's differentiation bounds. Requiring those bounds on a
     /// recursive operation rule instead creates a cycle (e.g., differentiating the family requires its `while` rule,
     /// which would then require differentiation of the family again). The built-in driver delegates to the same
-    /// internal context function as [`Context::bind`], so recursion preserves its reference and runtime geometry
-    /// checks.
+    /// internal context function as [`Context::bind`], so recursion preserves its reference and runtime extent checks.
     ///
     /// # Parameters
     ///
@@ -1197,6 +1211,8 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
 
 impl<C, D> DifferentiationDriver<C> for RecursiveDifferentiationDriver<'_, D>
 where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type: DifferentiableType>,
     D: RegionDriver<C::Constant, C::Operation>,
     C::Operation: DifferentiableOperation<C>
@@ -1601,9 +1617,9 @@ pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext
 /// rule definitions and value family. [`Self::new`] supports custom policies, and [`Self::project`] preserves the
 /// current policy while exposing a member family.
 ///
-/// Structural zero tangents remain symbolic. When every input tangent is zero, binding can skip derivative work if
-/// the operation cannot introduce reference state and its output geometry can be reconstructed from the primals.
-/// Otherwise, the ordinary rule runs, so a zero initialized tangent reference still receives its own allocation.
+/// Structural zero tangents remain symbolic. When every input tangent is zero, binding can skip derivative work if the
+/// operation cannot introduce reference state and its output shapes can be reconstructed from the primals. Otherwise,
+/// the ordinary rule runs, so a zero initialized tangent reference still receives its own allocation.
 #[derive(Clone)]
 pub struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = FusedDifferentiationPolicy> {
     /// [`Context`] that computes primal values and also computes tangent values when using the
@@ -1702,7 +1718,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     /// primal and tangent programs through their projected contexts.
     pub fn project<T: Type>(&self) -> DifferentiationContext<ProjectedContext<C, T>, ProjectedDifferentiationPolicy<P>>
     where
-        C: DomainProjection<T>,
+        C: ContextProjection<T>,
     {
         // Reuse the existing contexts instead of invoking the policy's tangent context constructor again.
         DifferentiationContext {
@@ -1752,7 +1768,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
 
     /// Binds an operation to the provided dual inputs using the same dispatch as [`Context::bind`]. Ordinary binding
     /// unwraps tracers before calling this function. Recursive differentiation instead passes its duals directly.
-    /// Keeping the structural zero checks here ensures that both paths run reference and runtime geometry rules when
+    /// Keeping the structural zero checks here ensures that both paths run reference and runtime extent rules when
     /// needed, while evaluating eligible primal operations only once.
     ///
     /// # Parameters
@@ -1773,6 +1789,8 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         operation.validate_region_interfaces(&driver.region_interfaces())?;
 
@@ -1785,9 +1803,9 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         let zero_input_tangents = !inputs.is_empty() && inputs.iter().all(|dual| dual.tangent().is_zero());
 
         // Region-carrying operations retain structural zero tangents because the transform boundary captures their
-        // runtime geometry from the staged primal outputs, but only while no reference is involved. A reference input
-        // or an attached region that allocates or accesses references (e.g., a `condition` whose branches allocate and
-        // return a reference) must reach the rule so that every reference result carries its tangent reference.
+        // runtime extents from the staged primal outputs, but only while no reference is involved. A reference input
+        // or an attached region that allocates or accesses references (e.g., a `condition` whose branches allocate
+        // and return a reference) must reach the rule so that every reference result carries its tangent reference.
         // Region-free operations can instead inspect their outputs without reproducing the primal's region-identity
         // instantiation.
         let reusable_zero_outputs = if !zero_input_tangents {
@@ -1877,6 +1895,8 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
@@ -1999,6 +2019,7 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Builds the fused Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`] with respect to
     /// `input_indices`. The program receives all primal inputs in source order, followed by tangent inputs in the
@@ -2196,10 +2217,10 @@ where
                             .enumerate()
                             .map(|(output_index, primal)| {
                                 // When the primal instruction is itself known to produce zero and its output already
-                                // has the required tangent type, the primal Single Static Assignment (SSA) value is
-                                // the canonical materialized tangent. Reusing it preserves source-relative geometry
-                                // such as explicit shaped-constructor extents and avoids inventing a nullary dynamic
-                                // zero at the fused Jacobian-Vector Product (JVP) boundary.
+                                // has the required tangent type, the primal Single Static Assignment (SSA) value is the
+                                // canonical materialized tangent. Reusing it preserves source-relative shapes such as
+                                // explicit shaped-constructor extents and avoids inventing a nullary dynamic zero at
+                                // the fused Jacobian-Vector Product (JVP) boundary.
                                 let primal_type = primal.r#type();
                                 let tangent_type = primal_type.tangent()?;
                                 if instruction.operation().is_zero(output_index)
@@ -2590,13 +2611,13 @@ where
             }
         }
 
-        // Reference transposition can need the full allocation geometry even when a live tangent or its output
-        // describes only a view. Retain dimensions of ordinary primal inputs without introducing reference reads.
-        // Without reference state, only disconnected tangent inputs require additional zero-construction residuals.
+        // Reference transposition can need the full allocation shape even when a live tangent or its output describes
+        // only a view. Retain dimensions of ordinary primal inputs without introducing reference reads. Without
+        // reference state, only disconnected tangent inputs require additional zero-construction residuals.
         let has_references = tangent_program.entry_region_ref().contains_references_in_closure();
 
-        // Deferred work can consume a tangent without returning its cotangent. Geometry must therefore follow output
-        // liveness, matching the trailing-residual mapping recovered during transposition.
+        // Deferred work can consume a tangent without returning its cotangent. Retained extents must therefore follow
+        // output liveness, matching the trailing-residual mapping recovered during transposition.
         let tangent_live_sets = tangent_program.live_sets();
         let differentiable_primal_inputs = arguments
             .input_indices
@@ -2625,8 +2646,8 @@ where
 
         if !zero_residual_types.is_empty() {
             // Program boundaries are immutable. Rebuild the tangent program with the old inputs as an unchanged prefix
-            // and the zero-geometry residuals as a trailing suffix; the primal program emits residual values in this
-            // same order below.
+            // and the zero-extent residuals as a trailing suffix; the primal program emits residual values in this same
+            // order below.
             let mut builder = ProgramBuilder::<V, O>::new();
             let old_input_count = tangent_program.input_ids().len();
             let inputs = tangent_program
@@ -2672,6 +2693,7 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
     /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
@@ -2996,7 +3018,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let output = function(input, capture)?;
 
         // Split each output dual into its primal value and its materialized tangent. A structural zero derives its
-        // runtime geometry from the corresponding primal result before the public boundary requires a concrete value.
+        // runtime extents from the corresponding primal result before the public boundary requires a concrete value.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
@@ -3066,7 +3088,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 
 /// Linearizes `function` at `primal` using the provided [`DifferentiationRule`], returning its primal outputs and
 /// a [`Pushforward`] containing the saved residuals and derivative program. Shares boundary validation, partial
-/// evaluation, geometry retention, and reference-lifetime handling with public linearization. When the rule is
+/// evaluation, extent retention, and reference-lifetime handling with public linearization. When the rule is
 /// [`DifferentiationRule::JvpForTranspose`], the derivative program need only support transposition and must not be
 /// assumed executable as a pushforward.
 #[allow(clippy::type_complexity)]
@@ -3087,6 +3109,8 @@ where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
     if primal.parameters().next().is_none() {
         return Err(DifferentiationError::EmptyInput);
@@ -3111,7 +3135,7 @@ where
     let evaluation_context = differentiation_context.tangent().clone();
     let mut tangent_index = 0usize;
 
-    // Retain the primals for the geometry capture below; only the values stamped into duals need cloning.
+    // Retain the primals for the extent capture below; only the values stamped into duals need cloning.
     let input_duals = input_values
         .iter()
         .cloned()
@@ -3255,14 +3279,14 @@ where
         }
     }
 
-    // Preserve allocation geometry for reference adjoints, including live inputs whose outputs describe only a
-    // view. Only ordinary inputs supply these extra dimensions as reading a primal reference solely for geometry
-    // could move a synchronization or lifecycle error ahead of the original computation. For reference-free
-    // programs, disconnected tangent inputs alone require extra zero geometry.
+    // Preserve allocation shapes for reference adjoints, including live inputs whose outputs describe only a view.
+    // Only ordinary inputs supply these extra dimensions as reading a primal reference solely for its extents could
+    // move a synchronization or lifecycle error ahead of the original computation. For reference-free programs,
+    // disconnected tangent inputs alone require extra extents for their zeros.
     let mut program = evaluation.program;
     let has_references = program.entry_region_ref().contains_references_in_closure();
 
-    // A tangent retained only by deferred work can still receive a structural-zero cotangent. Keep its geometry using
+    // A tangent retained only by deferred work can still receive a structural-zero cotangent. Keep its extents using
     // output liveness, matching transposition's reconstruction of the trailing residual boundary.
     let live_sets = program.live_sets();
     let differentiable_primal_inputs = input_values
@@ -3345,7 +3369,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 pub fn jvp_projected_operation<
     T: DifferentiableType,
     O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    C: Context<Type: DifferentiableType> + DomainProjection<T>,
+    C: ContextProjection<T, Type: DifferentiableType>,
     P: DifferentiationPolicy<C>,
 >(
     context: &DifferentiationContext<C, P>,
@@ -3370,7 +3394,7 @@ pub fn jvp_projected_operation<
 pub fn jvp_for_transpose_projected_operation<
     T: DifferentiableType,
     O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    C: Context<Type: DifferentiableType> + DomainProjection<T>,
+    C: ContextProjection<T, Type: DifferentiableType>,
     P: DifferentiationPolicy<C>,
 >(
     context: &DifferentiationContext<C, P>,
@@ -3390,7 +3414,7 @@ pub fn jvp_for_transpose_projected_operation<
 /// # Parameters
 ///
 ///   - `builder`: Program builder in which residual-capture operations are staged.
-///   - `source`: Primal program atom from which the provider obtains runtime geometry.
+///   - `source`: Primal program atom from which the provider obtains runtime extents.
 ///   - `r#type`: Type of the zero that will later be materialized.
 ///   - `site`: Description of the capture site included in malformed-program diagnostics.
 fn capture_and_validate_zero_residual_atoms<
@@ -3432,13 +3456,13 @@ fn capture_and_validate_zero_residual_atoms<
 /// Static Assignment (SSA) values. Binding the zero normally could let partial evaluation fold it into a known value
 /// and remove that output from the program boundary. This helper instead marks the residual values as known inputs to
 /// the zero operation and explicitly residualizes that operation, preserving one unknown program output while retaining
-/// the runtime geometry needed to materialize the zero.
+/// the runtime extents needed to materialize the zero.
 ///
 /// # Parameters
 ///
 ///   - `context`: Partial-evaluation context whose residual program receives the zero operation.
 ///   - `r#type`: Type of the zero to materialize.
-///   - `residual_values`: Runtime geometry values declared by [`ResidualZeroProvider::zero_residual_types`], in
+///   - `residual_values`: Runtime extent values declared by [`ResidualZeroProvider::zero_residual_types`], in
 ///     provider-declaration order.
 fn residualize_zero_from_residual_values<
     C: Context<Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
@@ -3446,7 +3470,11 @@ fn residualize_zero_from_residual_values<
     context: &PartialEvaluationContext<C>,
     r#type: C::Type,
     residual_values: Vec<C::Value>,
-) -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
+) -> Result<PartialEvaluationValue<C::Value>, ProgramError>
+where
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+{
     let residual_values = residual_values.into_iter().map(PartialEvaluationValue::known_input).collect::<Vec<_>>();
     let (operation, zero_inputs) = C::Operation::zero_operation_with_residuals(r#type, residual_values.as_slice())?;
     let mut outputs = context.residualize(operation, Vec::new(), zero_inputs.as_slice())?;
@@ -3556,8 +3584,8 @@ pub(crate) mod tests {
         DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{
-        BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-        BatchingPolicy, ProgramBatchingOutputAxesPolicy,
+        BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+        ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
@@ -3565,10 +3593,11 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_non_transposable_operation;
     use crate::operations::{
-        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, LinearCallOperation, Mul,
-        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
+        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, GuardOperation,
+        LinearCallOperation, Mul, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
+        StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -5007,7 +5036,7 @@ pub(crate) mod tests {
         let (batched, output_axes) = program
             .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
-            .into_parts();
+            .into_program_and_output_axes();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let reverse = batched
             .entry_region_ref()
@@ -5591,6 +5620,14 @@ pub(crate) mod tests {
             }
         }
 
+        impl OperationProvider<ArrayType, GuardOperation<ArrayType>> for ObservedOperation {
+            type Operation = Self;
+
+            fn provide(request: GuardOperation<ArrayType>, _input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                Err(request.unsupported_family_error())
+            }
+        }
+
         impl ResidualZeroProvider<ArrayType> for ObservedOperation {}
 
         let primal_calls = Rc::new(std::cell::Cell::new(0));
@@ -5655,7 +5692,7 @@ pub(crate) mod tests {
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )
                 .unwrap()
-                .into_parts();
+                .into_program_and_output_axes();
             let xs = Array::matrix(2, 3, rows.to_vec()).unwrap();
             let context = EagerContext::<Value, ArrayIrOperation<Array>>::new();
             let (_, pullback) = differentiate_at(Value::Array(xs))

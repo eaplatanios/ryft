@@ -209,7 +209,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::arrays::{ArrayIrType, ArrayType, Memory};
 use crate::axes::NamedAxes;
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationRule;
 use crate::differentiation::forward::DifferentiableOperation;
 use crate::differentiation::types::DifferentiableType;
@@ -324,6 +324,8 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         Output: Parameterized<DomainTracer<C>>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
         Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -369,6 +371,8 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         Output: Parameterized<DomainTracer<C>>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<C::Value>,
         Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -397,6 +401,8 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         Output: Parameterized<DomainTracer<C>>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<C::Value>,
         Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let policy = self.policy.reference::<C::Type>()?;
         let (output_types, body) =
@@ -585,7 +591,10 @@ pub fn saved_residuals<
 >(
     function: F,
     input_types: Input,
-) -> Result<Vec<SavedResidual<V::Type>>, ProgramError> {
+) -> Result<Vec<SavedResidual<V::Type>>, ProgramError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
     // The program is linearized with the `jvp_for_transpose` rules that reverse mode differentiation uses,
     // which can save different values than the `jvp` rules (e.g., for custom functions with distinct rules).
     let (_, program) = TracingContext::<V, O>::trace(function, input_types)?;
@@ -1359,12 +1368,12 @@ mod tests {
         DimensionBounds, DimensionType, Memory, ShardingDimension,
     };
     use crate::axes::AxisError;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::operations::{
-        AxisIndex, Constant, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp,
-        MulOperation, ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, custom_function,
+        AxisIndex, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, MulOperation,
+        ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, custom_function,
     };
     use crate::partial::ResidualProducer;
     use crate::programs::{Program, ReferenceType};
@@ -1701,7 +1710,7 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             )
             .unwrap()
-            .into_parts();
+            .into_program_and_output_axes();
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -2030,7 +2039,7 @@ mod tests {
         assert_eq!(
             saved_residuals(
                 |x: TestTracer| {
-                    let constant = x.context().constant(Array::scalar(3.0f64).unwrap())?.reduce_precision(8, 7)?;
+                    let constant = x.context().lift(Array::scalar(3.0f64).unwrap())?.reduce_precision(8, 7)?;
                     Ok(x.sin()? * constant)
                 },
                 scalar_type.clone(),
